@@ -172,7 +172,11 @@ import {
 	RELAY_WRITE_DEADLINE_MS,
 	type RelaySessionSink,
 } from "./scenarios/fanout-relay.ts";
-import type { FanoutWireV1 } from "./scenarios/fanout-wire.ts";
+import {
+	decodeFanoutDelivery,
+	type FanoutWireV1,
+	fanoutDeliveryUnitKind,
+} from "./scenarios/fanout-wire.ts";
 import { parseStrictJsonBytes, sha256HexOfBytes } from "./secure-fs.ts";
 import {
 	buildStagedServerLaunchRecord,
@@ -1805,15 +1809,24 @@ function loopbackPeerSink(transport: "ws" | "wt"): {
 	const codec = fanoutFrameCodecFor(transport);
 	const inbox: FanoutWireV1[] = [];
 	let blocked = false;
+	const take = (bytes: Uint8Array): "accepted" | "would-block" => {
+		if (blocked) return "would-block";
+		// A compact delivery is decoded to prove the relay wrote a well-formed
+		// unit; only the JSON frames are kept, which is all these tests read.
+		if (fanoutDeliveryUnitKind(bytes, transport) === "compact") {
+			const delivery = decodeFanoutDelivery(bytes, MESSAGE_BYTES);
+			if (!delivery.ok) throw new Error(`peer delivery: ${delivery.code}`);
+			return "accepted";
+		}
+		const decoded = codec.decode(bytes);
+		if (!decoded.ok) throw new Error(`peer decode: ${decoded.code}`);
+		inbox.push(decoded.value);
+		return "accepted";
+	};
 	return {
 		sink: {
-			trySend: (bytes) => {
-				if (blocked) return "would-block";
-				const decoded = codec.decode(bytes);
-				if (!decoded.ok) throw new Error(`peer decode: ${decoded.code}`);
-				inbox.push(decoded.value);
-				return "accepted";
-			},
+			trySend: take,
+			trySendDelivery: take,
 			close: () => {},
 		},
 		inbox,
@@ -2396,6 +2409,7 @@ describe("linux is the cohort authority", () => {
 		const roleId = fanoutRoleId("subscriber", 0);
 		const sessionId = session.relay.openSession({
 			trySend: () => "accepted",
+			trySendDelivery: () => "accepted",
 			close: () => {},
 		});
 		// A structurally perfect registration whose token opens another cohort's
@@ -2425,6 +2439,7 @@ describe("linux is the cohort authority", () => {
 		const wrongShardRoleId = fanoutRoleId("subscriber", 1);
 		const wrongShardSession = session.relay.openSession({
 			trySend: () => "accepted",
+			trySendDelivery: () => "accepted",
 			close: () => {},
 		});
 		const wrongShard = session.relay.handleInbound(wrongShardSession, {
@@ -5664,6 +5679,7 @@ describe("cohort replacement and reap", () => {
 		const staleRoleId = fanoutRoleId("subscriber", 0);
 		const sessionId = started.value.openSession({
 			trySend: () => "accepted",
+			trySendDelivery: () => "accepted",
 			close: () => {},
 		});
 		const stale = started.value.handleInbound(sessionId, {

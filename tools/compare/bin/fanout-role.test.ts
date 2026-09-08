@@ -44,7 +44,17 @@ import {
 	type FanoutCohortFixture,
 	fanoutPayload,
 } from "../scenarios/fanout-relay.ts";
-import type { FanoutWireV1 } from "../scenarios/fanout-wire.ts";
+import {
+	buildFanoutDeliveryContext,
+	contextTagOfDeliveryContextSha256,
+	decodeFanoutDelivery,
+	decodeFanoutWsMessage,
+	encodeFanoutDelivery,
+	encodeFanoutWsMessage,
+	type FanoutDeliveryContextFacts,
+	type FanoutWireV1,
+	fanoutDeliveryUnitKind,
+} from "../scenarios/fanout-wire.ts";
 import { sha256HexOfBytes } from "../secure-fs.ts";
 import {
 	type FanoutRoleChildOutcome,
@@ -84,6 +94,12 @@ const WARMUP_NONCE = HEX("7");
 
 const base64Of = (bytes: Uint8Array): Base64 =>
 	Buffer.from(bytes).toString("base64") as Base64;
+
+/** The cell-sized payload a relay would copy into a compact frame. */
+const payloadBytesOf = (label: string): Uint8Array =>
+	new Uint8Array(
+		Buffer.from(fanoutPayload(MESSAGE_BYTES, label).payloadBase64, "base64"),
+	);
 
 function stagedLaunchRecord(): StagedServerLaunchRecordV1 {
 	return {
@@ -551,7 +567,23 @@ interface ScriptedSession {
 	readonly role: "publisher" | "subscriber";
 	readonly outbound: FanoutWireV1[];
 	readonly closedAt: () => number | null;
+	/** A JSON frame, the way the connector hands one over. */
 	deliver(frame: FanoutWireV1): void;
+	/** The epoch's delivery context, built from the relay's own facts. */
+	deliverContext(epoch: "warmup" | "measured"): void;
+	/** One compact frame, tagged for the epoch unless a tag is given. */
+	deliverCompact(args: {
+		readonly epoch: "warmup" | "measured";
+		readonly windowIndex: number;
+		readonly publisherIndex: number;
+		readonly publisherSequence: number;
+		readonly linuxAcceptedOrdinal: number;
+		readonly payload: Uint8Array;
+		readonly subscriberIndex?: number;
+		readonly contextTag?: number;
+	}): void;
+	/** Raw bytes through the WS discriminator, as the connector routes them. */
+	deliverBytes(bytes: Uint8Array): void;
 }
 
 interface ScriptedRelay extends RoleTransportConnector {
@@ -564,16 +596,51 @@ interface ScriptedRelay extends RoleTransportConnector {
 	releaseHeldAcks(): void;
 	readonly heldAckCount: () => number;
 	onEnd: (session: ScriptedSession) => void;
+	/** Every reason the child's connector callbacks refused a unit. */
+	readonly malformed: string[];
+	/** The epoch digest the warmup contexts are built from; set by `driveChild`. */
+	warmupEpochSha256: Sha256Hex | null;
 }
 
 function scriptedRelay(args: {
 	readonly cohortGrantSha256: Sha256Hex;
 	readonly cohortStartBarrierSha256: Sha256Hex;
+	/** What the relay writes its delivery contexts from; the honest facts by default. */
+	readonly contextGrantSha256?: Sha256Hex;
 }): ScriptedRelay {
 	const sessions = new Map<string, ScriptedSession>();
 	const held: (() => void)[] = [];
 	let closes = 0;
 	let ordinal = 0;
+	const publisherIds = Array.from(
+		{ length: PUBLISHER_COUNT },
+		(_u, index) => `publisher-${index.toString().padStart(6, "0")}`,
+	);
+	const contextFacts = (
+		roleId: string,
+		epoch: "warmup" | "measured",
+	): FanoutDeliveryContextFacts => {
+		const common = {
+			cohortGrantSha256: args.contextGrantSha256 ?? args.cohortGrantSha256,
+			subscriberId: roleId,
+			subscriberIndex: Number(roleId.slice("subscriber-".length)),
+			publisherIds,
+			windowCount: WINDOW_COUNT,
+			messageBytes: MESSAGE_BYTES,
+		};
+		return epoch === "warmup"
+			? {
+					...common,
+					epoch,
+					cohortWarmupEpochSha256: relay.warmupEpochSha256 ?? HEX("0"),
+					warmupNonce: WARMUP_NONCE,
+				}
+			: {
+					...common,
+					epoch,
+					cohortStartBarrierSha256: args.cohortStartBarrierSha256,
+				};
+	};
 	const relay: ScriptedRelay = {
 		transport: "ws",
 		sessions,
@@ -584,15 +651,76 @@ function scriptedRelay(args: {
 			for (const release of held.splice(0)) release();
 		},
 		onEnd: () => {},
+		malformed: [],
+		warmupEpochSha256: null,
 		connect: async (request) => {
 			let closedAt: number | null = null;
 			const outbound: FanoutWireV1[] = [];
+			const tags: { warmup: number | null; measured: number | null } = {
+				warmup: null,
+				measured: null,
+			};
+			const onMalformed = (detail: string): void => {
+				relay.malformed.push(`${request.roleId}: ${detail}`);
+				request.onMalformed(detail);
+			};
+			const deliverBytes = (bytes: Uint8Array): void => {
+				switch (fanoutDeliveryUnitKind(bytes, "ws")) {
+					case "compact": {
+						const delivery = decodeFanoutDelivery(bytes, request.messageBytes);
+						if (delivery.ok) request.onDelivery(delivery.value);
+						else onMalformed(delivery.message ?? delivery.code);
+						return;
+					}
+					case "json": {
+						const decoded = decodeFanoutWsMessage(bytes);
+						if (decoded.ok) request.onFrame(decoded.value);
+						else onMalformed(decoded.message ?? decoded.code);
+						return;
+					}
+					default:
+						onMalformed("neither compact nor JSON");
+				}
+			};
 			const session: ScriptedSession = {
 				roleId: request.roleId,
 				role: request.role,
 				outbound,
 				closedAt: () => closedAt,
 				deliver: (frame) => request.onFrame(frame),
+				deliverContext: (epoch) => {
+					const context = buildFanoutDeliveryContext(
+						contextFacts(request.roleId, epoch),
+					);
+					if (!context.ok) throw new Error(`context: ${context.code}`);
+					tags[epoch] = contextTagOfDeliveryContextSha256(
+						context.value.deliveryContextSha256,
+					);
+					const encoded = encodeFanoutWsMessage(context.value);
+					if (!encoded.ok) throw new Error(`context encode: ${encoded.code}`);
+					deliverBytes(encoded.value);
+				},
+				deliverCompact: (frame) => {
+					const tag = frame.contextTag ?? tags[frame.epoch];
+					if (tag === null) throw new Error(`no ${frame.epoch} context yet`);
+					const encoded = encodeFanoutDelivery(
+						{
+							windowIndex: frame.windowIndex,
+							publisherIndex: frame.publisherIndex,
+							subscriberIndex:
+								frame.subscriberIndex ??
+								Number(request.roleId.slice("subscriber-".length)),
+							publisherSequence: frame.publisherSequence,
+							linuxAcceptedOrdinal: frame.linuxAcceptedOrdinal,
+							contextTag: tag,
+							payloadBytes: MESSAGE_BYTES,
+						},
+						frame.payload,
+					);
+					if (!encoded.ok) throw new Error(`compact encode: ${encoded.code}`);
+					deliverBytes(encoded.value);
+				},
+				deliverBytes,
 			};
 			sessions.set(request.roleId, session);
 			const handle: RoleSessionHandle = {
@@ -672,6 +800,11 @@ function driveChild(args: {
 		readonly relay: ScriptedRelay;
 		readonly clock: ReturnType<typeof manualClock>;
 	}) => void;
+	/**
+	 * What the scripted relay puts on each subscriber's delivery channel at
+	 * the warmup start; the default is the amended wire.
+	 */
+	readonly warmupWire?: (session: ScriptedSession, roleId: string) => void;
 }): DrivenChild {
 	const { cohort, config, relay, clock } = args;
 	const control = scriptedControl();
@@ -682,6 +815,7 @@ function driveChild(args: {
 		cohort,
 		config.role === "publisher" ? "publisher" : "subscriber-worker",
 	);
+	relay.warmupEpochSha256 ??= warmup.epochSha256;
 
 	control.onSent((frame) => {
 		switch (frame.schema) {
@@ -700,32 +834,31 @@ function driveChild(args: {
 			case "role-ready/v1":
 				control.supply(warmup.frame);
 				if (config.role === "subscriber-worker") {
-					// The relay fans every publisher's ten warmup frames to each
-					// subscriber this worker owns.
+					// The relay puts the warmup context first on each channel, then
+					// fans every publisher's ten warmup frames to each subscriber
+					// this worker owns, every one tagged with that context.
 					for (const roleId of args.roleIds) {
 						const session = relay.sessions.get(roleId);
 						if (session === undefined) throw new Error(`no session ${roleId}`);
+						if (args.warmupWire !== undefined) {
+							args.warmupWire(session, roleId);
+							continue;
+						}
+						session.deliverContext("warmup");
+						let ordinal = 0;
 						for (
 							let publisher = 0;
 							publisher < PUBLISHER_COUNT;
 							publisher += 1
 						) {
 							for (let sequence = 0; sequence < 10; sequence += 1) {
-								const payload = fanoutPayload(MESSAGE_BYTES, `w:${sequence}`);
-								session.deliver({
-									schema: "fanout-wire/v1",
-									kind: "warmup-data",
-									direction: "relay-to-subscriber",
-									cohortGrantSha256: config.cohortGrantSha256,
-									cohortWarmupEpochSha256: warmup.epochSha256,
-									warmupNonce: WARMUP_NONCE,
-									publisherId: `publisher-${publisher.toString().padStart(6, "0")}`,
+								session.deliverCompact({
+									epoch: "warmup",
+									windowIndex: 0,
+									publisherIndex: publisher,
 									publisherSequence: sequence,
-									subscriberId: roleId,
-									linuxAcceptedOrdinal: sequence,
-									payloadBase64: payload.payloadBase64,
-									payloadSha256: payload.payloadSha256,
-									payloadBytes: MESSAGE_BYTES,
+									linuxAcceptedOrdinal: ordinal++,
+									payload: payloadBytesOf(`w:${sequence}`),
 								});
 							}
 						}
@@ -1014,21 +1147,16 @@ describe("the worker's deliveries are stamped when they arrive", () => {
 						500n * NS_PER_MS,
 				);
 				for (const roleId of worker.roleIds) {
-					const payload = fanoutPayload(MESSAGE_BYTES, `m:${roleId}`);
-					relay.sessions.get(roleId)?.deliver({
-						schema: "fanout-wire/v1",
-						kind: "data",
-						direction: "relay-to-subscriber",
-						cohortGrantSha256: cohort.grantSha256,
-						cohortStartBarrierSha256: barrierSha256,
+					const session = relay.sessions.get(roleId);
+					if (session === undefined) throw new Error(`no session ${roleId}`);
+					session.deliverContext("measured");
+					session.deliverCompact({
+						epoch: "measured",
 						windowIndex: ARRIVAL_WINDOW,
-						publisherId: "publisher-000000",
+						publisherIndex: 0,
 						publisherSequence: 0,
-						subscriberId: roleId,
 						linuxAcceptedOrdinal: 0,
-						payloadBase64: payload.payloadBase64,
-						payloadSha256: payload.payloadSha256,
-						payloadBytes: MESSAGE_BYTES,
+						payload: payloadBytesOf(`m:${roleId}`),
 					});
 				}
 				// ... and the stop frame is read five windows later, as it is when
@@ -1129,5 +1257,310 @@ describe("the child's exit", () => {
 		expect(last?.schema).toBe("role-exited/v1");
 		expect(last?.childId).toBe(worker.config.childId);
 		expect(last?.exitCode).toBe(0);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Physical-budget amendment D2: the worker's delivery channel fails closed
+// ---------------------------------------------------------------------------
+
+describe("D2: the worker refuses the delivery channel on the first wrong unit", () => {
+	function armWorker(args: {
+		readonly cohort: CohortFixtures;
+		readonly workerIndex?: number;
+		readonly relayArgs?: Partial<Parameters<typeof scriptedRelay>[0]>;
+		readonly warmupWire?: (session: ScriptedSession, roleId: string) => void;
+		readonly onArmed?: (child: {
+			readonly control: ScriptedControl;
+			readonly relay: ScriptedRelay;
+			readonly clock: ReturnType<typeof manualClock>;
+		}) => void;
+	}) {
+		const worker = workerChild(args.cohort, args.workerIndex ?? 3);
+		const clock = manualClock(0n);
+		const barrierSha256 = sha256HexOfBytes(
+			bytesOfCanonical(startBarrier(args.cohort)),
+		);
+		const relay = scriptedRelay({
+			cohortGrantSha256: args.cohort.grantSha256,
+			cohortStartBarrierSha256: barrierSha256,
+			...args.relayArgs,
+		});
+		const child = driveChild({
+			cohort: args.cohort,
+			config: worker.config,
+			bundle: worker.bundle,
+			roleIds: worker.roleIds,
+			relay,
+			clock,
+			onArmed:
+				args.onArmed ??
+				(({ control }) => {
+					control.supply(roleStop(worker.config, barrierSha256, clock.nowNs()));
+				}),
+			...(args.warmupWire === undefined ? {} : { warmupWire: args.warmupWire }),
+		});
+		return { worker, child, relay, clock, barrierSha256 };
+	}
+
+	/** The §4.2 JSON delivery a relay that predates the amendment still writes. */
+	function legacyWarmupData(
+		cohort: CohortFixtures,
+		roleId: string,
+	): FanoutWireV1 {
+		const payload = fanoutPayload(MESSAGE_BYTES, "legacy");
+		return {
+			schema: "fanout-wire/v1",
+			kind: "warmup-data",
+			direction: "relay-to-subscriber",
+			cohortGrantSha256: cohort.grantSha256,
+			cohortWarmupEpochSha256: warmupStartFrame(cohort, "subscriber-worker")
+				.epochSha256,
+			warmupNonce: WARMUP_NONCE,
+			publisherId: "publisher-000000",
+			publisherSequence: 0,
+			subscriberId: roleId,
+			linuxAcceptedOrdinal: 0,
+			payloadBase64: payload.payloadBase64,
+			payloadSha256: payload.payloadSha256,
+			payloadBytes: MESSAGE_BYTES,
+		};
+	}
+
+	async function expectMismatch(
+		child: DrivenChild,
+		worker: { readonly config: RoleSpawnConfigV1 },
+		detail: string,
+	): Promise<void> {
+		const outcome = await child.outcome;
+		expect(outcome.ok).toBe(false);
+		if (outcome.ok) throw new Error("unreachable");
+		expect(outcome.code).toBe("DELIVERY_CONTEXT_MISMATCH");
+		expect(outcome.message).toContain(detail);
+		// The child said why before exiting: the closed code is on the pipe.
+		const last = child.control.sent.at(-1);
+		expect(last?.schema).toBe("role-failed/v1");
+		expect(last?.code).toBe("DELIVERY_CONTEXT_MISMATCH");
+		expect(last?.childId).toBe(worker.config.childId);
+		expect(last?.executionSha256).toBe(worker.config.executionSha256);
+		expect(
+			child.control.sent.some((f) => f.schema === "role-warmup-complete/v1"),
+		).toBe(false);
+	}
+
+	test("a JSON data frame where the warmup context belongs is DELIVERY_CONTEXT_MISMATCH, not a shortfall", async () => {
+		const cohort = buildCohort();
+		const { child, worker } = armWorker({
+			cohort,
+			warmupWire: (session, roleId) => {
+				session.deliver(legacyWarmupData(cohort, roleId));
+			},
+		});
+		await expectMismatch(
+			child,
+			worker,
+			"warmup-data frame on the delivery channel",
+		);
+	});
+
+	test("a compact frame before its context is refused", async () => {
+		const cohort = buildCohort();
+		const { child, worker } = armWorker({
+			cohort,
+			warmupWire: (session) => {
+				session.deliverCompact({
+					epoch: "warmup",
+					windowIndex: 0,
+					publisherIndex: 0,
+					publisherSequence: 0,
+					linuxAcceptedOrdinal: 0,
+					payload: payloadBytesOf("early"),
+					contextTag: 0x1234_5678,
+				});
+			},
+		});
+		await expectMismatch(child, worker, "no delivery context on this session");
+	});
+
+	test("a context bound to another grant is refused by the worker's own recompute", async () => {
+		const cohort = buildCohort();
+		const { child, worker } = armWorker({
+			cohort,
+			relayArgs: { contextGrantSha256: HEX("e") },
+		});
+		await expectMismatch(
+			child,
+			worker,
+			"does not match this session's admission",
+		);
+	});
+
+	test("a frame carrying another session's subscriber index is refused", async () => {
+		const cohort = buildCohort();
+		const { child, worker } = armWorker({
+			cohort,
+			warmupWire: (session) => {
+				session.deliverContext("warmup");
+				session.deliverCompact({
+					epoch: "warmup",
+					windowIndex: 0,
+					publisherIndex: 0,
+					publisherSequence: 0,
+					linuxAcceptedOrdinal: 0,
+					payload: payloadBytesOf("elsewhere"),
+					subscriberIndex: 1_000,
+				});
+			},
+		});
+		await expectMismatch(child, worker, "subscriber index 1000");
+	});
+
+	test("a unit the connector cannot decode is counted and, in the warmup epoch, ends the child", async () => {
+		const cohort = buildCohort();
+		const { child, worker, relay } = armWorker({
+			cohort,
+			warmupWire: (session) => {
+				session.deliverContext("warmup");
+				const bytes = new Uint8Array(24 + MESSAGE_BYTES);
+				bytes[0] = 0xc1;
+				new DataView(bytes.buffer).setUint16(20, MESSAGE_BYTES, true);
+				bytes[22] = 1; // the reserved field must be zero
+				session.deliverBytes(bytes);
+			},
+		});
+		await expectMismatch(child, worker, "undecodable delivery unit");
+		// One bad unit per session was counted; the first of them ended the child.
+		expect(relay.malformed.length).toBe(worker.roleIds.length);
+		expect(relay.malformed.every((detail) => detail.includes("reserved"))).toBe(
+			true,
+		);
+	});
+
+	test("a warmup-tagged frame after the measured context is refused", async () => {
+		const cohort = buildCohort();
+		const { child, worker } = armWorker({
+			cohort,
+			onArmed: ({ relay: scripted, control, clock }) => {
+				for (const roleId of worker.roleIds) {
+					const session = scripted.sessions.get(roleId);
+					if (session === undefined) throw new Error(`no session ${roleId}`);
+					session.deliverContext("measured");
+					session.deliverCompact({
+						epoch: "warmup",
+						windowIndex: 0,
+						publisherIndex: 0,
+						publisherSequence: 11,
+						linuxAcceptedOrdinal: 99,
+						payload: payloadBytesOf("late"),
+					});
+					break;
+				}
+				control.supply(roleStop(worker.config, barrierSha256, clock.nowNs()));
+			},
+		});
+		const barrierSha256 = child.barrierSha256;
+		const outcome = await child.outcome;
+		expect(outcome.ok).toBe(false);
+		if (outcome.ok) throw new Error("unreachable");
+		expect(outcome.code).toBe("DELIVERY_CONTEXT_MISMATCH");
+		expect(outcome.message).toContain(
+			"warmup-tagged frame during the measured epoch",
+		);
+		expect(child.control.sent.at(-1)?.schema).toBe("role-failed/v1");
+		expect(child.control.sent.some((f) => f.schema === "role-partial/v1")).toBe(
+			false,
+		);
+	});
+
+	test("a JSON data frame in the measured window is refused with the same code", async () => {
+		const cohort = buildCohort();
+		const { child, worker } = armWorker({
+			cohort,
+			onArmed: ({ relay: scripted, control, clock }) => {
+				const roleId = worker.roleIds[0] as string;
+				const session = scripted.sessions.get(roleId);
+				if (session === undefined) throw new Error(`no session ${roleId}`);
+				session.deliverContext("measured");
+				const payload = fanoutPayload(MESSAGE_BYTES, "legacy-measured");
+				session.deliver({
+					schema: "fanout-wire/v1",
+					kind: "data",
+					direction: "relay-to-subscriber",
+					cohortGrantSha256: cohort.grantSha256,
+					cohortStartBarrierSha256: child.barrierSha256,
+					windowIndex: 0,
+					publisherId: "publisher-000000",
+					publisherSequence: 0,
+					subscriberId: roleId,
+					linuxAcceptedOrdinal: 0,
+					payloadBase64: payload.payloadBase64,
+					payloadSha256: payload.payloadSha256,
+					payloadBytes: MESSAGE_BYTES,
+				});
+				control.supply(
+					roleStop(worker.config, child.barrierSha256, clock.nowNs()),
+				);
+			},
+		});
+		const outcome = await child.outcome;
+		expect(outcome.ok).toBe(false);
+		if (outcome.ok) throw new Error("unreachable");
+		expect(outcome.code).toBe("DELIVERY_CONTEXT_MISMATCH");
+		expect(outcome.message).toContain("data frame on the delivery channel");
+		expect(child.control.sent.at(-1)?.code).toBe("DELIVERY_CONTEXT_MISMATCH");
+	});
+
+	test("in the measured window an undecodable unit is counted in the partial and the child completes", async () => {
+		const cohort = buildCohort();
+		const { child, worker, relay } = armWorker({
+			cohort,
+			onArmed: ({ relay: scripted, control, clock }) => {
+				clock.advanceTo(MEASURE_START_NS + 2n * NS_PER_S);
+				for (const [index, roleId] of worker.roleIds.entries()) {
+					const session = scripted.sessions.get(roleId);
+					if (session === undefined) throw new Error(`no session ${roleId}`);
+					session.deliverContext("measured");
+					if (index === 0) {
+						const bytes = new Uint8Array(24 + MESSAGE_BYTES);
+						bytes[0] = 0xc1;
+						new DataView(bytes.buffer).setUint16(20, MESSAGE_BYTES, true);
+						bytes[22] = 1;
+						session.deliverBytes(bytes);
+					}
+					session.deliverCompact({
+						epoch: "measured",
+						windowIndex: 2,
+						publisherIndex: 1,
+						publisherSequence: 0,
+						linuxAcceptedOrdinal: 0,
+						payload: payloadBytesOf(`m:${roleId}`),
+					});
+				}
+				control.supply(
+					roleStop(worker.config, child.barrierSha256, clock.nowNs()),
+				);
+				for (const roleId of worker.roleIds) {
+					scripted.sessions.get(roleId)?.deliver({
+						schema: "fanout-wire/v1",
+						kind: "end",
+						cohortGrantSha256: cohort.grantSha256,
+						cohortStartBarrierSha256: child.barrierSha256,
+						role: "subscriber",
+						roleId,
+						finalWindowIndex: WINDOW_COUNT - 1,
+						finalPublisherSequence: null,
+						reason: "relay-drained",
+					});
+				}
+			},
+		});
+		const outcome = await child.outcome;
+		expect(outcome.ok).toBe(true);
+		const partial = child.partial() as WorkerPartialV1;
+		expect(partial.malformedCount).toBe(1);
+		expect(relay.malformed.length).toBe(1);
+		expect(sum(partial.deliveredByOriginWindow)).toBe(worker.roleIds.length);
+		expect(partial.perSubscriberDelivered).toEqual(worker.roleIds.map(() => 1));
+		expect(partial.duplicateCount).toBe(0);
 	});
 });

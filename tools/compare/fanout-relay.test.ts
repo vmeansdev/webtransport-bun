@@ -64,15 +64,23 @@ import {
 	type RelaySessionSink,
 } from "./scenarios/fanout-relay.ts";
 import {
+	contextTagOfDeliveryContextSha256,
+	decodeFanoutDelivery,
 	decodeFanoutWsMessage,
 	decodeFanoutWtStream,
 	encodeFanoutWsMessage,
 	encodeFanoutWtFrame,
 	FANOUT_CONTROL_FRAME_MAX_DECODED_BYTES,
+	FANOUT_DELIVERY_MAGIC,
 	FANOUT_WT_LENGTH_PREFIX_BYTES,
 	type FanoutAckV1,
 	type FanoutDataV1,
+	type FanoutDeliveryC1,
+	type FanoutDeliveryContextFacts,
 	type FanoutWireV1,
+	fanoutDeliveryUnitBytes,
+	fanoutDeliveryUnitKind,
+	verifyFanoutDeliveryContext,
 } from "./scenarios/fanout-wire.ts";
 import { sha256HexOfBytes } from "./secure-fs.ts";
 import {
@@ -88,11 +96,77 @@ import {
 // The binding seam
 // ---------------------------------------------------------------------------
 
+/**
+ * A compact delivery as a peer saw it: the decoded header, the payload's
+ * digest, and the epoch the peer resolved from its own delivery contexts.
+ */
+interface ReceivedDelivery extends FanoutDeliveryC1 {
+	readonly kind: "delivery";
+	readonly epoch: "warmup" | "measured";
+	readonly payloadSha256: Sha256Hex;
+}
+
+type ReceivedUnit = FanoutWireV1 | ReceivedDelivery;
+
+/**
+ * What every peer of every binding does with the bytes the relay writes it:
+ * a JSON unit is decoded through the transport's codec; a compact unit is
+ * decoded against the cell's payload size and resolved to the epoch whose
+ * delivery context this peer has already seen. A unit neither path takes is
+ * a harness defect and throws.
+ */
+function peerInbox(
+	transport: "ws" | "wt",
+	messageBytes: 100 | 128,
+): { readonly inbox: ReceivedUnit[]; accept(bytes: Uint8Array): void } {
+	const codec = fanoutFrameCodecFor(transport);
+	const inbox: ReceivedUnit[] = [];
+	const tags: { warmup: number | null; measured: number | null } = {
+		warmup: null,
+		measured: null,
+	};
+	return {
+		inbox,
+		accept: (bytes) => {
+			if (fanoutDeliveryUnitKind(bytes, transport) === "compact") {
+				const delivery = decodeFanoutDelivery(bytes, messageBytes);
+				if (!delivery.ok) throw new Error(`peer delivery: ${delivery.code}`);
+				const epoch =
+					delivery.value.contextTag === tags.measured
+						? "measured"
+						: delivery.value.contextTag === tags.warmup
+							? "warmup"
+							: null;
+				if (epoch === null) {
+					throw new Error(
+						`peer saw a compact frame tagged ${delivery.value.contextTag} before its context`,
+					);
+				}
+				inbox.push({
+					...delivery.value,
+					kind: "delivery",
+					epoch,
+					payloadSha256: sha256HexOfBytes(delivery.value.payload),
+				});
+				return;
+			}
+			const decoded = codec.decode(bytes);
+			if (!decoded.ok) throw new Error(`peer decode: ${decoded.code}`);
+			if (decoded.value.kind === "delivery-context") {
+				tags[decoded.value.epoch] = contextTagOfDeliveryContextSha256(
+					decoded.value.deliveryContextSha256,
+				);
+			}
+			inbox.push(decoded.value);
+		},
+	};
+}
+
 interface RelayPeer {
 	readonly role: "publisher" | "subscriber";
 	readonly roleId: string;
 	send(frame: FanoutWireV1): Promise<ProtocolResult<true>>;
-	received(): readonly FanoutWireV1[];
+	received(): readonly ReceivedUnit[];
 	/** Make the transport report backpressure for every subsequent write. */
 	block(): void;
 	unblock(): Promise<void>;
@@ -180,18 +254,21 @@ const IN_PROCESS_BINDING: RelayBinding = {
 			role: "publisher" | "subscriber",
 			roleId: string,
 		): Promise<RelayPeer> => {
-			const inbox: FanoutWireV1[] = [];
+			const { inbox, accept } = peerInbox(
+				config.transport,
+				config.messageBytes,
+			);
 			let blocked = false;
 			let dropped = false;
+			const deliver = (bytes: Uint8Array): RelaySendOutcome => {
+				if (dropped) return "closed";
+				if (blocked) return "would-block";
+				accept(bytes);
+				return "accepted";
+			};
 			const sink: RelaySessionSink = {
-				trySend: (bytes): RelaySendOutcome => {
-					if (dropped) return "closed";
-					if (blocked) return "would-block";
-					const decoded = codec.decode(bytes);
-					if (!decoded.ok) throw new Error(`peer decode: ${decoded.code}`);
-					inbox.push(decoded.value);
-					return "accepted";
-				},
+				trySend: deliver,
+				trySendDelivery: deliver,
 				close: () => {
 					dropped = true;
 				},
@@ -284,7 +361,7 @@ async function waitUntil(
 interface WsPeerState {
 	readonly sessionId: string;
 	readonly session: BinaryMessageServerSession;
-	readonly inbox: FanoutWireV1[];
+	readonly inbox: ReceivedUnit[];
 }
 
 /**
@@ -379,14 +456,10 @@ const WS_BINDING: RelayBinding = {
 			role: "publisher" | "subscriber",
 			roleId: string,
 		): Promise<RelayPeer> => {
-			const inbox: FanoutWireV1[] = [];
+			const { inbox, accept } = peerInbox("ws", config.messageBytes);
 			const client = await connectBinaryMessageClient({
 				url: peer.url,
-				onMessage: (bytes) => {
-					const decoded = codec.decode(bytes);
-					if (!decoded.ok) throw new Error(`peer decode: ${decoded.code}`);
-					inbox.push(decoded.value);
-				},
+				onMessage: accept,
 			});
 			clients.push(client);
 			await waitUntil(
@@ -475,7 +548,7 @@ const WT_SETTLE_STABLE_TICKS = 4;
 interface WtPeerState {
 	readonly sessionId: string;
 	readonly session: FanoutRelayWtSession;
-	readonly inbox: FanoutWireV1[];
+	readonly inbox: ReceivedUnit[];
 }
 
 /**
@@ -573,17 +646,24 @@ const WT_BINDING: RelayBinding = {
 			role: "publisher" | "subscriber",
 			roleId: string,
 		): Promise<RelayPeer> => {
-			const inbox: FanoutWireV1[] = [];
-			const readInto = (stream: NodeReadableLike): void => {
+			const { inbox, accept } = peerInbox("wt", config.messageBytes);
+			// The control bidi is prefixed JSON only; the server-opened uni is
+			// the delivery channel and is read in mixed mode, as the worker does.
+			const readInto = (
+				stream: NodeReadableLike,
+				channel: "control" | "delivery",
+			): void => {
 				const frames = new LengthPrefixedFrameReader(
 					FANOUT_CONTROL_FRAME_MAX_DECODED_BYTES,
+					channel === "delivery"
+						? {
+								firstByte: FANOUT_DELIVERY_MAGIC,
+								unitBytes: fanoutDeliveryUnitBytes(config.messageBytes),
+							}
+						: undefined,
 				);
 				stream.on("data", (chunk: Uint8Array) => {
-					for (const bytes of frames.push(chunk)) {
-						const decoded = codec.decode(bytes);
-						if (!decoded.ok) throw new Error(`peer decode: ${decoded.code}`);
-						inbox.push(decoded.value);
-					}
+					for (const bytes of frames.push(chunk)) accept(bytes);
 				});
 			};
 
@@ -596,10 +676,10 @@ const WT_BINDING: RelayBinding = {
 				(await client.createBidirectionalStream()) as unknown as NodeReadableLike & {
 					write(chunk: Uint8Array): boolean;
 				};
-			readInto(control);
+			readInto(control, "control");
 			void (async () => {
 				for await (const uni of client.incomingUnidirectionalStreams()) {
-					readInto(uni as unknown as NodeReadableLike);
+					readInto(uni as unknown as NodeReadableLike, "delivery");
 				}
 			})().catch(() => {
 				// The session ended; whatever it had already delivered stands.
@@ -898,10 +978,34 @@ async function armMeasured(cohort: Cohort): Promise<void> {
 	expect(armed.ok).toBe(true);
 }
 
-function dataFramesOf(peer: RelayPeer): FanoutDataV1[] {
+/** The compact deliveries a peer took under its measured context. */
+function dataFramesOf(peer: RelayPeer): ReceivedDelivery[] {
 	return peer
 		.received()
-		.filter((frame): frame is FanoutDataV1 => frame.kind === "data");
+		.filter(
+			(unit): unit is ReceivedDelivery =>
+				unit.kind === "delivery" && unit.epoch === "measured",
+		);
+}
+
+/** The compact deliveries a peer took under its warmup context. */
+function warmupDeliveriesOf(peer: RelayPeer): ReceivedDelivery[] {
+	return peer
+		.received()
+		.filter(
+			(unit): unit is ReceivedDelivery =>
+				unit.kind === "delivery" && unit.epoch === "warmup",
+		);
+}
+
+/** No §4.2 JSON data frame may ever reach a subscriber, warmup included. */
+function jsonDataFramesOf(peer: RelayPeer): FanoutWireV1[] {
+	return peer
+		.received()
+		.filter(
+			(unit): unit is FanoutWireV1 =>
+				unit.kind === "data" || unit.kind === "warmup-data",
+		);
 }
 
 function acksOf(peer: RelayPeer): FanoutAckV1[] {
@@ -1064,12 +1168,18 @@ for (const binding of RELAY_BINDINGS) {
 				expect(delivered.map((frame) => frame.publisherSequence)).toEqual([
 					0, 1, 2, 3, 4,
 				]);
-				expect(new Set(delivered.map((frame) => frame.subscriberId))).toEqual(
-					new Set([subscriber.roleId]),
-				);
+				// Every clone was patched for this session: its own index, and
+				// the tag of the measured context this very peer was handed.
 				expect(
-					delivered.every((frame) => frame.direction === "relay-to-subscriber"),
-				).toBe(true);
+					new Set(delivered.map((frame) => frame.subscriberIndex)),
+				).toEqual(
+					new Set([
+						cohort.harness.fixture.expectedSubscriberIds.indexOf(
+							subscriber.roleId,
+						),
+					]),
+				);
+				expect(jsonDataFramesOf(subscriber)).toEqual([]);
 			}
 
 			const counters = cohort.harness.relay.counters();
@@ -1259,10 +1369,9 @@ for (const binding of RELAY_BINDINGS) {
 				WARMUP_MESSAGES_PER_PUBLISHER * cohort.subscribers.length,
 			);
 			for (const subscriber of cohort.subscribers) {
-				const warmupData = subscriber
-					.received()
-					.filter((frame) => frame.kind === "warmup-data");
+				const warmupData = warmupDeliveriesOf(subscriber);
 				expect(warmupData.length).toBe(WARMUP_MESSAGES_PER_PUBLISHER);
+				expect(jsonDataFramesOf(subscriber)).toEqual([]);
 			}
 
 			const drained = cohort.harness.relay.drainWarmup();
@@ -1638,13 +1747,16 @@ for (const binding of RELAY_BINDINGS) {
 			);
 			await cohort.harness.settle();
 
-			// Every frame this cohort actually produced, on both mappings.
+			// Every JSON frame this cohort actually produced, on both mappings.
+			// The compact deliveries are one byte string on both transports by
+			// construction (`fanout-delivery.ts`), so they have no mapping to
+			// compare here.
 			const frames: FanoutWireV1[] = [
 				...publisher.received(),
 				...(cohort.subscribers[0] as RelayPeer).received(),
 				...(cohort.subscribers[1] as RelayPeer).received(),
 				dataFrame(publisher.roleId, 0),
-			];
+			].filter((unit): unit is FanoutWireV1 => unit.kind !== "delivery");
 			expect(frames.length).toBeGreaterThan(0);
 
 			for (const frame of frames) {
@@ -1746,6 +1858,227 @@ function s4Reachable(root: unknown): { path: string; value: unknown }[] {
 	walk(root, "authority");
 	return out;
 }
+
+// ---------------------------------------------------------------------------
+// D2: the delivery channel (physical-budget amendment)
+// ---------------------------------------------------------------------------
+
+/** The admission facts a subscriber of `cohort` recomputes its context from. */
+function contextFactsOf(
+	cohort: Cohort,
+	roleId: string,
+	epoch: "warmup" | "measured",
+): FanoutDeliveryContextFacts {
+	const fixture = cohort.harness.fixture;
+	const common = {
+		cohortGrantSha256: grantDigest(),
+		subscriberId: roleId,
+		subscriberIndex: fixture.expectedSubscriberIds.indexOf(roleId),
+		publisherIds: fixture.publishers.map((publisher) => publisher.publisherId),
+		windowCount: cohort.harness.relay.config.windowCount,
+		messageBytes: cohort.harness.relay.config.messageBytes,
+	};
+	return epoch === "warmup"
+		? {
+				...common,
+				epoch,
+				cohortWarmupEpochSha256: warmupEpochDigest(),
+				warmupNonce: warmupNonce(),
+			}
+		: { ...common, epoch, cohortStartBarrierSha256: barrierDigest() };
+}
+
+for (const binding of RELAY_BINDINGS) {
+	describe(`D2 delivery channel over ${binding.name}`, () => {
+		test("the_context_is_the_first_unit_of_each_epoch_and_every_frame_is_bound_to_it", async () => {
+			const cohort = await connectCohort(binding, {
+				publisherCount: 2,
+				subscriberCount: 8,
+			});
+			await cohort.harness.settle();
+			// Registration closed: the warmup context is on every channel before
+			// any warmup delivery exists, and it is not a delivery.
+			for (const subscriber of cohort.subscribers) {
+				const units = subscriber.received();
+				const context = units.find((unit) => unit.kind === "delivery-context");
+				expect(context?.kind).toBe("delivery-context");
+				if (context?.kind !== "delivery-context")
+					throw new Error("unreachable");
+				expect(context.epoch).toBe("warmup");
+				expect(units.filter((unit) => unit.kind === "delivery").length).toBe(0);
+				const verified = verifyFanoutDeliveryContext(
+					context,
+					contextFactsOf(cohort, subscriber.roleId, "warmup"),
+				);
+				expect(verified.ok).toBe(true);
+			}
+			const afterClose = cohort.harness.relay.counters();
+			expect(afterClose.warmupDeliveries).toBe(0);
+			expect(afterClose.queuedItems).toBe(0);
+
+			await runWarmup(cohort);
+			for (const subscriber of cohort.subscribers) {
+				const warmup = warmupDeliveriesOf(subscriber);
+				expect(warmup.length).toBe(WARMUP_MESSAGES_PER_PUBLISHER * 2);
+				const index = cohort.harness.fixture.expectedSubscriberIds.indexOf(
+					subscriber.roleId,
+				);
+				expect(warmup.every((unit) => unit.subscriberIndex === index)).toBe(
+					true,
+				);
+				expect(jsonDataFramesOf(subscriber)).toEqual([]);
+			}
+			const drained = cohort.harness.relay.drainWarmup();
+			expect(drained.ok).toBe(true);
+			const armed = cohort.harness.relay.openMeasuredWindow(
+				barrierAcceptance(),
+			);
+			expect(armed.ok).toBe(true);
+			await cohort.harness.settle();
+
+			// The measured context precedes the first measured delivery on every
+			// channel, and writing it moved no delivery counter.
+			const armedCounters = cohort.harness.relay.counters();
+			expect(
+				armedCounters.relayWritesCompletedByOriginWindow.every((n) => n === 0),
+			).toBe(true);
+			expect(
+				armedCounters.relayWriteBytesByOriginWindow.every((n) => n === 0),
+			).toBe(true);
+			for (const subscriber of cohort.subscribers) {
+				const measuredContext = subscriber
+					.received()
+					.find(
+						(unit) =>
+							unit.kind === "delivery-context" && unit.epoch === "measured",
+					);
+				expect(measuredContext).toBeDefined();
+				if (measuredContext?.kind !== "delivery-context") {
+					throw new Error("unreachable");
+				}
+				const verified = verifyFanoutDeliveryContext(
+					measuredContext,
+					contextFactsOf(cohort, subscriber.roleId, "measured"),
+				);
+				expect(verified.ok).toBe(true);
+				if (!verified.ok) throw new Error("unreachable");
+
+				const publisher = cohort.publishers[1] as RelayPeer;
+				expect(
+					(await publisher.send(dataFrame(publisher.roleId, 0, 3))).ok,
+				).toBe(true);
+				await cohort.harness.settle();
+				const units = subscriber.received();
+				const contextAt = units.indexOf(measuredContext);
+				const delivered = dataFramesOf(subscriber);
+				expect(delivered.length).toBe(1);
+				const frame = delivered[0] as ReceivedDelivery;
+				expect(units.indexOf(frame)).toBeGreaterThan(contextAt);
+				// The clone carries this session's index and this session's tag,
+				// the publisher's grant index, the origin window and the cell's
+				// payload size -- everything the worker's book reads.
+				expect(frame.contextTag).toBe(verified.value.contextTag);
+				expect(frame.subscriberIndex).toBe(
+					cohort.harness.fixture.expectedSubscriberIds.indexOf(
+						subscriber.roleId,
+					),
+				);
+				expect(frame.publisherIndex).toBe(1);
+				expect(frame.windowIndex).toBe(3);
+				expect(frame.publisherSequence).toBe(0);
+				expect(frame.payloadBytes).toBe(100);
+				expect(frame.payloadSha256).toBe(
+					fanoutPayload(100, `measured:${publisher.roleId}:0`).payloadSha256,
+				);
+				expect(jsonDataFramesOf(subscriber)).toEqual([]);
+				break;
+			}
+			await cohort.harness.close();
+		});
+	});
+}
+
+describe("D2 delivery channel: the relay's own bookkeeping", () => {
+	test("a_context_the_transport_cannot_take_before_the_deadline_closes_the_session_and_counts_no_delivery", async () => {
+		const harness = await IN_PROCESS_BINDING.open({
+			publisherCount: 1,
+			subscriberCount: 8,
+		});
+		const publisherId = fanoutRoleId("publisher", 0);
+		const publisher = await harness.connect("publisher", publisherId);
+		expect(
+			(await publisher.send(registerFrame(harness, "publisher", publisherId)))
+				.ok,
+		).toBe(true);
+		const subscribers: RelayPeer[] = [];
+		for (let index = 0; index < 8; index += 1) {
+			const roleId = fanoutRoleId("subscriber", index);
+			const peer = await harness.connect("subscriber", roleId);
+			expect(
+				(await peer.send(registerFrame(harness, "subscriber", roleId))).ok,
+			).toBe(true);
+			subscribers.push(peer);
+		}
+		const stuck = subscribers[3] as RelayPeer;
+		stuck.block();
+		expect(harness.relay.closeRegistration().ok).toBe(true);
+
+		// Seven contexts went out; the stuck one waits at the head of its queue.
+		expect(harness.relay.counters().queuedItems).toBe(1);
+		for (const subscriber of subscribers) {
+			expect(
+				subscriber.received().filter((unit) => unit.kind === "delivery-context")
+					.length,
+			).toBe(subscriber === stuck ? 0 : 1);
+		}
+
+		await harness.advanceMs(RELAY_WRITE_DEADLINE_MS + 1);
+		harness.relay.pump();
+		const counters = harness.relay.counters();
+		expect(faultKinds(harness.relay)).toContain("write-timeout");
+		expect(counters.queuedItems).toBe(0);
+		expect(counters.registeredSubscriberIds).not.toContain(stuck.roleId);
+		expect(counters.subscriberDisconnects).toBe(1);
+		// Not a delivery: no per-window delivery counter moved for it.
+		expect(
+			counters.writeTimeoutDeliveriesByOriginWindow.every((n) => n === 0),
+		).toBe(true);
+		expect(
+			counters.disconnectUndeliveredByOriginWindow.every((n) => n === 0),
+		).toBe(true);
+		expect(harness.relay.isPromotable()).toBe(false);
+		await harness.close();
+	});
+
+	test("the_global_byte_cap_is_sized_by_the_compact_frame", async () => {
+		// Exactly one ingress worth of compact frames fits; the §4.2 JSON
+		// estimate (654 B a frame) would have refused even that one.
+		const cohort = await connectCohort(IN_PROCESS_BINDING, {
+			publisherCount: 1,
+			subscriberCount: 8,
+			caps: { globalQueueMaxBytes: 8 * fanoutDeliveryUnitBytes(100) },
+		});
+		await armMeasured(cohort);
+		const publisher = cohort.publishers[0] as RelayPeer;
+		for (const subscriber of cohort.subscribers) subscriber.block();
+		expect((await publisher.send(dataFrame(publisher.roleId, 0))).ok).toBe(
+			true,
+		);
+		expect(cohort.harness.relay.counters().queuedBytes).toBe(
+			8 * fanoutDeliveryUnitBytes(100),
+		);
+		const overflow = await publisher.send(dataFrame(publisher.roleId, 1));
+		expect(overflow.ok).toBe(false);
+		await cohort.harness.settle();
+		const closed = acksOf(publisher).filter(
+			(ack) => ack.disposition === "closed",
+		);
+		expect(closed.map((ack) => ack.code)).toEqual(["RELAY_INGRESS_QUEUE_FULL"]);
+		expect(faultKinds(cohort.harness.relay)).toContain("global-queue-full");
+		for (const subscriber of cohort.subscribers) await subscriber.unblock();
+		await cohort.harness.close();
+	});
+});
 
 describe("S4: the Linux authority is an observer", () => {
 	test("the_linux_authority_holds_no_signing_key", () => {
@@ -1996,14 +2329,14 @@ describe("S4: the Linux authority is an observer", () => {
 		};
 		const relay = new FanoutRelay(config);
 		const codec = fanoutFrameCodecFor("ws");
-		const inbox: FanoutWireV1[] = [];
+		const { inbox, accept } = peerInbox("ws", 100);
+		const take = (bytes: Uint8Array): RelaySendOutcome => {
+			accept(bytes);
+			return "accepted";
+		};
 		const sessionId = relay.openSession({
-			trySend: (bytes): RelaySendOutcome => {
-				const decoded = codec.decode(bytes);
-				if (!decoded.ok) throw new Error(`peer decode: ${decoded.code}`);
-				inbox.push(decoded.value);
-				return "accepted";
-			},
+			trySend: take,
+			trySendDelivery: take,
 			close: () => {},
 		});
 		const frame = registerFrame(

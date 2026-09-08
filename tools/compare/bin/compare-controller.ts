@@ -141,6 +141,7 @@ import type {
 	Sha256Hex,
 } from "../cross-supervisor-protocol.ts";
 import {
+	CAMPAIGN_FAILURE_CODES,
 	type CampaignFailureCode,
 	isCampaignFailureCode,
 	PHASE_A_DECLARED_MESSAGE_BYTES,
@@ -1367,6 +1368,23 @@ export function writeControllerTerminalRecord(
 	}
 }
 
+/**
+ * The §7 failure code a reason names, if it names one. The reason is the
+ * controller's own text and embeds the code as a whole token (`(CODE):` from
+ * the dispatch, `CODE:` from a throw), so the match is by token over the
+ * exported closed array, in its order, never by substring and never against
+ * a copy of the list kept here.
+ */
+export function campaignFailureCodeNamedIn(
+	reason: string,
+): CampaignFailureCode | null {
+	const tokens = new Set(reason.match(/[A-Z][A-Z0-9_]*/g) ?? []);
+	for (const code of CAMPAIGN_FAILURE_CODES) {
+		if (tokens.has(code)) return code;
+	}
+	return null;
+}
+
 export function classifyControllerTerminal(input: {
 	readonly candidate: string;
 	readonly campaignId: string;
@@ -1429,35 +1447,7 @@ export function classifyControllerTerminal(input: {
 			};
 		}
 	}
-	let failureCode: CampaignFailureCode = "TRUST_PROTOCOL";
-	for (const code of [
-		"MAC_GRANT_SIGNATURE_INVALID",
-		"MAC_SIGNING_KEY_MISMATCH",
-		"APPROVAL_IDENTITY_MISMATCH",
-		"MAC_GRANT_EXPIRED",
-		"MAC_GRANT_REPLAYED",
-		"RIG_RECEIPT_SIGNATURE_INVALID",
-		"RIG_SIGNING_KEY_MISMATCH",
-		"RIG_RECEIPT_EXPIRED",
-		"RIG_RECEIPT_REPLAYED",
-		"TRUST_PROTOCOL",
-		"CROSS_SUPERVISOR_MISMATCH",
-		"COHORT_PROTOCOL",
-		"COHORT_NOT_READY",
-		"WARMUP_PROTOCOL",
-		"MEASUREMENT_WINDOW",
-		"RELAY_DELIVERY",
-		"CHILD_LIFECYCLE",
-		"RUNTIME_RESOURCE_EXHAUSTION",
-	] as const satisfies readonly CampaignFailureCode[]) {
-		if (reason.includes(code)) {
-			failureCode = code;
-			break;
-		}
-	}
-	if (!isCampaignFailureCode(failureCode)) {
-		failureCode = "TRUST_PROTOCOL";
-	}
+	const failureCode = campaignFailureCodeNamedIn(reason) ?? "TRUST_PROTOCOL";
 	return {
 		schema: "controller-terminal/v1",
 		candidate: input.candidate,
@@ -7729,6 +7719,16 @@ export class MacRoleChildCohortDriver {
 		};
 
 		const outcomes = await Promise.all(this.config.children.map(runChild));
+		// A child that named its own refusal outranks a sibling's deadline: the
+		// deadline is what this side saw while that child was already saying
+		// why, and the sealed code has to be the child's, not the wait's.
+		const reported = outcomes.find(
+			(outcome) =>
+				!outcome.ok &&
+				"reportedByChild" in outcome &&
+				outcome.reportedByChild === true,
+		);
+		if (reported !== undefined) return reported;
 		for (const outcome of outcomes) if (!outcome.ok) return outcome;
 		return { ok: true, value: true };
 	}

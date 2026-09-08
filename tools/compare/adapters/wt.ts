@@ -2184,18 +2184,50 @@ const LENGTH_PREFIX_BYTES = 4;
 export type LengthPrefixedSendOutcome = "accepted" | "would-block" | "closed";
 
 /**
+ * A second unit kind a stream may carry beside the prefixed ones: every unit
+ * that opens with `firstByte` is exactly `unitBytes` long and carries no
+ * prefix (its own header states the length). The caller owns both values; the
+ * reader only frames by them.
+ */
+export interface FixedLengthUnitKind {
+	readonly firstByte: number;
+	readonly unitBytes: number;
+}
+
+/**
  * Reassemble whole `u32be length || body` units from arbitrary stream reads.
  *
  * A reliable stream may split or coalesce writes anywhere, so a reader that
  * decoded each chunk on its own would refuse valid traffic and accept two
  * frames as one. Each unit comes back with its prefix still attached, which is
  * what lets the caller hand it to the frame codec unchanged.
+ *
+ * In mixed mode (`fixed` given) the first byte of each unit decides its
+ * framing before the prefix is read: a unit opening with the fixed kind's
+ * byte is sliced at exactly `unitBytes` and handed back as-is, so a wrong
+ * length inside such a unit is the decoder's refusal, never a stall here; a
+ * prefixed unit can never open with that byte, since a legal prefix is far
+ * below 2^24 and so starts with `0x00`.
  */
 export class LengthPrefixedFrameReader {
 	private buffered = new Uint8Array(0);
 
 	/** `maxBodyBytes` is the caller's decoded-frame cap, not a buffer size. */
-	constructor(private readonly maxBodyBytes: number) {}
+	constructor(
+		private readonly maxBodyBytes: number,
+		private readonly fixed?: FixedLengthUnitKind,
+	) {
+		if (
+			fixed !== undefined &&
+			(!Number.isInteger(fixed.firstByte) ||
+				fixed.firstByte < 0 ||
+				fixed.firstByte > 0xff ||
+				!Number.isInteger(fixed.unitBytes) ||
+				fixed.unitBytes <= 0)
+		) {
+			throw new RangeError("fixed-length unit kind needs a byte and a length");
+		}
+	}
 
 	/** Bytes held back because they do not yet complete a unit. */
 	get pendingBytes(): number {
@@ -2214,7 +2246,18 @@ export class LengthPrefixedFrameReader {
 
 		const units: Uint8Array[] = [];
 		let offset = 0;
-		while (this.buffered.byteLength - offset >= LENGTH_PREFIX_BYTES) {
+		while (this.buffered.byteLength - offset > 0) {
+			if (
+				this.fixed !== undefined &&
+				this.buffered[offset] === this.fixed.firstByte
+			) {
+				const total = this.fixed.unitBytes;
+				if (this.buffered.byteLength - offset < total) break;
+				units.push(this.buffered.slice(offset, offset + total));
+				offset += total;
+				continue;
+			}
+			if (this.buffered.byteLength - offset < LENGTH_PREFIX_BYTES) break;
 			const view = new DataView(
 				this.buffered.buffer,
 				this.buffered.byteOffset + offset,

@@ -27,7 +27,10 @@ import {
 	STAGED_SERVER_TLS_CERTIFICATE_LEAF,
 	stagedServerLaunchRecordProfile,
 } from "../cohort-protocol.ts";
-import { FANOUT_EXPANDED_DECLARATION_BY_CELL_ID } from "../cross-supervisor-protocol.ts";
+import {
+	CAMPAIGN_FAILURE_CODES,
+	FANOUT_EXPANDED_DECLARATION_BY_CELL_ID,
+} from "../cross-supervisor-protocol.ts";
 import {
 	FANOUT_COHORT_CELL_BY_ID,
 	FANOUT_COHORT_CELL_IDS,
@@ -44,8 +47,10 @@ import {
 	buildNetemCommands,
 	buildProductionClientArgv,
 	buildSshArgv,
+	campaignFailureCodeNamedIn,
 	campaignIndexKey,
 	canonicalSealArmCount,
+	classifyControllerTerminal,
 	createPhaseLog,
 	DEFAULT_SSH_IDENTITY,
 	defaultRigEndpoints,
@@ -2873,5 +2878,59 @@ describe("the ordinary arm's exit tears the rig server child down", () => {
 		expect(afterFailure.ok === false && afterFailure.reason).toBe(
 			"series admission",
 		);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Physical-budget amendment D2, fail-closed 2: the campaign-level terminal
+// code is derived from the exported closed array, by whole token, so a code
+// that joins the vocabulary reaches `controller-terminal/v1` with no copy of
+// the list to update here and no substring to be fooled by.
+// ---------------------------------------------------------------------------
+
+describe("controller-terminal/v1 derives its failure code from CAMPAIGN_FAILURE_CODES", () => {
+	const terminalFor = (reason: string) =>
+		classifyControllerTerminal({
+			candidate: "cand",
+			campaignId: "camp",
+			executionPurpose: "pilot",
+			exitCode: 1,
+			reason,
+			trafficStarted: true,
+			timedOut: false,
+		});
+
+	it("names every member the dispatch can embed in a reason", () => {
+		for (const code of CAMPAIGN_FAILURE_CODES) {
+			const reason = `cohort executor refused (${code}): the child said so`;
+			expect(campaignFailureCodeNamedIn(reason)).toBe(code);
+			expect(terminalFor(reason).failureCode).toBe(code);
+		}
+		expect(CAMPAIGN_FAILURE_CODES).toContain("DELIVERY_CONTEXT_MISMATCH");
+		const sealed = terminalFor(
+			"cohort executor refused (DELIVERY_CONTEXT_MISMATCH): subscriber-000003: data frame on the delivery channel",
+		);
+		expect(sealed.terminalKind).toBe("FAIL");
+		expect(sealed.failureCode).toBe("DELIVERY_CONTEXT_MISMATCH");
+		expect(sealed.refusalCode).toBeNull();
+	});
+
+	it("matches whole tokens, never substrings, and keeps the closed order", () => {
+		expect(campaignFailureCodeNamedIn("NOT_COHORT_PROTOCOL_AT_ALL")).toBeNull();
+		expect(campaignFailureCodeNamedIn("delivery_context_mismatch")).toBeNull();
+		expect(terminalFor("something with no code in it").failureCode).toBe(
+			"TRUST_PROTOCOL",
+		);
+		// Two members in one reason: the earlier one in the closed array wins,
+		// which is the order the hand-kept list used to encode.
+		expect(
+			campaignFailureCodeNamedIn(
+				"RELAY_DELIVERY after COHORT_PROTOCOL: both named",
+			),
+		).toBe("COHORT_PROTOCOL");
+		// A throw's reason shape is a bare `CODE:` prefix.
+		expect(
+			campaignFailureCodeNamedIn("CHILD_LIFECYCLE: controller threw"),
+		).toBe("CHILD_LIFECYCLE");
 	});
 });

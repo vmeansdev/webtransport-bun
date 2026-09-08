@@ -692,8 +692,11 @@ export function serveFanoutRelayOverWebSocket(
 		...(options.tls ? { tls: options.tls } : {}),
 		handlers: {
 			onOpen: (session) => {
+				// On WS the delivery channel is the socket itself: one binary
+				// message per unit, control and delivery alike.
 				const sink: RelaySessionSink = {
 					trySend: (bytes) => session.send(bytes),
+					trySendDelivery: (bytes) => session.send(bytes),
 					close: (reason) => {
 						session.close(reason);
 					},
@@ -822,17 +825,6 @@ export interface FanoutRelayWtPeer {
 /** How long a closing session waits for its streams to flush before resetting. */
 const WT_SESSION_FLUSH_DEADLINE_MS = 2_000;
 
-/** Delivery rides the server-opened uni stream; everything else is control. */
-function isRelayDeliveryFrame(frame: {
-	kind: string;
-	direction?: string;
-}): boolean {
-	return (
-		(frame.kind === "data" || frame.kind === "warmup-data") &&
-		frame.direction === "relay-to-subscriber"
-	);
-}
-
 const RELAY_FRAME_ROUTE_DECODER = new TextDecoder();
 
 /** The three fields that decide a frame's stream, and nothing else. */
@@ -843,21 +835,16 @@ interface RelayFrameRoutingFields {
 }
 
 /**
- * The routing fields of one frame the relay has already accepted or produced.
+ * The routing fields of one inbound frame the relay has just accepted.
  *
- * Both call sites are downstream of the one decode that validates: outbound
- * bytes were encoded by `FanoutRelay.pump`/`sendFrame`/`drainControl`
- * microseconds earlier, and inbound bytes have just been accepted by
- * `relay.handleInboundBytes`. Neither is a trust boundary, and running
- * `codec.decode` at either re-parsed, re-canonicalised and byte-compared the
- * frame a second time -- a third time for a delivery, whose first routing
- * attempt opens the uni stream and answers `would-block`. Measured on the
- * chat-1k loopback acceptance (2026-09-05): 18 us a frame against 1.1 us for
- * the stream write it chose, which is 180 ms of the WT server child's 271 ms
- * of relay work per second of the measured window and 1,110 ms of its 1,804 ms
- * while the warmup fans 100,000 deliveries out -- inside the 5,000 ms plus 1 s
- * ack grace that fanout has to finish in
- * (plan 2026-08-30-busyMs-attested-fanout.md:1202).
+ * The call site is downstream of the one decode that validates: the bytes
+ * have just been accepted by `relay.handleInboundBytes`, so this is not a
+ * trust boundary, and running `codec.decode` here re-parsed, re-canonicalised
+ * and byte-compared the frame a second time. It runs once per accepted
+ * inbound frame and never on a delivery: the relay addresses the delivery
+ * channel itself through `trySendDelivery`, so no outbound unit is parsed to
+ * find its stream (physical-budget amendment D2, which is what removed the
+ * per-pump context parse storm at chat 1k).
  *
  * A frame that is not the relay's own shape is a defect in this process, not a
  * peer's doing, and throws where the decode refusal used to.
@@ -1056,19 +1043,24 @@ export async function serveFanoutRelayOverWebTransport(
 				});
 		};
 
+		// The engine says which channel a unit belongs on; nothing here reads the
+		// bytes. The uni stream is requested the moment a subscriber's
+		// registration is admitted (below) and never on a delivery's behalf: a
+		// unit that arrives before the open completes waits at the head of its
+		// queue, under the relay's own write deadline, and the open's callback
+		// pumps it out.
 		const sink: RelaySessionSink = {
 			trySend: (bytes) => {
 				if (closed) return "closed";
 				if (paused) return "would-block";
-				if (isRelayDeliveryFrame(relayFrameRoutingFields(bytes))) {
-					if (delivery === null) {
-						openDeliveryStream();
-						return "would-block";
-					}
-					return delivery.trySend(bytes);
-				}
 				if (control === null) return "would-block";
 				return control.trySend(bytes);
+			},
+			trySendDelivery: (bytes) => {
+				if (closed) return "closed";
+				if (paused) return "would-block";
+				if (delivery === null) return "would-block";
+				return delivery.trySend(bytes);
 			},
 			close: (reason) => {
 				session.close(reason);
@@ -1165,10 +1157,10 @@ export async function serveFanoutRelayOverWebTransport(
 					});
 					settler.settle();
 					if (result.ok) {
-						// The routing decode is charged for the same reason the
-						// delivery-side call at `sink.trySend` already is: it is
-						// how this loop decides which stream the answer goes out
-						// on, and it runs once per accepted frame.
+						// The routing decode is the relay's own loop work: it is
+						// how this loop learns that a subscriber was admitted and
+						// owes a delivery stream, and it runs once per accepted
+						// frame, so it is charged like the inbound handling.
 						const routing = timed(() => relayFrameRoutingFields(bytes));
 						if (routing.kind === "register" && routing.role === "subscriber") {
 							openDeliveryStream();
