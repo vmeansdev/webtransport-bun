@@ -368,7 +368,7 @@ finalize_terminal_integrity() {
   # see deviations/2026-08-31-a5-verify-campaign-index-argv.md.
   # --integrity-only: this attempt proves bytes, reports zero promotable, and
   # cannot move a campaign's status or complete a canonical claim (§6/§11).
-  "$MAC_BUN" tools/compare/bin/verify-campaign-index.ts \
+  "$MAC_BUN" "$REPO/tools/compare/bin/verify-campaign-index.ts" \
     --campaign-root="$OUT" \
     --index="$OUT/campaign-index.json" \
     --external-trust-bound-sha256="$EXTERNAL_TRUST_BOUND_SHA256" \
@@ -467,12 +467,13 @@ on_exit() {
   fi
   exit "$rc"
 }
-# Install traps only after OUT and all digest/path literals exist in this file.
-trap 'on_signal 130' INT
-trap 'on_signal 143' TERM
-trap 'on_signal 129' HUP
-trap on_exit EXIT
-# Post-trap confirmation only: re-hash staged public leaves and compare to frozen literals.
+# Admission gates run BEFORE the traps are armed. Every check here is read-only,
+# and a refusal here is administrative (leaf drift, expired stage, missing or
+# mismatched approval), not the end of a campaign. Once the EXIT trap is armed,
+# every exit destroys both campaign private keys; a refusal that fired it cost a
+# whole stage on 2026-09-08 (run launched before exact-stage-approval.json
+# existed). Refusing here leaves the staged keys intact so the operator can
+# obtain the approval and launch the same frozen bytes again.
 test "$(shasum -a 256 "$MAC_TRUST/staging-root/mac-supervisor-ed25519.pub" | awk '{print $1}')" = "$MAC_PUBLIC_KEY_SHA256"
 test "$(shasum -a 256 "$MAC_TRUST/staging-root/rig-supervisor-ed25519.pub" | awk '{print $1}')" = "$RIG_PUBLIC_KEY_SHA256"
 NOW_MS=$(( $(date +%s) * 1000 ))
@@ -483,6 +484,13 @@ test "$(( STAGE_NOT_AFTER_MS - NOW_MS ))" -gt "$REQUIRED_REMAINING_MS"
   --stage-receipt="$MAC_TRUST/stage-receipt.json" \
   --upcoming-run-command="$MAC_TRUST/upcoming-run-command.sh" \
   --exact-stage-approval="$MAC_TRUST/exact-stage-approval.json"
+# Install traps only after OUT and all digest/path literals exist in this file
+# and the admission gates above have passed. From here on, every exit path
+# destroys both campaign private keys.
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
+trap 'on_signal 129' HUP
+trap on_exit EXIT
 
 # The topology every section registers. `ARM_KINDS` is what the controller is
 # told to run and what the verifier is told to prove -- one declaration, two
@@ -554,7 +562,7 @@ run_measured_campaign() {
     # both, the verifier parses the attestation records and verifies no signature
     # over them, which is a count check wearing a trust check's name. They are the
     # same leaves the pre-run gate above digest-checks against the stage receipt.
-    "$MAC_BUN" tools/compare/bin/verify-campaign-index.ts \
+    "$MAC_BUN" "$REPO/tools/compare/bin/verify-campaign-index.ts" \
       --campaign-root="$OUT" \
       --index="$OUT/campaign-index.json" \
       --external-trust-bound-sha256="$EXTERNAL_TRUST_BOUND_SHA256" \

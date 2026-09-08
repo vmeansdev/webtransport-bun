@@ -722,6 +722,177 @@ function verifyIndexInvocations(bun: string[][]): string[][] {
 	);
 }
 
+/**
+ * Runs the generated command with REAL traps (no `trap() { :; }` stub), so
+ * the EXIT trap's key destruction is observable through the recorded
+ * `sudo`/`ssh` stubs. `approval` decides whether verify-stage-approval
+ * succeeds; `controllerRc` is what the controller stub exits with.
+ */
+async function runFrozenWrapperWithRealTraps(opts: {
+	readonly approval: "ok" | "missing";
+	readonly controllerRc: number;
+}): Promise<{
+	readonly exitCode: number;
+	readonly stderr: string;
+	readonly sudo: string[][];
+	readonly ssh: string[][];
+	readonly integrityDirExists: boolean;
+}> {
+	const root = mkdtempSync(join(tmpdir(), "frozen-admission-"));
+	const out = join(root, "out");
+	const trust = join(root, "trust");
+	mkdirSync(out, { recursive: true });
+	mkdirSync(join(trust, "staging-root"), { recursive: true });
+	writeFileSync(join(out, "controller-terminal.json"), "{}\n");
+	const macLeaf = "mac-leaf\n";
+	const rigLeaf = "rig-leaf\n";
+	writeFileSync(
+		join(trust, "staging-root/mac-supervisor-ed25519.pub"),
+		macLeaf,
+	);
+	writeFileSync(
+		join(trust, "staging-root/rig-supervisor-ed25519.pub"),
+		rigLeaf,
+	);
+	const sudoLog = join(root, "sudo.log");
+	const sshLog = join(root, "ssh.log");
+	const macBun = join(root, "mac-bun");
+	writeFileSync(
+		macBun,
+		[
+			"#!/bin/sh",
+			'case "$*" in',
+			// The wrapper itself assigns CONTROLLER_RC (inherited exports stay
+			// exported), so the stub reads names the wrapper never touches.
+			'  *verify-stage-approval*) exit "$STUB_APPROVAL_RC" ;;',
+			'  *compare-controller.ts*) exit "$STUB_CONTROLLER_RC" ;;',
+			"esac",
+			"exit 0",
+			"",
+		].join("\n"),
+		{ mode: 0o755 },
+	);
+	const receipt = buildMinimalStageReceipt({
+		profile: "phase-a",
+		candidate: "c".repeat(40),
+		campaignId: "busyms-attested-focused-r1",
+		macPublicKeySha256: sha256Text(macLeaf),
+		rigPublicKeySha256: sha256Text(rigLeaf),
+		issuedAtMs: Date.now(),
+		notAfterMs: Date.now() + 72 * 3600_000,
+	});
+	const command = buildFrozenRunCommand({
+		section: "9.5",
+		repo: process.cwd(),
+		candidate: "c".repeat(40),
+		campaignId: "busyms-attested-focused-r1",
+		executionPurpose: "focused",
+		stageReceipt: receipt,
+		macTrust: trust,
+		macRuntime: join(root, "runtime"),
+		rig: "rig@example.invalid",
+		rigStage: join(root, "rig-stage"),
+		sshKey: join(root, "ssh-key"),
+		macBun,
+		out,
+		runTimeoutMs: 1000,
+	}).replaceAll("/usr/bin/sudo", "sudo");
+	const record = (log: string) =>
+		`{ for a in "$@"; do printf '%s\\036' "$a"; done; printf '\\035'; } >>"${log}"`;
+	const script = [
+		"sudo() {",
+		`  ${record("$SUDO_LOG")}`,
+		'  case "$*" in *campaign-key-absence*) printf %s ABSENT; return 0 ;; esac',
+		"  return 0",
+		"}",
+		"ssh() {",
+		`  ${record("$SSH_LOG")}`,
+		'  case "$*" in *campaign-key-absence*) printf %s ABSENT; return 0 ;; esac',
+		"  return 0",
+		"}",
+		command,
+		"",
+	].join("\n");
+	const scriptPath = join(root, "run.sh");
+	writeFileSync(scriptPath, script);
+	const proc = Bun.spawn(["/bin/bash", scriptPath], {
+		cwd: process.cwd(),
+		env: {
+			...process.env,
+			SUDO_LOG: sudoLog,
+			SSH_LOG: sshLog,
+			STUB_APPROVAL_RC: opts.approval === "ok" ? "0" : "3",
+			STUB_CONTROLLER_RC: String(opts.controllerRc),
+		},
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const [stderr, exitCode] = await Promise.all([
+		new Response(proc.stderr).text(),
+		proc.exited,
+	]);
+	return {
+		exitCode,
+		stderr,
+		sudo: existsSync(sudoLog)
+			? decodeInvocations(readFileSync(sudoLog, "utf8"))
+			: [],
+		ssh: existsSync(sshLog)
+			? decodeInvocations(readFileSync(sshLog, "utf8"))
+			: [],
+		integrityDirExists: existsSync(join(out, "integrity-only")),
+	};
+}
+
+describe("frozen run wrapper admission gates", () => {
+	// 2026-09-08: the command was launched before exact-stage-approval.json
+	// existed; verify-stage-approval exited 3 under `set -e`, the already-armed
+	// EXIT trap destroyed both campaign private keys, and the stage had to be
+	// abandoned. An administrative refusal must not cost the stage.
+	it("a_missing_approval_refuses_before_any_key_can_be_destroyed", async () => {
+		const run = await runFrozenWrapperWithRealTraps({
+			approval: "missing",
+			controllerRc: 0,
+		});
+		expect(run.exitCode).not.toBe(0);
+		expect(run.sudo).toEqual([]);
+		expect(run.ssh).toEqual([]);
+		expect(run.integrityDirExists).toBe(false);
+	});
+
+	it("a_failure_after_admission_still_destroys_both_keys", async () => {
+		const run = await runFrozenWrapperWithRealTraps({
+			approval: "ok",
+			controllerRc: 1,
+		});
+		expect(run.exitCode).not.toBe(0);
+		const probes = (log: string[][]) =>
+			log.filter((argv) =>
+				argv.some((a) => a.includes("campaign-key-absence")),
+			);
+		expect(probes(run.sudo).length).toBeGreaterThan(0);
+		expect(probes(run.ssh).length).toBeGreaterThan(0);
+	});
+
+	it("the_admission_gates_precede_the_first_trap_in_the_emitted_bytes", () => {
+		const command = frozenCommandForEnvAudit();
+		const firstTrap = command.indexOf("\ntrap ");
+		const approval = command.indexOf("verify-stage-approval");
+		expect(approval).toBeGreaterThan(-1);
+		expect(approval).toBeLessThan(firstTrap);
+	});
+
+	it("the_integrity_verifier_path_does_not_depend_on_the_cwd", () => {
+		const command = frozenCommandForEnvAudit();
+		expect(command).not.toContain(
+			'"$MAC_BUN" tools/compare/bin/verify-campaign-index.ts',
+		);
+		expect(command).toContain(
+			'"$REPO/tools/compare/bin/verify-campaign-index.ts"',
+		);
+	});
+});
+
 describe("frozen run wrapper argv", () => {
 	it("integrity_attempt_is_integrity_only_and_success_path_is_not", async () => {
 		const run = await runFrozenWrapper({
