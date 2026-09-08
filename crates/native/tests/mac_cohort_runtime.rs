@@ -247,6 +247,7 @@ fn rig_record(schema: &str, execution_sha256: &str, receipt_sequence: u64) -> Va
             "captureRequestSequence": 4,
             "signingPublicKeySha256": digest("unsigned"),
             "frameReceivedAtRigNs": LINUX_NS.to_string(),
+            "serverChildCpu": { "processMs": 7_000, "mainThreadMs": 3_100, "windowMs": 10_000 },
         }),
         "rig-relay-observation-receipt/v1" => json!({
             "cohortGrantSha256": digest("cohort-grant"),
@@ -5560,12 +5561,16 @@ fn the_ticker_250_evidence_vector_is_reproducible_and_pinned() {
 /// The chat-1k hex is under
 /// `.scratch/2026-09-05-cohort-completion/notes/vectors-v3/`; both are
 /// mirrored by the TS pins in `tools/compare/fixtures/cohort-evidence-vectors/`.
+/// Both were re-pinned again on 2026-09-08 when `rig-server-snapshot-receipt/v1`
+/// gained `serverChildCpu` (physical-budget amendment D6): the evidence embeds
+/// only the receipt's digest, through the cohort admission receipt, so the
+/// sizes held and the digests moved.
 const CHAT_1K_EVIDENCE_SIZE: usize = 507_198;
 const CHAT_1K_EVIDENCE_SHA256: &str =
-    "a543d54d948cb6c400cef70c7890af9eb04130c5ed4f81d2e58f565b69db5a61";
+    "f5de5f284adf873ef6c5c9d6d2bbac8850e039d3a802e78d84571be2add0819b";
 const TICKER_250_EVIDENCE_SIZE: usize = 133_171;
 const TICKER_250_EVIDENCE_SHA256: &str =
-    "e8e9a64af869f4a0138c788db525cbf8942c1a39b3a1bef2fca90ce308e0fc74";
+    "58cbcb792d59d17f01d3a364a1713db605a7f075feeda0d69160edba9db900c5";
 
 /// The frame caps are per kind on both sides, and the ones that differ from
 /// the default differ in three directions: the open grew to 7 MiB for C1's

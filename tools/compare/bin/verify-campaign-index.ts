@@ -7,13 +7,16 @@
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { cohortCellCardinality } from "../cohort-protocol.ts";
 import type {
 	CampaignFailureCode,
 	CampaignRefusalCode,
 	ExecutionPurpose,
 } from "../cross-supervisor-protocol.ts";
 import {
+	type ArmKind,
 	type ArtifactTrustContext,
+	cohortCellForArm,
 	FANOUT_COHORT_CELL_IDS,
 	type RunArtifact,
 	requiresCohortObservationEvidence,
@@ -33,6 +36,8 @@ import {
 	verifyArmAttestationEvidence,
 } from "../server-observation-artifact.ts";
 import {
+	type CohortReconstruction,
+	reconstructCohortEvidenceOffline,
 	trustContextForArtifact,
 	verifyRunArtifact,
 } from "../verify-artifact.ts";
@@ -260,6 +265,69 @@ export function validateIndexEntryConsistency(
 		return { ok: true };
 	}
 	return { ok: false, code: "TRUST_PROTOCOL", message: "unknown status" };
+}
+
+/**
+ * Physical-budget amendment D6: a pilot or canonical index is refused when a
+ * sealed arm's totals are not the cell's cardinalities.
+ *
+ * The §4.5 promotion predicate compares the same totals, but a pilot never
+ * promotes and a canonical arm that misses is merely non-promotable, so until
+ * this check a cell whose relay delivered two orders of magnitude below its
+ * gate sealed PASS entries and satisfied every wrapper count. The totals are
+ * the ones `reconstructCohortEvidenceOffline` recomputed from the retained
+ * partials, never the seal's own summary.
+ */
+export function checkExpectedTotals(args: {
+	readonly cellId: string;
+	readonly armKind: ArmKind;
+	readonly executionPurpose: ExecutionPurpose;
+	readonly reconstruction: Pick<
+		CohortReconstruction,
+		"publisherCount" | "subscriberCount" | "ledger"
+	>;
+}): IndexEntryConsistency {
+	if (
+		args.executionPurpose !== "pilot" &&
+		args.executionPurpose !== "canonical"
+	) {
+		return { ok: true };
+	}
+	const cell = cohortCellForArm({
+		cellId: args.cellId,
+		armKind: args.armKind,
+	});
+	if (cell === null) return { ok: true };
+	const cardinality = cohortCellCardinality(cell);
+	const { ledger } = args.reconstruction;
+	const expected: readonly (readonly [string, number, number])[] = [
+		[
+			"publishers",
+			args.reconstruction.publisherCount,
+			cardinality.publisherCount,
+		],
+		[
+			"subscribers",
+			args.reconstruction.subscriberCount,
+			cardinality.subscriberCount,
+		],
+		["offered ingress", ledger.offeredIngress, cardinality.measuredIngress],
+		[
+			"accepted ingress",
+			ledger.serverAcceptedIngress,
+			cardinality.measuredIngress,
+		],
+		["delivered", ledger.delivered, cardinality.expandedDeliveries],
+	];
+	const differing = expected.filter(([, actual, wanted]) => actual !== wanted);
+	if (differing.length === 0) return { ok: true };
+	return {
+		ok: false,
+		code: "EXPECTED_TOTALS_MISMATCH",
+		message: `${args.cellId} sealed ${differing
+			.map(([what, actual, wanted]) => `${what} ${actual} (cell ${wanted})`)
+			.join(", ")} under ${args.executionPurpose}`,
+	};
 }
 
 /**
@@ -821,7 +889,10 @@ export function verifyCampaignIndex(args: {
 			// context is named here rather than counted.
 			if (requiresCohortObservationEvidence(entry.cellId, entry.armKind)) {
 				const attestation = parsed.attestationEvidence as
-					| { readonly cohortObservationEvidence?: unknown }
+					| {
+							readonly executionSha256?: unknown;
+							readonly cohortObservationEvidence?: unknown;
+					  }
 					| undefined;
 				if (
 					parsed.cohortEvidenceExport === null ||
@@ -842,6 +913,35 @@ export function verifyCampaignIndex(args: {
 						"COHORT_PROTOCOL",
 						`trust context cohort digest does not match the export receipt for ${entry.sealedPath}`,
 					);
+				}
+				// `verifyRunArtifact` reconstructed this cohort and passed, so the
+				// reconstruction below cannot fail; it is repeated because the
+				// verifier keeps its totals to itself and this index-level refusal
+				// needs them, not a restatement from the seal.
+				const reconstruction = reconstructCohortEvidenceOffline({
+					cellId: entry.cellId,
+					armKind: entry.armKind,
+					transport: entry.transport,
+					executionSha256: String(attestation?.executionSha256 ?? ""),
+					cohortObservationEvidence: attestation?.cohortObservationEvidence,
+					cohortEvidenceExport: parsed.cohortEvidenceExport,
+					stagedMacPublicRaw32: context.stagedMacPublicRaw32,
+					stagedRigPublicRaw32: context.stagedRigPublicRaw32,
+				});
+				if (!reconstruction.ok) {
+					return reject(
+						"COHORT_PROTOCOL",
+						`cohort evidence does not reconstruct for ${entry.sealedPath}: ${reconstruction.code} ${reconstruction.reason}`,
+					);
+				}
+				const totals = checkExpectedTotals({
+					cellId: entry.cellId,
+					armKind: entry.armKind,
+					executionPurpose: index.executionPurpose,
+					reconstruction,
+				});
+				if (!totals.ok) {
+					return reject(totals.code, `${totals.message}: ${entry.sealedPath}`);
 				}
 			} else if (
 				parsed.cohortEvidenceExport !== null &&

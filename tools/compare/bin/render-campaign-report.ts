@@ -12,8 +12,19 @@
  */
 import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import {
+	COHORT_WORKER_COUNT,
+	cohortCellCardinality,
+	cohortCellGrantParameters,
+	parseCohortCapacity,
+	parseCohortObservationEvidence,
+	recomputeCohortLedger,
+	recomputeCohortOriginConservation,
+	type RetainedCanonicalBytesV1,
+} from "../cohort-protocol.ts";
 import { compareRunArtifacts, trustContextForArtifact } from "../compare.ts";
 import {
+	cohortCellForArm,
 	FANOUT_COHORT_CELL_IDS,
 	metricContractForScenario,
 	requiresCohortObservationEvidence,
@@ -31,6 +42,10 @@ import {
 	type ComparisonSummary,
 } from "../render-report.ts";
 import { CANONICAL_SCENARIO_REGISTRY } from "../scenario-registry.ts";
+import {
+	type ServerChildCpuV1,
+	serverChildCpuIssue,
+} from "../server-observation-artifact.ts";
 
 /**
  * §6 report rule 2, verbatim.
@@ -50,6 +65,226 @@ export const INCOMPLETE_ATTESTATION_CAVEAT =
 	"INCOMPLETE ATTESTATION: this report includes at least one primary arm with no complete attestation evidence. No ranking or capacity statement in it is attested.";
 
 export type ArmAttestationLabel = "attested" | "unattested" | "not-applicable";
+
+/**
+ * Physical-budget amendment D5, the claim boundary, printed under every
+ * measured arm so the three figures above it are read as what they are.
+ */
+export const CLAIM_BOUNDARY_SENTENCE =
+	"Claim boundary: this is a resource-accounting comparison at equal work, not a throughput ranking -- a promoted arm's delivered rate equals the declared rate by construction (promotion requires D = L = A x K in every window at the row's pacing), so what separates the transports is the three attested figures above, of which busyMs is only the relay's timed spans on the server child's JS thread and excludes the settler's bookkeeping between spans, the transport's asynchronous completion work on that thread and the native transport threads, which the main-thread and process CPU account for.";
+
+/** What the report prints under one measured arm (amendment D6). */
+export interface ArmAccounting {
+	/** The grant's topology; absent on an arm that runs no cohort. */
+	readonly topology: {
+		readonly publishers: number;
+		readonly workers: number;
+		readonly subscribers: number;
+		readonly sessions: number;
+	} | null;
+	/** Recomputed from the retained partials; absent with the topology. */
+	readonly totals: {
+		readonly offeredIngress: number;
+		readonly acceptedIngress: number;
+		readonly relayWrites: number;
+		readonly delivered: number;
+		readonly deliveredBytes: number;
+		readonly postStopDrain: number;
+	} | null;
+	/** The child's timed spans, from the signed snapshot frame. */
+	readonly busy: { readonly busyMs: number; readonly windowMs: number } | null;
+	/** The rig's reading of the child's CPU, from the signed snapshot receipt. */
+	readonly cpu: ServerChildCpuV1 | null;
+}
+
+function embeddedRecord(
+	container: unknown,
+	field: string,
+): Record<string, unknown> | undefined {
+	if (typeof container !== "object" || container === null) return undefined;
+	return decodedRecord((container as Record<string, unknown>)[field]);
+}
+
+function decodedRecord(base64: unknown): Record<string, unknown> | undefined {
+	if (typeof base64 !== "string") return undefined;
+	try {
+		const parsed: unknown = JSON.parse(
+			Buffer.from(base64, "base64").toString("utf8"),
+		);
+		return typeof parsed === "object" &&
+			parsed !== null &&
+			!Array.isArray(parsed)
+			? (parsed as Record<string, unknown>)
+			: undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function retainedRecord(
+	member: RetainedCanonicalBytesV1,
+): Record<string, unknown> | undefined {
+	return decodedRecord(member.bytesBase64);
+}
+
+function wholeCount(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+		? value
+		: undefined;
+}
+
+/**
+ * The topology and totals of one cohort arm, recomputed from the retained
+ * partials the way the verifier recomputes them (`recomputeCohortOriginConservation`
+ * and `recomputeCohortLedger` over the same bytes), never read off the seal's
+ * summary. The report runs after `verify-campaign-index` has proved the seal
+ * under the staged keys, so no signature is re-checked here; what is read is
+ * the arithmetic, and it is read from its inputs.
+ */
+function cohortAccounting(input: {
+	readonly cellId: string;
+	readonly armKind: ArmKind;
+	readonly evidence: unknown;
+}): Pick<ArmAccounting, "topology" | "totals"> {
+	const none = { topology: null, totals: null } as const;
+	const cell = cohortCellForArm({
+		cellId: input.cellId,
+		armKind: input.armKind,
+	});
+	if (cell === null || input.evidence == null) return none;
+	const cardinality = cohortCellCardinality(cell);
+	const parsed = parseCohortObservationEvidence({
+		evidence: input.evidence,
+		expectedPublisherCount: cardinality.publisherCount,
+		expectedSubscriberCount: cardinality.subscriberCount,
+	});
+	if (!parsed.ok) return none;
+	const evidence = parsed.value;
+	const publishers = evidence.publisherPartials.map(retainedRecord);
+	const workers = evidence.workerPartials.map(retainedRecord);
+	const linux = retainedRecord(evidence.linuxRelayObservation);
+	const capacity = parseCohortCapacity(retainedRecord(evidence.capacity));
+	if (
+		publishers.some((p) => p === undefined) ||
+		workers.some((w) => w === undefined) ||
+		linux === undefined ||
+		!capacity.ok
+	) {
+		return none;
+	}
+	const { messageBytes } = cohortCellGrantParameters(cell);
+	const conservation = recomputeCohortOriginConservation({
+		publisherPartials: publishers,
+		workerPartials: workers,
+		linuxRelayObservation: linux,
+		subscriberCount: cardinality.subscriberCount,
+		messageBytes,
+	});
+	if (!conservation.ok) return none;
+	const ledger = recomputeCohortLedger({
+		conservation: conservation.value,
+		subscriberCount: cardinality.subscriberCount,
+		messageBytes,
+	});
+	if (!ledger.ok) return none;
+	const drain = workers.reduce(
+		(sum, worker) => sum + (wholeCount(worker?.deliveredAfterMeasureStop) ?? 0),
+		0,
+	);
+	return {
+		topology: {
+			publishers: publishers.length,
+			workers: COHORT_WORKER_COUNT,
+			subscribers: conservation.value.subscriberCount,
+			sessions: capacity.value.expectedSessions,
+		},
+		totals: {
+			offeredIngress: ledger.value.offeredIngress,
+			acceptedIngress: ledger.value.serverAcceptedIngress,
+			relayWrites: ledger.value.linuxRelayWritesCompleted,
+			delivered: ledger.value.delivered,
+			deliveredBytes: ledger.value.deliveredBytes,
+			postStopDrain: drain,
+		},
+	};
+}
+
+/**
+ * Read one sealed arm for the report: the topology and totals from the
+ * retained partials, and the three figures from the two signed records the
+ * attestation embeds. A reader, not a verifier: whatever is missing or
+ * malformed is reported as absent, and the verifier is where a seal in that
+ * state is refused.
+ */
+export function armAccountingFromArtifact(input: {
+	readonly cellId: string;
+	readonly armKind: ArmKind;
+	readonly artifact: RunArtifact | undefined;
+}): ArmAccounting {
+	const attestation = input.artifact?.attestationEvidence as
+		| {
+				readonly serverObservationEvidence?: unknown;
+				readonly cohortObservationEvidence?: unknown;
+		  }
+		| undefined;
+	const observation = attestation?.serverObservationEvidence;
+	const frame = embeddedRecord(observation, "snapshotFrameBase64");
+	const busyMs = wholeCount(frame?.busyMs);
+	const windowMs = wholeCount(frame?.windowMs);
+	const receipt = embeddedRecord(observation, "rigServerSnapshotReceiptBase64");
+	const cpu = receipt?.serverChildCpu;
+	return {
+		...cohortAccounting({
+			cellId: input.cellId,
+			armKind: input.armKind,
+			evidence: attestation?.cohortObservationEvidence,
+		}),
+		busy:
+			busyMs !== undefined && windowMs !== undefined && windowMs > 0
+				? { busyMs, windowMs }
+				: null,
+		cpu: serverChildCpuIssue(cpu) === null ? (cpu as ServerChildCpuV1) : null,
+	};
+}
+
+function shareOfWindow(ms: number, windowMs: number): string {
+	return `${ms} ms (${((ms / windowMs) * 100).toFixed(1)}% of the ${windowMs} ms window)`;
+}
+
+/** The D6 lines under one arm heading, in the order the amendment lists them. */
+export function renderArmAccounting(accounting: ArmAccounting): string[] {
+	const lines: string[] = [];
+	if (accounting.topology !== null) {
+		const t = accounting.topology;
+		lines.push(
+			`- Topology: ${t.publishers} publisher${t.publishers === 1 ? "" : "s"} / ${t.workers} workers / ${t.subscribers} subscribers / ${t.sessions} sessions`,
+		);
+	}
+	if (accounting.totals !== null) {
+		const c = accounting.totals;
+		lines.push(
+			`- Totals (recomputed from the retained partials): offered ingress ${c.offeredIngress}, accepted ingress ${c.acceptedIngress}, relay writes ${c.relayWrites}, delivered ${c.delivered}, delivered bytes ${c.deliveredBytes}, post-stop drain ${c.postStopDrain}`,
+		);
+	}
+	lines.push(
+		accounting.busy === null
+			? "- busyMs (relay timed spans on the server child's JS thread): not attested"
+			: `- busyMs (relay timed spans on the server child's JS thread): ${shareOfWindow(accounting.busy.busyMs, accounting.busy.windowMs)}`,
+	);
+	if (accounting.cpu === null) {
+		lines.push(
+			"- Server-child main-thread CPU (rig-read utime+stime): not attested",
+			"- Server-child process CPU (rig-read utime+stime): not attested",
+		);
+	} else {
+		lines.push(
+			`- Server-child main-thread CPU (rig-read utime+stime): ${shareOfWindow(accounting.cpu.mainThreadMs, accounting.cpu.windowMs)}`,
+			`- Server-child process CPU (rig-read utime+stime): ${shareOfWindow(accounting.cpu.processMs, accounting.cpu.windowMs)}`,
+		);
+	}
+	lines.push(`- ${CLAIM_BOUNDARY_SENTENCE}`);
+	return lines;
+}
 
 const PURPOSE_LABEL: Readonly<Record<string, string>> = Object.freeze({
 	focused: "focused probe",
@@ -181,6 +416,7 @@ function renderSealedIndexDiagnostic(args: {
 	}
 	const entries = Array.isArray(index.entries) ? index.entries : [];
 	const rows: string[] = [];
+	const armSections: string[] = [];
 	let unattestedPrimaries = 0;
 	let measuredPassSeals = 0;
 	for (const entry of entries) {
@@ -225,6 +461,16 @@ function renderSealedIndexDiagnostic(args: {
 		rows.push(
 			`| \`${escapeMarkdown(cellId)}\` | \`${escapeMarkdown(armId)}\` | ${escapeMarkdown(transport)} | ${escapeMarkdown(status)} | ${promotable} | ${attestation} | ${escapeMarkdown(String(sealedRel ?? ""))} | ${p50} |`,
 		);
+		if (artifact !== undefined && entry.repetitionKind === "measured") {
+			armSections.push(
+				`### \`${escapeMarkdown(armId)}\` (${escapeMarkdown(transport)}, ${attestation})`,
+				"",
+				...renderArmAccounting(
+					armAccountingFromArtifact({ cellId, armKind, artifact }),
+				),
+				"",
+			);
+		}
 	}
 	const purpose = String(index.executionPurpose ?? "unknown");
 	const stage = String(index.stage ?? "unknown");
@@ -266,6 +512,9 @@ function renderSealedIndexDiagnostic(args: {
 		`| :--- | :--- | :---: | :---: | :---: | :---: | :--- | ---: |`,
 		...rows,
 		``,
+		`## Per-arm accounting`,
+		``,
+		...armSections,
 		`Source: \`campaign-index.json\` sealed paths under this campaign root. No promoted flats.`,
 		``,
 	].join("\n");
@@ -336,7 +585,9 @@ function renderFromFlats(args: {
 	let stageNote = "Full sealed campaign report.";
 	try {
 		if (existsSync(indexPath)) {
-			const index = JSON.parse(readFileSync(indexPath, "utf8")) as CampaignIndex;
+			const index = JSON.parse(
+				readFileSync(indexPath, "utf8"),
+			) as CampaignIndex;
 			if (index.stage === "phase4") {
 				stageNote = "Phase-4 gate subset (not a failed full 35-cell matrix).";
 			} else if (index.stage === "full") {
@@ -411,6 +662,9 @@ function renderFromFlats(args: {
 				"",
 				`- p50: ${artifact.metrics?.percentiles?.p50 ?? "-"} ${contract?.unit ?? "?"}`,
 				`- serverAggregate: ${SERVER_AGGREGATE_LABEL}`,
+				...renderArmAccounting(
+					armAccountingFromArtifact({ cellId, armKind: "primary", artifact }),
+				),
 				"",
 			);
 		}

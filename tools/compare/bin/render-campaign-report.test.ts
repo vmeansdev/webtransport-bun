@@ -13,13 +13,17 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { mintPhaseAAttestationFixture } from "../cohort-fixture-signing.ts";
 import { FANOUT_COHORT_CELL_IDS, type RunArtifact } from "../evidence.ts";
 import {
+	armAccountingFromArtifact,
+	CLAIM_BOUNDARY_SENTENCE,
 	classifyArmAttestation,
 	canonicalFanoutLanguage,
 	INCOMPLETE_ATTESTATION_CAVEAT,
 	main,
 	purposeLabel,
+	renderArmAccounting,
 	SERVER_AGGREGATE_LABEL,
 } from "./render-campaign-report.ts";
 
@@ -476,7 +480,9 @@ describe("render-campaign-report argv", () => {
 		// falls through to the sealed-index diagnostic rather than failing a
 		// valid zero-flat campaign.
 		expect(code).toBe(0);
-		expect(readFileSync(report, "utf8")).toContain("Diagnostic campaign report");
+		expect(readFileSync(report, "utf8")).toContain(
+			"Diagnostic campaign report",
+		);
 	});
 });
 
@@ -571,5 +577,122 @@ describe("render-campaign-report promoted flats", () => {
 		const md = readFileSync(report, "utf8");
 		expect(md).toContain("NOT A CANONICAL FANOUT RESULT");
 		expect(md).toContain("1/6 paired promotions");
+	});
+});
+
+describe("render-campaign-report per-arm accounting (amendment D6)", () => {
+	it("prints_the_three_attested_figures_with_their_window_shares_and_the_claim_boundary", () => {
+		const fx = mintPhaseAAttestationFixture({
+			busyMs: 250,
+			spanMs: 1_000,
+			serverChildCpu: { processMs: 700, mainThreadMs: 310, windowMs: 1_000 },
+		});
+		const accounting = armAccountingFromArtifact({
+			cellId: "bulk-one-way/physical",
+			armKind: "primary",
+			artifact: {
+				...(seal({}) as Record<string, unknown>),
+				transport: "ws",
+				attestationEvidence: fx.attestation,
+			} as unknown as RunArtifact,
+		});
+		expect(accounting.topology).toBeNull();
+		expect(accounting.totals).toBeNull();
+		expect(accounting.busy).toEqual({ busyMs: 250, windowMs: 1_000 });
+		expect(accounting.cpu).toEqual({
+			processMs: 700,
+			mainThreadMs: 310,
+			windowMs: 1_000,
+		});
+		const lines = renderArmAccounting(accounting);
+		expect(lines).toEqual([
+			"- busyMs (relay timed spans on the server child's JS thread): 250 ms (25.0% of the 1000 ms window)",
+			"- Server-child main-thread CPU (rig-read utime+stime): 310 ms (31.0% of the 1000 ms window)",
+			"- Server-child process CPU (rig-read utime+stime): 700 ms (70.0% of the 1000 ms window)",
+			`- ${CLAIM_BOUNDARY_SENTENCE}`,
+		]);
+	});
+
+	it("a_seal_without_the_signed_records_prints_the_figures_as_not_attested", () => {
+		const accounting = armAccountingFromArtifact({
+			cellId: "bulk-one-way/physical",
+			armKind: "primary",
+			artifact: seal({}) as RunArtifact,
+		});
+		expect(accounting.busy).toBeNull();
+		expect(accounting.cpu).toBeNull();
+		const lines = renderArmAccounting(accounting);
+		expect(lines[0]).toContain("busyMs");
+		expect(lines[0]).toContain("not attested");
+		expect(lines[1]).toContain("main-thread CPU");
+		expect(lines[1]).toContain("not attested");
+		expect(lines[2]).toContain("process CPU");
+		expect(lines[2]).toContain("not attested");
+		expect(lines[3]).toBe(`- ${CLAIM_BOUNDARY_SENTENCE}`);
+	});
+
+	it("the_diagnostic_report_heads_every_measured_arm_with_its_accounting_and_keeps_its_label", () => {
+		const dir = campaignRoot("render-accounting-");
+		const fx = mintPhaseAAttestationFixture({
+			busyMs: 250,
+			spanMs: 1_000,
+			serverChildCpu: { processMs: 700, mainThreadMs: 310, windowMs: 1_000 },
+		});
+		writeIndex(dir, {
+			schema: "campaign-index/v2",
+			campaignId: "fanout-pilot-r1",
+			candidate: CANDIDATE,
+			executionPurpose: "pilot",
+			stage: "full",
+			cells: ["bulk-one-way/physical"],
+			entries: [
+				{
+					cellId: "bulk-one-way/physical",
+					armId: "bulk-one-way/physical/ws",
+					transport: "ws",
+					armKind: "primary",
+					status: "PASS",
+					promotable: false,
+					repetitionKind: "measured",
+					sealedPath: "arms/ws.sealed.json",
+					primaryMetricP50: 1.25,
+					repetitionIndex: 1,
+				},
+			],
+		});
+		mkdirSync(join(dir, "arms"));
+		writeFileSync(
+			join(dir, "arms", "ws.sealed.json"),
+			JSON.stringify({
+				...(seal({ p50: 1.25 }) as Record<string, unknown>),
+				transport: "ws",
+				attestationEvidence: fx.attestation,
+			}),
+		);
+		const report = join(dir, "diagnostic-report.md");
+		const { code } = runMain([
+			"--source=sealed-index",
+			"--allow-non-promotable",
+			`--candidate=${CANDIDATE}`,
+			"--campaign-id=fanout-pilot-r1",
+			`--campaign-root=${dir}`,
+			`--output=${report}`,
+		]);
+		expect(code).toBe(0);
+		const md = readFileSync(report, "utf8");
+		expect(md.startsWith("# Diagnostic campaign report")).toBe(true);
+		expect(md).toContain("NON-PROMOTABLE PILOT EVIDENCE");
+		expect(md).toContain("## Per-arm accounting");
+		expect(md).toContain("### `bulk-one-way/physical/ws` (ws, attested)");
+		expect(md).toContain(
+			"busyMs (relay timed spans on the server child's JS thread): 250 ms (25.0% of the 1000 ms window)",
+		);
+		expect(md).toContain(
+			"Server-child main-thread CPU (rig-read utime+stime): 310 ms (31.0% of the 1000 ms window)",
+		);
+		expect(md).toContain(
+			"Server-child process CPU (rig-read utime+stime): 700 ms (70.0% of the 1000 ms window)",
+		);
+		expect(md).toContain(CLAIM_BOUNDARY_SENTENCE);
 	});
 });

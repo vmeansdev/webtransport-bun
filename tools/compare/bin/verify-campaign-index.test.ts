@@ -18,6 +18,7 @@ import {
 	CAMPAIGN_INDEX_V2_SCHEMA,
 	type CampaignIndexEntryV2,
 	type CampaignIndexV2,
+	checkExpectedTotals,
 	main,
 	parseVerifyCampaignIndexArgs,
 	validateIndexEntryConsistency,
@@ -1652,3 +1653,100 @@ describe("verify-campaign-index registered topology", () => {
 function safeName(cellId: string): string {
 	return cellId.replace(/[/:]/g, "_");
 }
+
+describe("verify-campaign-index expected totals", () => {
+	// Physical-budget amendment D6: a pilot or canonical index whose sealed
+	// arm totals are not the cell's cardinalities is refused with its own
+	// code. Before this, only promotion was gated by totals, so a pilot that
+	// delivered two orders of magnitude below its gate sealed two PASS entries.
+	const TICKER_250 = "ticker-fanout/rate-250";
+	function reconstruction(partial: {
+		readonly publisherCount?: number;
+		readonly subscriberCount?: number;
+		readonly offeredIngress?: number;
+		readonly serverAcceptedIngress?: number;
+		readonly delivered?: number;
+	}) {
+		const delivered = partial.delivered ?? 250_000;
+		return {
+			publisherCount: partial.publisherCount ?? 1,
+			subscriberCount: partial.subscriberCount ?? 100,
+			ledger: {
+				schema: "cohort-ledger/v1" as const,
+				offeredIngress: partial.offeredIngress ?? 2_500,
+				serverAcceptedIngress: partial.serverAcceptedIngress ?? 2_500,
+				offeredExpandedDeliveries: 250_000,
+				serverAcceptedExpandedDeliveries: 250_000,
+				linuxRelayWritesCompleted: delivered,
+				delivered,
+				deliveredBytes: delivered * 100,
+				messageBytes: 100 as const,
+			},
+		};
+	}
+
+	it("accepts_the_cell_cardinalities_under_pilot_and_canonical", () => {
+		for (const purpose of ["pilot", "canonical"] as const) {
+			expect(
+				checkExpectedTotals({
+					cellId: TICKER_250,
+					armKind: "primary",
+					executionPurpose: purpose,
+					reconstruction: reconstruction({}),
+				}),
+			).toEqual({ ok: true });
+		}
+	});
+
+	it("refuses_a_pilot_whose_delivered_total_is_below_the_cell", () => {
+		const result = checkExpectedTotals({
+			cellId: TICKER_250,
+			armKind: "primary",
+			executionPurpose: "pilot",
+			reconstruction: reconstruction({ delivered: 2_500 }),
+		});
+		expect(result.ok).toBe(false);
+		if (result.ok) return;
+		expect(result.code).toBe("EXPECTED_TOTALS_MISMATCH");
+		expect(result.message).toContain("delivered 2500");
+		expect(result.message).toContain("250000");
+	});
+
+	it("refuses_every_other_total_that_differs_from_the_cardinality", () => {
+		const cases = [
+			{ offeredIngress: 2_499 },
+			{ serverAcceptedIngress: 2_501 },
+			{ publisherCount: 2 },
+			{ subscriberCount: 99 },
+		];
+		for (const partial of cases) {
+			const result = checkExpectedTotals({
+				cellId: TICKER_250,
+				armKind: "primary",
+				executionPurpose: "canonical",
+				reconstruction: reconstruction(partial),
+			});
+			expect(result.ok).toBe(false);
+			if (!result.ok) expect(result.code).toBe("EXPECTED_TOTALS_MISMATCH");
+		}
+	});
+
+	it("does_not_gate_a_focused_probe_or_a_non_cohort_arm", () => {
+		expect(
+			checkExpectedTotals({
+				cellId: TICKER_250,
+				armKind: "primary",
+				executionPurpose: "focused",
+				reconstruction: reconstruction({ delivered: 2_500 }),
+			}),
+		).toEqual({ ok: true });
+		expect(
+			checkExpectedTotals({
+				cellId: TICKER_250,
+				armKind: "read-path",
+				executionPurpose: "pilot",
+				reconstruction: reconstruction({ delivered: 2_500 }),
+			}),
+		).toEqual({ ok: true });
+	});
+});

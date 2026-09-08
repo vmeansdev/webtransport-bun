@@ -16,9 +16,9 @@ mod secure_fs;
 
 use base64::Engine as _;
 use secure_fs::cohort::rig::{
-    AbsentServerChild, ChildBaseline, ChildCapture, RigCohortRuntime, RigCohortSession,
-    RigCohortStage, RigExecutionAcceptanceInputs, RigExecutionBinding, RigIdentity,
-    ServerChildChannel, ServerSpawner, SpawnServerRequest, SpawnedServerChild,
+    AbsentServerChild, ChildBaseline, ChildCapture, ChildCpuSample, RigCohortRuntime,
+    RigCohortSession, RigCohortStage, RigExecutionAcceptanceInputs, RigExecutionBinding,
+    RigIdentity, ServerChildChannel, ServerSpawner, SpawnServerRequest, SpawnedServerChild,
 };
 use secure_fs::cohort::{
     canonical_bytes, merkle_proof, merkle_root, ordered_leaf_nodes, sha256_hex, CohortPhase,
@@ -431,7 +431,27 @@ struct ScriptedServerChild {
     /// How many times the control pipe was abandoned without the teardown
     /// handshake — the refused-arm path.
     abandoned: u64,
+    /// The CPU reading the channel reports with the capture ack. The baseline
+    /// reading is fixed (`BASELINE_CPU`), so a test can hand the rig a capture
+    /// that does not follow from it.
+    cpu_at_capture: ChildCpuSample,
 }
+
+/// The rig's reading as the measure-start ack arrives, on every scripted
+/// channel: 1,000 ms of process CPU, 400 ms of it on the main thread.
+const BASELINE_CPU: ChildCpuSample = ChildCpuSample {
+    process_ms: 1_000,
+    main_thread_ms: 400,
+    at_ns: 6_200_000_000,
+};
+
+/// The reading 10 s later: the receipt states the deltas, 7,000 / 3,100 ms
+/// over a 10,000 ms window.
+const CAPTURE_CPU: ChildCpuSample = ChildCpuSample {
+    process_ms: 8_000,
+    main_thread_ms: 3_500,
+    at_ns: 16_200_000_000,
+};
 
 impl ScriptedServerChild {
     fn new() -> Self {
@@ -448,6 +468,7 @@ impl ScriptedServerChild {
             carries_relay_observation: true,
             snapshot_frame_is_non_canonical: false,
             abandoned: 0,
+            cpu_at_capture: CAPTURE_CPU,
         }
     }
 
@@ -628,6 +649,7 @@ impl ServerChildChannel for ScriptedServerChild {
             busy_ms: 17,
             at_linux_ns: 6_200_000_000,
             response_sequence: 3,
+            cpu: BASELINE_CPU,
         })
     }
 
@@ -674,6 +696,7 @@ impl ServerChildChannel for ScriptedServerChild {
             capture_ack,
             request_sequence: 5,
             response_sequence: 5,
+            cpu: self.cpu_at_capture,
         })
     }
 
@@ -1895,6 +1918,12 @@ fn the_capture_receipts_bind_the_bytes_the_child_sent() {
     // Both sequences are the rig's own counters, never numbers the child stated.
     assert_eq!(receipt["captureRequestSequence"], 5);
     assert_eq!(receipt["childResponseSequence"], 5);
+    // Physical-budget amendment D6: the attested CPU is the rig's own two
+    // readings differenced, beside the child's busyMs, over the rig's window.
+    assert_eq!(
+        receipt["serverChildCpu"],
+        json!({ "processMs": 7_000, "mainThreadMs": 3_100, "windowMs": 10_000 })
+    );
     verify_rig_receipt(
         &rig.rig_keys,
         "rig-server-snapshot-receipt/v1",
@@ -3218,6 +3247,8 @@ struct OrdinaryServerChild {
     baseline_reads: u64,
     captures: u64,
     teardowns: u64,
+    /// The capture reading this channel reports; `None` is the honest one.
+    cpu_at_capture: Option<ChildCpuSample>,
 }
 
 impl ServerChildChannel for OrdinaryServerChild {
@@ -3241,6 +3272,7 @@ impl ServerChildChannel for OrdinaryServerChild {
             busy_ms: 11,
             at_linux_ns: 6_200_000_000,
             response_sequence: 1,
+            cpu: BASELINE_CPU,
         })
     }
 
@@ -3267,6 +3299,7 @@ impl ServerChildChannel for OrdinaryServerChild {
             capture_ack,
             request_sequence: 3,
             response_sequence: 3,
+            cpu: self.cpu_at_capture.unwrap_or(CAPTURE_CPU),
         })
     }
 
@@ -3357,6 +3390,54 @@ fn ordinary_capture_payload(request_seq: u64) -> Vec<u8> {
         "drainDeadlineMs": 10_000,
     }))
     .expect("canonical ordinary capture request")
+}
+
+/// Physical-budget amendment D6: the CPU figures are differences of two rig
+/// readings, and a pair that does not difference — a process clock that ran
+/// backwards, a main thread ahead of its own process, or no window between
+/// the reads — is refused at the capture rather than minted into a receipt.
+#[test]
+fn a_cpu_reading_that_does_not_follow_from_its_baseline_refuses_the_capture() {
+    let broken = [
+        // Process clock below the baseline.
+        ChildCpuSample {
+            process_ms: 900,
+            main_thread_ms: 400,
+            at_ns: 16_200_000_000,
+        },
+        // Main thread spent more than the whole process over the window.
+        ChildCpuSample {
+            process_ms: 2_000,
+            main_thread_ms: 1_900,
+            at_ns: 16_200_000_000,
+        },
+        // Both readings at the same instant.
+        ChildCpuSample {
+            process_ms: 8_000,
+            main_thread_ms: 3_500,
+            at_ns: 6_200_000_000,
+        },
+    ];
+    for capture in broken {
+        let mut rig = ordinary_rig();
+        let mut spawner = RecordingSpawner::default();
+        let mut child = OrdinaryServerChild {
+            cpu_at_capture: Some(capture),
+            ..OrdinaryServerChild::default()
+        };
+        rig.session
+            .spawn_server(&ordinary_spawn_payload(), &mut spawner)
+            .expect("the ordinary server child spawns");
+        rig.session
+            .measure_start(&ordinary_measure_start_payload(3), &mut child, NOW_MS)
+            .expect("the ordinary baseline");
+        let refused = rig
+            .session
+            .stop_and_capture(&ordinary_capture_payload(4), &mut child, NOW_MS)
+            .expect_err("a reading that does not difference is refused");
+        assert_eq!(refused.code(), "TRUST_PROTOCOL", "{capture:?}");
+        assert_eq!(child.captures, 1);
+    }
 }
 
 /// §5 on the ordinary arm end to end: spawn under the signed launch record,
@@ -3481,6 +3562,11 @@ fn the_ordinary_arm_runs_the_signed_server_lifecycle_with_no_cohort() {
     assert_eq!(
         receipt["snapshotFrameSha256"],
         sha256_hex(&ordinary_snapshot_frame())
+    );
+    // The ordinary arm attests the same CPU window as the fanout arm.
+    assert_eq!(
+        receipt["serverChildCpu"],
+        json!({ "processMs": 7_000, "mainThreadMs": 3_100, "windowMs": 10_000 })
     );
     assert_eq!(rig.session.stage(), RigCohortStage::Captured);
 
@@ -3637,6 +3723,7 @@ fn an_ordinary_capture_frame_that_states_a_cohort_is_refused() {
                 busy_ms: 11,
                 at_linux_ns: 6_200_000_000,
                 response_sequence: 1,
+                cpu: BASELINE_CPU,
             })
         }
         fn present_start_barrier(&mut self, _: &[u8], _: &[u8]) -> Result<Vec<u8>, CohortRefusal> {
@@ -3662,6 +3749,7 @@ fn an_ordinary_capture_frame_that_states_a_cohort_is_refused() {
                 capture_ack,
                 request_sequence: 3,
                 response_sequence: 3,
+                cpu: CAPTURE_CPU,
             })
         }
         fn teardown(&mut self) -> Result<Vec<u8>, CohortRefusal> {

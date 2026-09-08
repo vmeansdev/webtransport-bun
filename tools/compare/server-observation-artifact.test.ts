@@ -11,9 +11,14 @@ import {
 import type { CohortObservationEvidenceV1 } from "./cohort-protocol.ts";
 import { bytesOfCanonical, toBase64 } from "./cross-supervisor-protocol.ts";
 import { FANOUT_COHORT_CELL_IDS } from "./evidence.ts";
-import type { RigMeasureStartAckV1 } from "./server-observation-artifact.ts";
+import type {
+	RigMeasureStartAckV1,
+	RigServerSnapshotReceiptV1,
+} from "./server-observation-artifact.ts";
 import {
 	RIG_MEASURE_START_ACK_KEYS,
+	RIG_SERVER_SNAPSHOT_RECEIPT_KEYS,
+	serverChildCpuIssue,
 	verifyArmAttestationEvidence,
 } from "./server-observation-artifact.ts";
 
@@ -587,5 +592,114 @@ describe("rig-measure-start-ack/v1 conformance", () => {
 		// `rig-measure-started-ack/v1`, the frame this record travels inside.
 		expect(RIG_MEASURE_START_ACK_KEYS).not.toContain("responseSeq");
 		expect(RIG_MEASURE_START_ACK_KEYS).not.toContain("ackRequestSeq");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Physical-budget amendment D6 -- `serverChildCpu` on
+// `rig-server-snapshot-receipt/v1`: the rig's own reading of the child's
+// process and main-thread CPU over its window, beside the child's `busyMs`.
+// The receipt has no hex pin (the fixture graph is minted at test time); its
+// key set is asserted here against the Rust mint's, and the verifier's
+// invariants are proved by execution against re-encoded receipts.
+// ---------------------------------------------------------------------------
+
+describe("D6: attested server-child CPU on the snapshot receipt", () => {
+	function snapshotReceipt(
+		attestation: ReturnType<typeof mintPhaseAAttestationFixture>["attestation"],
+	): RigServerSnapshotReceiptV1 {
+		const observation = attestation.serverObservationEvidence as unknown as {
+			readonly rigServerSnapshotReceiptBase64: string;
+		};
+		return JSON.parse(
+			Buffer.from(
+				observation.rigServerSnapshotReceiptBase64,
+				"base64",
+			).toString("utf8"),
+		) as RigServerSnapshotReceiptV1;
+	}
+
+	function withReceipt(
+		fx: ReturnType<typeof mintPhaseAAttestationFixture>,
+		receipt: Record<string, unknown>,
+	) {
+		const mutated = replaceEmbeddedBase64Field(
+			fx.attestation,
+			"rigServerSnapshotReceiptBase64",
+			toBase64(bytesOfCanonical(receipt as never)),
+		);
+		return verifyArmAttestationEvidence(mutated, fx.trust, {
+			...PHASE_A_IDENTITY,
+			executionSha256: fx.executionSha256,
+		});
+	}
+
+	it("the minted receipt carries exactly the key set the Rust mint has, with the three figures", () => {
+		const fx = mintPhaseAAttestationFixture({ busyMs: 65, spanMs: 1_250 });
+		const receipt = snapshotReceipt(fx.attestation);
+		expect(Object.keys(receipt).sort()).toEqual([
+			...RIG_SERVER_SNAPSHOT_RECEIPT_KEYS,
+		]);
+		expect(receipt.serverChildCpu).toEqual(fx.serverChildCpu);
+		expect(receipt.serverChildCpu.windowMs).toBe(1_250);
+		expect(receipt.serverChildCpu.mainThreadMs).toBeLessThanOrEqual(
+			receipt.serverChildCpu.processMs,
+		);
+		const honest = verifyArmAttestationEvidence(fx.attestation, fx.trust, {
+			...PHASE_A_IDENTITY,
+			executionSha256: fx.executionSha256,
+		});
+		expect(honest.ok).toBe(true);
+	});
+
+	it("a figure that is not a non-negative integer, a main thread ahead of its process, or an empty window is refused by name", () => {
+		const fx = mintPhaseAAttestationFixture();
+		const receipt = snapshotReceipt(fx.attestation);
+		const broken: unknown[] = [
+			{ processMs: 100, mainThreadMs: 101, windowMs: 1_250 },
+			{ processMs: -1, mainThreadMs: 0, windowMs: 1_250 },
+			{ processMs: 1.5, mainThreadMs: 0, windowMs: 1_250 },
+			{ processMs: "100", mainThreadMs: 0, windowMs: 1_250 },
+			{ processMs: 100, mainThreadMs: 10, windowMs: 0 },
+			{ processMs: 100, mainThreadMs: 10 },
+			{ processMs: 100, mainThreadMs: 10, windowMs: 1_250, instrument: "x" },
+			null,
+			[100, 10, 1_250],
+		];
+		for (const serverChildCpu of broken) {
+			const result = withReceipt(fx, { ...receipt, serverChildCpu });
+			expect(result.ok).toBe(false);
+			if (result.ok) continue;
+			expect(result.code).toBe("TRUST_PROTOCOL");
+			expect(result.message).toContain("serverChildCpu");
+		}
+	});
+
+	it("a receipt without serverChildCpu is a different record, not a lenient one", () => {
+		const fx = mintPhaseAAttestationFixture();
+		const { serverChildCpu: _dropped, ...without } = snapshotReceipt(
+			fx.attestation,
+		);
+		const result = withReceipt(fx, without);
+		expect(result.ok).toBe(false);
+		if (result.ok) return;
+		expect(result.message).toContain("rig snapshot receipt key set");
+		expect(result.message).toContain("27 keys");
+	});
+
+	it("serverChildCpuIssue names every invariant and passes the honest shape", () => {
+		expect(
+			serverChildCpuIssue({ processMs: 0, mainThreadMs: 0, windowMs: 1 }),
+		).toBeNull();
+		expect(
+			serverChildCpuIssue({ processMs: 5, mainThreadMs: 6, windowMs: 1 }),
+		).toContain("exceeds");
+		expect(
+			serverChildCpuIssue({ processMs: 5, mainThreadMs: 5, windowMs: 0 }),
+		).toContain("windowMs is 0");
+		expect(serverChildCpuIssue({ processMs: 5, mainThreadMs: 5 })).toContain(
+			"keys",
+		);
+		expect(serverChildCpuIssue(undefined)).toContain("not an object");
 	});
 });

@@ -25,6 +25,7 @@ import {
 	parseRigRelayObservationReceipt,
 	parseRigWarmupDrainedReceipt,
 	parseTokenCommitmentLeafManifest,
+	parseWorkerPartial,
 	verifyPresentedCohortTopology,
 	type RetainedCanonicalBytesV1,
 	recomputeCohortLedger,
@@ -4150,6 +4151,30 @@ export function reconstructCohortEvidenceOffline(
 	if (recomputedSeries.value.postStopDrainDelivered !== 0) {
 		// Never folded backward into the measured samples; it simply refuses.
 		promotionEligible = false;
+	}
+	// The worker half of the same predicate (physical-budget amendment D2,
+	// fail-closed 3). The origin-window sums above balance whether or not a
+	// worker refused, duplicated or reordered a unit, and they balance across
+	// a shard whose subscribers saw uneven counts; the worker's own book is
+	// where those show, so it is read here rather than trusted to be zero.
+	for (const json of workerJson) {
+		if (!promotionEligible) break;
+		const worker = parseWorkerPartial(json);
+		if (!worker.ok) {
+			promotionEligible = false;
+			break;
+		}
+		const book = worker.value;
+		if (
+			book.malformedCount !== 0 ||
+			book.duplicateCount !== 0 ||
+			book.reorderCount !== 0 ||
+			book.perSubscriberDelivered.some(
+				(count) => count !== c.serverAcceptedIngressTotal,
+			)
+		) {
+			promotionEligible = false;
+		}
 	}
 
 	return {
