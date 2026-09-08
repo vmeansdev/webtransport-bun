@@ -12160,9 +12160,13 @@ pub mod cohort {
     pub const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
     /// §7's closed refusal-code table
-    /// (`cross-supervisor-protocol.ts:140-165`): three staging codes and
-    /// eighteen failure codes, and nothing else may travel on
-    /// `remote-supervisor-refusal/v1`.
+    /// (`cross-supervisor-protocol.ts:141-167`): three staging codes and
+    /// nineteen failure codes, and nothing else may travel on
+    /// `remote-supervisor-refusal/v1`.  `DELIVERY_CONTEXT_MISMATCH` is the
+    /// Mac worker's refusal of its delivery channel (physical-budget
+    /// amendment D2); no rig or Mac supervisor condition maps onto it, so no
+    /// variant below answers with it, but the sealed record may carry it and
+    /// the TypeScript vocabulary test holds this list equal to its own.
     ///
     /// This is not decoration.  Both supervisors publish onto that one record,
     /// so both refusal enums answer out of this list and nowhere else:
@@ -12190,6 +12194,7 @@ pub mod cohort {
         "RELAY_DELIVERY",
         "CHILD_LIFECYCLE",
         "RUNTIME_RESOURCE_EXHAUSTION",
+        "DELIVERY_CONTEXT_MISMATCH",
     ];
 
     /// Why the cohort codec refused.

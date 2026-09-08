@@ -1877,6 +1877,7 @@ export const PHASE_B_ROLE_CHILD_ORIGINATED_SCHEMAS = [
 	"role-measure-start-ack/v1",
 	"role-partial/v1",
 	"role-exited/v1",
+	"role-failed/v1",
 ] as const;
 
 export type RoleRecordOrigin = "supervisor" | "child-reported";

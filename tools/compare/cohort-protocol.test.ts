@@ -5,6 +5,7 @@
 import { describe, expect, test } from "bun:test";
 import {
 	buildChat10kWorstCaseTokenBundleFixture,
+	buildRoleFailed,
 	CHAT_10K_TOKEN_BUNDLE_MARGIN_BYTES,
 	CHAT_10K_TOKEN_BUNDLE_MAX_BYTES,
 	CHAT_10K_WORST_CASE_WORKER_SUBSCRIBERS,
@@ -47,6 +48,7 @@ import {
 	parseRigWarmupDrainedReceipt,
 	parseRoleExit,
 	parseRoleExited,
+	parseRoleFailed,
 	parseRoleMeasureStart,
 	parseRoleMeasureStartAck,
 	parseRolePartial,
@@ -3134,10 +3136,12 @@ import {
 	COHORT_REMOTE_EVIDENCE_BUDGET_BYTES as B1_EVIDENCE_BUDGET,
 	COHORT_OBSERVATION_EVIDENCE_MAX_DECODED_BYTES as B1_EVIDENCE_DECODED,
 	COHORT_OBSERVATION_EVIDENCE_MAX_ENCODED_BYTES as B1_EVIDENCE_ENCODED,
+	ROLE_FAILED_MESSAGE_MAX_CHARS,
 	ROLE_SPAWN_CONFIG_MAX_BYTES as B1_SPAWN_CONFIG_CAP,
 	ROLE_WARMUP_COMPLETION_MANIFEST_MAX_BYTES as B1_WARMUP_MANIFEST_CAP,
 } from "./cohort-protocol.ts";
 import {
+	CAMPAIGN_FAILURE_CODES,
 	COHORT_EVIDENCE_EXPORT_MAX_DECODED_BYTES,
 	COHORT_EVIDENCE_EXPORT_MAX_ENCODED_BYTES,
 	COHORT_REMOTE_EVIDENCE_BUDGET_MAX_BYTES,
@@ -3561,8 +3565,8 @@ describe("B1 §3.3 remote frame registration", () => {
 
 describe("B1 §3.4 role-child frame registration", () => {
 	test("role-child kinds are registered and disjoint from Phase A kinds", () => {
-		expect(PHASE_B_ROLE_CHILD_SCHEMAS.length).toBe(15);
-		expect(new Set(PHASE_B_ROLE_CHILD_SCHEMAS).size).toBe(15);
+		expect(PHASE_B_ROLE_CHILD_SCHEMAS.length).toBe(16);
+		expect(new Set(PHASE_B_ROLE_CHILD_SCHEMAS).size).toBe(16);
 		for (const schema of PHASE_B_ROLE_CHILD_SCHEMAS) {
 			expect(isRoleChildSchema(schema)).toBe(true);
 		}
@@ -3693,6 +3697,106 @@ describe("B1 role-record origin registration", () => {
 				origin: "child-reported",
 			}).ok,
 		).toBe(false);
+	});
+});
+
+describe("role-failed/v1: a child names its own closed failure code before exiting", () => {
+	const failed = {
+		schema: "role-failed/v1",
+		sequence: 0,
+		executionSha256: B1_HEX_X,
+		childId: "worker-000003",
+		code: "DELIVERY_CONTEXT_MISMATCH",
+		message:
+			"measured delivery context does not match this session's admission",
+	};
+
+	test("is registered as a child-originated role frame at the control bound", () => {
+		expect(isRoleChildSchema("role-failed/v1")).toBe(true);
+		expect(roleChildFrameBoundForSchema("role-failed/v1")).toBe(
+			CHILD_PIPE_CONTROL_MAX_BYTES,
+		);
+		expect(roleRecordOrigin("role-failed/v1")).toBe("child-reported");
+		expect(
+			(PHASE_B_ROLE_CHILD_ORIGINATED_SCHEMAS as readonly string[]).includes(
+				"role-failed/v1",
+			),
+		).toBe(true);
+	});
+
+	test("round-trips through the role-child pipe codec and its record parser", () => {
+		const encoded = encodeRoleChildFrame(failed);
+		expect(encoded.ok).toBe(true);
+		if (!encoded.ok) throw new Error("unreachable");
+		const decoded = decodeRoleChildFrame(encoded.value, "role-failed/v1");
+		expect(decoded.ok).toBe(true);
+		if (!decoded.ok) throw new Error("unreachable");
+		expect(decoded.value).toEqual(failed);
+		const parsed = parseRoleFailed(decoded.value);
+		expect(parsed.ok).toBe(true);
+		if (!parsed.ok) throw new Error("unreachable");
+		expect(parsed.value.code).toBe("DELIVERY_CONTEXT_MISMATCH");
+		// Read where another frame was expected it is the state refusal, as
+		// for every other kind: accepting it at every await is the driver's job.
+		const wrongState = decodeRoleChildFrame(encoded.value, "role-exited/v1");
+		expect(wrongState.ok).toBe(false);
+		if (wrongState.ok) throw new Error("unreachable");
+		expect(wrongState.code).toBe("STATE_INVALID");
+	});
+
+	test("the builder always yields a parseable frame with the code intact", () => {
+		for (const code of CAMPAIGN_FAILURE_CODES) {
+			const built = buildRoleFailed({
+				executionSha256: B1_HEX_X,
+				childId: "publisher-000000",
+				code,
+				message: `refused: ${code}`,
+			});
+			expect(built.schema).toBe("role-failed/v1");
+			expect(built.code).toBe(code);
+			expect(parseRoleFailed(built).ok).toBe(true);
+			expect(encodeRoleChildFrame(built).ok).toBe(true);
+		}
+		const clipped = buildRoleFailed({
+			executionSha256: B1_HEX_X,
+			childId: "worker-000000",
+			code: "COHORT_PROTOCOL",
+			message: "x".repeat(10_000),
+		});
+		expect(clipped.message.length).toBe(ROLE_FAILED_MESSAGE_MAX_CHARS);
+		expect(parseRoleFailed(clipped).ok).toBe(true);
+		const empty = buildRoleFailed({
+			executionSha256: B1_HEX_X,
+			childId: "worker-000000",
+			code: "RELAY_DELIVERY",
+			message: "",
+		});
+		expect(empty.message).toBe("RELAY_DELIVERY");
+		expect(parseRoleFailed(empty).ok).toBe(true);
+	});
+
+	test("refuses a code outside the closed vocabulary and every other bad field", () => {
+		expect(parseRoleFailed(failed).ok).toBe(true);
+		const bad: Array<Record<string, unknown>> = [
+			{ code: "RIG_UNREACHABLE" },
+			{ code: "UNEXPECTED_EOF" },
+			{ code: "STATE_INVALID" },
+			{ code: "delivery_context_mismatch" },
+			{ code: 7 },
+			{ message: "" },
+			{ message: "x".repeat(513) },
+			{ message: 1 },
+			{ childId: "" },
+			{ executionSha256: B1_HEX_X.slice(1) },
+			{ sequence: -1 },
+			{ schema: "role-exited/v1" },
+			{ extra: true },
+		];
+		for (const override of bad) {
+			expect(parseRoleFailed({ ...failed, ...override }).ok).toBe(false);
+		}
+		const { message: _m, ...missing } = failed;
+		expect(parseRoleFailed(missing).ok).toBe(false);
 	});
 });
 

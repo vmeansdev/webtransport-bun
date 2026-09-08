@@ -27,9 +27,11 @@ import {
 	type Sha256Hex,
 } from "../cross-supervisor-protocol.ts";
 import {
+	COHORT_MAX_PUBLISHERS,
 	COHORT_PROTOCOL_FAILURE_CODE,
 	COHORT_WORKER_COUNT,
 	decodeStrictBase64,
+	DELIVERY_CONTEXT_MISMATCH_FAILURE_CODE,
 	TOKEN_BASE64_LENGTH,
 	TOKEN_MERKLE_MAX_PROOF_LENGTH,
 	TOKEN_RAW_BYTES,
@@ -41,6 +43,17 @@ import {
 	parseStrictJsonBytes,
 	sha256HexOfBytes,
 } from "../secure-fs.ts";
+import {
+	contextTagOfDeliveryContextSha256,
+	deliveryContextSha256Of,
+	FANOUT_MAX_WINDOW_COUNT,
+	FANOUT_PAYLOAD_BYTES_VALUES,
+	type FanoutPayloadBytes,
+} from "./fanout-delivery.ts";
+
+// The compact relay-to-subscriber frame and the delivery-channel discriminator
+// live in their own leaf module; this is the one import site for both halves.
+export * from "./fanout-delivery.ts";
 
 // ---------------------------------------------------------------------------
 // Caps, kinds, and code sets (exact plan values)
@@ -55,25 +68,11 @@ export const FANOUT_DATA_FRAME_MAX_DECODED_BYTES = 1_024;
 /** WT reliable streams prefix each logical frame with a u32 big-endian length. */
 export const FANOUT_WT_LENGTH_PREFIX_BYTES = 4;
 
-/** Ticker payloads are exactly 100 bytes; chat payloads exactly 128. */
-export const FANOUT_TICKER_PAYLOAD_BYTES = 100;
-export const FANOUT_CHAT_PAYLOAD_BYTES = 128;
-export const FANOUT_PAYLOAD_BYTES_VALUES = [
-	FANOUT_TICKER_PAYLOAD_BYTES,
-	FANOUT_CHAT_PAYLOAD_BYTES,
-] as const;
-
-/**
- * Window indices are bounded by the largest declared measured window count
- * (30 one-second windows); a 10-window cell uses a strict prefix of the same
- * domain, so one bound covers both without inventing a per-cell parameter.
- */
-export const FANOUT_MAX_WINDOW_COUNT = 30;
-
 export const FANOUT_WIRE_KINDS = [
 	"accept",
 	"ack",
 	"data",
+	"delivery-context",
 	"end",
 	"refuse",
 	"register",
@@ -106,8 +105,10 @@ export const FANOUT_ACK_DISPOSITIONS = [
 ] as const;
 export type FanoutAckDisposition = (typeof FANOUT_ACK_DISPOSITIONS)[number];
 
-export const FANOUT_ACK_DUPLICATE_CODE = "DUPLICATE_PUBLISHER_SEQUENCE" as const;
-export const FANOUT_ACK_REORDERED_CODE = "REORDERED_PUBLISHER_SEQUENCE" as const;
+export const FANOUT_ACK_DUPLICATE_CODE =
+	"DUPLICATE_PUBLISHER_SEQUENCE" as const;
+export const FANOUT_ACK_REORDERED_CODE =
+	"REORDERED_PUBLISHER_SEQUENCE" as const;
 export const FANOUT_ACK_CLOSED_CODES = [
 	"REGISTRATION_CLOSED",
 	"RELAY_INGRESS_QUEUE_FULL",
@@ -276,6 +277,60 @@ export interface FanoutEndV1 {
 	readonly reason: "publisher-complete" | "relay-drained";
 }
 
+/**
+ * The one JSON frame on a subscriber's delivery channel, sent once per epoch
+ * before any compact frame of that epoch. Its digest is over the frame minus
+ * `deliveryContextSha256`; the first four digest bytes are the `contextTag`
+ * every compact frame of the epoch carries. The worker recomputes the digest
+ * from its own admission facts, so a context can only bind a session to the
+ * grant, epoch, index and publisher set the worker was admitted under.
+ */
+export interface FanoutDeliveryContextMeasuredV1 {
+	readonly schema: typeof FANOUT_WIRE_SCHEMA;
+	readonly kind: "delivery-context";
+	readonly epoch: "measured";
+	readonly cohortGrantSha256: Sha256Hex;
+	readonly cohortStartBarrierSha256: Sha256Hex;
+	readonly subscriberId: string;
+	readonly subscriberIndex: number;
+	readonly publisherIds: readonly string[];
+	readonly windowCount: number;
+	readonly messageBytes: FanoutPayloadBytes;
+	readonly deliveryContextSha256: Sha256Hex;
+}
+
+export interface FanoutDeliveryContextWarmupV1 {
+	readonly schema: typeof FANOUT_WIRE_SCHEMA;
+	readonly kind: "delivery-context";
+	readonly epoch: "warmup";
+	readonly cohortGrantSha256: Sha256Hex;
+	readonly cohortWarmupEpochSha256: Sha256Hex;
+	readonly warmupNonce: Sha256Hex;
+	readonly subscriberId: string;
+	readonly subscriberIndex: number;
+	readonly publisherIds: readonly string[];
+	readonly windowCount: number;
+	readonly messageBytes: FanoutPayloadBytes;
+	readonly deliveryContextSha256: Sha256Hex;
+}
+
+export type FanoutDeliveryContextV1 =
+	| FanoutDeliveryContextMeasuredV1
+	| FanoutDeliveryContextWarmupV1;
+
+export type FanoutDeliveryEpoch = FanoutDeliveryContextV1["epoch"];
+
+/** The admission facts a delivery context binds; the worker holds its own copy. */
+export type FanoutDeliveryContextFacts =
+	| Omit<
+			FanoutDeliveryContextMeasuredV1,
+			"schema" | "kind" | "deliveryContextSha256"
+	  >
+	| Omit<
+			FanoutDeliveryContextWarmupV1,
+			"schema" | "kind" | "deliveryContextSha256"
+	  >;
+
 export type FanoutWireV1 =
 	| FanoutRegisterV1
 	| FanoutAcceptV1
@@ -285,7 +340,8 @@ export type FanoutWireV1 =
 	| FanoutWarmupEndV1
 	| FanoutDataV1
 	| FanoutAckV1
-	| FanoutEndV1;
+	| FanoutEndV1
+	| FanoutDeliveryContextV1;
 
 // ---------------------------------------------------------------------------
 // Local strict-parse helpers (mirrors of the A2 / §4.1 codec helpers)
@@ -368,16 +424,21 @@ const WARMUP_FIELDS_FORBIDDEN_IN_MEASURED = [
 	"warmupNonce",
 ] as const;
 
-function rejectEpochMixing(record: Rec, kind: string): ProtocolResult<true> {
-	const isWarmup = kind.startsWith("warmup-");
-	const forbidden = isWarmup
-		? MEASURED_FIELDS_FORBIDDEN_IN_WARMUP
-		: WARMUP_FIELDS_FORBIDDEN_IN_MEASURED;
+/**
+ * Keyed on the epoch, not the kind: every `warmup-*` kind is a warmup frame,
+ * but a delivery context carries either epoch under one kind.
+ */
+function rejectEpochMixing(
+	record: Rec,
+	epoch: FanoutDeliveryEpoch,
+): ProtocolResult<true> {
+	const forbidden =
+		epoch === "warmup"
+			? MEASURED_FIELDS_FORBIDDEN_IN_WARMUP
+			: WARMUP_FIELDS_FORBIDDEN_IN_MEASURED;
 	for (const field of forbidden) {
 		if (hasOwn(record, field)) {
-			return warmupFail(
-				`${isWarmup ? "warmup" : "measured"} frame must not carry ${field}`,
-			);
+			return warmupFail(`${epoch} frame must not carry ${field}`);
 		}
 	}
 	return { ok: true, value: true };
@@ -392,7 +453,9 @@ function validatePayload(record: Rec): ProtocolResult<true> {
 		return wireFail("payloadBase64 must be a string");
 	}
 	// Encoded length is checked before any decode allocation.
-	if (record.payloadBase64.length !== base64EncodedLength(record.payloadBytes)) {
+	if (
+		record.payloadBase64.length !== base64EncodedLength(record.payloadBytes)
+	) {
 		return wireFail("payload base64 length does not match payloadBytes");
 	}
 	const payload = decodeStrictBase64(
@@ -606,7 +669,7 @@ export function parseFanoutWarmupData(
 	value: unknown,
 ): ProtocolResult<FanoutWarmupDataV1> {
 	if (!isPlainObject(value)) return wireFail("fanout warmup data");
-	const mixing = rejectEpochMixing(value, "warmup-data");
+	const mixing = rejectEpochMixing(value, "warmup");
 	if (!mixing.ok) return mixing;
 	if (!exactKeys(value, WARMUP_DATA_KEYS)) {
 		return wireFail("fanout warmup data keys");
@@ -648,7 +711,7 @@ export function parseFanoutWarmupAck(
 	value: unknown,
 ): ProtocolResult<FanoutWarmupAckV1> {
 	if (!isPlainObject(value)) return wireFail("fanout warmup ack");
-	const mixing = rejectEpochMixing(value, "warmup-ack");
+	const mixing = rejectEpochMixing(value, "warmup");
 	if (!mixing.ok) return mixing;
 	if (!exactKeys(value, WARMUP_ACK_KEYS)) {
 		return wireFail("fanout warmup ack keys");
@@ -693,7 +756,7 @@ export function parseFanoutWarmupEnd(
 	value: unknown,
 ): ProtocolResult<FanoutWarmupEndV1> {
 	if (!isPlainObject(value)) return wireFail("fanout warmup end");
-	const mixing = rejectEpochMixing(value, "warmup-end");
+	const mixing = rejectEpochMixing(value, "warmup");
 	if (!mixing.ok) return mixing;
 	if (!exactKeys(value, WARMUP_END_KEYS)) {
 		return wireFail("fanout warmup end keys");
@@ -712,7 +775,10 @@ export function parseFanoutWarmupEnd(
 	) {
 		return wireFail("fanout warmup end fields");
 	}
-	if (value.reason === "publisher-warmup-complete" && value.role !== "publisher") {
+	if (
+		value.reason === "publisher-warmup-complete" &&
+		value.role !== "publisher"
+	) {
 		return wireFail("only a publisher completes its own warmup");
 	}
 	// A publisher always reports the sequence it finished on; a subscriber has
@@ -745,7 +811,7 @@ const DATA_KEYS = [
 
 export function parseFanoutData(value: unknown): ProtocolResult<FanoutDataV1> {
 	if (!isPlainObject(value)) return wireFail("fanout data");
-	const mixing = rejectEpochMixing(value, "data");
+	const mixing = rejectEpochMixing(value, "measured");
 	if (!mixing.ok) return mixing;
 	if (!exactKeys(value, DATA_KEYS)) return wireFail("fanout data keys");
 	if (
@@ -785,7 +851,7 @@ const ACK_KEYS = [
 
 export function parseFanoutAck(value: unknown): ProtocolResult<FanoutAckV1> {
 	if (!isPlainObject(value)) return wireFail("fanout ack");
-	const mixing = rejectEpochMixing(value, "ack");
+	const mixing = rejectEpochMixing(value, "measured");
 	if (!mixing.ok) return mixing;
 	if (!exactKeys(value, ACK_KEYS)) return wireFail("fanout ack keys");
 	if (
@@ -826,7 +892,9 @@ export function parseFanoutAck(value: unknown): ProtocolResult<FanoutAckV1> {
 		);
 	}
 	if (value.linuxAcceptedAtNs !== null) {
-		return wireFail(`${value.disposition} ack must carry null linuxAcceptedAtNs`);
+		return wireFail(
+			`${value.disposition} ack must carry null linuxAcceptedAtNs`,
+		);
 	}
 	if (value.disposition === "duplicate") {
 		if (value.code !== FANOUT_ACK_DUPLICATE_CODE) {
@@ -862,7 +930,7 @@ const END_REASONS = ["publisher-complete", "relay-drained"] as const;
 
 export function parseFanoutEnd(value: unknown): ProtocolResult<FanoutEndV1> {
 	if (!isPlainObject(value)) return wireFail("fanout end");
-	const mixing = rejectEpochMixing(value, "end");
+	const mixing = rejectEpochMixing(value, "measured");
 	if (!mixing.ok) return mixing;
 	if (!exactKeys(value, END_KEYS)) return wireFail("fanout end keys");
 	if (
@@ -893,6 +961,164 @@ export function parseFanoutEnd(value: unknown): ProtocolResult<FanoutEndV1> {
 	return { ok: true, value: value as unknown as FanoutEndV1 };
 }
 
+const DELIVERY_CONTEXT_COMMON_KEYS = [
+	"cohortGrantSha256",
+	"deliveryContextSha256",
+	"epoch",
+	"kind",
+	"messageBytes",
+	"publisherIds",
+	"schema",
+	"subscriberId",
+	"subscriberIndex",
+	"windowCount",
+] as const;
+
+const DELIVERY_CONTEXT_MEASURED_KEYS = [
+	...DELIVERY_CONTEXT_COMMON_KEYS,
+	"cohortStartBarrierSha256",
+].sort();
+
+const DELIVERY_CONTEXT_WARMUP_KEYS = [
+	...DELIVERY_CONTEXT_COMMON_KEYS,
+	"cohortWarmupEpochSha256",
+	"warmupNonce",
+].sort();
+
+/** The header carries `subscriberIndex` as a u32. */
+const SUBSCRIBER_INDEX_MAX = 0xffff_ffff;
+
+function isPublisherIdList(value: unknown): value is readonly string[] {
+	if (!Array.isArray(value) || value.length === 0) return false;
+	if (value.length > COHORT_MAX_PUBLISHERS) return false;
+	let previous = "";
+	for (const id of value) {
+		if (
+			!isNonEmptyString(id) ||
+			!ROLE_ID_RE.test(id) ||
+			!id.startsWith("publisher-") ||
+			id <= previous
+		) {
+			return false;
+		}
+		previous = id;
+	}
+	return true;
+}
+
+/**
+ * Exact keys per epoch, the epoch's forbidden set, and a digest that commits
+ * to every other key. A context that fails here never reaches the worker's
+ * recompute, and a compact frame can never be bound through it.
+ */
+export function parseFanoutDeliveryContext(
+	value: unknown,
+): ProtocolResult<FanoutDeliveryContextV1> {
+	if (!isPlainObject(value)) return wireFail("fanout delivery context");
+	if (value.epoch !== "warmup" && value.epoch !== "measured") {
+		return wireFail("delivery context epoch is not warmup or measured");
+	}
+	const epoch: FanoutDeliveryEpoch = value.epoch;
+	const mixing = rejectEpochMixing(value, epoch);
+	if (!mixing.ok) return mixing;
+	const keys =
+		epoch === "warmup"
+			? DELIVERY_CONTEXT_WARMUP_KEYS
+			: DELIVERY_CONTEXT_MEASURED_KEYS;
+	if (!exactKeys(value, keys)) return wireFail("delivery context keys");
+	if (
+		value.schema !== FANOUT_WIRE_SCHEMA ||
+		value.kind !== "delivery-context" ||
+		!isHex64(value.cohortGrantSha256) ||
+		!isNonEmptyString(value.subscriberId) ||
+		!ROLE_ID_RE.test(value.subscriberId) ||
+		!value.subscriberId.startsWith("subscriber-") ||
+		!isSafeNonNegInt(value.subscriberIndex) ||
+		value.subscriberIndex > SUBSCRIBER_INDEX_MAX ||
+		!isPublisherIdList(value.publisherIds) ||
+		!isSafeNonNegInt(value.windowCount) ||
+		value.windowCount === 0 ||
+		value.windowCount > FANOUT_MAX_WINDOW_COUNT ||
+		!isOneOf(value.messageBytes, FANOUT_PAYLOAD_BYTES_VALUES) ||
+		!isHex64(value.deliveryContextSha256)
+	) {
+		return wireFail("delivery context fields");
+	}
+	if (epoch === "warmup") {
+		if (
+			!isHex64(value.cohortWarmupEpochSha256) ||
+			!isHex64(value.warmupNonce)
+		) {
+			return wireFail("delivery context warmup epoch fields");
+		}
+	} else if (!isHex64(value.cohortStartBarrierSha256)) {
+		return wireFail("delivery context start barrier");
+	}
+	const { deliveryContextSha256, ...preimage } = value;
+	if (deliveryContextSha256Of(preimage) !== deliveryContextSha256) {
+		return wireFail("deliveryContextSha256 does not commit to the context");
+	}
+	return { ok: true, value: value as unknown as FanoutDeliveryContextV1 };
+}
+
+/** The relay's builder: digest the facts, then hold the result to the parser. */
+export function buildFanoutDeliveryContext(
+	facts: FanoutDeliveryContextFacts,
+): ProtocolResult<FanoutDeliveryContextV1> {
+	const preimage: Rec = {
+		...facts,
+		schema: FANOUT_WIRE_SCHEMA,
+		kind: "delivery-context",
+	};
+	return parseFanoutDeliveryContext({
+		...preimage,
+		deliveryContextSha256: deliveryContextSha256Of(preimage),
+	});
+}
+
+/**
+ * The worker's check at consumption: rebuild the context from its own
+ * admission facts and require the received digest to be that one. Anything
+ * else on the delivery channel in the context's place, or a context bound to
+ * another grant, epoch, session or publisher set, is `DELIVERY_CONTEXT_MISMATCH`.
+ */
+export function verifyFanoutDeliveryContext(
+	received: unknown,
+	facts: FanoutDeliveryContextFacts,
+): ProtocolResult<{
+	readonly frame: FanoutDeliveryContextV1;
+	readonly contextTag: number;
+}> {
+	const expected = buildFanoutDeliveryContext(facts);
+	if (!expected.ok) return expected;
+	const parsed = parseFanoutDeliveryContext(received);
+	if (!parsed.ok) {
+		return {
+			ok: false,
+			code: DELIVERY_CONTEXT_MISMATCH_FAILURE_CODE,
+			message: `delivery channel did not carry a delivery context: ${parsed.message ?? parsed.code}`,
+		};
+	}
+	if (
+		parsed.value.deliveryContextSha256 !== expected.value.deliveryContextSha256
+	) {
+		return {
+			ok: false,
+			code: DELIVERY_CONTEXT_MISMATCH_FAILURE_CODE,
+			message: `${parsed.value.epoch} delivery context does not match this session's admission`,
+		};
+	}
+	return {
+		ok: true,
+		value: {
+			frame: parsed.value,
+			contextTag: contextTagOfDeliveryContextSha256(
+				parsed.value.deliveryContextSha256,
+			),
+		},
+	};
+}
+
 /** Dispatch on `kind`; an unknown kind is refused before any field is read. */
 export function parseFanoutWire(value: unknown): ProtocolResult<FanoutWireV1> {
 	if (!isPlainObject(value)) return wireFail("fanout frame is not an object");
@@ -917,6 +1143,8 @@ export function parseFanoutWire(value: unknown): ProtocolResult<FanoutWireV1> {
 			return parseFanoutData(value);
 		case "ack":
 			return parseFanoutAck(value);
+		case "delivery-context":
+			return parseFanoutDeliveryContext(value);
 		default:
 			return parseFanoutEnd(value);
 	}
@@ -928,6 +1156,12 @@ export function parseFanoutWire(value: unknown): ProtocolResult<FanoutWireV1> {
 
 export function isWarmupFanoutKind(kind: string): boolean {
 	return kind.startsWith("warmup-");
+}
+
+/** Every `warmup-*` kind is a warmup frame; a delivery context is its epoch. */
+export function isWarmupFanoutFrame(frame: FanoutWireV1): boolean {
+	if (frame.kind === "delivery-context") return frame.epoch === "warmup";
+	return isWarmupFanoutKind(frame.kind);
 }
 
 /**
@@ -945,13 +1179,14 @@ export function requireWarmupFrameBinding(
 ): ProtocolResult<true> {
 	const parsed = parseFanoutWire(frame);
 	if (!parsed.ok) return parsed;
-	if (!isWarmupFanoutKind(parsed.value.kind)) {
+	if (!isWarmupFanoutFrame(parsed.value)) {
 		return warmupFail("measured frame presented as warmup");
 	}
 	const warmup = parsed.value as
 		| FanoutWarmupDataV1
 		| FanoutWarmupAckV1
-		| FanoutWarmupEndV1;
+		| FanoutWarmupEndV1
+		| FanoutDeliveryContextWarmupV1;
 	if (warmup.cohortGrantSha256 !== expected.cohortGrantSha256) {
 		return warmupFail("warmup frame names another cohort grant");
 	}
@@ -978,7 +1213,7 @@ export function requireMeasuredFrameBinding(
 ): ProtocolResult<true> {
 	const parsed = parseFanoutWire(frame);
 	if (!parsed.ok) return parsed;
-	if (isWarmupFanoutKind(parsed.value.kind)) {
+	if (isWarmupFanoutFrame(parsed.value)) {
 		return warmupFail("warmup frame presented as measured");
 	}
 	if (
@@ -988,7 +1223,11 @@ export function requireMeasuredFrameBinding(
 	) {
 		return wireFail("registration frames carry no measured barrier");
 	}
-	const measured = parsed.value as FanoutDataV1 | FanoutAckV1 | FanoutEndV1;
+	const measured = parsed.value as
+		| FanoutDataV1
+		| FanoutAckV1
+		| FanoutEndV1
+		| FanoutDeliveryContextMeasuredV1;
 	if (measured.cohortGrantSha256 !== expected.cohortGrantSha256) {
 		return wireFail("measured frame names another cohort grant");
 	}
