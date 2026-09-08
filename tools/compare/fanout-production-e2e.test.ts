@@ -202,7 +202,13 @@ import {
 	fanoutPayload,
 	fanoutRoleId,
 } from "./scenarios/fanout-relay.ts";
-import type { FanoutWireV1 } from "./scenarios/fanout-wire.ts";
+import {
+	contextTagOfDeliveryContextSha256,
+	decodeFanoutDelivery,
+	type FanoutDeliveryC1,
+	type FanoutWireV1,
+	fanoutDeliveryUnitKind,
+} from "./scenarios/fanout-wire.ts";
 import {
 	decodeSupervisorFrame,
 	encodeSupervisorFrame,
@@ -1859,16 +1865,37 @@ describe("B3.5 e2e: the real fanout-cohort server process", () => {
 				// A real role peer: a real WSS session carrying the real token and
 				// Merkle proof the grant's commitment root covers.
 				const codec = fanoutFrameCodecFor("ws");
+				// A compact delivery as this peer saw it, resolved to its epoch
+				// by the delivery context the relay wrote ahead of it (D2).
+				interface ReceivedDelivery extends FanoutDeliveryC1 {
+					readonly kind: "delivery";
+					readonly epoch: "warmup" | "measured";
+				}
+				type ReceivedUnit = FanoutWireV1 | ReceivedDelivery;
 				interface RolePeer {
 					readonly roleId: string;
 					send(frame: FanoutWireV1): void;
-					received(): readonly FanoutWireV1[];
+					received(): readonly ReceivedUnit[];
 				}
+				const deliveriesOf = (
+					peer: RolePeer,
+					epoch: "warmup" | "measured",
+				): ReceivedDelivery[] =>
+					peer
+						.received()
+						.filter(
+							(unit): unit is ReceivedDelivery =>
+								unit.kind === "delivery" && unit.epoch === epoch,
+						);
 				const connectRole = async (
 					role: "publisher" | "subscriber",
 					roleId: string,
 				): Promise<RolePeer> => {
-					const received: FanoutWireV1[] = [];
+					const received: ReceivedUnit[] = [];
+					const tags: { warmup: number | null; measured: number | null } = {
+						warmup: null,
+						measured: null,
+					};
 					const client = await connectBinaryMessageClient({
 						url: `wss://127.0.0.1:${port}/fanout`,
 						tls: {
@@ -1877,8 +1904,33 @@ describe("B3.5 e2e: the real fanout-cohort server process", () => {
 							ca: tls.cert,
 						},
 						onMessage: (bytes) => {
+							if (fanoutDeliveryUnitKind(bytes, "ws") === "compact") {
+								const delivery = decodeFanoutDelivery(bytes, MESSAGE_BYTES);
+								if (!delivery.ok) {
+									throw new Error(`peer delivery: ${delivery.code}`);
+								}
+								const epoch =
+									delivery.value.contextTag === tags.measured
+										? "measured"
+										: delivery.value.contextTag === tags.warmup
+											? "warmup"
+											: null;
+								if (epoch === null) {
+									throw new Error(
+										`${roleId} saw a compact frame before its context`,
+									);
+								}
+								received.push({ ...delivery.value, kind: "delivery", epoch });
+								return;
+							}
 							const decoded = codec.decode(bytes);
-							if (decoded.ok) received.push(decoded.value);
+							if (!decoded.ok) throw new Error(`peer decode: ${decoded.code}`);
+							if (decoded.value.kind === "delivery-context") {
+								tags[decoded.value.epoch] = contextTagOfDeliveryContextSha256(
+									decoded.value.deliveryContextSha256,
+								);
+							}
+							received.push(decoded.value);
 						},
 					});
 					openPeers.push(client);
@@ -2006,9 +2058,7 @@ describe("B3.5 e2e: the real fanout-cohort server process", () => {
 				for (const subscriber of subscribers) {
 					await waitUntil(
 						() =>
-							subscriber
-								.received()
-								.filter((frame) => frame.kind === "warmup-data").length >=
+							deliveriesOf(subscriber, "warmup").length >=
 							expectedWarmupIngress,
 						`warmup deliveries to ${subscriber.roleId}`,
 					);
@@ -2153,8 +2203,7 @@ describe("B3.5 e2e: the real fanout-cohort server process", () => {
 				for (const subscriber of subscribers) {
 					await waitUntil(
 						() =>
-							subscriber.received().filter((frame) => frame.kind === "data")
-								.length >= expectedMeasured,
+							deliveriesOf(subscriber, "measured").length >= expectedMeasured,
 						`measured deliveries to ${subscriber.roleId}`,
 					);
 				}

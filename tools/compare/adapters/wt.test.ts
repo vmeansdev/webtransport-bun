@@ -33,6 +33,7 @@ import {
 	type FakeWtClientSession,
 	HARNESS_STREAMS_PER_SESSION,
 	type FakeWtServerSession,
+	LengthPrefixedFrameReader,
 	type WtClientFactory,
 	type WtServerFactory,
 } from "./wt.ts";
@@ -1711,5 +1712,124 @@ describe("WT delivery funnel", () => {
 		expect(metrics.delivered).toBe(4);
 		expect(metrics.serverObserved).toBe(4);
 		expect(metrics.streamsAccepted).toBe(1);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Mixed-mode framing (physical-budget amendment D2): one stream carries both
+// `u32be length || body` units and fixed-length units told apart by their
+// first byte. The reader frames by the caller's constants and never looks
+// inside a fixed unit; a wrong length in there is the decoder's refusal.
+// ---------------------------------------------------------------------------
+
+describe("LengthPrefixedFrameReader mixed mode", () => {
+	const MAGIC = 0xc1;
+	const UNIT_BYTES = 24 + 100;
+	const prefixed = (body: Uint8Array): Uint8Array => {
+		const out = new Uint8Array(4 + body.byteLength);
+		new DataView(out.buffer).setUint32(0, body.byteLength, false);
+		out.set(body, 4);
+		return out;
+	};
+	const fixed = (fill: number): Uint8Array => {
+		const out = new Uint8Array(UNIT_BYTES).fill(fill);
+		out[0] = MAGIC;
+		return out;
+	};
+	const concat = (...parts: Uint8Array[]): Uint8Array => {
+		const out = new Uint8Array(
+			parts.reduce((total, part) => total + part.byteLength, 0),
+		);
+		let offset = 0;
+		for (const part of parts) {
+			out.set(part, offset);
+			offset += part.byteLength;
+		}
+		return out;
+	};
+
+	it("frames a fixed unit at exactly its length whatever the chunk boundaries", () => {
+		const reader = new LengthPrefixedFrameReader(4_096, {
+			firstByte: MAGIC,
+			unitBytes: UNIT_BYTES,
+		});
+		const unit = fixed(7);
+		const first = reader.push(unit.subarray(0, 10));
+		expect(first).toEqual([]);
+		expect(reader.pendingBytes).toBe(10);
+		const second = reader.push(unit.subarray(10, UNIT_BYTES - 1));
+		expect(second).toEqual([]);
+		const third = reader.push(unit.subarray(UNIT_BYTES - 1));
+		expect(third.length).toBe(1);
+		expect([...(third[0] as Uint8Array)]).toEqual([...unit]);
+		expect(reader.pendingBytes).toBe(0);
+	});
+
+	it("keeps prefixed units around fixed ones on the same stream, in order", () => {
+		const reader = new LengthPrefixedFrameReader(4_096, {
+			firstByte: MAGIC,
+			unitBytes: UNIT_BYTES,
+		});
+		const json = prefixed(
+			new TextEncoder().encode('{"kind":"delivery-context"}'),
+		);
+		const a = fixed(1);
+		const b = fixed(2);
+		const units = reader.push(concat(json, a, b, json.subarray(0, 3)));
+		expect(units.map((unit) => unit[0])).toEqual([0x00, MAGIC, MAGIC]);
+		expect(units.map((unit) => unit.byteLength)).toEqual([
+			json.byteLength,
+			UNIT_BYTES,
+			UNIT_BYTES,
+		]);
+		expect([...(units[1] as Uint8Array)]).toEqual([...a]);
+		expect([...(units[2] as Uint8Array)]).toEqual([...b]);
+		expect(reader.pendingBytes).toBe(3);
+		const rest = reader.push(json.subarray(3));
+		expect(rest.length).toBe(1);
+		expect([...(rest[0] as Uint8Array)]).toEqual([...json]);
+	});
+
+	it("hands a fixed unit back at the cell length even when its own header lies", () => {
+		// The reader owns no header knowledge: a unit that claims another
+		// payload length is still exactly `unitBytes` on this stream, and it is
+		// the decoder that refuses it. Framing by the header instead would
+		// wait for bytes that never come.
+		const reader = new LengthPrefixedFrameReader(4_096, {
+			firstByte: MAGIC,
+			unitBytes: UNIT_BYTES,
+		});
+		const lying = fixed(9);
+		new DataView(lying.buffer).setUint16(20, 128, true);
+		const units = reader.push(concat(lying, fixed(3)));
+		expect(units.length).toBe(2);
+		expect(units.every((unit) => unit.byteLength === UNIT_BYTES)).toBe(true);
+	});
+
+	it("still throws on a prefixed unit over the cap, and treats the magic as a prefix without mixed mode", () => {
+		const mixed = new LengthPrefixedFrameReader(64, {
+			firstByte: MAGIC,
+			unitBytes: UNIT_BYTES,
+		});
+		expect(() => mixed.push(prefixed(new Uint8Array(65)))).toThrow(RangeError);
+		const plain = new LengthPrefixedFrameReader(4_096);
+		expect(() => plain.push(fixed(1))).toThrow(RangeError);
+	});
+
+	it("refuses a fixed unit kind it cannot frame by", () => {
+		expect(
+			() =>
+				new LengthPrefixedFrameReader(4_096, {
+					firstByte: 0x100,
+					unitBytes: 1,
+				}),
+		).toThrow(RangeError);
+		expect(
+			() =>
+				new LengthPrefixedFrameReader(4_096, {
+					firstByte: MAGIC,
+					unitBytes: 0,
+				}),
+		).toThrow(RangeError);
 	});
 });

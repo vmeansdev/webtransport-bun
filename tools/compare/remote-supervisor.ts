@@ -138,6 +138,7 @@ import {
 	parseRigCohortAcceptance,
 	parseRigRelayObservationReceipt,
 	parseRigWarmupDrainedReceipt,
+	parseRoleFailed,
 	parseRolePartial,
 	parseRoleWarmupComplete,
 	parseRoleWarmupCompletionManifest,
@@ -8492,6 +8493,12 @@ export type MacRoleChildChannelRefusal = {
 	readonly ok: false;
 	readonly code: string;
 	readonly message: string;
+	/**
+	 * Set when the code is the child's own, carried by a `role-failed/v1` the
+	 * child wrote before exiting -- as opposed to a deadline or a framing fault
+	 * this side named. A caller holding several refusals keeps the child's.
+	 */
+	readonly reportedByChild?: true;
 };
 
 /** One accepted child -> supervisor frame: the record and the bytes it came in. */
@@ -8628,6 +8635,31 @@ export class MacRoleChildControlChannel {
 		return { ok: false, code, message: `${this.childId}: ${message}` };
 	}
 
+	/**
+	 * A frame the lifecycle did not expect may be the child saying why it is
+	 * about to exit. `role-failed/v1` is accepted at every await: the refusal
+	 * it returns carries the child's own closed code, and the poison keeps
+	 * that code for every later read on this channel.
+	 */
+	private childFailure(framed: Uint8Array): MacRoleChildChannelRefusal | null {
+		const decoded = decodeRoleChildFrame(framed, "role-failed/v1");
+		if (!decoded.ok) return null;
+		const parsed = parseRoleFailed(decoded.value);
+		if (!parsed.ok) return null;
+		const inbound = assertChildInboundSequence(
+			this.sequence,
+			parsed.value.sequence,
+			this.config.maxFramesPerDirection,
+		);
+		if (!inbound.ok) {
+			return this.poison(inbound.code, inbound.message ?? "inbound sequence");
+		}
+		return {
+			...this.poison(parsed.value.code, parsed.value.message),
+			reportedByChild: true,
+		};
+	}
+
 	/** Stamp, encode and write one supervisor -> child frame. */
 	async send<T extends { readonly schema: string }>(
 		payload: T,
@@ -8692,6 +8724,10 @@ export class MacRoleChildControlChannel {
 			if (framed !== undefined) {
 				const decoded = decodeRoleChildFrame(framed, expectedSchema);
 				if (!decoded.ok) {
+					if (decoded.code === "STATE_INVALID") {
+						const failure = this.childFailure(framed);
+						if (failure !== null) return failure;
+					}
 					return this.poison(decoded.code, decoded.message ?? "frame");
 				}
 				const inbound = assertChildInboundSequence(

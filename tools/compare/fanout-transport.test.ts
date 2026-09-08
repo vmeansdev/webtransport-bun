@@ -19,7 +19,12 @@ import {
 	COHORT_CELL_CARDINALITIES,
 	COHORT_CONNECTION_RATE_PER_SECOND,
 } from "./cohort-protocol.ts";
-import { FANOUT_CONTROL_FRAME_MAX_DECODED_BYTES } from "./scenarios/fanout-wire.ts";
+import {
+	decodeFanoutDelivery,
+	FANOUT_CONTROL_FRAME_MAX_DECODED_BYTES,
+	FANOUT_DELIVERY_MAGIC,
+	fanoutDeliveryUnitBytes,
+} from "./scenarios/fanout-wire.ts";
 import {
 	cohortWtListenerAdmission,
 	createRelaySettler,
@@ -90,7 +95,10 @@ test("ws role connector translates development TLS opt-out for a real listener",
 			serverHost: "127.0.0.1",
 			serverPort: server.port!,
 			tlsServerName: "wt-compare.local",
+			messageBytes: 100,
 			onFrame() {},
+			onDelivery() {},
+			onMalformed() {},
 		});
 		expect(session.roleId).toBe("publisher-000000");
 	} finally {
@@ -123,7 +131,10 @@ test("ws role connector accepts its staged CA and verifies the named server", as
 			serverHost: "127.0.0.1",
 			serverPort: server.port!,
 			tlsServerName: "wt-compare.local",
+			messageBytes: 100,
 			onFrame() {},
+			onDelivery() {},
+			onMalformed() {},
 		});
 		expect(session.roleId).toBe("publisher-000000");
 		await expect(
@@ -133,7 +144,10 @@ test("ws role connector accepts its staged CA and verifies the named server", as
 				serverHost: "127.0.0.1",
 				serverPort: server.port!,
 				tlsServerName: "wrong.invalid",
+				messageBytes: 100,
 				onFrame() {},
+				onDelivery() {},
+				onMalformed() {},
 			}),
 		).rejects.toThrow();
 	} finally {
@@ -484,17 +498,33 @@ test("the wt peer decodes the frames it reads and never the ones it writes", asy
 			write(bytes: Uint8Array): void;
 		}> => {
 			const inbox: unknown[] = [];
-			const readInto = (stream: {
-				on(event: "data", listener: (chunk: Uint8Array) => void): unknown;
-			}): void => {
+			const readInto = (
+				stream: {
+					on(event: "data", listener: (chunk: Uint8Array) => void): unknown;
+				},
+				channel: "control" | "delivery",
+			): void => {
 				const frames = new LengthPrefixedFrameReader(
 					FANOUT_CONTROL_FRAME_MAX_DECODED_BYTES,
+					channel === "delivery"
+						? {
+								firstByte: FANOUT_DELIVERY_MAGIC,
+								unitBytes: fanoutDeliveryUnitBytes(100),
+							}
+						: undefined,
 				);
 				stream.on("data", (chunk: Uint8Array) => {
 					for (const bytes of frames.push(chunk)) {
+						if (bytes[0] === FANOUT_DELIVERY_MAGIC) {
+							const delivery = decodeFanoutDelivery(bytes, 100);
+							if (!delivery.ok)
+								throw new Error(`peer delivery: ${delivery.code}`);
+							inbox.push({ kind: "delivery", channel, ...delivery.value });
+							continue;
+						}
 						const read = codec.decode(bytes);
 						if (!read.ok) throw new Error(`peer decode: ${read.code}`);
-						inbox.push(read.value);
+						inbox.push({ ...read.value, channel });
 					}
 				});
 			};
@@ -507,13 +537,14 @@ test("the wt peer decodes the frames it reads and never the ones it writes", asy
 				on(event: "data", listener: (chunk: Uint8Array) => void): unknown;
 				write(chunk: Uint8Array): boolean;
 			};
-			readInto(control);
+			readInto(control, "control");
 			void (async () => {
 				for await (const uni of client.incomingUnidirectionalStreams()) {
 					readInto(
 						uni as unknown as {
 							on(event: "data", listener: (chunk: Uint8Array) => void): unknown;
 						},
+						"delivery",
 					);
 				}
 			})().catch(() => {
@@ -584,18 +615,19 @@ test("the wt peer decodes the frames it reads and never the ones it writes", asy
 			}),
 		);
 		await until(
-			() => subscribers.every((subscriber) => subscriber.inbox.length > 1),
+			() => subscribers.every((subscriber) => subscriber.inbox.length > 2),
 			"a warmup delivery on each subscriber's uni stream",
 		);
 
-		// Both deliveries went out on the uni stream, so the routing still holds.
+		// The delivery channel carried the warmup context and then the compact
+		// frame, both on the uni stream; the accept stayed on the control bidi.
 		for (const subscriber of subscribers) {
-			expect(
-				(subscriber.inbox[1] as { kind: string; direction: string }).kind,
-			).toBe("warmup-data");
-			expect(
-				(subscriber.inbox[1] as { kind: string; direction: string }).direction,
-			).toBe("relay-to-subscriber");
+			const units = subscriber.inbox as { kind: string; channel: string }[];
+			expect(units.map((unit) => [unit.kind, unit.channel])).toEqual([
+				["accept", "control"],
+				["delivery-context", "delivery"],
+				["delivery", "delivery"],
+			]);
 		}
 		// Ten frames reached the peer: nine registrations and one warmup record.
 		// Nine accepts and eight deliveries left it, and none of them was

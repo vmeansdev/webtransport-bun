@@ -39,16 +39,19 @@ import {
 	roleChildMaxFramesPerDirection,
 } from "../child-pipe-protocol.ts";
 import {
+	buildRoleFailed,
 	CHAT_10K_WORST_CASE_WORKER_SUBSCRIBERS,
 	COHORT_DRAIN_DEADLINE_MS,
 	COHORT_GRANT_MAX_BYTES,
 	COHORT_NOT_READY_FAILURE_CODE,
 	COHORT_PROTOCOL_FAILURE_CODE,
 	COHORT_WARMUP_EPOCH_MAX_BYTES,
+	COHORT_WINDOW_COUNT_VALUES,
 	COHORT_WORKER_COUNT,
 	type CohortGrantV1,
 	type CohortStartBarrierV1,
 	type CohortWarmupEpochV1,
+	DELIVERY_CONTEXT_MISMATCH_FAILURE_CODE,
 	decodeStrictBase64,
 	ED25519_PUBLIC_KEY_BYTES,
 	ED25519_SIGNATURE_BYTES,
@@ -86,7 +89,9 @@ import {
 } from "../cohort-protocol.ts";
 import {
 	bytesOfCanonical,
+	type CampaignFailureCode,
 	ed25519Verify,
+	isCampaignFailureCode,
 	type Base64,
 	type NsString,
 	type ProtocolResult,
@@ -94,12 +99,21 @@ import {
 } from "../cross-supervisor-protocol.ts";
 import { fanoutPayload } from "../scenarios/fanout-relay.ts";
 import {
+	decodeFanoutDelivery,
 	decodeFanoutWsMessage,
 	decodeFanoutWtStream,
 	encodeFanoutWsMessage,
 	encodeFanoutWtFrame,
 	FANOUT_CONTROL_FRAME_MAX_DECODED_BYTES,
+	FANOUT_DELIVERY_MAGIC,
+	type FanoutDeliveryC1,
+	type FanoutDeliveryContextFacts,
+	type FanoutPayloadBytes,
 	type FanoutWireV1,
+	fanoutDeliveryUnitBytes,
+	fanoutDeliveryUnitKind,
+	resolveDeliveryEpochByTag,
+	verifyFanoutDeliveryContext,
 } from "../scenarios/fanout-wire.ts";
 import { parseStrictJsonBytes, sha256HexOfBytes } from "../secure-fs.ts";
 
@@ -226,7 +240,27 @@ export interface RoleSessionHandle {
 	close(): void;
 }
 
-/** How this child reaches the relay; `ws` and `wt` differ only in framing. */
+/**
+ * One compact delivery as the connector decoded it, queued in the session's
+ * inbox beside the JSON frames so consumption sees the delivery channel in
+ * arrival order: the epoch's context, then the frames bound to it.
+ */
+export interface RoleDeliveryUnit {
+	readonly kind: "delivery";
+	readonly delivery: FanoutDeliveryC1;
+}
+
+export type RoleInboundUnit = FanoutWireV1 | RoleDeliveryUnit;
+
+/**
+ * How this child reaches the relay; `ws` and `wt` differ only in framing.
+ *
+ * A connector hands every unit it reads to exactly one of the three
+ * callbacks: a JSON frame to `onFrame`, a compact delivery whose header
+ * decodes to `onDelivery`, and anything it could not decode -- a bad magic,
+ * a header field the cell refuses, a WT unit carrying other than one frame --
+ * to `onMalformed`. Nothing is dropped on the way to the session.
+ */
 export interface RoleTransportConnector {
 	readonly transport: "ws" | "wt";
 	connect(args: {
@@ -235,8 +269,14 @@ export interface RoleTransportConnector {
 		readonly serverHost: string;
 		readonly serverPort: number;
 		readonly tlsServerName: string;
-		/** Every frame the relay sends this session, in per-channel order. */
+		/** The cell's payload size: the length authority for compact units. */
+		readonly messageBytes: FanoutPayloadBytes;
+		/** Every JSON frame the relay sends this session, in per-channel order. */
 		readonly onFrame: (frame: FanoutWireV1) => void;
+		/** Every compact delivery, decoded, in delivery-channel order. */
+		readonly onDelivery: (delivery: FanoutDeliveryC1) => void;
+		/** Every unit that refused to decode, with the decoder's reason. */
+		readonly onMalformed: (detail: string) => void;
 	}): Promise<RoleSessionHandle>;
 }
 
@@ -1123,6 +1163,77 @@ export interface FanoutRoleChildOutcome {
 export async function runFanoutRoleChild(
 	args: FanoutRoleChildArgs,
 ): Promise<ProtocolResult<FanoutRoleChildOutcome>> {
+	let identity: RoleFailureIdentity | null = null;
+	const outcome = await runRoleLifecycle(args, (facts) => {
+		identity = facts;
+	});
+	if (!outcome.ok && identity !== null) {
+		await reportRoleFailure(args.control, identity, outcome);
+	}
+	return outcome;
+}
+
+interface RoleFailureIdentity {
+	readonly executionSha256: Sha256Hex;
+	readonly childId: string;
+}
+
+/**
+ * §7's mapping for the codes a child can refuse on that are not themselves
+ * members of the closed set: a drain that ran out is a relay delivery fault,
+ * and everything else the child names in its own vocabulary is a protocol
+ * failure -- which is also what the supervisor filed the pipe's EOF under
+ * before the child could say anything at all.
+ */
+export function roleFailureCodeFor(code: string): CampaignFailureCode {
+	if (isCampaignFailureCode(code)) return code;
+	if (code === "DRAIN_DEADLINE_EXCEEDED") return "RELAY_DELIVERY";
+	return "COHORT_PROTOCOL";
+}
+
+/**
+ * Say why before exiting non-zero. The supervisor's next read on this pipe
+ * is a `role-failed/v1` it accepts at any await, so the closed code reaches
+ * the sealed record instead of the pipe's EOF. A pipe that is already gone
+ * cannot be told, and that case keeps the EOF mapping it always had.
+ */
+async function reportRoleFailure(
+	control: RoleControlChannel,
+	identity: RoleFailureIdentity,
+	outcome: { readonly code: string; readonly message?: string },
+): Promise<void> {
+	try {
+		await control.send(
+			buildRoleFailed({
+				executionSha256: identity.executionSha256,
+				childId: identity.childId,
+				code: roleFailureCodeFor(outcome.code),
+				message: `${outcome.code}: ${outcome.message ?? outcome.code}`,
+			}),
+		);
+	} catch {
+		// The pipe is closed or poisoned; the exit code still says it failed.
+	}
+}
+
+/** Where a delivery unit lands decides what it may be. */
+type RolePhase = "ramp" | "warmup" | "measured";
+
+interface WorkerSessionFacts {
+	readonly subscriberIndex: number;
+	warmupTag: number | null;
+	measuredTag: number | null;
+}
+
+interface RoleFatal {
+	readonly code: CampaignFailureCode;
+	readonly message: string;
+}
+
+async function runRoleLifecycle(
+	args: FanoutRoleChildArgs,
+	onIdentity: (identity: RoleFailureIdentity) => void,
+): Promise<ProtocolResult<FanoutRoleChildOutcome>> {
 	const { control, clock, connector } = args;
 
 	// -- 1. spawn config ----------------------------------------------------
@@ -1138,9 +1249,46 @@ export async function runFanoutRoleChild(
 		assignedGlobalOrdinals: ordinals,
 		assignedRoleIds,
 	} = validated.value;
+	onIdentity({
+		executionSha256: config.executionSha256,
+		childId: config.childId,
+	});
 	if (connector.transport !== config.transport) {
 		return cohortFail("connector transport is not the signed transport");
 	}
+	const windowCount = config.measuredDurationMs / config.measuredSampleWindowMs;
+	if (
+		!(COHORT_WINDOW_COUNT_VALUES as readonly number[]).includes(windowCount)
+	) {
+		return cohortFail(`signed schedule yields ${windowCount} windows`);
+	}
+	const publisherIds = grant.publishers.map(
+		(publisher) => publisher.publisherId,
+	);
+
+	// The worker's book exists from the first connect, so a unit the connector
+	// refuses during the ramp or the warmup is counted in the same place as one
+	// refused inside the measured window. A publisher keeps no book.
+	const workerBook =
+		config.role === "subscriber-worker"
+			? new WorkerWindowBook({
+					windowCount: windowCount as 10 | 30,
+					messageBytes: config.payloadBytes,
+					orderedSubscriberIds: assignedRoleIds,
+				})
+			: null;
+	const sessionFacts = new Map<string, WorkerSessionFacts>();
+	let phase: RolePhase = "ramp";
+	let fatal: RoleFatal | null = null;
+	// Read through a call so the lifecycle's own checks see what the
+	// connectors' callbacks wrote, not a narrowing taken before they ran.
+	const failed = (): RoleFatal | null => fatal;
+	const refuse = (code: CampaignFailureCode, message: string): void => {
+		fatal ??= { code, message };
+	};
+	const mismatch = (message: string): void => {
+		refuse(DELIVERY_CONTEXT_MISMATCH_FAILURE_CODE, message);
+	};
 
 	// -- 2. FD 5, closed before the first connect ---------------------------
 	const loaded = await loadRoleTokenBundle({
@@ -1199,6 +1347,15 @@ export async function runFanoutRoleChild(
 
 		const inbox = createFrameQueue(clock);
 		inboxes.set(roleId, inbox);
+		if (role === "subscriber") {
+			// The grant's subscriber order is the ordinal order, so this
+			// session's index is the ordinal it was derived from.
+			sessionFacts.set(roleId, {
+				subscriberIndex: globalOrdinal,
+				warmupTag: null,
+				measuredTag: null,
+			});
+		}
 		let session: RoleSessionHandle;
 		try {
 			session = await connector.connect({
@@ -1207,8 +1364,37 @@ export async function runFanoutRoleChild(
 				serverHost: config.serverHost,
 				serverPort: config.serverPort,
 				tlsServerName: config.tlsServerName,
+				messageBytes: config.payloadBytes,
 				onFrame: (frame) => {
 					inbox.push(frame);
+				},
+				onDelivery: (delivery) => {
+					if (workerBook === null) {
+						refuse(
+							COHORT_PROTOCOL_FAILURE_CODE,
+							`${roleId}: a delivery unit reached a publisher session`,
+						);
+						return;
+					}
+					inbox.push({ kind: "delivery", delivery });
+				},
+				onMalformed: (detail) => {
+					if (workerBook === null) {
+						refuse(
+							COHORT_PROTOCOL_FAILURE_CODE,
+							`${roleId}: undecodable unit on a publisher session: ${detail}`,
+						);
+						return;
+					}
+					// Counted always. Before the measured window it is also the
+					// first wrong unit -- the warmup context can land on the
+					// channel before the epoch's start frame is even read -- and
+					// it ends the child rather than letting the epoch fail by
+					// shortfall on a deadline.
+					workerBook.recordMalformed();
+					if (phase !== "measured") {
+						mismatch(`${roleId}: undecodable delivery unit: ${detail}`);
+					}
 				},
 			});
 		} catch (error) {
@@ -1306,6 +1492,89 @@ export async function runFanoutRoleChild(
 	const warmupStartedAtMacNs = clock.nowNs();
 	let offeredWarmupIngress = 0;
 	let deliveredWarmupRecords = 0;
+	phase = "warmup";
+	// Anything a channel refused while the sessions were coming up is the
+	// epoch's first wrong unit; the epoch is not started on top of it.
+	const rampFailure = failed();
+	if (rampFailure !== null) {
+		closeAll();
+		return fail(rampFailure.code, rampFailure.message);
+	}
+
+	// The admission facts a delivery context must digest to, per session and
+	// per epoch. The worker holds every one of them already; the relay's
+	// context can only confirm them.
+	const contextFactsFor = (
+		roleId: string,
+		facts: WorkerSessionFacts,
+		epoch: "warmup" | "measured",
+		measuredBarrierSha256: Sha256Hex | null,
+	): FanoutDeliveryContextFacts => {
+		const common = {
+			cohortGrantSha256: config.cohortGrantSha256,
+			subscriberId: roleId,
+			subscriberIndex: facts.subscriberIndex,
+			publisherIds,
+			windowCount,
+			messageBytes: config.payloadBytes,
+		};
+		return epoch === "warmup"
+			? {
+					...common,
+					epoch,
+					cohortWarmupEpochSha256: warmupStart.cohortWarmupEpochSha256,
+					warmupNonce: warmupStart.warmupNonce,
+				}
+			: {
+					...common,
+					epoch,
+					cohortStartBarrierSha256: measuredBarrierSha256 as Sha256Hex,
+				};
+	};
+
+	/**
+	 * The epoch a compact frame belongs to is the one whose verified context
+	 * carries its tag, on this session. Anything else on the delivery channel
+	 * in its place is the first wrong unit and ends the child.
+	 */
+	const acceptDelivery = (
+		roleId: string,
+		facts: WorkerSessionFacts,
+		delivery: FanoutDeliveryC1,
+	): { readonly publisherId: string } | null => {
+		const epoch = resolveDeliveryEpochByTag(delivery.contextTag, {
+			warmup: facts.warmupTag,
+			measured: facts.measuredTag,
+		});
+		if (!epoch.ok) {
+			mismatch(`${roleId}: ${epoch.message ?? epoch.code}`);
+			return null;
+		}
+		if (epoch.value !== phase) {
+			mismatch(
+				`${roleId}: a ${epoch.value}-tagged frame during the ${phase} epoch`,
+			);
+			return null;
+		}
+		if (delivery.subscriberIndex !== facts.subscriberIndex) {
+			mismatch(
+				`${roleId}: frame for subscriber index ${delivery.subscriberIndex} on the session of index ${facts.subscriberIndex}`,
+			);
+			return null;
+		}
+		const publisherId = publisherIds[delivery.publisherIndex];
+		if (publisherId === undefined) {
+			workerBook?.recordMalformed();
+			if (phase === "warmup") {
+				mismatch(
+					`${roleId}: publisher index ${delivery.publisherIndex} is not in the grant`,
+				);
+			}
+			return null;
+		}
+		return { publisherId };
+	};
+
 	if (config.role === "publisher") {
 		const publisherId = config.publisherId as string;
 		const session = sessions.get(publisherId) as RoleSessionHandle;
@@ -1360,13 +1629,63 @@ export async function runFanoutRoleChild(
 		const expected = warmupStart.expectedChildDeliveredWarmupRecords;
 		const deadlineMs =
 			Date.now() + config.warmupDurationMs + COHORT_DRAIN_DEADLINE_MS;
-		while (deliveredWarmupRecords < expected && Date.now() < deadlineMs) {
-			const drained = await drainOnce(inboxes, ({ frame }) => {
-				if (frame.kind === "warmup-data") {
+		// The loop refuses, it does not ignore: the only units a subscriber
+		// session may carry during the epoch are its warmup delivery context
+		// and the compact frames tagged with it, in that order.
+		const consumeWarmupUnit = (roleId: string, { unit }: StampedUnit): void => {
+			if (fatal !== null) return;
+			const facts = sessionFacts.get(roleId);
+			if (facts === undefined) {
+				refuse(COHORT_PROTOCOL_FAILURE_CODE, `${roleId} is not a session`);
+				return;
+			}
+			if (unit.kind === "delivery-context") {
+				if (unit.epoch !== "warmup") {
+					mismatch(
+						`${roleId}: ${unit.epoch} delivery context in the warmup epoch`,
+					);
+					return;
+				}
+				if (facts.warmupTag !== null) {
+					mismatch(`${roleId}: a second warmup delivery context`);
+					return;
+				}
+				const verified = verifyFanoutDeliveryContext(
+					unit,
+					contextFactsFor(roleId, facts, "warmup", null),
+				);
+				if (!verified.ok) {
+					refuse(
+						roleFailureCodeFor(verified.code),
+						`${roleId}: ${verified.message ?? verified.code}`,
+					);
+					return;
+				}
+				facts.warmupTag = verified.value.contextTag;
+				return;
+			}
+			if (unit.kind === "delivery") {
+				if (acceptDelivery(roleId, facts, unit.delivery) !== null) {
 					deliveredWarmupRecords += 1;
 				}
-			});
+				return;
+			}
+			mismatch(
+				`${roleId}: ${unit.kind} frame on the delivery channel in the warmup epoch`,
+			);
+		};
+		while (
+			deliveredWarmupRecords < expected &&
+			failed() === null &&
+			Date.now() < deadlineMs
+		) {
+			const drained = await drainOnce(inboxes, consumeWarmupUnit);
 			if (!drained) await tick();
+		}
+		const warmupFailure = failed();
+		if (warmupFailure !== null) {
+			closeAll();
+			return fail(warmupFailure.code, warmupFailure.message);
 		}
 		if (deliveredWarmupRecords !== expected) {
 			closeAll();
@@ -1411,76 +1730,122 @@ export async function runFanoutRoleChild(
 	const macClockId = armed.value.barrier.macClockId;
 
 	// -- 6. measured traffic ------------------------------------------------
-	const windowCount = barrier.windowCount;
+	if (barrier.windowCount !== windowCount) {
+		closeAll();
+		return cohortFail(
+			"start barrier window count is not the signed schedule's",
+		);
+	}
 	const publisherBook =
 		config.role === "publisher"
 			? new PublisherWindowBook({
-					windowCount,
+					windowCount: barrier.windowCount,
 					messageBytes: config.payloadBytes,
 				})
 			: null;
-	const workerBook =
-		config.role === "subscriber-worker"
-			? new WorkerWindowBook({
-					windowCount,
-					messageBytes: config.payloadBytes,
-					orderedSubscriberIds: assignedRoleIds,
-				})
-			: null;
+	phase = "measured";
 
 	// Subscriber sessions the relay has sent its `relay-drained` end marker to;
 	// a worker's drain is complete when every session it owns has one.
 	const endedSubscribers = new Set<string>();
 
-	const consumeWorkerFrame = ({
-		frame,
-		arrivedAtMacNs,
-	}: StampedFrame): void => {
-		if (workerBook === null) return;
-		if (frame.kind === "end" && frame.role === "subscriber") {
-			endedSubscribers.add(frame.roleId);
+	const consumeWorkerUnit = (
+		roleId: string,
+		{ unit, arrivedAtMacNs }: StampedUnit,
+	): void => {
+		if (workerBook === null || fatal !== null) return;
+		const facts = sessionFacts.get(roleId);
+		if (facts === undefined) {
+			refuse(COHORT_PROTOCOL_FAILURE_CODE, `${roleId} is not a session`);
 			return;
 		}
-		if (frame.kind !== "data") return;
-		const event = classifyDelivery({
-			deliveredAtMacNs: arrivedAtMacNs,
-			measureStartAtMacNs,
-			measureStopAtMacNs,
-			windowCount,
-		});
-		workerBook.recordDelivery({
-			subscriberId: frame.subscriberId ?? "",
-			publisherId: frame.publisherId,
-			publisherSequence: frame.publisherSequence,
-			originWindowIndex: frame.windowIndex,
-			deliveredAtMacNs: arrivedAtMacNs,
-			eventWindow: event,
-		});
+		switch (unit.kind) {
+			case "end":
+				if (unit.role === "subscriber") endedSubscribers.add(roleId);
+				return;
+			case "warmup-end":
+				// The relay's own drain marker on the control channel.
+				return;
+			case "delivery-context": {
+				if (unit.epoch !== "measured") {
+					mismatch(
+						`${roleId}: ${unit.epoch} delivery context after the measured barrier`,
+					);
+					return;
+				}
+				if (facts.measuredTag !== null) {
+					mismatch(`${roleId}: a second measured delivery context`);
+					return;
+				}
+				const verified = verifyFanoutDeliveryContext(
+					unit,
+					contextFactsFor(roleId, facts, "measured", cohortStartBarrierSha256),
+				);
+				if (!verified.ok) {
+					refuse(
+						roleFailureCodeFor(verified.code),
+						`${roleId}: ${verified.message ?? verified.code}`,
+					);
+					return;
+				}
+				if (verified.value.contextTag === facts.warmupTag) {
+					mismatch(
+						`${roleId}: warmup and measured delivery contexts carry equal tags`,
+					);
+					return;
+				}
+				facts.measuredTag = verified.value.contextTag;
+				return;
+			}
+			case "delivery": {
+				const accepted = acceptDelivery(roleId, facts, unit.delivery);
+				if (accepted === null) return;
+				const event = classifyDelivery({
+					deliveredAtMacNs: arrivedAtMacNs,
+					measureStartAtMacNs,
+					measureStopAtMacNs,
+					windowCount: barrier.windowCount,
+				});
+				workerBook.recordDelivery({
+					subscriberId: roleId,
+					publisherId: accepted.publisherId,
+					publisherSequence: unit.delivery.publisherSequence,
+					originWindowIndex: unit.delivery.windowIndex,
+					deliveredAtMacNs: arrivedAtMacNs,
+					eventWindow: event,
+				});
+				return;
+			}
+			default:
+				// A JSON data frame from a relay that still speaks §4.2's
+				// delivery shape, or any other frame on the delivery channel.
+				mismatch(`${roleId}: ${unit.kind} frame on the delivery channel`);
+		}
 	};
 
-	const consumePublisherFrame = ({
-		frame,
+	const consumePublisherUnit = ({
+		unit,
 		arrivedAtMacNs,
-	}: StampedFrame): void => {
+	}: StampedUnit): void => {
 		if (publisherBook === null) return;
-		if (frame.kind !== "ack") return;
+		if (unit.kind !== "ack") return;
 		publisherBook.recordAck({
-			originWindowIndex: frame.windowIndex,
-			disposition: frame.disposition,
+			originWindowIndex: unit.windowIndex,
+			disposition: unit.disposition,
 			atMacNs: arrivedAtMacNs,
 		});
-	};
-
-	const consume = (stamped: StampedFrame): void => {
-		consumePublisherFrame(stamped);
-		consumeWorkerFrame(stamped);
 	};
 
 	// Armed means consuming: from here every ack and delivery is booked the
 	// moment the transport hands it over, stamped with its arrival, whether or
 	// not this child happens to be sleeping on its offer schedule or waiting on
 	// the control pipe. The ack goes out only once that is true.
-	for (const inbox of inboxes.values()) inbox.attach(consume);
+	for (const [roleId, inbox] of inboxes) {
+		inbox.attach((stamped) => {
+			consumePublisherUnit(stamped);
+			consumeWorkerUnit(roleId, stamped);
+		});
+	}
 	await control.send({
 		schema: "role-measure-start-ack/v1",
 		sequence: 0,
@@ -1545,6 +1910,7 @@ export async function runFanoutRoleChild(
 			}
 			finalPublisherSequence = sequence;
 			finalWindowIndex = originWindowIndex;
+			if (failed() !== null) break;
 		}
 	}
 
@@ -1558,6 +1924,13 @@ export async function runFanoutRoleChild(
 	if (stop.value.cohortStartBarrierSha256 !== cohortStartBarrierSha256) {
 		closeAll();
 		return cohortFail("stop names another start barrier");
+	}
+	// The first wrong unit on a delivery channel ended this child's window the
+	// moment it was consumed; it is reported here, before any partial exists.
+	const windowFailure = failed();
+	if (windowFailure !== null) {
+		closeAll();
+		return fail(windowFailure.code, windowFailure.message);
 	}
 
 	let endMarkerSent = false;
@@ -1600,12 +1973,21 @@ export async function runFanoutRoleChild(
 		publisherBook !== null
 			? publisherBook.outstandingAcks() === 0
 			: endedSubscribers.size >= assignedRoleIds.length;
-	while (!drained() && BigInt(clock.nowNs()) < drainDeadlineAtMacNs) {
+	while (
+		!drained() &&
+		failed() === null &&
+		BigInt(clock.nowNs()) < drainDeadlineAtMacNs
+	) {
 		await tick();
 	}
 	// Whatever lands after this is past the deadline the verifier refuses; the
 	// books close here so the partial states exactly what arrived in time.
 	for (const inbox of inboxes.values()) inbox.detach();
+	const drainFailure = failed();
+	if (drainFailure !== null) {
+		closeAll();
+		return fail(drainFailure.code, drainFailure.message);
+	}
 	if (publisherBook !== null && !drained()) {
 		// An offer with no answer is not an offer the relay refused: it is an
 		// unknown, and a partial that booked it as unaccepted would make
@@ -1796,31 +2178,31 @@ function requirePermitGrant(
  * is taken here, at arrival, and never at whatever later moment the frame is
  * read out of the queue.
  */
-interface StampedFrame {
-	readonly frame: FanoutWireV1;
+interface StampedUnit {
+	readonly unit: RoleInboundUnit;
 	readonly arrivedAtMacNs: NsString;
 }
 
 interface FrameQueue {
-	push(frame: FanoutWireV1): void;
-	take(): StampedFrame | null;
+	push(unit: RoleInboundUnit): void;
+	take(): StampedUnit | null;
 	nextOfKind(...kinds: readonly string[]): Promise<FanoutWireV1 | null>;
 	/**
-	 * Hand every queued frame, then every later one the moment it arrives, to
+	 * Hand every queued unit, then every later one the moment it arrives, to
 	 * `consumer`. After this the queue holds nothing; the measured phase reads
-	 * frames as they land rather than in batches.
+	 * units as they land rather than in batches.
 	 */
-	attach(consumer: (stamped: StampedFrame) => void): void;
-	/** Back to queueing; frames after this are held and not consumed. */
+	attach(consumer: (stamped: StampedUnit) => void): void;
+	/** Back to queueing; units after this are held and not consumed. */
 	detach(): void;
 }
 
 function createFrameQueue(clock: RoleClock): FrameQueue {
-	const pending: StampedFrame[] = [];
-	let live: ((stamped: StampedFrame) => void) | null = null;
+	const pending: StampedUnit[] = [];
+	let live: ((stamped: StampedUnit) => void) | null = null;
 	return {
-		push: (frame) => {
-			const stamped: StampedFrame = { frame, arrivedAtMacNs: clock.nowNs() };
+		push: (unit) => {
+			const stamped: StampedUnit = { unit, arrivedAtMacNs: clock.nowNs() };
 			if (live !== null) live(stamped);
 			else pending.push(stamped);
 		},
@@ -1828,11 +2210,14 @@ function createFrameQueue(clock: RoleClock): FrameQueue {
 		nextOfKind: async (...kinds) => {
 			const deadlineMs = Date.now() + COHORT_DRAIN_DEADLINE_MS;
 			while (Date.now() < deadlineMs) {
-				const index = pending.findIndex((stamped) =>
-					kinds.includes(stamped.frame.kind),
+				const index = pending.findIndex(
+					(stamped) =>
+						stamped.unit.kind !== "delivery" &&
+						kinds.includes(stamped.unit.kind),
 				);
 				if (index >= 0) {
-					return (pending.splice(index, 1)[0] as StampedFrame).frame;
+					const { unit } = pending.splice(index, 1)[0] as StampedUnit;
+					return unit as FanoutWireV1;
 				}
 				await tick();
 			}
@@ -1848,17 +2233,21 @@ function createFrameQueue(clock: RoleClock): FrameQueue {
 	};
 }
 
-/** Drain whatever has already arrived; `true` if anything moved. */
+/**
+ * Drain whatever has already arrived; `true` if anything moved. The consumer
+ * is told which session's inbox a unit came out of, so a worker's book is
+ * keyed by the session it owns and never by a field the unit carries.
+ */
 async function drainOnce(
 	inboxes: ReadonlyMap<string, FrameQueue>,
-	consume: (stamped: StampedFrame) => void,
+	consume: (roleId: string, stamped: StampedUnit) => void,
 ): Promise<boolean> {
 	let moved = false;
-	for (const inbox of inboxes.values()) {
+	for (const [roleId, inbox] of inboxes) {
 		for (;;) {
 			const stamped = inbox.take();
 			if (stamped === null) break;
-			consume(stamped);
+			consume(roleId, stamped);
 			moved = true;
 		}
 	}
@@ -2193,8 +2582,29 @@ export function createWsRoleTransportConnector(args?: {
 			const client = await connectBinaryMessageClient({
 				url,
 				onMessage: (bytes) => {
-					const decoded = decodeFanoutWsMessage(bytes);
-					if (decoded.ok) session.onFrame(decoded.value);
+					// The socket is both channels; the first byte says which unit
+					// this is, and every refusal is the session's to count.
+					switch (fanoutDeliveryUnitKind(bytes, "ws")) {
+						case "compact": {
+							const delivery = decodeFanoutDelivery(
+								bytes,
+								session.messageBytes,
+							);
+							if (delivery.ok) session.onDelivery(delivery.value);
+							else session.onMalformed(delivery.message ?? delivery.code);
+							return;
+						}
+						case "json": {
+							const decoded = decodeFanoutWsMessage(bytes);
+							if (decoded.ok) session.onFrame(decoded.value);
+							else session.onMalformed(decoded.message ?? decoded.code);
+							return;
+						}
+						default:
+							session.onMalformed(
+								`ws message opens with 0x${(bytes[0] ?? 0).toString(16)}, neither a compact frame nor JSON`,
+							);
+					}
 				},
 				tls,
 			});
@@ -2241,16 +2651,46 @@ export function createWtRoleTransportConnector(args?: {
 				},
 			});
 			await client.ready;
-			const readInto = (stream: {
-				on(event: "data", listener: (chunk: Uint8Array) => void): unknown;
-			}): void => {
+			// The control bidi carries prefixed JSON only. The server-opened uni
+			// stream is the delivery channel and is read in mixed mode: a unit
+			// opening with the compact magic is exactly the cell's unit length,
+			// everything else is `u32be length || JSON` (the delivery context).
+			// A prefix over the cap still throws inside the reader and ends the
+			// child; every other refusal is handed to the session and counted.
+			const readInto = (
+				stream: {
+					on(event: "data", listener: (chunk: Uint8Array) => void): unknown;
+				},
+				channel: "control" | "delivery",
+			): void => {
 				const frames = new LengthPrefixedFrameReader(
 					FANOUT_CONTROL_FRAME_MAX_DECODED_BYTES,
+					channel === "delivery"
+						? {
+								firstByte: FANOUT_DELIVERY_MAGIC,
+								unitBytes: fanoutDeliveryUnitBytes(session.messageBytes),
+							}
+						: undefined,
 				);
 				stream.on("data", (chunk) => {
 					for (const bytes of frames.push(chunk)) {
+						if (bytes[0] === FANOUT_DELIVERY_MAGIC) {
+							const delivery = decodeFanoutDelivery(
+								bytes,
+								session.messageBytes,
+							);
+							if (delivery.ok) session.onDelivery(delivery.value);
+							else session.onMalformed(delivery.message ?? delivery.code);
+							continue;
+						}
 						const decoded = decodeFanoutWtStream(bytes);
-						if (decoded.ok && decoded.value.length === 1) {
+						if (!decoded.ok) {
+							session.onMalformed(decoded.message ?? decoded.code);
+						} else if (decoded.value.length !== 1) {
+							session.onMalformed(
+								`wt ${channel} unit carried ${decoded.value.length} frames, expected exactly 1`,
+							);
+						} else {
 							session.onFrame(decoded.value[0] as FanoutWireV1);
 						}
 					}
@@ -2260,13 +2700,14 @@ export function createWtRoleTransportConnector(args?: {
 				on(event: "data", listener: (chunk: Uint8Array) => void): unknown;
 				write(chunk: Uint8Array): boolean;
 			};
-			readInto(control);
+			readInto(control, "control");
 			void (async () => {
 				for await (const uni of client.incomingUnidirectionalStreams()) {
 					readInto(
 						uni as unknown as {
 							on(event: "data", listener: (chunk: Uint8Array) => void): unknown;
 						},
+						"delivery",
 					);
 				}
 			})().catch(() => {

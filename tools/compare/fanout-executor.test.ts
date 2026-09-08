@@ -30,6 +30,10 @@ import {
 	mkdtempSync,
 	readSync,
 	writeSync,
+	openSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -56,6 +60,7 @@ import {
 	type SealedRepResult,
 	sealArmsForCell,
 	sealGrantDeclarationForArm,
+	EXECUTABLE_ROLE_ENTRYPOINT_PATH,
 } from "./bin/compare-controller.ts";
 import {
 	decodeRoleChildFrame,
@@ -74,6 +79,19 @@ import {
 	cohortCellCardinality,
 	type TokenBundleV1,
 	type TokenCommitmentLeafManifestV1,
+	COHORT_LOCAL_ACCEPTANCE_SERVER_HOST,
+	COHORT_WORKER_COUNT,
+	type CohortGrantV1,
+	type CohortStartBarrierV1,
+	type CohortWarmupEpochV1,
+	expectedWarmupDeliveries,
+	expectedWarmupIngress,
+	READINESS_DEADLINE_MS_TICKER,
+	type RoleSpawnConfigV1,
+	type StagedServerLaunchRecordV1,
+	SUBSCRIBER_SHARD_MODULUS,
+	type SubscriberShardV1,
+	subscriberShardCommitmentWindowEnd,
 } from "./cohort-protocol.ts";
 import {
 	bytesOfCanonical,
@@ -86,6 +104,11 @@ import {
 	type Sha256Hex,
 	signRigReceipt,
 	verifyMacReceiptSignature,
+	type Base64,
+	ed25519Sign,
+	macConstructFinalExecution,
+	type NsString,
+	sha256CanonicalRecord,
 } from "./cross-supervisor-protocol.ts";
 import {
 	cohortCellForArm,
@@ -103,14 +126,20 @@ import {
 	MacPermitScheduler,
 	MacRoleChildControlChannel,
 	macTokenBundleForPlan,
+	createMacFanoutRoleChildHost,
 } from "./remote-supervisor.ts";
 import { CANONICAL_SCENARIO_REGISTRY } from "./scenario-registry.ts";
 import {
 	buildFanoutCohortFixture,
 	createManualRelayClock,
 	type FanoutCohortFixture,
+	FanoutRelay,
+	fanoutPayload,
 } from "./scenarios/fanout-relay.ts";
+import { STAGED_TLS_CA_PEM_ENV } from "./bin/fanout-role.ts";
+import { encodeFanoutWsMessage } from "./scenarios/fanout-wire.ts";
 import { sha256HexOfBytes } from "./secure-fs.ts";
+import { serveFanoutRelayOverWebSocket } from "./server.ts";
 
 const HEX = (character: string): Sha256Hex => character.repeat(64) as Sha256Hex;
 
@@ -1691,6 +1720,8 @@ interface ScriptedChild {
 	readonly received: Record<string, unknown>[];
 	/** Queue one child -> supervisor frame, stamped with the next sequence. */
 	readonly reply: (payload: Record<string, unknown>) => void;
+	/** Several frames in one pipe chunk, the way a burst lands in one read. */
+	readonly replyMany: (payloads: readonly Record<string, unknown>[]) => void;
 	/** Close the child's write end: the supervisor sees EOF. */
 	readonly hangUp: () => void;
 	/** Exact canonical payloads this child put on the wire, in order. */
@@ -1762,6 +1793,28 @@ function scriptedChild(args: {
 			childOutboundSequence += 1;
 			sentPayloads.push(encoded.value.slice(4));
 			deliver(encoded.value);
+		},
+		replyMany: (payloads) => {
+			const chunks = payloads.map((payload) => {
+				const encoded = encodeRoleChildFrame({
+					...payload,
+					schema: payload.schema as string,
+					sequence: childOutboundSequence,
+				});
+				if (!encoded.ok) throw new Error(`child frame: ${encoded.code}`);
+				childOutboundSequence += 1;
+				sentPayloads.push(encoded.value.slice(4));
+				return encoded.value;
+			});
+			const merged = new Uint8Array(
+				chunks.reduce((total, chunk) => total + chunk.byteLength, 0),
+			);
+			let offset = 0;
+			for (const chunk of chunks) {
+				merged.set(chunk, offset);
+				offset += chunk.byteLength;
+			}
+			deliver(merged);
 		},
 		hangUp: () => {
 			ended = true;
@@ -2952,4 +3005,972 @@ describe("plan 2210: one pre-readiness cohort replacement, the second loss is te
 			"teardownServer",
 		]);
 	});
+});
+
+// ---------------------------------------------------------------------------
+// Physical-budget amendment D2, fail-closed 2: `role-failed/v1` is the child's
+// own closed code, accepted at every supervisor await, kept by the poison,
+// propagated by the driver unchanged and sealed by the dispatch as itself.
+// ---------------------------------------------------------------------------
+
+describe("D2: role-failed/v1 travels child -> channel -> driver -> seal", () => {
+	const EXECUTION = HEX("1");
+	const GRANT = HEX("2");
+	const BARRIER = HEX("3");
+	const MEASURE_STOP_NS = "1000000000";
+	const roleFailed = (childId: string) => ({
+		schema: "role-failed/v1",
+		executionSha256: EXECUTION,
+		childId,
+		code: "DELIVERY_CONTEXT_MISMATCH",
+		message: "subscriber-000003: data frame on the delivery channel",
+	});
+	const planFor = (index: number): MacFanoutChildPlanV1 => ({
+		childId: `publisher-child-${index}`,
+		role: "publisher",
+		publisherId: `publisher-${index.toString().padStart(6, "0")}`,
+		workerIndex: null,
+		assignedGlobalOrdinals: [24 + index],
+		assignedRoleIds: [`publisher-${index.toString().padStart(6, "0")}`],
+		controlReadFd: 3,
+		controlWriteFd: 4,
+		tokenBundleFd: 5,
+	});
+	const driverOver = (
+		children: ReadonlyMap<string, ScriptedChild>,
+		plans: readonly MacFanoutChildPlanV1[],
+		deadlines = 1_000,
+	) => {
+		const host = scriptedHost(children);
+		return new MacRoleChildCohortDriver({
+			host: host as unknown as MacFanoutRoleChildHost,
+			children: plans,
+			executionSha256: EXECUTION,
+			joins: {
+				cohortGrantSha256: () => GRANT,
+				cohortStartBarrierSha256: () => BARRIER,
+				measureStopAtMacNs: () => MEASURE_STOP_NS,
+			},
+			stamps: {
+				markChildLifecycle: () => ({ ok: true as const, value: true as const }),
+			},
+			frames: {
+				spawnConfigFor: () => ({
+					ok: true,
+					value: { schema: "role-spawn-config/v1" as const },
+				}),
+				warmupStartFor: () => ({
+					ok: true,
+					value: { schema: "role-warmup-start/v1" as const },
+				}),
+				measureStart: () => ({
+					ok: true,
+					value: { schema: "role-measure-start/v1" as const },
+				}),
+			},
+			clock: { nowMs: () => Date.now(), nowNs: () => "1000000000" },
+			readinessDeadlineMs: deadlines,
+			warmupDeadlineMs: deadlines,
+			measuredDeadlineMs: deadlines,
+			teardownDeadlineMs: deadlines,
+		});
+	};
+
+	test("the_channel_accepts_role_failed_at_every_await_and_the_poison_keeps_the_code", async () => {
+		for (const expected of [
+			"connect-permit-request/v1",
+			"role-ready/v1",
+			"role-warmup-complete/v1",
+			"role-measure-start-ack/v1",
+			"role-partial/v1",
+			"role-exited/v1",
+		]) {
+			const child = scriptedChild({
+				childId: "publisher-child-0",
+				assignedSessionCount: 1,
+			});
+			child.reply(roleFailed("publisher-child-0"));
+			const refused = await child.channel.receive(expected, {
+				deadlineMs: 500,
+				deadlineCode: "READY_DEADLINE_EXCEEDED",
+			});
+			expect(refused.ok).toBe(false);
+			if (refused.ok) throw new Error("unreachable");
+			expect(refused.code).toBe("DELIVERY_CONTEXT_MISMATCH");
+			expect(refused.message).toContain("data frame on the delivery channel");
+			expect(
+				"reportedByChild" in refused && refused.reportedByChild === true,
+			).toBe(true);
+			// Poisoned with the child's code: every later read says the same.
+			expect(child.channel.refusal).toContain("DELIVERY_CONTEXT_MISMATCH");
+			const again = await child.channel.receive(expected, { deadlineMs: 10 });
+			expect(again.ok).toBe(false);
+			if (again.ok) throw new Error("unreachable");
+			expect(again.message).toContain("DELIVERY_CONTEXT_MISMATCH");
+			child.channel.close();
+		}
+	});
+
+	test("a_deadline_that_fires_after_the_frame_arrived_does_not_overwrite_it", async () => {
+		const child = scriptedChild({
+			childId: "publisher-child-0",
+			assignedSessionCount: 1,
+		});
+		// One pipe read brought the child's readiness and its refusal together;
+		// the deadline for the next await is already past when it starts, and
+		// the frame the channel already holds is still what it answers with.
+		child.replyMany([
+			{
+				schema: "role-ready/v1",
+				executionSha256: EXECUTION,
+				cohortGrantSha256: GRANT,
+				childId: "publisher-child-0",
+				childPid: 1,
+				childPgid: 1,
+				childInstanceNonce: HEX("9"),
+				registeredSessionCount: 1,
+			},
+			roleFailed("publisher-child-0"),
+		]);
+		const ready = await child.channel.receive("role-ready/v1", {
+			deadlineMs: 500,
+		});
+		expect(ready.ok).toBe(true);
+		const refused = await child.channel.receive("role-warmup-complete/v1", {
+			deadlineMs: 0,
+			deadlineCode: "WARMUP_DEADLINE_EXCEEDED",
+		});
+		expect(refused.ok).toBe(false);
+		if (refused.ok) throw new Error("unreachable");
+		expect(refused.code).toBe("DELIVERY_CONTEXT_MISMATCH");
+		child.channel.close();
+	});
+
+	test("an_unregistered_or_malformed_frame_is_still_STATE_INVALID", async () => {
+		const child = scriptedChild({
+			childId: "publisher-child-0",
+			assignedSessionCount: 1,
+		});
+		// A role-failed with a code outside the closed set is not the child's
+		// refusal; the lifecycle's own expectation is what refuses it.
+		child.reply({ ...roleFailed("publisher-child-0"), code: "NOT_A_CODE" });
+		const refused = await child.channel.receive("role-ready/v1", {
+			deadlineMs: 500,
+		});
+		expect(refused.ok).toBe(false);
+		if (refused.ok) throw new Error("unreachable");
+		expect(refused.code).toBe("STATE_INVALID");
+		expect("reportedByChild" in refused).toBe(false);
+		child.channel.close();
+	});
+
+	test("the_driver_propagates_the_childs_code_unchanged_from_the_warmup_await", async () => {
+		const plan = planFor(0);
+		const child = scriptedChild({
+			childId: plan.childId,
+			assignedSessionCount: 1,
+		});
+		const children = new Map([[plan.childId, child]]);
+		const driver = driverOver(children, [plan]);
+		child.reply(roleFailed(plan.childId));
+		const warmup = await driver.runWarmupWire();
+		expect(warmup.ok).toBe(false);
+		if (warmup.ok) throw new Error("unreachable");
+		expect(warmup.code).toBe("DELIVERY_CONTEXT_MISMATCH");
+		expect(child.received.map((frame) => frame.schema)).toEqual([
+			"role-warmup-start/v1",
+		]);
+		child.channel.close();
+	});
+
+	test("the_ramp_keeps_a_childs_own_refusal_over_a_siblings_deadline", async () => {
+		// Child 0 says nothing and times out; child 1 refuses with its own code
+		// while the driver is still waiting on child 0. The arm's code is the
+		// child's, whichever pipe the driver happened to fold first.
+		const silent = planFor(0);
+		const failing = planFor(1);
+		const children = new Map([
+			[
+				silent.childId,
+				scriptedChild({ childId: silent.childId, assignedSessionCount: 1 }),
+			],
+			[
+				failing.childId,
+				scriptedChild({ childId: failing.childId, assignedSessionCount: 1 }),
+			],
+		]);
+		const driver = driverOver(children, [silent, failing], 200);
+		expect((await driver.deliverSpawnConfigs()).ok).toBe(true);
+		children.get(failing.childId)?.reply(roleFailed(failing.childId));
+		const scheduler = new MacPermitScheduler({
+			executionSha256: EXECUTION,
+			cohortGrantSha256: GRANT,
+			publisherCount: 2,
+			subscriberCount: 0,
+			rampEpochMacNs: "1000000000",
+			readinessDeadlineMs: 30_000,
+			childIdForOrdinal: (ordinal) => `publisher-child-${ordinal}`,
+		});
+		const ramp = await driver.registerRolePeers({ scheduler });
+		expect(ramp.ok).toBe(false);
+		if (ramp.ok) throw new Error("unreachable");
+		expect(ramp.code).toBe("DELIVERY_CONTEXT_MISMATCH");
+		for (const child of children.values()) child.channel.close();
+	});
+
+	test("the_dispatch_seals_the_childs_code_as_itself", async () => {
+		const harness = await miniHarness();
+		const seals: CohortArmMeasuredV1[] = [];
+		const dispatched = await dispatchArmRepetition({
+			arm: legInputFor(cellOf("ticker-fanout/rate-250"), "primary"),
+			cohortRuntime: cohortRuntimeOf(harness, refusingBinding(), seals),
+			executors: {
+				measureSealAndWriteRep: forbiddenLeg(),
+				driveCohortArm: async () => ({
+					ok: false,
+					code: "DELIVERY_CONTEXT_MISMATCH",
+					message: "subscriber-000003: data frame on the delivery channel",
+				}),
+			},
+		});
+		expect(dispatched.route).toBe("cohort");
+		expect(dispatched.result.ok).toBe(false);
+		if (dispatched.result.ok) throw new Error("unreachable");
+		expect(dispatched.result.failureCode).toBe("DELIVERY_CONTEXT_MISMATCH");
+		expect(dispatched.result.reason).toContain("DELIVERY_CONTEXT_MISMATCH");
+		expect(seals).toEqual([]);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// The role-child fixtures the mixed-version test below spawns a real worker
+// with: the same cohort shape `bin/fanout-role.test.ts` drives in-process.
+// ---------------------------------------------------------------------------
+
+const MIXED_PUBLISHER_COUNT = 2;
+const MIXED_SUBSCRIBER_COUNT = 24;
+const MIXED_SHARD_SUBSCRIBERS =
+	MIXED_SUBSCRIBER_COUNT / SUBSCRIBER_SHARD_MODULUS;
+const MIXED_COHORT_ID = "cohort-role-child";
+const MIXED_SERVER_PORT = 44_301;
+const MIXED_MESSAGE_BYTES = 100 as const;
+const MIXED_WINDOW_COUNT = 10 as const;
+const MIXED_MESSAGE_RATE_PER_SECOND = 10;
+const MIXED_MEASURED_DURATION_MS = 10_000;
+const MIXED_TOTAL_MEASURED_MESSAGES =
+	(MIXED_MESSAGE_RATE_PER_SECOND * MIXED_MEASURED_DURATION_MS) / 1000;
+const MIXED_NS_PER_MS = 1_000_000n;
+const MIXED_NS_PER_S = 1_000_000_000n;
+const MIXED_MINTED_AT_NS = 5_000_000_000n;
+const MIXED_MEASURE_START_NS = MIXED_MINTED_AT_NS + 250n * MIXED_NS_PER_MS;
+const MIXED_MEASURE_STOP_NS =
+	MIXED_MEASURE_START_NS + BigInt(MIXED_WINDOW_COUNT) * MIXED_NS_PER_S;
+const MIXED_DRAIN_DEADLINE_NS =
+	MIXED_MEASURE_STOP_NS + 10_000n * MIXED_NS_PER_MS;
+const MIXED_WARMUP_NONCE = HEX("7");
+
+const mixedBase64Of = (bytes: Uint8Array): Base64 =>
+	Buffer.from(bytes).toString("base64") as Base64;
+
+/** The cell-sized payload a relay would copy into a compact frame. */
+const payloadBytesOf = (label: string): Uint8Array =>
+	new Uint8Array(
+		Buffer.from(
+			fanoutPayload(MIXED_MESSAGE_BYTES, label).payloadBase64,
+			"base64",
+		),
+	);
+
+function mixedLaunchRecord(): StagedServerLaunchRecordV1 {
+	return {
+		schema: "staged-server-launch-record/v1",
+		stageReceiptSha256: HEX("1"),
+		serverEntrypointSha256: HEX("2"),
+		bunSha256: HEX("3"),
+		addonSha256: HEX("4"),
+		bindAddress: "10.99.0.2",
+		bindPort: MIXED_SERVER_PORT,
+		advertisedHost: "10.99.0.2",
+		tlsServerName: "wt-compare.local",
+		tlsCertificateSha256: HEX("5"),
+		tlsPrivateKeySha256: HEX("6"),
+		transport: "ws",
+		argv: [
+			"tools/compare/bin/compare-server.ts",
+			"--bind=10.99.0.2",
+			"--stage-profile=phase-b",
+		],
+		allowedEnvironment: [],
+	};
+}
+
+function mixedSubscriberShards(): SubscriberShardV1[] {
+	return Array.from({ length: COHORT_WORKER_COUNT }, (_unused, worker) => ({
+		schema: "subscriber-shard/v1" as const,
+		childId: `subscriber-worker-${worker}`,
+		workerIndex: worker,
+		modulus: SUBSCRIBER_SHARD_MODULUS,
+		residue: worker,
+		firstSubscriberIndex: 0 as const,
+		lastSubscriberIndexExclusive: MIXED_SUBSCRIBER_COUNT,
+		subscriberCount: MIXED_SHARD_SUBSCRIBERS,
+		orderedSubscriberIdsSha256: sha256CanonicalRecord({ worker }),
+		firstTokenCommitmentIndex: MIXED_PUBLISHER_COUNT + worker,
+		lastTokenCommitmentIndexExclusive: subscriberShardCommitmentWindowEnd(
+			MIXED_PUBLISHER_COUNT + worker,
+			MIXED_SHARD_SUBSCRIBERS,
+		),
+	}));
+}
+
+interface MixedCohortFixtures {
+	readonly keys: Ed25519KeyPairBytes;
+	readonly signingPublicKeySha256: Sha256Hex;
+	readonly tokens: FanoutCohortFixture;
+	readonly grant: CohortGrantV1;
+	readonly grantBytes: Uint8Array;
+	readonly grantSha256: Sha256Hex;
+	readonly grantSignature: Uint8Array;
+	readonly executionSha256: Sha256Hex;
+	readonly workloadRolePlanInputSha256: Sha256Hex;
+	readonly workloadRolePlanInputBase64: Base64;
+}
+
+function buildMixedCohort(): MixedCohortFixtures {
+	const keys = generateEd25519KeyPair();
+	const signingPublicKeySha256 = sha256HexOfBytes(keys.publicRaw32);
+	const tokens = buildFanoutCohortFixture({
+		cohortId: MIXED_COHORT_ID,
+		publisherCount: MIXED_PUBLISHER_COUNT,
+		subscriberCount: MIXED_SUBSCRIBER_COUNT,
+	});
+	const workloadRolePlanInput = {
+		plan: "role-child-plan",
+		cohortId: MIXED_COHORT_ID,
+	};
+	const workloadBytes = bytesOfCanonical(workloadRolePlanInput);
+	const workloadRolePlanInputSha256 = sha256HexOfBytes(workloadBytes);
+
+	const built = macConstructFinalExecution({
+		draft: {
+			schema: "cross-supervisor-execution-draft/v1",
+			authoritySha256: HEX("a"),
+			campaignLockSha256: HEX("b"),
+			stagedCapabilitySha256: HEX("c"),
+			sourceArchiveSha256: HEX("d"),
+			approvedPlanSha256: HEX("e"),
+			approvalRecordSha256: HEX("f"),
+			candidate: "cand",
+			campaignId: "camp",
+			runId: "camp/ticker-fanout-250/ws/measured-1",
+			executionPurpose: "focused",
+			cellId: "ticker-fanout/rate-250",
+			scenarioHash: HEX("5"),
+			rolePlanHash: HEX("6"),
+			workloadRolePlanInputSha256,
+			stagedServerLaunchRecordSha256: sha256HexOfBytes(
+				bytesOfCanonical(mixedLaunchRecord()),
+			),
+			armKind: "primary",
+			transport: "ws",
+			repetitionKind: "measured",
+			repetitionIndex: 1,
+			repetitionTotal: 1,
+			grantDeclaration: "fanout-expanded-deliveries",
+			declaredMessageCount: 250_000,
+			declaredMessageBytes: 100,
+			requestedNotAfterMs: 17_000_000_000_000,
+		},
+		executionIndex: 0,
+		macSupervisorInstanceNonce: HEX("7"),
+		issuedAtMs: 1_000,
+		notAfterMs: 2_000,
+		grantNonceSha256: HEX("8"),
+	});
+	if (!built.ok) throw new Error(`execution: ${built.code}`);
+	const { execution, executionSha256 } = built.value;
+
+	const offeredIngress = MIXED_PUBLISHER_COUNT * MIXED_TOTAL_MEASURED_MESSAGES;
+	const grant: CohortGrantV1 = {
+		schema: "cohort-grant/v1",
+		execution,
+		executionSha256,
+		macExecutionGrantReceiptSha256: HEX("9"),
+		approvedPlanSha256: execution.approvedPlanSha256,
+		approvalRecordSha256: execution.approvalRecordSha256,
+		cohortId: MIXED_COHORT_ID,
+		cohortAttempt: 1,
+		scenarioHash: execution.scenarioHash,
+		rolePlanHash: execution.rolePlanHash,
+		workloadRolePlanInputSha256: execution.workloadRolePlanInputSha256,
+		transport: "ws",
+		publisherCount: MIXED_PUBLISHER_COUNT,
+		subscriberCount: MIXED_SUBSCRIBER_COUNT,
+		workerCount: 8,
+		expectedProcessCount: MIXED_PUBLISHER_COUNT + COHORT_WORKER_COUNT,
+		expectedSessionCount: MIXED_PUBLISHER_COUNT + MIXED_SUBSCRIBER_COUNT,
+		publishers: tokens.publishers,
+		subscriberShards: mixedSubscriberShards(),
+		tokenCommitmentLeafManifestSha256: HEX("0"),
+		roleTokenCommitmentRootSha256: tokens.roleTokenCommitmentRootSha256,
+		roleTokenCommitmentCount: tokens.roleTokenCommitmentCount,
+		connectionRatePerSecond: 500,
+		maxConnectionsInFlight: 200,
+		readinessDeadlineMs: READINESS_DEADLINE_MS_TICKER,
+		inRepetitionWarmupMs: 5_000,
+		sampleWindowMs: 1_000,
+		measuredDurationMs: MIXED_MEASURED_DURATION_MS,
+		drainDeadlineMs: 10_000,
+		messageBytes: MIXED_MESSAGE_BYTES,
+		expectedOfferedIngress: offeredIngress,
+		expectedExpandedDeliveries: offeredIngress * MIXED_SUBSCRIBER_COUNT,
+		macSupervisorInstanceNonce: HEX("7"),
+		signingPublicKeySha256,
+		receiptSequence: 1,
+		issuedAtMs: 1_000,
+		notAfterMs: 2_000,
+	};
+	const grantBytes = bytesOfCanonical(grant);
+	return {
+		keys,
+		signingPublicKeySha256,
+		tokens,
+		grant,
+		grantBytes,
+		grantSha256: sha256HexOfBytes(grantBytes),
+		grantSignature: ed25519Sign(keys.privatePkcs8Der, grantBytes),
+		executionSha256,
+		workloadRolePlanInputSha256,
+		workloadRolePlanInputBase64: mixedBase64Of(workloadBytes),
+	};
+}
+
+function mixedTokenBundleFor(
+	cohort: MixedCohortFixtures,
+	args: {
+		readonly childId: string;
+		readonly roleIds: readonly string[];
+		readonly role: "publisher" | "subscriber";
+	},
+): TokenBundleV1 {
+	const entries = args.roleIds.map((roleId) => ({
+		schema: "token-bundle-entry/v1" as const,
+		role: args.role,
+		roleId,
+		workerIndex: cohort.tokens.workerIndexByRoleId.get(roleId) ?? null,
+		tokenBase64: cohort.tokens.tokenBase64ByRoleId.get(roleId) as Base64,
+		tokenSha256: cohort.tokens.tokenSha256ByRoleId.get(roleId) as Sha256Hex,
+		tokenCommitmentIndex: cohort.tokens.commitmentIndexByRoleId.get(
+			roleId,
+		) as number,
+		tokenMerkleProofSha256: [
+			...(cohort.tokens.proofByRoleId.get(roleId) as readonly Sha256Hex[]),
+		],
+	}));
+	return {
+		schema: "token-bundle/v1",
+		executionSha256: cohort.executionSha256,
+		cohortGrantSha256: cohort.grantSha256,
+		childId: args.childId,
+		entryCount: entries.length,
+		entries,
+	};
+}
+
+function mixedSpawnConfig(
+	cohort: MixedCohortFixtures,
+	bundle: TokenBundleV1,
+	overrides: Partial<RoleSpawnConfigV1>,
+	launch: StagedServerLaunchRecordV1 = mixedLaunchRecord(),
+): RoleSpawnConfigV1 {
+	const bundleBytes = bytesOfCanonical(bundle);
+	const launchBytes = bytesOfCanonical(launch);
+	return {
+		schema: "role-spawn-config/v1",
+		sequence: 0,
+		executionSha256: cohort.executionSha256,
+		cohortGrantSha256: cohort.grantSha256,
+		cohortGrantBase64: mixedBase64Of(cohort.grantBytes),
+		cohortGrantSignatureBase64: mixedBase64Of(cohort.grantSignature),
+		workloadRolePlanInputBase64: cohort.workloadRolePlanInputBase64,
+		workloadRolePlanInputSha256: cohort.workloadRolePlanInputSha256,
+		stagedServerLaunchRecordBase64: mixedBase64Of(launchBytes),
+		stagedServerLaunchRecordSha256: sha256HexOfBytes(launchBytes),
+		stagedServerLaunchRecordSize: launchBytes.byteLength,
+		childId: bundle.childId,
+		role: "publisher",
+		publisherId: null,
+		workerIndex: null,
+		childInstanceNonce: HEX("c"),
+		tokenBundleFd: 5,
+		tokenBundleSha256: sha256HexOfBytes(bundleBytes),
+		tokenBundleSize: bundleBytes.byteLength,
+		tokenBundleEntryCount: bundle.entryCount,
+		tokenBundleMaxSize: 2_097_152,
+		transport: "ws",
+		serverHost: "10.99.0.2",
+		serverPort: MIXED_SERVER_PORT,
+		tlsServerName: "wt-compare.local",
+		messageRatePerSecond: MIXED_MESSAGE_RATE_PER_SECOND,
+		warmupMessagesPerPublisher: 10,
+		warmupIntervalMs: 500,
+		warmupDurationMs: 5_000,
+		measuredDurationMs: MIXED_MEASURED_DURATION_MS,
+		measuredSampleWindowMs: 1_000,
+		payloadBytes: MIXED_MESSAGE_BYTES,
+		channelMapping: "ws-binary-message-per-frame",
+		macSigningPublicKeyBase64: mixedBase64Of(cohort.keys.publicRaw32),
+		macSigningPublicKeySha256: cohort.signingPublicKeySha256,
+		...overrides,
+	} as RoleSpawnConfigV1;
+}
+
+function mixedWorkerChild(
+	cohort: MixedCohortFixtures,
+	workerIndex: number,
+): {
+	readonly config: RoleSpawnConfigV1;
+	readonly bundle: TokenBundleV1;
+	readonly roleIds: readonly string[];
+} {
+	const roleIds: string[] = [];
+	for (
+		let ordinal = workerIndex;
+		ordinal < MIXED_SUBSCRIBER_COUNT;
+		ordinal += SUBSCRIBER_SHARD_MODULUS
+	) {
+		roleIds.push(`subscriber-${ordinal.toString().padStart(6, "0")}`);
+	}
+	const bundle = mixedTokenBundleFor(cohort, {
+		childId: `subscriber-worker-${workerIndex}`,
+		roleIds,
+		role: "subscriber",
+	});
+	return {
+		bundle,
+		roleIds,
+		config: mixedSpawnConfig(cohort, bundle, {
+			role: "subscriber-worker",
+			publisherId: null,
+			workerIndex,
+		}),
+	};
+}
+
+function mixedWarmupStartFrame(
+	cohort: MixedCohortFixtures,
+	role: "publisher" | "subscriber-worker",
+): {
+	readonly frame: Record<string, unknown>;
+	readonly epochSha256: Sha256Hex;
+} {
+	const epoch: CohortWarmupEpochV1 = {
+		schema: "cohort-warmup-epoch/v1",
+		executionSha256: cohort.executionSha256,
+		cohortGrantSha256: cohort.grantSha256,
+		cohortId: MIXED_COHORT_ID,
+		warmupNonce: MIXED_WARMUP_NONCE,
+		durationMs: 5_000,
+		warmupMessagesPerPublisher: 10,
+		warmupIntervalMs: 500,
+		expectedWarmupIngress: expectedWarmupIngress(MIXED_PUBLISHER_COUNT),
+		expectedWarmupDeliveries: expectedWarmupDeliveries(
+			MIXED_PUBLISHER_COUNT,
+			MIXED_SUBSCRIBER_COUNT,
+		),
+		macSupervisorInstanceNonce: HEX("7"),
+		signingPublicKeySha256: cohort.signingPublicKeySha256,
+		receiptSequence: 2,
+		issuedAtMs: 1_000,
+		notAfterMs: 2_000,
+	};
+	const epochBytes = bytesOfCanonical(epoch);
+	const signature = ed25519Sign(cohort.keys.privatePkcs8Der, epochBytes);
+	const epochSha256 = sha256HexOfBytes(epochBytes);
+	return {
+		epochSha256,
+		frame: {
+			schema: "role-warmup-start/v1",
+			sequence: 0,
+			executionSha256: cohort.executionSha256,
+			cohortGrantSha256: cohort.grantSha256,
+			cohortWarmupEpochBase64: mixedBase64Of(epochBytes),
+			cohortWarmupEpochSha256: epochSha256,
+			cohortWarmupEpochSignatureBase64: mixedBase64Of(signature),
+			cohortWarmupEpochSignatureSha256: sha256HexOfBytes(signature),
+			warmupNonce: MIXED_WARMUP_NONCE,
+			expectedChildOfferedWarmupIngress: role === "publisher" ? 10 : 0,
+			expectedChildDeliveredWarmupRecords:
+				role === "publisher"
+					? 0
+					: MIXED_SHARD_SUBSCRIBERS * MIXED_PUBLISHER_COUNT * 10,
+			startAtMacNs: "1000000000",
+			durationMs: 5_000,
+		},
+	};
+}
+
+function mixedStartBarrier(cohort: MixedCohortFixtures): CohortStartBarrierV1 {
+	return {
+		schema: "cohort-start-barrier/v1",
+		executionSha256: cohort.executionSha256,
+		cohortGrantSha256: cohort.grantSha256,
+		rigCohortAcceptanceSha256: HEX("1"),
+		rigMeasureStartAckSha256: HEX("2"),
+		roleWarmupCompletionManifestSha256: HEX("3"),
+		roleWarmupCompletionManifestSignatureSha256: HEX("4"),
+		rigWarmupDrainedReceiptSha256: HEX("5"),
+		cohortId: MIXED_COHORT_ID,
+		barrierNonce: HEX("6"),
+		macClockId: "mac-clock-role-child",
+		warmupStartedAtMacNs: "1000000000",
+		warmupCompletedAtMacNs: "4900000000",
+		mintedAtMacNs: MIXED_MINTED_AT_NS.toString(),
+		measureStartAtMacNs: MIXED_MEASURE_START_NS.toString(),
+		measureStopAtMacNs: MIXED_MEASURE_STOP_NS.toString(),
+		sampleWindowMs: 1_000,
+		windowCount: MIXED_WINDOW_COUNT,
+		measuredDurationMs: MIXED_MEASURED_DURATION_MS,
+		drainDeadlineMs: 10_000,
+		macSupervisorInstanceNonce: HEX("7"),
+		signingPublicKeySha256: cohort.signingPublicKeySha256,
+		receiptSequence: 3,
+		issuedAtMs: 1_000,
+		notAfterMs: 2_000,
+	};
+}
+
+// ---------------------------------------------------------------------------
+// Mixed versions, real processes: a relay that still writes §4.2's JSON
+// deliveries against the amended worker. The worker is the production
+// `bin/fanout-role.ts` spawned by the production host, on the production
+// pipe; the relay is the production `FanoutRelay` behind the production WS
+// listener, with the legacy frame put on the socket the way an old relay
+// would. The first unit on the delivery channel is wrong, so the child names
+// `DELIVERY_CONTEXT_MISMATCH` on its pipe before exiting, the channel carries
+// it, and the dispatch seals exactly that code.
+// ---------------------------------------------------------------------------
+
+function selfSignedTls(dir: string): { cert: string; key: string } {
+	const certPath = join(dir, "server.crt");
+	const keyPath = join(dir, "server.key");
+	const made = Bun.spawnSync({
+		cmd: [
+			"openssl",
+			"req",
+			"-x509",
+			"-newkey",
+			"rsa:2048",
+			"-keyout",
+			keyPath,
+			"-out",
+			certPath,
+			"-days",
+			"1",
+			"-nodes",
+			"-subj",
+			"/CN=wt-compare.local",
+			"-addext",
+			"subjectAltName=DNS:wt-compare.local,IP:127.0.0.1",
+		],
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if (made.exitCode !== 0) {
+		throw new Error(`openssl failed: ${made.stderr.toString().slice(-500)}`);
+	}
+	return {
+		cert: readFileSync(certPath, "utf8"),
+		key: readFileSync(keyPath, "utf8"),
+	};
+}
+
+function isAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function waitUntil(
+	predicate: () => boolean,
+	whatFor: string,
+	timeoutMs = 15_000,
+): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!predicate()) {
+		if (Date.now() > deadline)
+			throw new Error(`timed out waiting for ${whatFor}`);
+		await Bun.sleep(20);
+	}
+}
+
+describe("D2 mixed versions: a real worker child against a relay that still writes JSON deliveries", () => {
+	test("the first JSON delivery is DELIVERY_CONTEXT_MISMATCH on the child's pipe and in the sealed record", async () => {
+		const cohort = buildMixedCohort();
+		const workerIndex = 3;
+		const worker = mixedWorkerChild(cohort, workerIndex);
+		const warmup = mixedWarmupStartFrame(cohort, "subscriber-worker");
+		const barrierSha256 = sha256HexOfBytes(
+			bytesOfCanonical(mixedStartBarrier(cohort)),
+		);
+		const dir = mkdtempSync(join(tmpdir(), "fanout-role-mixed-"));
+		const tls = selfSignedTls(dir);
+
+		// The production relay for this cohort, already bound to the epoch
+		// and barrier the child will be told about, behind a real listener.
+		const relay = new FanoutRelay({
+			transport: "ws",
+			cohortId: MIXED_COHORT_ID,
+			cohortGrantSha256: cohort.grantSha256,
+			cohortWarmupEpochSha256: warmup.epochSha256,
+			warmupNonce: MIXED_WARMUP_NONCE,
+			cohortStartBarrierSha256: barrierSha256,
+			roleTokenCommitmentRootSha256:
+				cohort.tokens.roleTokenCommitmentRootSha256,
+			roleTokenCommitmentCount: cohort.tokens.roleTokenCommitmentCount,
+			publishers: cohort.tokens.publishers,
+			subscriberShards: cohort.tokens.subscriberShards,
+			expectedSubscriberIds: cohort.tokens.expectedSubscriberIds,
+			windowCount: MIXED_WINDOW_COUNT,
+			messageBytes: MIXED_MESSAGE_BYTES,
+			linuxClockId: "linux-mixed-version",
+			clock: createManualRelayClock(),
+		});
+		const sessions: { sessionId: string; send(bytes: Uint8Array): unknown }[] =
+			[];
+		const peer = serveFanoutRelayOverWebSocket({
+			relay,
+			hostname: COHORT_LOCAL_ACCEPTANCE_SERVER_HOST,
+			port: 0,
+			tls: { cert: tls.cert, key: tls.key },
+			onSession: (event) => {
+				sessions.push({
+					sessionId: event.sessionId,
+					send: (bytes) => event.session.send(bytes),
+				});
+			},
+		});
+
+		const launch: StagedServerLaunchRecordV1 = {
+			...mixedLaunchRecord(),
+			bindAddress: COHORT_LOCAL_ACCEPTANCE_SERVER_HOST,
+			advertisedHost: COHORT_LOCAL_ACCEPTANCE_SERVER_HOST,
+			bindPort: peer.port,
+			argv: [
+				"tools/compare/bin/compare-server.ts",
+				`--bind=${COHORT_LOCAL_ACCEPTANCE_SERVER_HOST}`,
+				"--stage-profile=local-acceptance",
+			],
+		};
+		const config = mixedSpawnConfig(
+			cohort,
+			worker.bundle,
+			{
+				role: "subscriber-worker",
+				publisherId: null,
+				workerIndex,
+				serverHost: COHORT_LOCAL_ACCEPTANCE_SERVER_HOST,
+				serverPort: peer.port,
+			},
+			launch,
+		);
+		const bundleBytes = bytesOfCanonical(worker.bundle);
+		const bundlePath = join(dir, "bundle.json");
+		writeFileSync(bundlePath, bundleBytes, { mode: 0o600 });
+		const bundleFd = openSync(bundlePath, "r");
+		// As the supervisor seals it: an open descriptor on an unlinked file,
+		// which the child requires before it reads a byte.
+		rmSync(bundlePath);
+
+		const stderr: string[] = [];
+		const host = createMacFanoutRoleChildHost({
+			bunExecutablePath: process.execPath,
+			roleEntrypointPath: EXECUTABLE_ROLE_ENTRYPOINT_PATH,
+			transport: "ws",
+			stagedMacSigningPublicKeySha256: cohort.signingPublicKeySha256,
+			receiveDeadlineMs: 10_000,
+			env: { [STAGED_TLS_CA_PEM_ENV]: tls.cert },
+			onChildStderr: (_childId, text) => {
+				stderr.push(text);
+			},
+		});
+		const plan: MacFanoutChildPlanV1 = {
+			childId: config.childId,
+			role: "subscriber-worker",
+			publisherId: null,
+			workerIndex,
+			assignedGlobalOrdinals: worker.roleIds.map((roleId) =>
+				Number(roleId.slice("subscriber-".length)),
+			),
+			assignedRoleIds: [...worker.roleIds],
+			controlReadFd: 3,
+			controlWriteFd: 4,
+			tokenBundleFd: 5,
+		};
+		let pid = -1;
+		try {
+			const spawned = host.spawnChild({
+				plan,
+				tokenBundleReadFd: bundleFd,
+				tokenBundleSha256: sha256HexOfBytes(bundleBytes),
+				tokenBundleSize: bundleBytes.byteLength,
+				tokenBundleEntryCount: worker.bundle.entryCount,
+				childInstanceNonce: config.childInstanceNonce,
+				inheritedChildFds: [3, 4, 5],
+			});
+			expect(spawned.ok).toBe(true);
+			if (!spawned.ok) throw new Error(spawned.message);
+			pid = spawned.value.pid;
+			const channel = host.channel(plan.childId);
+			if (channel === undefined) throw new Error("no channel");
+
+			const sent = await channel.send(
+				config as unknown as Record<string, unknown> & { schema: string },
+			);
+			expect(sent.ok).toBe(true);
+			for (let index = 0; index < worker.roleIds.length; index += 1) {
+				const request = await channel.receive("connect-permit-request/v1", {
+					deadlineMs: 15_000,
+				});
+				if (!request.ok) {
+					throw new Error(
+						`${request.code}: ${request.message}; child stderr: ${stderr.join("")}`,
+					);
+				}
+				const granted = await channel.send({
+					schema: "connect-permit-grant/v1",
+					executionSha256: config.executionSha256,
+					cohortGrantSha256: config.cohortGrantSha256,
+					childId: config.childId,
+					globalOrdinal: request.value.record.globalOrdinal,
+					notBeforeMacNs: "0",
+					permitNonce: HEX("d"),
+				});
+				expect(granted.ok).toBe(true);
+				const complete = await channel.receive("connect-permit-complete/v1", {
+					deadlineMs: 15_000,
+				});
+				expect(complete.ok).toBe(true);
+				if (!complete.ok) throw new Error(complete.message);
+				expect(complete.value.record.outcome).toBe("ready");
+			}
+			const ready = await channel.receive("role-ready/v1", {
+				deadlineMs: 15_000,
+			});
+			expect(ready.ok).toBe(true);
+			expect(relay.counters().registeredSubscriberIds).toEqual([
+				...worker.roleIds,
+			]);
+			expect(sessions.length).toBe(worker.roleIds.length);
+
+			// What a relay from before the amendment writes first on every
+			// subscriber's channel: the §4.2 JSON warmup delivery, in place of
+			// the delivery context. Put on the real sockets by hand.
+			const payload = fanoutPayload(MIXED_MESSAGE_BYTES, "legacy");
+			for (const session of sessions) {
+				const legacy = encodeFanoutWsMessage({
+					schema: "fanout-wire/v1",
+					kind: "warmup-data",
+					direction: "relay-to-subscriber",
+					cohortGrantSha256: cohort.grantSha256,
+					cohortWarmupEpochSha256: warmup.epochSha256,
+					warmupNonce: MIXED_WARMUP_NONCE,
+					publisherId: "publisher-000000",
+					publisherSequence: 0,
+					subscriberId: worker.roleIds[0] as string,
+					linuxAcceptedOrdinal: 0,
+					payloadBase64: payload.payloadBase64,
+					payloadSha256: payload.payloadSha256,
+					payloadBytes: MIXED_MESSAGE_BYTES,
+				});
+				if (!legacy.ok) throw new Error("legacy encode");
+				expect(session.send(legacy.value)).toBe("accepted");
+			}
+
+			const started = await channel.send(
+				warmup.frame as Record<string, unknown> & { schema: string },
+			);
+			expect(started.ok).toBe(true);
+			const refused = await channel.receive("role-warmup-complete/v1", {
+				deadlineMs: 11_000,
+				deadlineCode: "WARMUP_DEADLINE_EXCEEDED",
+			});
+			expect(refused.ok).toBe(false);
+			if (refused.ok) throw new Error("unreachable");
+			expect(refused.code).toBe("DELIVERY_CONTEXT_MISMATCH");
+			expect(refused.message).toContain(
+				"warmup-data frame on the delivery channel",
+			);
+			expect("reportedByChild" in refused && refused.reportedByChild).toBe(
+				true,
+			);
+			expect(channel.refusal).toContain("DELIVERY_CONTEXT_MISMATCH");
+
+			// The child exited non-zero on its own, naming the same code.
+			await waitUntil(() => !isAlive(pid), "the worker child to exit");
+			expect(stderr.join("")).toContain("DELIVERY_CONTEXT_MISMATCH");
+
+			// The seal: the executor's refusal, exactly as the channel produced
+			// it, through the production dispatch.
+			const cell = CANONICAL_SCENARIO_REGISTRY.cells.find(
+				(candidate) => candidate.cellId === "ticker-fanout/rate-250",
+			);
+			if (cell === undefined) throw new Error("no ticker cell");
+			const arm = sealArmsForCell(cell, ["ws"], ["primary"])[0];
+			if (arm === undefined) throw new Error("no ws primary");
+			const dispatched = await dispatchArmRepetition({
+				arm: {
+					cell,
+					arm,
+					runId: "mixed-version/ticker-fanout/ws/measured-1",
+					repIndex: 1,
+					repetitionKind: "measured",
+					repetitionTotal: 1,
+					executionPurpose: "pilot",
+					perRepPath: "/dev/null",
+					sealedPath: "/dev/null",
+				} as unknown as Parameters<typeof dispatchArmRepetition>[0]["arm"],
+				cohortRuntime: () =>
+					({
+						ok: true,
+						value: {
+							seal: async () => {
+								throw new Error("a refused arm has nothing to seal");
+							},
+							cleanup: async () => ({ ok: true, value: true }),
+						},
+					}) as unknown as ReturnType<
+						NonNullable<
+							Parameters<typeof dispatchArmRepetition>[0]["cohortRuntime"]
+						>
+					>,
+				executors: {
+					driveCohortArm: async () => refused,
+					measureSealAndWriteRep: async () => {
+						throw new Error("a fanout primary never reaches the leg");
+					},
+				},
+			});
+			expect(dispatched.route).toBe("cohort");
+			expect(dispatched.result.ok).toBe(false);
+			if (dispatched.result.ok) throw new Error("unreachable");
+			expect(dispatched.result.failureCode).toBe("DELIVERY_CONTEXT_MISMATCH");
+			expect(dispatched.result.reason).toContain("DELIVERY_CONTEXT_MISMATCH");
+		} finally {
+			if (pid > 0 && isAlive(pid)) {
+				try {
+					process.kill(-pid, "SIGKILL");
+				} catch {
+					// Already gone.
+				}
+			}
+			host.closeAll();
+			closeSync(bundleFd);
+			await peer.stop();
+			rmSync(dir, { recursive: true, force: true });
+		}
+	}, 60_000);
 });

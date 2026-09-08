@@ -37,6 +37,7 @@ import {
 	type CohortGrantV1,
 	cohortGrantBytes,
 	type CohortWarmupEpochV1,
+	decodeStrictBase64,
 	type LinuxRelayObservationV1,
 	type PublisherRoleGrantV1,
 	parseCohortStartBarrier,
@@ -82,19 +83,27 @@ import {
 } from "../server-snapshot-protocol.ts";
 import { isHex64, sha256HexOfBytes } from "../secure-fs.ts";
 import {
+	buildFanoutDeliveryContext,
+	cloneFanoutDeliveryForSubscriber,
+	contextTagOfDeliveryContextSha256,
 	decodeFanoutWsMessage,
 	decodeFanoutWtStream,
+	encodeFanoutDeliveryTemplate,
 	encodeFanoutWsMessage,
 	encodeFanoutWtFrame,
+	FANOUT_DATA_FRAME_MAX_DECODED_BYTES,
 	type FanoutAckClosedCode,
 	type FanoutAckV1,
 	type FanoutDataV1,
+	type FanoutDeliveryContextFacts,
+	type FanoutDeliveryEpoch,
 	type FanoutEndV1,
 	type FanoutRefuseCode,
 	type FanoutRegisterV1,
 	type FanoutWarmupDataV1,
 	type FanoutWarmupEndV1,
 	type FanoutWireV1,
+	fanoutDeliveryUnitBytes,
 	parseFanoutWire,
 	requireMeasuredFrameBinding,
 	requireWarmupFrameBinding,
@@ -157,15 +166,32 @@ export const FANOUT_RELAY_DEFAULT_CAPS: FanoutRelayCaps = {
 export type RelaySendOutcome = "accepted" | "would-block" | "closed";
 
 /**
- * One relay-owned session. `trySend` must not block: a transport that cannot
+ * One relay-owned session. Neither send may block: a transport that cannot
  * take the bytes right now answers `would-block` and the engine leaves the
  * item at the head of that subscriber's queue, where the write deadline still
  * applies to it.
+ *
+ * `trySend` is the control channel (accept, refuse, ack, end). `trySendDelivery`
+ * is the subscriber's delivery channel -- the socket itself on WS, the
+ * server-opened uni stream on WT -- and carries only what the relay queues per
+ * subscriber: the per-epoch delivery context and the compact frames bound to
+ * it. The engine addresses the channel; the transport never has to look inside
+ * the bytes to find out which one they belong on.
  */
 export interface RelaySessionSink {
 	trySend(bytes: Uint8Array): RelaySendOutcome;
+	trySendDelivery(bytes: Uint8Array): RelaySendOutcome;
 	close(reason: string): void;
 }
+
+/**
+ * The header offset of `contextTag` in a `fanout-delivery/c1` frame (D2 table).
+ * The tag is per session -- the context digest commits to the subscriber's id
+ * and index -- so every clone of an ingress template is patched here as well
+ * as at `subscriberIndex`. `fanout-relay.test.ts` decodes a clone through the
+ * codec and asserts the tag, so a header change is caught there.
+ */
+const FANOUT_DELIVERY_CONTEXT_TAG_OFFSET = 16;
 
 /** Framing is the only thing that differs between WS and WT (§4.2). */
 export interface FanoutFrameCodec {
@@ -361,7 +387,14 @@ export interface FanoutRelayShutdownSummaryV1 {
 // Internal state
 // ---------------------------------------------------------------------------
 
+/**
+ * One item of a subscriber's delivery queue. A `context` item is the epoch's
+ * delivery context, placed at the head when the epoch binds; it shares the
+ * queue's cap and write deadline with the deliveries behind it but is never
+ * counted as one of them.
+ */
 interface QueuedDelivery {
+	readonly kind: "context" | "delivery";
 	readonly bytes: Uint8Array;
 	readonly originWindowIndex: number;
 	readonly linuxAcceptedOrdinal: number;
@@ -375,6 +408,11 @@ interface RelaySession {
 	role: "publisher" | "subscriber" | null;
 	roleId: string | null;
 	workerIndex: number | null;
+	/** The subscriber's position in the grant's subscriber order, once registered. */
+	subscriberIndex: number | null;
+	/** The tag every compact frame of the epoch carries for this session. */
+	warmupContextTag: number | null;
+	measuredContextTag: number | null;
 	registered: boolean;
 	closed: boolean;
 	faultCode: FanoutAckClosedCode | null;
@@ -454,6 +492,7 @@ export class FanoutRelay {
 	private readonly sessionsByRoleId = new Map<string, RelaySession>();
 	private readonly spentTokenSha256 = new Set<string>();
 	private readonly publisherById = new Map<string, PublisherRoleGrantV1>();
+	private readonly publisherIndexById = new Map<string, number>();
 	private readonly shardByWorkerIndex = new Map<number, SubscriberShardV1>();
 	private readonly faultList: FanoutRelayFaultV1[] = [];
 
@@ -503,8 +542,9 @@ export class FanoutRelay {
 			config.cohortStartBarrierSha256 !== FANOUT_RELAY_UNBOUND_DIGEST;
 		this.caps = { ...FANOUT_RELAY_DEFAULT_CAPS, ...(config.caps ?? {}) };
 		this.codec = fanoutFrameCodecFor(config.transport);
-		for (const publisher of config.publishers) {
+		for (const [index, publisher] of config.publishers.entries()) {
 			this.publisherById.set(publisher.publisherId, publisher);
+			this.publisherIndexById.set(publisher.publisherId, index);
 		}
 		for (const shard of config.subscriberShards) {
 			this.shardByWorkerIndex.set(shard.workerIndex, shard);
@@ -537,6 +577,9 @@ export class FanoutRelay {
 			role: null,
 			roleId: null,
 			workerIndex: null,
+			subscriberIndex: null,
+			warmupContextTag: null,
+			measuredContextTag: null,
 			registered: false,
 			closed: false,
 			faultCode: null,
@@ -562,17 +605,21 @@ export class FanoutRelay {
 		const session = this.sessions.get(sessionId);
 		if (session === undefined || session.closed) return;
 		session.closed = true;
+		let undelivered = 0;
 		for (const item of session.queue) {
-			this.disconnectUndelivered[item.originWindowIndex] =
-				(this.disconnectUndelivered[item.originWindowIndex] ?? 0) + 1;
+			if (item.kind === "delivery") {
+				this.disconnectUndelivered[item.originWindowIndex] =
+					(this.disconnectUndelivered[item.originWindowIndex] ?? 0) + 1;
+				undelivered += 1;
+			}
 			this.queuedItems -= 1;
 			this.queuedBytes -= item.bytes.byteLength;
 		}
-		if (session.queue.length > 0) {
+		if (undelivered > 0) {
 			this.recordFault(
 				"disconnect-undelivered",
 				RELAY_DELIVERY_FAILURE_CODE,
-				`${session.roleId ?? sessionId} closed with ${session.queue.length} queued deliveries`,
+				`${session.roleId ?? sessionId} closed with ${undelivered} queued deliveries`,
 			);
 		}
 		session.queue = [];
@@ -659,6 +706,10 @@ export class FanoutRelay {
 			this.admittedPublisherIds.add(frame.roleId);
 		} else {
 			this.admittedSubscriberIds.add(frame.roleId);
+			// Admission already required the id to be in the grant's order.
+			session.subscriberIndex = this.config.expectedSubscriberIds.indexOf(
+				frame.roleId,
+			);
 		}
 		this.sessionsByRoleId.set(frame.roleId, session);
 		this.sessionsAccepted += 1;
@@ -792,6 +843,79 @@ export class FanoutRelay {
 	}
 
 	/**
+	 * Put the epoch's delivery context at the head of every registered
+	 * subscriber's queue. Both callers reach this with empty queues -- the
+	 * registration close leaves phase `registration`, in which nothing is ever
+	 * queued, and the measured open requires `warmup-drained`, which
+	 * `drainWarmup` refuses while anything is queued -- so "at the head" is
+	 * asserted rather than assumed: a context can never be placed ahead of a
+	 * delivery already owed.
+	 */
+	private enqueueDeliveryContexts(
+		epoch: FanoutDeliveryEpoch,
+	): ProtocolResult<true> {
+		const failureCode =
+			epoch === "warmup"
+				? WARMUP_PROTOCOL_FAILURE_CODE
+				: COHORT_PROTOCOL_FAILURE_CODE;
+		const subscribers = this.registeredSubscribers();
+		for (const subscriber of subscribers) {
+			if (subscriber.queue.length !== 0) {
+				return relayFail(
+					failureCode,
+					`${subscriber.roleId} has ${subscriber.queue.length} items queued at the ${epoch} bind`,
+				);
+			}
+		}
+		const publisherIds = this.config.publishers.map(
+			(publisher) => publisher.publisherId,
+		);
+		for (const subscriber of subscribers) {
+			const roleId = subscriber.roleId as string;
+			const subscriberIndex = subscriber.subscriberIndex as number;
+			const common = {
+				cohortGrantSha256: this.config.cohortGrantSha256,
+				subscriberId: roleId,
+				subscriberIndex,
+				publisherIds,
+				windowCount: this.config.windowCount,
+				messageBytes: this.config.messageBytes,
+			};
+			const facts: FanoutDeliveryContextFacts =
+				epoch === "warmup"
+					? {
+							...common,
+							epoch,
+							cohortWarmupEpochSha256: this.config.cohortWarmupEpochSha256,
+							warmupNonce: this.config.warmupNonce,
+						}
+					: {
+							...common,
+							epoch,
+							cohortStartBarrierSha256: this.config.cohortStartBarrierSha256,
+						};
+			const context = buildFanoutDeliveryContext(facts);
+			if (!context.ok) return context;
+			const encoded = this.codec.encode(context.value);
+			if (!encoded.ok) return encoded;
+			const tag = contextTagOfDeliveryContextSha256(
+				context.value.deliveryContextSha256,
+			);
+			if (epoch === "warmup") subscriber.warmupContextTag = tag;
+			else subscriber.measuredContextTag = tag;
+			this.queueItem(subscriber, {
+				kind: "context",
+				bytes: encoded.value,
+				originWindowIndex: 0,
+				linuxAcceptedOrdinal: 0,
+				enqueuedAtMs: this.config.clock.nowMs(),
+				warmup: epoch === "warmup",
+			});
+		}
+		return { ok: true, value: true };
+	}
+
+	/**
 	 * Bind the start barrier this relay will accept measured traffic under.
 	 * Legal only once the warmup has drained, which is the point in §4.1 at
 	 * which the barrier exists at all.
@@ -855,7 +979,31 @@ export class FanoutRelay {
 			);
 		}
 		this.phaseValue = "warmup";
+		// Nobody joins after this and nothing has been queued for anyone, so
+		// the epoch's context is the first unit on every delivery channel; a
+		// relay bound at construction reaches here without `bindWarmupEpoch`.
+		const contexts = this.enqueueDeliveryContexts("warmup");
+		if (!contexts.ok) return contexts;
+		this.pumpContexts();
 		return { ok: true, value: true };
+	}
+
+	/**
+	 * Write the contexts just queued, as far as the transports will take them.
+	 * A round is bounded at `maxConcurrentWrites` subscribers, and no ingress
+	 * pumps again until the epoch's traffic starts, so one round would leave a
+	 * cohort wider than a round with contexts still queued -- under the write
+	 * deadline -- for as long as the Mac takes to start the epoch. Rounds run
+	 * until one moves nothing; a channel that is not ready yet keeps its
+	 * context at the head and the transport's own drain pumps it.
+	 */
+	private pumpContexts(): void {
+		for (;;) {
+			const before = this.queuedItems;
+			if (before === 0) return;
+			this.pump();
+			if (this.queuedItems === before) return;
+		}
 	}
 
 	// -- warmup -------------------------------------------------------------
@@ -914,31 +1062,96 @@ export class FanoutRelay {
 			linuxAcceptedOrdinal: ordinal,
 			linuxAcceptedAtNs: this.config.clock.nowNs(),
 		});
-		for (const subscriber of this.registeredSubscribers()) {
-			const roleId = subscriber.roleId as string;
-			const fanned: FanoutWireV1 = {
-				schema: "fanout-wire/v1",
-				kind: "warmup-data",
-				direction: "relay-to-subscriber",
-				cohortGrantSha256: this.config.cohortGrantSha256,
-				cohortWarmupEpochSha256: this.config.cohortWarmupEpochSha256,
-				warmupNonce: this.config.warmupNonce,
-				publisherId: frame.publisherId,
-				publisherSequence: frame.publisherSequence,
-				subscriberId: roleId,
-				linuxAcceptedOrdinal: ordinal,
-				payloadBase64: frame.payloadBase64,
-				payloadSha256: frame.payloadSha256,
-				payloadBytes: frame.payloadBytes,
-			};
-			const enqueued = this.enqueue(subscriber, fanned, 0, ordinal, true);
-			if (enqueued) {
-				this.warmupDeliveries += 1;
-				subscriber.warmupDeliveriesEnqueued += 1;
+		const template = this.deliveryTemplate(frame, 0, ordinal);
+		if (template !== null) {
+			for (const subscriber of this.registeredSubscribers()) {
+				const enqueued = this.enqueue(
+					subscriber,
+					this.deliveryFor(subscriber, template, "warmup"),
+					0,
+					ordinal,
+					true,
+				);
+				if (enqueued) {
+					this.warmupDeliveries += 1;
+					subscriber.warmupDeliveriesEnqueued += 1;
+				}
 			}
 		}
 		this.pump();
 		return { ok: true, value: true };
+	}
+
+	/**
+	 * One compact template per accepted ingress: the payload is decoded and
+	 * copied once, and every field but the two that are per session is written.
+	 * The ingress parser already proved the payload's length and digest, so a
+	 * refusal here is the relay's own defect and is recorded as malformed for
+	 * the ingress window rather than charged to a subscriber.
+	 */
+	private deliveryTemplate(
+		frame: FanoutDataV1 | FanoutWarmupDataV1,
+		windowIndex: number,
+		linuxAcceptedOrdinal: number,
+	): Uint8Array | null {
+		const publisherIndex = this.publisherIndexById.get(frame.publisherId);
+		const payload = decodeStrictBase64(
+			frame.payloadBase64,
+			FANOUT_DATA_FRAME_MAX_DECODED_BYTES,
+		);
+		if (publisherIndex === undefined || payload === null) {
+			this.recordMalformedAt(
+				windowIndex,
+				"relay could not template the ingress",
+			);
+			return null;
+		}
+		const template = encodeFanoutDeliveryTemplate({
+			windowIndex,
+			publisherIndex,
+			publisherSequence: frame.publisherSequence,
+			linuxAcceptedOrdinal,
+			// Patched per subscriber; the template carries no session's tag.
+			contextTag: 0,
+			payload,
+		});
+		if (!template.ok) {
+			this.recordMalformedAt(
+				windowIndex,
+				`relay delivery template: ${template.message ?? template.code}`,
+			);
+			return null;
+		}
+		return template.value;
+	}
+
+	/** The per-subscriber clone: `subscriberIndex` and the session's epoch tag. */
+	private deliveryFor(
+		subscriber: RelaySession,
+		template: Uint8Array,
+		epoch: FanoutDeliveryEpoch,
+	): Uint8Array {
+		const bytes = cloneFanoutDeliveryForSubscriber(
+			template,
+			subscriber.subscriberIndex as number,
+		);
+		const tag =
+			epoch === "warmup"
+				? subscriber.warmupContextTag
+				: subscriber.measuredContextTag;
+		if (tag === null) {
+			// Unreachable by construction: every registered subscriber was given
+			// its context when the epoch bound, before any ingress of it exists.
+			throw new Error(
+				`${subscriber.roleId} has no ${epoch} delivery context to tag against`,
+			);
+		}
+		new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).setUint32(
+			FANOUT_DELIVERY_CONTEXT_TAG_OFFSET,
+			tag,
+			true,
+		);
+		return bytes;
 	}
 
 	private handleWarmupEnd(
@@ -1103,8 +1316,13 @@ export class FanoutRelay {
 				"barrier acceptance names another start barrier",
 			);
 		}
+		// The measured context goes out ahead of the first measured delivery on
+		// every subscriber's channel; the drain left every queue empty.
+		const contexts = this.enqueueDeliveryContexts("measured");
+		if (!contexts.ok) return contexts;
 		this.phaseValue = "measured";
 		this.measurementStartedAtNs = this.config.clock.nowNs();
+		this.pumpContexts();
 		return { ok: true, value: true };
 	}
 
@@ -1203,7 +1421,7 @@ export class FanoutRelay {
 
 		const subscribers = this.registeredSubscribers();
 		const expansion = subscribers.length;
-		const frameBytesEstimate = this.estimateDeliveryBytes(frame);
+		const frameBytesEstimate = this.estimateDeliveryBytes();
 		if (
 			this.queuedItems + expansion > this.caps.globalQueueMaxItems ||
 			this.queuedBytes + expansion * frameBytesEstimate >
@@ -1229,23 +1447,17 @@ export class FanoutRelay {
 			disposition: "accepted",
 			ordinal,
 		});
-		for (const subscriber of subscribers) {
-			const fanned: FanoutWireV1 = {
-				schema: "fanout-wire/v1",
-				kind: "data",
-				direction: "relay-to-subscriber",
-				cohortGrantSha256: this.config.cohortGrantSha256,
-				cohortStartBarrierSha256: this.config.cohortStartBarrierSha256,
-				windowIndex: window,
-				publisherId: frame.publisherId,
-				publisherSequence: frame.publisherSequence,
-				subscriberId: subscriber.roleId as string,
-				linuxAcceptedOrdinal: ordinal,
-				payloadBase64: frame.payloadBase64,
-				payloadSha256: frame.payloadSha256,
-				payloadBytes: frame.payloadBytes,
-			};
-			this.enqueue(subscriber, fanned, window, ordinal, false);
+		const template = this.deliveryTemplate(frame, window, ordinal);
+		if (template !== null) {
+			for (const subscriber of subscribers) {
+				this.enqueue(
+					subscriber,
+					this.deliveryFor(subscriber, template, "measured"),
+					window,
+					ordinal,
+					false,
+				);
+			}
 		}
 		this.pump();
 		return { ok: true, value: true };
@@ -1278,17 +1490,11 @@ export class FanoutRelay {
 
 	private enqueue(
 		subscriber: RelaySession,
-		frame: FanoutWireV1,
+		bytes: Uint8Array,
 		originWindowIndex: number,
 		linuxAcceptedOrdinal: number,
 		warmup: boolean,
 	): boolean {
-		const encoded = this.codec.encode(frame);
-		if (!encoded.ok) {
-			this.recordMalformedAt(originWindowIndex, "relay frame failed to encode");
-			return false;
-		}
-		const bytes = encoded.value;
 		const overItems =
 			subscriber.queue.length + 1 > this.caps.subscriberQueueMaxItems;
 		const overBytes =
@@ -1306,21 +1512,27 @@ export class FanoutRelay {
 			this.closeSession(subscriber.sessionId, "subscriber queue full");
 			return false;
 		}
-		subscriber.queue.push({
+		this.queueItem(subscriber, {
+			kind: "delivery",
 			bytes,
 			originWindowIndex,
 			linuxAcceptedOrdinal,
 			enqueuedAtMs: this.config.clock.nowMs(),
 			warmup,
 		});
-		subscriber.queueBytes += bytes.byteLength;
+		return true;
+	}
+
+	/** Append one item and keep the queue-depth bookkeeping exact. */
+	private queueItem(subscriber: RelaySession, item: QueuedDelivery): void {
+		subscriber.queue.push(item);
+		subscriber.queueBytes += item.bytes.byteLength;
 		this.queuedItems += 1;
-		this.queuedBytes += bytes.byteLength;
+		this.queuedBytes += item.bytes.byteLength;
 		if (this.queuedItems > this.queueItemsPeak)
 			this.queueItemsPeak = this.queuedItems;
 		if (this.queuedBytes > this.queueBytesPeak)
 			this.queueBytesPeak = this.queuedBytes;
-		return true;
 	}
 
 	/**
@@ -1355,18 +1567,23 @@ export class FanoutRelay {
 				const item = subscriber.queue[0] as QueuedDelivery;
 				if (nowMs - item.enqueuedAtMs > this.caps.writeDeadlineMs) {
 					this.dropHead(subscriber);
-					this.writeTimeouts[item.originWindowIndex] =
-						(this.writeTimeouts[item.originWindowIndex] ?? 0) + 1;
+					// A context that cannot be written in time fails the session
+					// exactly as a delivery would; it is just not a delivery, so
+					// the per-window delivery counter does not move for it.
+					if (item.kind === "delivery") {
+						this.writeTimeouts[item.originWindowIndex] =
+							(this.writeTimeouts[item.originWindowIndex] ?? 0) + 1;
+					}
 					this.recordFault(
 						"write-timeout",
 						RELAY_DELIVERY_FAILURE_CODE,
-						`${subscriber.roleId} write exceeded ${this.caps.writeDeadlineMs} ms`,
+						`${subscriber.roleId} ${item.kind} write exceeded ${this.caps.writeDeadlineMs} ms`,
 					);
 					subscriber.faultCode = "RELAY_WRITE_TIMEOUT";
 					this.closeSession(subscriber.sessionId, "relay write timeout");
 					break;
 				}
-				const outcome = subscriber.sink.trySend(item.bytes);
+				const outcome = subscriber.sink.trySendDelivery(item.bytes);
 				if (outcome === "would-block") break;
 				if (outcome === "closed") {
 					subscriber.faultCode = "SUBSCRIBER_DISCONNECTED";
@@ -1374,7 +1591,7 @@ export class FanoutRelay {
 					break;
 				}
 				this.dropHead(subscriber);
-				if (!item.warmup) {
+				if (item.kind === "delivery" && !item.warmup) {
 					this.writesCompleted[item.originWindowIndex] =
 						(this.writesCompleted[item.originWindowIndex] ?? 0) + 1;
 					this.writeBytes[item.originWindowIndex] =
@@ -1708,14 +1925,9 @@ export class FanoutRelay {
 		return null;
 	}
 
-	private estimateDeliveryBytes(frame: FanoutDataV1): number {
-		const probe: FanoutWireV1 = {
-			...frame,
-			direction: "relay-to-subscriber",
-			subscriberId: "subscriber-999999",
-			linuxAcceptedOrdinal: 0,
-		};
-		return bytesOfCanonical(probe).byteLength;
+	/** Every delivery of a cell is one compact unit of exactly this size. */
+	private estimateDeliveryBytes(): number {
+		return fanoutDeliveryUnitBytes(this.config.messageBytes);
 	}
 
 	private activeSessions(): RelaySession[] {
