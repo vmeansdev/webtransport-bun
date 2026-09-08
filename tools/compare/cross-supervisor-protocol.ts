@@ -131,7 +131,8 @@ export type CampaignFailureCode =
 	| "MEASUREMENT_WINDOW"
 	| "RELAY_DELIVERY"
 	| "CHILD_LIFECYCLE"
-	| "RUNTIME_RESOURCE_EXHAUSTION";
+	| "RUNTIME_RESOURCE_EXHAUSTION"
+	| "DELIVERY_CONTEXT_MISMATCH";
 
 export type RemoteSupervisorRefusalCode =
 	| CampaignRefusalCode
@@ -162,6 +163,7 @@ export const CAMPAIGN_FAILURE_CODES = [
 	"RELAY_DELIVERY",
 	"CHILD_LIFECYCLE",
 	"RUNTIME_RESOURCE_EXHAUSTION",
+	"DELIVERY_CONTEXT_MISMATCH",
 ] as const satisfies readonly CampaignFailureCode[];
 
 export const STAGED_MAC_PUBLIC_KEY_LEAF = "mac-supervisor-ed25519.pub" as const;

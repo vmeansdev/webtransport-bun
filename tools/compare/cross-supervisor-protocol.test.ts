@@ -652,7 +652,7 @@ describe("cross-supervisor-protocol A2", () => {
 			}).ok,
 		).toBe(false);
 		expect(CAMPAIGN_REFUSAL_CODES.length).toBe(3);
-		expect(CAMPAIGN_FAILURE_CODES.length).toBe(18);
+		expect(CAMPAIGN_FAILURE_CODES.length).toBe(19);
 	});
 
 	test("rejects_illegal_remote_status_code_pair", () => {

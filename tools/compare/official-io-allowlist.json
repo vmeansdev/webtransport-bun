@@ -50,7 +50,8 @@
 		"child-pipe-protocol.ts",
 		"server-observation-artifact.ts",
 		"cohort-protocol.ts",
-		"scenarios/fanout-wire.ts"
+		"scenarios/fanout-wire.ts",
+		"scenarios/fanout-delivery.ts"
 	],
 	"controllerOnlyTs": [
 		"host-sidecar.ts",

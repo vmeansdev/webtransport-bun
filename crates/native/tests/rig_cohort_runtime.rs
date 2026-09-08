@@ -2772,7 +2772,7 @@ fn a_rig_refusal_names_a_section_7_code() {
             refusal.code(),
         );
     }
-    assert_eq!(SECTION_7_CODES.len(), 21);
+    assert_eq!(SECTION_7_CODES.len(), 22);
     // The shape refusals are the six the gate mapped; pinned by value so a
     // later edit cannot quietly reintroduce the `TRUST_RECORD_*` vocabulary.
     assert_eq!(CohortRefusal::Malformed.code(), "TRUST_PROTOCOL");

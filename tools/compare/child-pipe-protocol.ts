@@ -1584,6 +1584,7 @@ export const PHASE_B_ROLE_CHILD_SCHEMAS = [
 	"role-partial-accepted/v1",
 	"role-exit/v1",
 	"role-exited/v1",
+	"role-failed/v1",
 ] as const;
 
 export type RoleChildSchema = (typeof PHASE_B_ROLE_CHILD_SCHEMAS)[number];

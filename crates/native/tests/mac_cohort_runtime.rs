@@ -2107,7 +2107,7 @@ fn a_mac_refusal_names_a_section_7_code() {
             refusal.code(),
         );
     }
-    assert_eq!(SECTION_7_CODES.len(), 21);
+    assert_eq!(SECTION_7_CODES.len(), 22);
 }
 
 // --- Phase A in the binary (§2.9(2c), C2) ------------------------------------

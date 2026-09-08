@@ -17,10 +17,12 @@ import { createHash } from "node:crypto";
 import {
 	bytesOfCanonical,
 	fromBase64,
+	isCampaignFailureCode,
 	parseMacReceiptSignature,
 	sha256CanonicalRecord,
 	verifyMacReceiptSignature,
 	type Base64,
+	type CampaignFailureCode,
 	type CrossSupervisorExecutionV1,
 	type MacReceiptSignatureV1,
 	type NsString,
@@ -45,6 +47,13 @@ export const COHORT_PROTOCOL_FAILURE_CODE = "COHORT_PROTOCOL" as const;
 export const COHORT_NOT_READY_FAILURE_CODE = "COHORT_NOT_READY" as const;
 /** Warmup was vacuous, mispaced, mis-bound, or incompletely reported. */
 export const WARMUP_PROTOCOL_FAILURE_CODE = "WARMUP_PROTOCOL" as const;
+/**
+ * The delivery channel did not carry what admission promised: a delivery
+ * context the worker's own recompute refuses, a compact frame with no context
+ * for its tag, or a JSON data frame where only compact frames may travel.
+ */
+export const DELIVERY_CONTEXT_MISMATCH_FAILURE_CODE =
+	"DELIVERY_CONTEXT_MISMATCH" as const;
 
 // ---------------------------------------------------------------------------
 // Caps and fixed schedule constants (exact plan values)
@@ -3666,6 +3675,79 @@ export function parseRoleExited(value: unknown): ProtocolResult<RoleExitedV1> {
 	const capped = childFrameWithinCap(value);
 	if (!capped.ok) return capped;
 	return { ok: true, value: value as unknown as RoleExitedV1 };
+}
+
+/**
+ * A role child's own account of why it is about to exit non-zero (§4.3 as
+ * amended by the physical-budget amendment D2). Without it the supervisor
+ * only ever sees the pipe close and files the arm under a channel code; with
+ * it the closed `CampaignFailureCode` the child refused on reaches the seal.
+ */
+export interface RoleFailedV1 {
+	readonly schema: "role-failed/v1";
+	readonly sequence: number;
+	readonly executionSha256: Sha256Hex;
+	readonly childId: string;
+	readonly code: CampaignFailureCode;
+	readonly message: string;
+}
+
+const ROLE_FAILED_KEYS = [
+	"childId",
+	"code",
+	"executionSha256",
+	"message",
+	"schema",
+	"sequence",
+] as const;
+
+/** The longest message a role-failed frame carries; `isNonEmptyString`'s bound. */
+export const ROLE_FAILED_MESSAGE_MAX_CHARS = 512;
+
+export function parseRoleFailed(value: unknown): ProtocolResult<RoleFailedV1> {
+	if (!isPlainObject(value) || !exactKeys(value, ROLE_FAILED_KEYS)) {
+		return cohortFail("role failed keys");
+	}
+	if (
+		value.schema !== "role-failed/v1" ||
+		!isSafeNonNegInt(value.sequence) ||
+		!isHex64(value.executionSha256) ||
+		!isNonEmptyString(value.childId) ||
+		typeof value.code !== "string" ||
+		!isCampaignFailureCode(value.code) ||
+		!isNonEmptyString(value.message)
+	) {
+		return cohortFail("role failed fields");
+	}
+	const capped = childFrameWithinCap(value);
+	if (!capped.ok) return capped;
+	return { ok: true, value: value as unknown as RoleFailedV1 };
+}
+
+/**
+ * Build the frame a child sends before exiting non-zero. The code is the
+ * load-bearing part, so a message longer than the frame admits is clipped
+ * rather than refused: a child must always be able to name its refusal. The
+ * result is also typed as a plain record so it goes straight into the pipe.
+ */
+export function buildRoleFailed(args: {
+	readonly executionSha256: Sha256Hex;
+	readonly childId: string;
+	readonly code: CampaignFailureCode;
+	readonly message: string;
+}): RoleFailedV1 & Rec {
+	const message =
+		args.message.length === 0
+			? args.code
+			: args.message.slice(0, ROLE_FAILED_MESSAGE_MAX_CHARS);
+	return {
+		schema: "role-failed/v1",
+		sequence: 0,
+		executionSha256: args.executionSha256,
+		childId: args.childId,
+		code: args.code,
+		message,
+	};
 }
 
 // ---------------------------------------------------------------------------
