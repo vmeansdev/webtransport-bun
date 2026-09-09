@@ -65,6 +65,18 @@ import {
 export const SERVER_AGGREGATE_LABEL =
 	"aggregate receive-loop work over Linux baseline-to-capture window; transparency only; may exceed 1x window";
 
+/**
+ * One arm's own topology/impairment/cleanup sidecar digests.  A cohort pair
+ * records these per execution and pairs on its signed identity instead, so
+ * the report prints each arm's digests rather than asserting they agree.
+ */
+function renderRawSidecarDigests(artifact: RunArtifact): string {
+	const digests = artifact.rawSidecarDigests;
+	const shown = (name: "topology" | "impairment" | "cleanup"): string =>
+		typeof digests?.[name] === "string" ? digests[name] : "-";
+	return `- Raw sidecar digests (this execution's own): topology ${shown("topology")}, impairment ${shown("impairment")}, cleanup ${shown("cleanup")}`;
+}
+
 /** §6 report rule 1: one unattested primary arm caveats the whole document. */
 export const INCOMPLETE_ATTESTATION_CAVEAT =
 	"INCOMPLETE ATTESTATION: this report includes at least one primary arm with no complete attestation evidence. No ranking or capacity statement in it is attested.";
@@ -697,6 +709,7 @@ function renderFromFlats(args: {
 				"",
 				`- p50: ${artifact.metrics?.percentiles?.p50 ?? "-"} ${contract?.unit ?? "?"}`,
 				`- serverAggregate: ${SERVER_AGGREGATE_LABEL}`,
+				renderRawSidecarDigests(artifact),
 				...renderArmAccounting(
 					armAccountingFromArtifact({ cellId, armKind: "primary", artifact }),
 				),
