@@ -19,7 +19,10 @@ import {
 	STAGED_SERVER_TLS_PRIVATE_KEY_LEAF,
 	stagedServerLaunchRecordProfile,
 } from "../cohort-protocol.ts";
-import type { Sha256Hex } from "../cross-supervisor-protocol.ts";
+import {
+	externalTrustBoundSha256,
+	type Sha256Hex,
+} from "../cross-supervisor-protocol.ts";
 import { parseServerArgs } from "../server.ts";
 import {
 	assertKnownSubcommand,
@@ -165,6 +168,11 @@ describe("stage-live-campaign", () => {
 		});
 		expect(receipt.fanoutRoleEntrypointSha256).toBeNull();
 		expect(receipt.externalTrustBoundSha256).toMatch(/^[0-9a-f]{64}$/);
+		// The fixture's bound is the live encoder over the fixture's own
+		// digests, so a verifier recomputing it from this receipt lands on it.
+		expect(receipt.externalTrustBoundSha256).toBe(
+			externalTrustBoundSha256(receipt),
+		);
 	});
 
 	it("live_mint_records_match_rust_exact_field_sets", () => {
@@ -947,6 +955,14 @@ describe("frozen run wrapper argv", () => {
 			expect(rig!.endsWith("/staging-root/rig-supervisor-ed25519.pub")).toBe(
 				true,
 			);
+			// The stage receipt beside them is what lets the verifier recompute
+			// the frozen external trust bound; without it no seal is promotable.
+			const receipt = success.find((arg) => arg.startsWith("--stage-receipt="));
+			expect(receipt).toBeDefined();
+			expect(receipt!.endsWith("/stage-receipt.json")).toBe(true);
+			expect(receipt!.slice("--stage-receipt=".length)).toBe(
+				`${mac!.slice("--mac-public-key=".length, -"/staging-root/mac-supervisor-ed25519.pub".length)}/stage-receipt.json`,
+			);
 			// The integrity attempt proves bytes only; it must not claim to have
 			// opened a signature graph it is not allowed to conclude anything from.
 			const integrity = verifyIndexInvocations(run.bun)[1]!;
@@ -954,6 +970,9 @@ describe("frozen run wrapper argv", () => {
 				false,
 			);
 			expect(integrity.some((arg) => arg.startsWith("--rig-public-key="))).toBe(
+				false,
+			);
+			expect(integrity.some((arg) => arg.startsWith("--stage-receipt="))).toBe(
 				false,
 			);
 		}

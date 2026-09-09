@@ -40,6 +40,7 @@ import {
 	STAGED_SERVER_TLS_PRIVATE_KEY_LEAF,
 } from "../cohort-protocol.ts";
 import {
+	externalTrustBoundSha256,
 	generateEd25519KeyPair,
 	type Sha256Hex,
 } from "../cross-supervisor-protocol.ts";
@@ -854,15 +855,20 @@ export function buildMinimalStageReceipt(input: {
 }): LiveStageReceiptV1 {
 	const H = (label: string) => sha256Bytes(label);
 	const fanout = input.profile === "phase-a" ? null : H("fanout-role.ts");
-	const externalTrustBoundSha256 = sha256Bytes(
-		canonicalJson({
-			schema: "external-trust-bound/v1",
-			candidate: input.candidate,
-			campaignId: input.campaignId,
-			macSigningPublicKeySha256: input.macPublicKeySha256,
-			rigSigningPublicKeySha256: input.rigPublicKeySha256,
-		}),
-	);
+	// The same encoder the live mint uses, over this receipt's own digests, so
+	// a verifier that recomputes the bound from a fixture receipt lands on it.
+	const externalTrustBound = externalTrustBoundSha256({
+		candidate: input.candidate,
+		campaignId: input.campaignId,
+		authoritySha256: H("authority"),
+		capabilitySha256: H("capability"),
+		lockSha256: H("lock"),
+		archiveSha256: H("archive"),
+		macSigningPublicKeySha256: input.macPublicKeySha256,
+		rigSigningPublicKeySha256: input.rigPublicKeySha256,
+		macDirectoryIdentitySha256: H("mac-dir"),
+		linuxDirectoryIdentitySha256: H("linux-dir"),
+	});
 	const launchDigests = {} as Record<
 		"ws" | "wt",
 		Partial<Record<ServerMode, Sha256Hex>>
@@ -913,7 +919,7 @@ export function buildMinimalStageReceipt(input: {
 		rigSigningKeyLeaseSha256: H("lease"),
 		macDirectoryIdentitySha256: H("mac-dir"),
 		linuxDirectoryIdentitySha256: H("linux-dir"),
-		externalTrustBoundSha256,
+		externalTrustBoundSha256: externalTrustBound,
 		issuedAtMs: input.issuedAtMs,
 		notAfterMs: input.notAfterMs,
 	};
@@ -2431,21 +2437,18 @@ async function runMint(argv: readonly string[]): Promise<number> {
 		canonicalJson(macStagingIdentity),
 	);
 	const linuxDirectoryIdentitySha256 = linuxObservation.directoryIdentitySha256;
-	const externalTrustBoundSha256 = sha256Bytes(
-		canonicalJson({
-			schema: "external-trust-bound/v1",
-			candidate,
-			campaignId,
-			authoritySha256,
-			capabilitySha256,
-			lockSha256,
-			archiveSha256: archiveMeta.archiveSha256,
-			macSigningPublicKeySha256: macPubSha,
-			rigSigningPublicKeySha256: rigPubSha,
-			macDirectoryIdentitySha256,
-			linuxDirectoryIdentitySha256,
-		}),
-	);
+	const externalTrustBound = externalTrustBoundSha256({
+		candidate,
+		campaignId,
+		authoritySha256,
+		capabilitySha256,
+		lockSha256,
+		archiveSha256: archiveMeta.archiveSha256,
+		macSigningPublicKeySha256: macPubSha,
+		rigSigningPublicKeySha256: rigPubSha,
+		macDirectoryIdentitySha256,
+		linuxDirectoryIdentitySha256,
+	});
 
 	const receipt: LiveStageReceiptV1 = {
 		schema: "live-stage-receipt/v1",
@@ -2487,7 +2490,7 @@ async function runMint(argv: readonly string[]): Promise<number> {
 		rigSigningKeyLeaseSha256: leaseSha,
 		macDirectoryIdentitySha256,
 		linuxDirectoryIdentitySha256,
-		externalTrustBoundSha256,
+		externalTrustBoundSha256: externalTrustBound,
 		issuedAtMs,
 		notAfterMs,
 	};
@@ -2499,9 +2502,7 @@ async function runMint(argv: readonly string[]): Promise<number> {
 	process.stdout.write(`CAPABILITY_SHA256=${capabilitySha256}\n`);
 	process.stdout.write(`LOCK_SHA256=${lockSha256}\n`);
 	process.stdout.write(`ARCHIVE_SHA256=${archiveMeta.archiveSha256}\n`);
-	process.stdout.write(
-		`EXTERNAL_TRUST_BOUND_SHA256=${externalTrustBoundSha256}\n`,
-	);
+	process.stdout.write(`EXTERNAL_TRUST_BOUND_SHA256=${externalTrustBound}\n`);
 	process.stdout.write("MINT_OK\n");
 	return 0;
 }

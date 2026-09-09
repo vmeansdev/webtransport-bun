@@ -169,6 +169,55 @@ export const CAMPAIGN_FAILURE_CODES = [
 export const STAGED_MAC_PUBLIC_KEY_LEAF = "mac-supervisor-ed25519.pub" as const;
 export const STAGED_RIG_PUBLIC_KEY_LEAF = "rig-supervisor-ed25519.pub" as const;
 
+export const EXTERNAL_TRUST_BOUND_SCHEMA = "external-trust-bound/v1" as const;
+
+/**
+ * What the stage tool binds a campaign to when it mints
+ * `externalTrustBoundSha256`: the candidate and campaign, the three staged
+ * records, the source archive, both supervisors' signing leaves, and the
+ * directory identity observed on each host. The frozen run command carries
+ * the digest to the index verifier, which recomputes it from the campaign
+ * index, the staged leaves it is handed and the stage receipt -- so the one
+ * encoder below is the only place this preimage is spelled out.
+ */
+export interface ExternalTrustBoundPreimageV1 {
+	readonly candidate: string;
+	readonly campaignId: string;
+	readonly authoritySha256: Sha256Hex;
+	readonly capabilitySha256: Sha256Hex;
+	readonly lockSha256: Sha256Hex;
+	readonly archiveSha256: Sha256Hex;
+	readonly macSigningPublicKeySha256: Sha256Hex;
+	readonly rigSigningPublicKeySha256: Sha256Hex;
+	readonly macDirectoryIdentitySha256: Sha256Hex;
+	readonly linuxDirectoryIdentitySha256: Sha256Hex;
+}
+
+export const EXTERNAL_TRUST_BOUND_PREIMAGE_FIELDS = [
+	"candidate",
+	"campaignId",
+	"authoritySha256",
+	"capabilitySha256",
+	"lockSha256",
+	"archiveSha256",
+	"macSigningPublicKeySha256",
+	"rigSigningPublicKeySha256",
+	"macDirectoryIdentitySha256",
+	"linuxDirectoryIdentitySha256",
+] as const satisfies readonly (keyof ExternalTrustBoundPreimageV1)[];
+
+export function externalTrustBoundSha256(
+	preimage: ExternalTrustBoundPreimageV1,
+): Sha256Hex {
+	const record: Record<string, string> = {
+		schema: EXTERNAL_TRUST_BOUND_SCHEMA,
+	};
+	for (const field of EXTERNAL_TRUST_BOUND_PREIMAGE_FIELDS) {
+		record[field] = preimage[field];
+	}
+	return sha256HexOfBytes(new TextEncoder().encode(canonicalJson(record)));
+}
+
 export const PHASE_A_DECLARED_MESSAGE_COUNT = 1600;
 export const PHASE_A_DECLARED_MESSAGE_BYTES = 104_857_600;
 

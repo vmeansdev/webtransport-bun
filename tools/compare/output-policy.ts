@@ -38,6 +38,7 @@ export const EMPTY_SHA256 = EMPTY_INPUT_SHA256;
 
 /** Sentinel used by the pre-quarantine producer for uncollected sidecars. */
 export const ALL_F_SENTINEL_SHA256 = "f".repeat(64);
+const SHA256_HEX = /^[0-9a-f]{64}$/;
 
 /**
  * The identity `evidence.ts` publishes for a toolchain nobody looked at.
@@ -81,6 +82,7 @@ export type OutputPolicyRejectionCode =
 	| "OUTPUT_TRUST_BOUNDARY_UNANCHORED"
 	| "EXTERNAL_TRUST_BOUND_MISSING"
 	| "EXTERNAL_TRUST_BOUND_UNVALIDATED"
+	| "EXTERNAL_TRUST_BOUND_MISMATCH"
 	| "COMPARISON_ID_MISSING"
 	| "COMPARISON_ID_MISMATCH"
 	| "ARTIFACT_NOT_MEASURED"
@@ -120,16 +122,31 @@ export interface ComparisonOutputFileInput extends ComparisonOutputPathInput {
 	readonly outputFile?: string;
 }
 
+/**
+ * The verifier's proof that `externalTrustBound` is the digest of the staged
+ * material and not a marker: the bound it was handed, the bound it recomputed
+ * with the stage tool's own encoder, and how. The quarantine lifts
+ * `EXTERNAL_TRUST_BOUND_UNVALIDATED` only when the two digests and the bound
+ * are one value; anything less is a marker wearing a validation's name.
+ */
+export interface ExternalTrustBoundValidation {
+	readonly sha256: string;
+	readonly recomputedSha256: string;
+	readonly method: string;
+}
+
 export interface PromotionQuarantineInput {
 	readonly artifact: unknown;
 	/** The campaign identity bound to the containing official output directory. */
 	readonly expectedComparisonId?: unknown;
 	/**
-	 * An opaque marker supplied by the external run/lock authority.  R0 does
-	 * not define or validate its schema, so every supplied marker remains
-	 * quarantined until the R1 evidence contract owns that validation.
+	 * The `external-trust-bound/v1` digest the frozen run command carries. On
+	 * its own it is opaque: without `externalTrustBoundValidation` every
+	 * supplied marker stays quarantined, however well-formed.
 	 */
 	readonly externalTrustBound?: unknown;
+	/** Present only when a verifier recomputed the bound; absent means unvalidated. */
+	readonly externalTrustBoundValidation?: ExternalTrustBoundValidation;
 }
 
 export interface PromotionQuarantineResult {
@@ -708,6 +725,7 @@ export function checkPromotionQuarantine(
 		}
 	}
 
+	const validation = input.externalTrustBoundValidation;
 	if (!isNonEmptyString(input.externalTrustBound))
 		addReason(
 			reasons,
@@ -715,11 +733,27 @@ export function checkPromotionQuarantine(
 			"externalTrustBound is required before evidence can be promoted",
 			"$.externalTrustBound",
 		);
-	else
+	else if (
+		validation === undefined ||
+		!isNonEmptyString(validation.sha256) ||
+		!isNonEmptyString(validation.recomputedSha256) ||
+		!isNonEmptyString(validation.method)
+	)
 		addReason(
 			reasons,
 			"EXTERNAL_TRUST_BOUND_UNVALIDATED",
-			"externalTrustBound is opaque until the external run/lock schema validates it",
+			"externalTrustBound is opaque until a verifier recomputes it from the staged material",
+			"$.externalTrustBound",
+		);
+	else if (
+		!SHA256_HEX.test(validation.sha256) ||
+		validation.sha256 !== validation.recomputedSha256 ||
+		validation.sha256 !== input.externalTrustBound
+	)
+		addReason(
+			reasons,
+			"EXTERNAL_TRUST_BOUND_MISMATCH",
+			"externalTrustBound is not the bound recomputed from the staged material",
 			"$.externalTrustBound",
 		);
 	if (!isNonEmptyString(input.expectedComparisonId))

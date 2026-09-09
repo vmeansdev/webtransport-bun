@@ -319,6 +319,87 @@ describe("promotion quarantine", () => {
 		});
 
 		expect(result.promotable).toBe(false);
+		expect(result.reasons.map(({ code }) => code)).toContain(
+			"EXTERNAL_TRUST_BOUND_UNVALIDATED",
+		);
+	});
+
+	test("promotes when the verifier's recomputation equals the bound", () => {
+		const bound = "9".repeat(64);
+		const result = checkPromotionQuarantine({
+			artifact: validEvidence(),
+			expectedComparisonId: "comparison-live",
+			externalTrustBound: bound,
+			externalTrustBoundValidation: {
+				sha256: bound,
+				recomputedSha256: bound,
+				method: "external-trust-bound/v1 recomputed in a unit test",
+			},
+		});
+
+		expect(result.reasons).toEqual([]);
+		expect(result.promotable).toBe(true);
+	});
+
+	test.each([
+		[
+			"a recomputation that disagrees with the bound",
+			{
+				sha256: "9".repeat(64),
+				recomputedSha256: "8".repeat(64),
+				method: "external-trust-bound/v1",
+			},
+			"9".repeat(64),
+		],
+		[
+			"a validation minted for another bound",
+			{
+				sha256: "8".repeat(64),
+				recomputedSha256: "8".repeat(64),
+				method: "external-trust-bound/v1",
+			},
+			"9".repeat(64),
+		],
+		[
+			"a validation whose digests are not sha-256 hex",
+			{
+				sha256: "trust-bound-1",
+				recomputedSha256: "trust-bound-1",
+				method: "external-trust-bound/v1",
+			},
+			"trust-bound-1",
+		],
+	] as const)("refuses %s", (_label, validation, bound) => {
+		const result = checkPromotionQuarantine({
+			artifact: validEvidence(),
+			expectedComparisonId: "comparison-live",
+			externalTrustBound: bound,
+			externalTrustBoundValidation: validation,
+		});
+
+		expect(result.promotable).toBe(false);
+		expect(result.reasons.map(({ code }) => code)).toEqual([
+			"EXTERNAL_TRUST_BOUND_MISMATCH",
+		]);
+	});
+
+	test("a validation that names no method leaves the bound unvalidated", () => {
+		const bound = "9".repeat(64);
+		const result = checkPromotionQuarantine({
+			artifact: validEvidence(),
+			expectedComparisonId: "comparison-live",
+			externalTrustBound: bound,
+			externalTrustBoundValidation: {
+				sha256: bound,
+				recomputedSha256: bound,
+				method: "",
+			},
+		});
+
+		expect(result.promotable).toBe(false);
+		expect(result.reasons.map(({ code }) => code)).toEqual([
+			"EXTERNAL_TRUST_BOUND_UNVALIDATED",
+		]);
 	});
 
 	test("rejects an artifact whose comparison ID is from another campaign", () => {

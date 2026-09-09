@@ -562,12 +562,17 @@ run_measured_campaign() {
     # both, the verifier parses the attestation records and verifies no signature
     # over them, which is a count check wearing a trust check's name. They are the
     # same leaves the pre-run gate above digest-checks against the stage receipt.
+    # The stage receipt is what makes the external trust bound checkable: the
+    # verifier recomputes the bound from the index's anchors, these two leaves and
+    # the receipt's remaining digests, and a promotable seal is accepted only when
+    # the recomputation equals the digest frozen above.
     "$MAC_BUN" "$REPO/tools/compare/bin/verify-campaign-index.ts" \
       --campaign-root="$OUT" \
       --index="$OUT/campaign-index.json" \
       --external-trust-bound-sha256="$EXTERNAL_TRUST_BOUND_SHA256" \
       --mac-public-key="$MAC_TRUST/staging-root/mac-supervisor-ed25519.pub" \
       --rig-public-key="$MAC_TRUST/staging-root/rig-supervisor-ed25519.pub" \
+      --stage-receipt="$MAC_TRUST/stage-receipt.json" \
       --expected-pass-count="$EXPECTED_PASS" \
       --expected-fail-count=0 \
       --expected-refused-count=0 \

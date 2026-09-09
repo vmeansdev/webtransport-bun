@@ -9,11 +9,19 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { sha256Canonical } from "../canonical.ts";
+import { canonicalJson, sha256Canonical } from "../canonical.ts";
 import { mintPhaseAAttestationFixture } from "../cohort-fixture-signing.ts";
 import { sealRunArtifact } from "../compare.ts";
+import {
+	type ExternalTrustBoundPreimageV1,
+	externalTrustBoundSha256,
+	generateEd25519KeyPair,
+} from "../cross-supervisor-protocol.ts";
 import { FANOUT_COHORT_CELL_IDS, type RunArtifact } from "../evidence.ts";
-import type { AttestationTrustMaterial } from "../server-observation-artifact.ts";
+import {
+	type AttestationTrustMaterial,
+	publicKeySha256,
+} from "../server-observation-artifact.ts";
 import {
 	CAMPAIGN_INDEX_V2_SCHEMA,
 	type CampaignIndexEntryV2,
@@ -21,6 +29,7 @@ import {
 	checkExpectedTotals,
 	main,
 	parseVerifyCampaignIndexArgs,
+	validateExternalTrustBound,
 	validateIndexEntryConsistency,
 	verifyCampaignIndex,
 } from "./verify-campaign-index.ts";
@@ -454,7 +463,11 @@ function writeIndex(root: string, index: CampaignIndexV2): string {
 	return indexPath;
 }
 
-function expectRejection(result: ReturnType<typeof verifyCampaignIndex>): {
+function expectRejection(
+	result:
+		| { readonly ok: true }
+		| { readonly ok: false; readonly code: string; readonly message: string },
+): {
 	readonly code: string;
 	readonly message: string;
 } {
@@ -1203,6 +1216,7 @@ describe("verify-campaign-index argv parser", () => {
 			`--external-trust-bound-sha256=${TRUST_BOUND}`,
 			"--mac-public-key=/tmp/mac.key",
 			"--rig-public-key=/tmp/rig.key",
+			"--stage-receipt=/tmp/stage-receipt.json",
 			"--integrity-only",
 			"--expect-canonical-fanout-complete",
 		]);
@@ -1210,6 +1224,7 @@ describe("verify-campaign-index argv parser", () => {
 		if (!parsed.ok) throw new Error("expected ok");
 		expect(parsed.args.macPublicKeyPath).toBe("/tmp/mac.key");
 		expect(parsed.args.rigPublicKeyPath).toBe("/tmp/rig.key");
+		expect(parsed.args.stageReceiptPath).toBe("/tmp/stage-receipt.json");
 		expect(parsed.args.integrityOnly).toBe(true);
 		expect(parsed.args.expectCanonicalFanoutComplete).toBe(true);
 	});
@@ -1748,5 +1763,292 @@ describe("verify-campaign-index expected totals", () => {
 				reconstruction: reconstruction({ delivered: 1_000 }),
 			}),
 		).toEqual({ ok: true });
+	});
+});
+
+/**
+ * A stage receipt the way the stage tool writes one -- canonical bytes plus a
+ * newline -- carrying every field the bound is minted over and the bound
+ * itself, alongside two raw 32-byte leaves the receipt's leaf digests name.
+ */
+function stagedTrust(
+	root: string,
+	options: {
+		readonly preimage?: Partial<ExternalTrustBoundPreimageV1>;
+		readonly receipt?: Record<string, unknown>;
+		readonly omit?: readonly string[];
+	} = {},
+): {
+	readonly receiptPath: string;
+	readonly macPublicKeyPath: string;
+	readonly rigPublicKeyPath: string;
+	readonly preimage: ExternalTrustBoundPreimageV1;
+	readonly bound: string;
+} {
+	// Beside the campaign root, never inside it: a stray `.json` at the root
+	// is a flat to the verifier.
+	const trust = mkdtempSync(join(root, "trust-"));
+	const mac = generateEd25519KeyPair().publicRaw32;
+	const rig = generateEd25519KeyPair().publicRaw32;
+	const macPublicKeyPath = join(trust, "mac-supervisor-ed25519.pub");
+	const rigPublicKeyPath = join(trust, "rig-supervisor-ed25519.pub");
+	writeFileSync(macPublicKeyPath, mac);
+	writeFileSync(rigPublicKeyPath, rig);
+	const preimage: ExternalTrustBoundPreimageV1 = {
+		candidate: "a".repeat(40),
+		campaignId: "c",
+		authoritySha256: sha256Canonical("authority"),
+		capabilitySha256: "3".repeat(64),
+		lockSha256: sha256Canonical("lock"),
+		archiveSha256: "5".repeat(64),
+		macSigningPublicKeySha256: publicKeySha256(mac),
+		rigSigningPublicKeySha256: publicKeySha256(rig),
+		macDirectoryIdentitySha256: sha256Canonical("mac-dir"),
+		linuxDirectoryIdentitySha256: sha256Canonical("linux-dir"),
+		...options.preimage,
+	};
+	const bound = externalTrustBoundSha256(preimage);
+	const receipt: Record<string, unknown> = {
+		schema: "live-stage-receipt/v1",
+		...preimage,
+		externalTrustBoundSha256: bound,
+		...options.receipt,
+	};
+	for (const field of options.omit ?? []) delete receipt[field];
+	const receiptPath = join(trust, "stage-receipt.json");
+	writeFileSync(receiptPath, `${canonicalJson(receipt)}\n`);
+	return { receiptPath, macPublicKeyPath, rigPublicKeyPath, preimage, bound };
+}
+
+describe("verify-campaign-index external trust bound", () => {
+	// The bound the frozen command carries was, until this suite, a digest the
+	// verifier handed to the quarantine and never recomputed -- so no
+	// promotable entry could pass. The verifier now recomputes it with the
+	// stage tool's encoder from the index, the leaves and the stage receipt.
+	it("recomputes_the_bound_from_the_index_the_leaves_and_the_receipt", () => {
+		const root = mkdtempSync(join(tmpdir(), "vci-bound-"));
+		const staged = stagedTrust(root);
+		const result = validateExternalTrustBound({
+			stageReceiptPath: staged.receiptPath,
+			externalTrustBoundSha256: staged.bound,
+			index: indexOf(),
+			macPublicKeySha256: staged.preimage.macSigningPublicKeySha256,
+			rigPublicKeySha256: staged.preimage.rigSigningPublicKeySha256,
+		});
+		expect(result).toEqual({
+			ok: true,
+			validation: {
+				sha256: staged.bound,
+				recomputedSha256: staged.bound,
+				method:
+					"external-trust-bound/v1 recomputed from the campaign index, the staged public leaves and the stage receipt",
+			},
+		});
+	});
+
+	it("names_a_receipt_field_the_verifier_holds_differently", () => {
+		for (const [field, index, leaf] of [
+			["candidate", indexOf({ candidate: "b".repeat(40) }), undefined],
+			["campaignId", indexOf({ campaignId: "other" }), undefined],
+			[
+				"capabilitySha256",
+				indexOf({ stagedCapabilitySha256: "4".repeat(64) }),
+				undefined,
+			],
+			[
+				"archiveSha256",
+				indexOf({ sourceArchiveSha256: "6".repeat(64) }),
+				undefined,
+			],
+			["macSigningPublicKeySha256", indexOf(), "mac"],
+			["rigSigningPublicKeySha256", indexOf(), "rig"],
+		] as const) {
+			const root = mkdtempSync(join(tmpdir(), "vci-bound-held-"));
+			const staged = stagedTrust(root);
+			const other = publicKeySha256(generateEd25519KeyPair().publicRaw32);
+			const bad = expectRejection(
+				validateExternalTrustBound({
+					stageReceiptPath: staged.receiptPath,
+					externalTrustBoundSha256: staged.bound,
+					index,
+					macPublicKeySha256:
+						leaf === "mac" ? other : staged.preimage.macSigningPublicKeySha256,
+					rigPublicKeySha256:
+						leaf === "rig" ? other : staged.preimage.rigSigningPublicKeySha256,
+				}),
+			);
+			expect(bad.code).toBe("EXTERNAL_TRUST_BOUND_MISMATCH");
+			expect(bad.message).toContain(`stage receipt ${field}`);
+		}
+	});
+
+	it("names_a_receipt_minted_for_another_bound", () => {
+		const root = mkdtempSync(join(tmpdir(), "vci-bound-other-"));
+		const staged = stagedTrust(root);
+		const bad = expectRejection(
+			validateExternalTrustBound({
+				stageReceiptPath: staged.receiptPath,
+				externalTrustBoundSha256: "9".repeat(64),
+				index: indexOf(),
+				macPublicKeySha256: staged.preimage.macSigningPublicKeySha256,
+				rigPublicKeySha256: staged.preimage.rigSigningPublicKeySha256,
+			}),
+		);
+		expect(bad.code).toBe("EXTERNAL_TRUST_BOUND_MISMATCH");
+		expect(bad.message).toContain("minted for bound");
+	});
+
+	it("refuses_a_receipt_whose_own_digests_do_not_reproduce_the_bound", () => {
+		// The receipt restates the bound it was minted with but one of the
+		// fields only it carries has moved: the recomputation is what catches it.
+		for (const field of [
+			"authoritySha256",
+			"lockSha256",
+			"macDirectoryIdentitySha256",
+			"linuxDirectoryIdentitySha256",
+		] as const) {
+			const root = mkdtempSync(join(tmpdir(), "vci-bound-flip-"));
+			const honest = stagedTrust(root);
+			const flipped = stagedTrust(root, {
+				preimage: { [field]: sha256Canonical(`flipped ${field}`) },
+				receipt: { externalTrustBoundSha256: honest.bound },
+			});
+			const bad = expectRejection(
+				validateExternalTrustBound({
+					stageReceiptPath: flipped.receiptPath,
+					externalTrustBoundSha256: honest.bound,
+					index: indexOf(),
+					macPublicKeySha256: flipped.preimage.macSigningPublicKeySha256,
+					rigPublicKeySha256: flipped.preimage.rigSigningPublicKeySha256,
+				}),
+			);
+			expect(bad.code).toBe("EXTERNAL_TRUST_BOUND_MISMATCH");
+			expect(bad.message).toContain("recomputed as");
+		}
+	});
+
+	it("refuses_a_receipt_that_is_absent_malformed_or_not_canonical", () => {
+		const root = mkdtempSync(join(tmpdir(), "vci-bound-bytes-"));
+		const staged = stagedTrust(root);
+		const verify = (path: string) =>
+			expectRejection(
+				validateExternalTrustBound({
+					stageReceiptPath: path,
+					externalTrustBoundSha256: staged.bound,
+					index: indexOf(),
+					macPublicKeySha256: staged.preimage.macSigningPublicKeySha256,
+					rigPublicKeySha256: staged.preimage.rigSigningPublicKeySha256,
+				}),
+			);
+		expect(verify(join(root, "missing.json")).message).toContain("absent");
+		expect(verify(root).message).toContain("not a regular file");
+		const pretty = join(root, "pretty.json");
+		writeFileSync(
+			pretty,
+			JSON.stringify(
+				JSON.parse(readFileSync(staged.receiptPath, "utf8")),
+				null,
+				2,
+			),
+		);
+		expect(verify(pretty).message).toContain("canonical bytes");
+		const missingField = stagedTrust(root, { omit: ["lockSha256"] });
+		expect(verify(missingField.receiptPath).message).toContain(
+			"lockSha256 is missing",
+		);
+		const wrongSchema = stagedTrust(root, { receipt: { schema: "other/v1" } });
+		expect(verify(wrongSchema.receiptPath).message).toContain(
+			"live-stage-receipt/v1",
+		);
+	});
+
+	it("a_canonical_index_claiming_promotion_without_the_receipt_is_refused_before_any_seal_opens", () => {
+		const root = mkdtempSync(join(tmpdir(), "vci-bound-claim-"));
+		const staged = stagedTrust(root);
+		const indexPath = writeIndex(
+			root,
+			indexOf({
+				executionPurpose: "canonical",
+				measuredRepetitions: 5,
+				cells: ["bulk-one-way/physical"],
+				scheduledMeasuredArms: 5,
+				entries: [
+					entry({
+						cellId: "bulk-one-way/physical",
+						armId: "bulk-one-way/physical/ws",
+						status: "PASS",
+						executionPurpose: "canonical",
+						repetitionTotal: 5,
+						promotable: true,
+						// Deliberately no seal: the refusal must land before the
+						// verifier looks for one.
+						sealedPath: null,
+					}),
+				],
+			}),
+		);
+		const bad = expectRejection(
+			verifyCampaignIndex({
+				campaignRoot: root,
+				indexPath,
+				externalTrustBoundSha256: staged.bound,
+				macPublicKeyPath: staged.macPublicKeyPath,
+				rigPublicKeyPath: staged.rigPublicKeyPath,
+			}),
+		);
+		expect(bad.code).toBe("EXTERNAL_TRUST_BOUND_UNVALIDATED");
+		expect(bad.message).toContain("--stage-receipt");
+		// The same claim under integrity-only is not a promotion claim.
+		const partial = verifyCampaignIndex({
+			campaignRoot: root,
+			indexPath,
+			externalTrustBoundSha256: staged.bound,
+			integrityOnly: true,
+		});
+		expect(partial.ok).toBe(false);
+		if (partial.ok) throw new Error("unreachable");
+		expect(partial.code).not.toBe("EXTERNAL_TRUST_BOUND_UNVALIDATED");
+	});
+
+	it("the_receipt_flag_needs_both_leaves", () => {
+		const root = mkdtempSync(join(tmpdir(), "vci-bound-leaves-"));
+		const staged = stagedTrust(root);
+		const indexPath = writeIndex(root, indexOf());
+		const bad = expectRejection(
+			verifyCampaignIndex({
+				campaignRoot: root,
+				indexPath,
+				externalTrustBoundSha256: staged.bound,
+				stageReceiptPath: staged.receiptPath,
+			}),
+		);
+		expect(bad.code).toBe("TRUST_PROTOCOL");
+		expect(bad.message).toContain("--stage-receipt needs");
+	});
+
+	it("a_supplied_receipt_is_checked_even_when_nothing_claims_promotion", () => {
+		const root = mkdtempSync(join(tmpdir(), "vci-bound-focused-"));
+		const staged = stagedTrust(root);
+		const indexPath = writeIndex(root, indexOf());
+		const bad = expectRejection(
+			verifyCampaignIndex({
+				campaignRoot: root,
+				indexPath,
+				externalTrustBoundSha256: "9".repeat(64),
+				macPublicKeyPath: staged.macPublicKeyPath,
+				rigPublicKeyPath: staged.rigPublicKeyPath,
+				stageReceiptPath: staged.receiptPath,
+			}),
+		);
+		expect(bad.code).toBe("EXTERNAL_TRUST_BOUND_MISMATCH");
+		const good = verifyCampaignIndex({
+			campaignRoot: root,
+			indexPath,
+			externalTrustBoundSha256: staged.bound,
+			macPublicKeyPath: staged.macPublicKeyPath,
+			rigPublicKeyPath: staged.rigPublicKeyPath,
+			stageReceiptPath: staged.receiptPath,
+		});
+		expect(good.ok).toBe(true);
 	});
 });
