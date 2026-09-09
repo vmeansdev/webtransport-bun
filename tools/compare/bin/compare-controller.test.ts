@@ -2934,3 +2934,350 @@ describe("controller-terminal/v1 derives its failure code from CAMPAIGN_FAILURE_
 		).toBe("CHILD_LIFECYCLE");
 	});
 });
+
+// ---------------------------------------------------------------------------
+// Promotion closes each seal's receipt graph against the staged leaves
+// ---------------------------------------------------------------------------
+
+import { sha256Canonical as sha256CanonicalP } from "../canonical.ts";
+import { sealRunArtifact as sealRunArtifactP } from "../compare.ts";
+import type { RunArtifact as RunArtifactP } from "../evidence.ts";
+import {
+	readStagedCohortMaterial as readStagedCohortMaterialP,
+	readStagedSigningLeaves,
+	resolveStagedSigningLeaves,
+	sealClosesReceiptGraph,
+} from "./compare-controller.ts";
+
+describe("promotion closes each seal's receipt graph against the staged leaves", () => {
+	// fanout-attested-r1 (2026-09-09): the controller's promotion verified
+	// every seal without the staged signing leaves, the verifier refused each
+	// export receipt it could not authenticate, and 53 PASS seals were filed
+	// under PROMOTION_RECEIPT_GRAPH_INCOMPLETE. The leaves are now read from
+	// the staged dir through the receipt's digests and handed to the same
+	// verification `verify-campaign-index` runs with `--mac-public-key` /
+	// `--rig-public-key`.
+	const CELL = "bulk-one-way/physical";
+	const CELL_SAFE = "bulk-one-way_physical";
+	const REPETITIONS = 5;
+
+	/** One canonical measured seal, fixture-signed, on the bulk cell. */
+	function attestedSeal(
+		transport: "ws" | "wt",
+		repetitionIndex: number,
+	): { readonly bytes: Uint8Array; readonly artifact: RunArtifactP } {
+		const artifact = JSON.parse(
+			readFileSync5(
+				join5(import.meta.dir, "..", "fixtures", `valid-${transport}-run.json`),
+				"utf8",
+			),
+		) as RunArtifactP & Record<string, unknown>;
+		artifact.artifactKind = "measured";
+		artifact.cohortEvidenceExport = null;
+		artifact.executionPurpose = "canonical";
+		artifact.repetitionKind = "measured";
+		artifact.repetitionIndex = repetitionIndex;
+		artifact.repetitionTotal = REPETITIONS;
+		artifact.promotable = true;
+		const fx = mintPhaseAAttestationFixture({
+			executionPurpose: "canonical",
+			repetitionKind: "measured",
+			repetitionIndex,
+			repetitionTotal: REPETITIONS,
+			transport,
+			cellId: CELL,
+			campaignId: artifact.comparisonId,
+			candidate: artifact.source.sourceSha,
+			runId: artifact.runId,
+		});
+		artifact.attestationEvidence = fx.attestation;
+		artifact.rawSidecarDigests = {
+			...artifact.rawSidecarDigests,
+			client: fx.observation.admittedClientSeriesSha256,
+			server: fx.observation.snapshotFrameSha256,
+		};
+		artifact.rawSidecarBindingSha256 = sha256CanonicalP({
+			comparisonId: artifact.comparisonId,
+			runId: artifact.runId,
+			transport: artifact.transport,
+			sourceBindingSha256: artifact.source.bindingSha256,
+			scenarioHash: artifact.scenario.scenarioHash,
+			metricContractHash: artifact.metricContractHash,
+			rawSidecarDigests: artifact.rawSidecarDigests,
+		});
+		const bytes = sealRunArtifactP(artifact);
+		return {
+			bytes,
+			artifact: JSON.parse(new TextDecoder().decode(bytes)) as RunArtifactP,
+		};
+	}
+
+	/** A staged dir holding exactly what promotion reads: receipt + leaves. */
+	function stagedLeavesDir(macKey: Uint8Array, rigKey: Uint8Array): string {
+		const stagedDir = mkdtempSync5(join5(tmpdir5(), "promotion-staged-"));
+		const stagingRootDir = join5(stagedDir, "staging-root");
+		mkdirSync5(stagingRootDir, { recursive: true });
+		writeFileSync5(join5(stagingRootDir, "mac-supervisor-ed25519.pub"), macKey);
+		writeFileSync5(join5(stagingRootDir, "rig-supervisor-ed25519.pub"), rigKey);
+		writeFileSync5(
+			join5(stagedDir, "stage-receipt.json"),
+			JSON.stringify({
+				schema: "live-stage-receipt/v1",
+				macSigningPublicKeySha256: sha256HexOfBytes(macKey),
+				rigSigningPublicKeySha256: sha256HexOfBytes(rigKey),
+			}),
+		);
+		return stagedDir;
+	}
+
+	/** A campaign root with the full paired canonical set, sealed. */
+	function sealedCampaign(): {
+		readonly root: string;
+		readonly entries: CampaignIndexEntry[];
+		readonly anchors: {
+			readonly campaignId: string;
+			readonly candidate: string;
+			readonly sourceArchiveSha256: string;
+			readonly stagedCapabilitySha256: string;
+		};
+	} {
+		const root = mkdtempSync5(join5(tmpdir5(), "promotion-root-"));
+		mkdirSync5(join5(root, "reps"), { recursive: true });
+		const entries: CampaignIndexEntry[] = [];
+		let anchors: ReturnType<typeof sealedCampaign>["anchors"] | undefined;
+		for (const transport of ["ws", "wt"] as const) {
+			for (let index = 1; index <= REPETITIONS; index += 1) {
+				const { bytes, artifact } = attestedSeal(transport, index);
+				const sealedPath = join5(
+					root,
+					"reps",
+					`${transport}-rep-${index}.sealed.json`,
+				);
+				writeFileSync5(sealedPath, bytes);
+				anchors ??= {
+					campaignId: artifact.comparisonId,
+					candidate: artifact.source.sourceSha,
+					sourceArchiveSha256: artifact.source.archiveSha256,
+					stagedCapabilitySha256: artifact.source.executableSha256,
+				};
+				entries.push({
+					schema: "campaign-index-entry/v2",
+					cellId: CELL,
+					armId: `${CELL}/${transport}`,
+					transport,
+					armKind: "primary",
+					armTransport: transport,
+					impairment: "physical",
+					executionPurpose: "canonical",
+					repetitionKind: "measured",
+					repetitionIndex: index,
+					repetitionTotal: REPETITIONS,
+					status: "PASS",
+					promotable: true,
+					failureCode: null,
+					refusalCode: null,
+					sealedPath,
+					artifactSha256: createHash("sha256").update(bytes).digest("hex"),
+					primaryMetricP50: 10 + index,
+					readPath: null,
+				});
+			}
+		}
+		if (anchors === undefined) throw new Error("no seal");
+		return { root, entries, anchors };
+	}
+
+	const macKey = new Uint8Array(32).fill(7);
+	const rigKey = new Uint8Array(32).fill(9);
+
+	it("resolves both leaves from the staged dir through the receipt's digests", () => {
+		const stagedDir = stagedLeavesDir(macKey, rigKey);
+		const leaves = resolveStagedSigningLeaves({ stagedDir });
+		expect(leaves.ok).toBe(true);
+		if (!leaves.ok) return;
+		expect(leaves.value.stagedMacPublicRaw32).toEqual(macKey);
+		expect(leaves.value.stagedRigPublicRaw32).toEqual(rigKey);
+	});
+
+	it("names the refusal when the leaves cannot be read, instead of a silent false", () => {
+		const noStagedDir = resolveStagedSigningLeaves({});
+		expect(noStagedDir).toMatchObject({
+			ok: false,
+			code: "STALE_OR_INVALID_STAGING",
+		});
+		if (!noStagedDir.ok) expect(noStagedDir.message).toContain("--staged-dir");
+
+		const missingReceipt = resolveStagedSigningLeaves({
+			stagedDir: mkdtempSync5(join5(tmpdir5(), "promotion-empty-")),
+		});
+		expect(missingReceipt).toMatchObject({
+			ok: false,
+			code: "STALE_OR_INVALID_STAGING",
+		});
+		if (!missingReceipt.ok)
+			expect(missingReceipt.message).toContain("stage receipt unreadable");
+
+		// A leaf that is not what the receipt digests is a stale stage.
+		const swapped = stagedLeavesDir(macKey, rigKey);
+		writeFileSync5(
+			join5(swapped, "staging-root", "rig-supervisor-ed25519.pub"),
+			new Uint8Array(32).fill(1),
+		);
+		const mismatched = resolveStagedSigningLeaves({ stagedDir: swapped });
+		expect(mismatched).toMatchObject({
+			ok: false,
+			code: "STALE_OR_INVALID_STAGING",
+		});
+		if (!mismatched.ok)
+			expect(mismatched.message).toBe(
+				"staged rig public key does not match the receipt",
+			);
+
+		// A truncated leaf is not a key.
+		const short = stagedLeavesDir(macKey, rigKey);
+		writeFileSync5(
+			join5(short, "staging-root", "mac-supervisor-ed25519.pub"),
+			macKey.slice(0, 31),
+		);
+		const truncated = resolveStagedSigningLeaves({ stagedDir: short });
+		if (truncated.ok) throw new Error("a 31-byte leaf resolved");
+		expect(truncated.message).toBe("staged Mac public key is not 32 raw bytes");
+	});
+
+	it("is the one reader the execution draft's staged material uses", () => {
+		const fixture = stagedFixture();
+		const material = readStagedCohortMaterialP(fixture.paths);
+		if (!material.ok) throw new Error(material.message);
+		const leaves = readStagedSigningLeaves(fixture.stagingRootDir, {
+			macSigningPublicKeySha256: fixture.receipt.macSigningPublicKeySha256,
+			rigSigningPublicKeySha256: fixture.receipt.rigSigningPublicKeySha256,
+		});
+		if (!leaves.ok) throw new Error(leaves.message);
+		expect(material.value.stagedMacPublicRaw32).toEqual(
+			leaves.value.stagedMacPublicRaw32,
+		);
+		expect(material.value.stagedRigPublicRaw32).toEqual(
+			leaves.value.stagedRigPublicRaw32,
+		);
+		const resolved = resolveStagedSigningLeaves({
+			stagedDir: fixture.stagedDir,
+		});
+		if (!resolved.ok) throw new Error(resolved.message);
+		expect(resolved.value).toEqual(leaves.value);
+	});
+
+	it("promotes a complete canonical set through sealClosesReceiptGraph with both leaves", async () => {
+		const { root, entries, anchors } = sealedCampaign();
+		const leaves = resolveStagedSigningLeaves({
+			stagedDir: stagedLeavesDir(macKey, rigKey),
+		});
+		if (!leaves.ok) throw new Error(leaves.message);
+		const receiptGraphAnchors = { ...anchors, ...leaves.value };
+		for (const entry of entries) {
+			expect(sealClosesReceiptGraph(entry, receiptGraphAnchors)).toBe(true);
+		}
+		const result = await promoteCampaignFlats({
+			evidenceDir: root,
+			campaignId: anchors.campaignId,
+			executionPurpose: "canonical",
+			cellIds: [CELL],
+			entries,
+			receiptGraphComplete: (entry) =>
+				sealClosesReceiptGraph(entry, receiptGraphAnchors),
+		});
+		expect(result.refusals).toEqual([]);
+		expect(result.promotedCells).toEqual([CELL]);
+		expect(result.flatsWritten.length).toBe(2);
+		expect(existsSync(join5(root, `${CELL_SAFE}-ws.json`))).toBe(true);
+		expect(existsSync(join5(root, `${CELL_SAFE}-wt.json`))).toBe(true);
+	});
+
+	it("refuses every seal on PROMOTION_RECEIPT_GRAPH_INCOMPLETE when the leaves are dropped", async () => {
+		const { root, entries, anchors } = sealedCampaign();
+		// The run's own shape: anchors without the staged leaves.
+		const keyless = anchors as unknown as Parameters<
+			typeof sealClosesReceiptGraph
+		>[1];
+		for (const entry of entries) {
+			expect(sealClosesReceiptGraph(entry, keyless)).toBe(false);
+		}
+		const result = await promoteCampaignFlats({
+			evidenceDir: root,
+			campaignId: anchors.campaignId,
+			executionPurpose: "canonical",
+			cellIds: [CELL],
+			entries,
+			receiptGraphComplete: (entry) => sealClosesReceiptGraph(entry, keyless),
+		});
+		expect(result.promotedCells).toEqual([]);
+		expect(result.flatsWritten).toEqual([]);
+		expect(result.refusals).toEqual([
+			{
+				cellId: CELL,
+				codes: [
+					"PROMOTION_RECEIPT_GRAPH_INCOMPLETE",
+					"PROMOTION_MEASURED_SET_INCOMPLETE",
+				],
+			},
+		]);
+		// Half the trust material is no trust material.
+		const halfKeyed = { ...anchors, stagedMacPublicRaw32: macKey };
+		expect(
+			sealClosesReceiptGraph(
+				entries[0]!,
+				halfKeyed as unknown as Parameters<typeof sealClosesReceiptGraph>[1],
+			),
+		).toBe(false);
+	});
+
+	it("hands the leaves to the verifier, whose shape rule refuses a 31-byte key", () => {
+		// The pin that the leaves travel: a bulk seal verifies with or without
+		// keys, so only a key the verifier itself refuses (`TRUST_CONTEXT_INVALID`
+		// for anything but 32 raw bytes) can show the context carried it.
+		const { entries, anchors } = sealedCampaign();
+		expect(
+			sealClosesReceiptGraph(entries[0]!, {
+				...anchors,
+				stagedMacPublicRaw32: macKey,
+				stagedRigPublicRaw32: rigKey,
+			}),
+		).toBe(true);
+		expect(
+			sealClosesReceiptGraph(entries[0]!, {
+				...anchors,
+				stagedMacPublicRaw32: macKey,
+				stagedRigPublicRaw32: rigKey.slice(0, 31),
+			}),
+		).toBe(false);
+		expect(
+			sealClosesReceiptGraph(entries[0]!, {
+				...anchors,
+				stagedMacPublicRaw32: macKey.slice(0, 31),
+				stagedRigPublicRaw32: rigKey,
+			}),
+		).toBe(false);
+	});
+
+	it("still answers with the verifier's verdict once the leaves are present", () => {
+		const { entries, anchors } = sealedCampaign();
+		const leaves = resolveStagedSigningLeaves({
+			stagedDir: stagedLeavesDir(macKey, rigKey),
+		});
+		if (!leaves.ok) throw new Error(leaves.message);
+		// A seal verified against another candidate's anchors does not close.
+		expect(
+			sealClosesReceiptGraph(entries[0]!, {
+				...anchors,
+				...leaves.value,
+				candidate: "b".repeat(40),
+			}),
+		).toBe(false);
+		// A seal that is not PASS never closes, keys or not.
+		expect(
+			sealClosesReceiptGraph(
+				{ ...entries[0]!, status: "FAIL" },
+				{ ...anchors, ...leaves.value },
+			),
+		).toBe(false);
+	});
+});

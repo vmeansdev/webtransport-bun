@@ -208,6 +208,7 @@ import {
 	stopSupervisor,
 	TRUST_BOOTSTRAP_AUTHORITY_DIGEST_LEAF,
 	TRUST_BOOTSTRAP_AUTHORITY_LEAF,
+	TRUST_BOOTSTRAP_STAGING_ROOT,
 	verifyStagedTrustBootstrap,
 } from "../remote-supervisor.ts";
 import { buildMeasuredArmArtifact } from "../run-campaign.ts";
@@ -979,9 +980,16 @@ export interface CampaignIndex {
  *
  * The answer is `verifyRunArtifact`'s, not the controller's: the seal is
  * re-read from disk and verified against the *staged* anchors (candidate,
- * source archive, capability digest) rather than its own word, which is the
- * same rule `bin/verify-campaign-index.ts` applies. Anything unreadable,
- * unparseable or short of PASS is false, so promotion fails closed.
+ * source archive, capability digest) and the *staged* signing leaves, which
+ * is the same context `bin/verify-campaign-index.ts` builds from
+ * `--mac-public-key` / `--rig-public-key`. The leaves are not optional: a
+ * canonical cohort seal carries a Mac-signed export receipt and both issuer
+ * graphs, and without the keys the verifier refuses the receipt
+ * (`COHORT_EXPORT_RECEIPT_INVALID`) rather than closing the graph -- which is
+ * how fanout-attested-r1 (2026-09-09) verified 53 of 53 PASS seals to
+ * `PROMOTION_RECEIPT_GRAPH_INCOMPLETE` and promoted nothing. Anything
+ * unreadable, unparseable, keyless or short of PASS is false, so promotion
+ * fails closed.
  */
 export function sealClosesReceiptGraph(
 	entry: CampaignIndexEntry,
@@ -990,9 +998,18 @@ export function sealClosesReceiptGraph(
 		readonly candidate: string;
 		readonly sourceArchiveSha256: string;
 		readonly stagedCapabilitySha256: string;
-	},
+	} & StagedSigningLeaves,
 ): boolean {
 	if (entry.sealedPath === null || entry.status !== "PASS") return false;
+	// Presence is the controller's rule -- no leaves, no graph to close -- and
+	// the leaves' shape is the verifier's (`TRUST_CONTEXT_INVALID`), so bytes
+	// of any length are handed on rather than judged here.
+	if (
+		!(anchors.stagedMacPublicRaw32 instanceof Uint8Array) ||
+		!(anchors.stagedRigPublicRaw32 instanceof Uint8Array)
+	) {
+		return false;
+	}
 	try {
 		const bytes = readFileSync(entry.sealedPath);
 		const parsed = JSON.parse(new TextDecoder().decode(bytes)) as RunArtifact;
@@ -1003,11 +1020,61 @@ export function sealClosesReceiptGraph(
 			sourceSha: anchors.candidate,
 			archiveSha256: anchors.sourceArchiveSha256,
 			executableSha256: anchors.stagedCapabilitySha256,
+			stagedMacPublicRaw32: anchors.stagedMacPublicRaw32,
+			stagedRigPublicRaw32: anchors.stagedRigPublicRaw32,
 		};
 		return verifyRunArtifact(bytes, context).evidenceStatus === "PASS";
 	} catch {
 		return false;
 	}
+}
+
+/** The two staged Ed25519 public leaves, raw 32 bytes each. */
+export interface StagedSigningLeaves {
+	readonly stagedMacPublicRaw32: Uint8Array;
+	readonly stagedRigPublicRaw32: Uint8Array;
+}
+
+/**
+ * The staged signing leaves a campaign's promotion closes each seal's receipt
+ * graph against, read from `<stagedDir>/staging-root/` through the stage
+ * receipt's digests -- the one reader (`readStagedSigningLeaves`) the
+ * execution draft uses too. A campaign with no staged dir has no leaves and
+ * therefore no promotion; that is a named refusal here, not a false the gate
+ * turns into fifty-three `PROMOTION_RECEIPT_GRAPH_INCOMPLETE` rows.
+ */
+export function resolveStagedSigningLeaves(
+	spec: Pick<RunSpec, "stagedDir">,
+): ProtocolResult<StagedSigningLeaves> {
+	if (spec.stagedDir === undefined) {
+		return stageFail(
+			"promotion needs --staged-dir: a receipt graph closes only against the staged signing leaves",
+		);
+	}
+	const receiptPath = join(spec.stagedDir, "stage-receipt.json");
+	let receipt: Record<string, unknown>;
+	try {
+		receipt = JSON.parse(readFileSync(receiptPath, "utf8")) as Record<
+			string,
+			unknown
+		>;
+	} catch {
+		return stageFail(`stage receipt unreadable at ${receiptPath}`);
+	}
+	const macSigningPublicKeySha256 = receipt.macSigningPublicKeySha256;
+	const rigSigningPublicKeySha256 = receipt.rigSigningPublicKeySha256;
+	if (
+		typeof macSigningPublicKeySha256 !== "string" ||
+		!HEX_64.test(macSigningPublicKeySha256) ||
+		typeof rigSigningPublicKeySha256 !== "string" ||
+		!HEX_64.test(rigSigningPublicKeySha256)
+	) {
+		return stageFail("stage receipt does not name both signing key digests");
+	}
+	return readStagedSigningLeaves(
+		join(spec.stagedDir, TRUST_BOOTSTRAP_STAGING_ROOT),
+		{ macSigningPublicKeySha256, rigSigningPublicKeySha256 },
+	);
 }
 
 export interface CampaignFlatPromotionInput {
@@ -3343,6 +3410,21 @@ async function realRunBody(
 		archiveSha256: campaignDigests.sourceArchiveSha256,
 		executableSha256: campaignDigests.stagedCapabilitySha256,
 	};
+	// The staged signing leaves the promotion gate closes every seal's receipt
+	// graph against. Resolved before traffic, and defined exactly when this
+	// campaign seals in-process: a campaign that could not promote is refused
+	// here, before it spends hours measuring what it then cannot promote.
+	let promotionTrust: StagedSigningLeaves | undefined;
+	if (useInProcessSeal) {
+		const leaves = resolveStagedSigningLeaves(spec);
+		if (!leaves.ok) {
+			return {
+				ok: false,
+				reason: `REFUSED/${leaves.code}: promotion cannot close a receipt graph: ${leaves.message}`,
+			};
+		}
+		promotionTrust = leaves.value;
+	}
 	// The cohort runtime the six fanout primaries are dispatched to. The
 	// provider is production and always supplied; the lease factory exists
 	// exactly when the campaign spawned both supervisors and read its stage
@@ -3803,8 +3885,18 @@ async function realRunBody(
 	// Promote the flats this campaign earned, through the one §6 gate.
 	// Focused/pilot write zero flats (plan A-stop / B5); only canonical promotes,
 	// and only for a cell whose whole measured set clears `evaluateCellPromotionGate`.
-	if (useInProcessSeal) {
+	// `promotionTrust` is defined exactly when the campaign sealed in-process:
+	// the leaves were resolved before traffic, or the campaign was refused.
+	if (promotionTrust !== undefined) {
 		const stagedDigests = resolveCampaignIndexDigests(spec);
+		const receiptGraphAnchors = {
+			campaignId: spec.campaignId,
+			candidate: spec.candidate,
+			sourceArchiveSha256: stagedDigests.sourceArchiveSha256,
+			stagedCapabilitySha256: stagedDigests.stagedCapabilitySha256,
+			stagedMacPublicRaw32: promotionTrust.stagedMacPublicRaw32,
+			stagedRigPublicRaw32: promotionTrust.stagedRigPublicRaw32,
+		};
 		const promotion = await promoteCampaignFlats({
 			evidenceDir,
 			campaignId: spec.campaignId,
@@ -3812,12 +3904,7 @@ async function realRunBody(
 			cellIds,
 			entries: indexEntries,
 			receiptGraphComplete: (entry) =>
-				sealClosesReceiptGraph(entry, {
-					campaignId: spec.campaignId,
-					candidate: spec.candidate,
-					sourceArchiveSha256: stagedDigests.sourceArchiveSha256,
-					stagedCapabilitySha256: stagedDigests.stagedCapabilitySha256,
-				}),
+				sealClosesReceiptGraph(entry, receiptGraphAnchors),
 		});
 		const digests = stagedDigests;
 		const index: CampaignIndex = {
@@ -4226,6 +4313,45 @@ function readBytesOrNull(path: string): Uint8Array | null {
 }
 
 /**
+ * Read the two staged Ed25519 public leaves under `stagingRootDir`, each
+ * checked against the digest the stage receipt states for it. Both leaves or
+ * a refusal: half the trust material verifies half a receipt graph, which is
+ * the shape of a flag that reads as evidence and proves nothing. The one
+ * reader for the execution draft (`readStagedCohortMaterial`) and for
+ * promotion (`resolveStagedSigningLeaves`).
+ */
+export function readStagedSigningLeaves(
+	stagingRootDir: string,
+	receipt: {
+		readonly macSigningPublicKeySha256: string;
+		readonly rigSigningPublicKeySha256: string;
+	},
+): ProtocolResult<StagedSigningLeaves> {
+	const macKey = readBytesOrNull(
+		join(stagingRootDir, "mac-supervisor-ed25519.pub"),
+	);
+	if (macKey === null || macKey.byteLength !== 32) {
+		return stageFail("staged Mac public key is not 32 raw bytes");
+	}
+	if (sha256HexOfBytes(macKey) !== receipt.macSigningPublicKeySha256) {
+		return stageFail("staged Mac public key does not match the receipt");
+	}
+	const rigKey = readBytesOrNull(
+		join(stagingRootDir, "rig-supervisor-ed25519.pub"),
+	);
+	if (rigKey === null || rigKey.byteLength !== 32) {
+		return stageFail("staged rig public key is not 32 raw bytes");
+	}
+	if (sha256HexOfBytes(rigKey) !== receipt.rigSigningPublicKeySha256) {
+		return stageFail("staged rig public key does not match the receipt");
+	}
+	return {
+		ok: true,
+		value: { stagedMacPublicRaw32: macKey, stagedRigPublicRaw32: rigKey },
+	};
+}
+
+/**
  * Read and digest-check the staged material a signed execution needs.
  *
  * Every refusal is `STALE_OR_INVALID_STAGING`: this runs before traffic, and
@@ -4289,24 +4415,8 @@ export function readStagedCohortMaterial(
 	}
 	const receipt = record as unknown as StagedCohortMaterialV1["receipt"];
 
-	const macKey = readBytesOrNull(
-		join(paths.stagingRootDir, "mac-supervisor-ed25519.pub"),
-	);
-	if (macKey === null || macKey.byteLength !== 32) {
-		return stageFail("staged Mac public key is not 32 raw bytes");
-	}
-	if (sha256HexOfBytes(macKey) !== receipt.macSigningPublicKeySha256) {
-		return stageFail("staged Mac public key does not match the receipt");
-	}
-	const rigKey = readBytesOrNull(
-		join(paths.stagingRootDir, "rig-supervisor-ed25519.pub"),
-	);
-	if (rigKey === null || rigKey.byteLength !== 32) {
-		return stageFail("staged rig public key is not 32 raw bytes");
-	}
-	if (sha256HexOfBytes(rigKey) !== receipt.rigSigningPublicKeySha256) {
-		return stageFail("staged rig public key does not match the receipt");
-	}
+	const leaves = readStagedSigningLeaves(paths.stagingRootDir, receipt);
+	if (!leaves.ok) return leaves;
 	const digestsByLaunch = record.stagedServerLaunchRecordSha256ByLaunch;
 	if (
 		typeof digestsByLaunch !== "object" ||
@@ -4452,8 +4562,8 @@ export function readStagedCohortMaterial(
 			stagedDir: paths.stagedDir,
 			stagingRootDir: paths.stagingRootDir,
 			receipt,
-			stagedMacPublicRaw32: macKey,
-			stagedRigPublicRaw32: rigKey,
+			stagedMacPublicRaw32: leaves.value.stagedMacPublicRaw32,
+			stagedRigPublicRaw32: leaves.value.stagedRigPublicRaw32,
 			stagedServerLaunchRecords: launchRecords,
 			tlsCaPem,
 			roleEntrypointPath,
