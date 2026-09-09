@@ -220,9 +220,9 @@ describe("Phase 2.1 all ScenarioExecutors are comparable", () => {
  */
 describe("B4: fanout primaries cannot reach the single-session rate leg", () => {
 	const fanoutCells = [
+		["ticker-fanout", "ticker-fanout/rate-25"],
 		["ticker-fanout", "ticker-fanout/rate-50"],
 		["ticker-fanout", "ticker-fanout/rate-100"],
-		["ticker-fanout", "ticker-fanout/rate-250"],
 		["chat-fanout", "chat-fanout/subscribers-250"],
 		["chat-fanout", "chat-fanout/subscribers-500"],
 		["chat-fanout", "chat-fanout/subscribers-1000"],
@@ -325,7 +325,7 @@ describe("B4: fanout primaries cannot reach the single-session rate leg", () => 
 		try {
 			await measureLegOverAdapter({
 				adapter: adapter as never,
-				cell: cell("ticker-fanout/rate-250"),
+				cell: cell("ticker-fanout/rate-100"),
 				serverUrl: "wss://10.99.0.2:4433",
 				role: "publisher",
 				driverRunId: "sever-connect",
@@ -378,7 +378,7 @@ describe("Phase 2.1 count/percent ScenarioExecutors", () => {
 		const leg = await executeRateLeg(
 			{
 				session: echoSession(clock),
-				cell: cell("ticker-fanout/rate-250"),
+				cell: cell("ticker-fanout/rate-100"),
 				driverRunId: "ticker-smoke",
 				runId: "run-ticker",
 				sessionId: "session-ticker",
@@ -607,7 +607,7 @@ describe("Phase 2.1 latency/bytes ScenarioExecutors", () => {
 			},
 			{
 				scenarioId: "ticker-fanout",
-				cellId: "ticker-fanout/rate-250",
+				cellId: "ticker-fanout/rate-100",
 				unit: RATE_SAMPLE_UNIT,
 				run: (input) =>
 					executeRateLeg(input, {

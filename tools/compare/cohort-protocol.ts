@@ -5673,13 +5673,16 @@ export function recomputeCohortRateSeries(args: {
 
 // ---------------------------------------------------------------------------
 // The six-cell cardinality table: physical-budget amendment D3, which replaces
-// the base plan's §4.5 rows with the ones the measured hardware budget admits
+// the base plan's §4.5 rows with the ones the measured hardware budget admits,
+// as retired and extended by the recorded deviations under
+// docs/superpowers/plans/deviations/ (2026-09-09: the top ticker row retired
+// by the D4 preflight, a bottom row added)
 // ---------------------------------------------------------------------------
 
 export type CohortCellId =
+	| "ticker 25"
 	| "ticker 50"
 	| "ticker 100"
-	| "ticker 250"
 	| "chat 250"
 	| "chat 500"
 	| "chat 1k";
@@ -5697,6 +5700,15 @@ export interface CohortCellCardinalityV1 {
 /** The exact D3 table; nothing here is derived at runtime from a knob. */
 export const COHORT_CELL_CARDINALITIES: readonly CohortCellCardinalityV1[] = [
 	{
+		cell: "ticker 25",
+		publisherCount: 1,
+		workerCount: 8,
+		subscriberCount: 100,
+		sessionCount: 101,
+		measuredIngress: 250,
+		expandedDeliveries: 25_000,
+	},
+	{
 		cell: "ticker 50",
 		publisherCount: 1,
 		workerCount: 8,
@@ -5713,15 +5725,6 @@ export const COHORT_CELL_CARDINALITIES: readonly CohortCellCardinalityV1[] = [
 		sessionCount: 101,
 		measuredIngress: 1_000,
 		expandedDeliveries: 100_000,
-	},
-	{
-		cell: "ticker 250",
-		publisherCount: 1,
-		workerCount: 8,
-		subscriberCount: 100,
-		sessionCount: 101,
-		measuredIngress: 2_500,
-		expandedDeliveries: 250_000,
 	},
 	{
 		cell: "chat 250",
@@ -5795,9 +5798,9 @@ export interface CohortCellGrantParametersV1 {
 
 export const COHORT_CELL_GRANT_PARAMETERS: readonly CohortCellGrantParametersV1[] =
 	[
+		{ cell: "ticker 25", measuredDurationMs: 10_000, messageBytes: 100 },
 		{ cell: "ticker 50", measuredDurationMs: 10_000, messageBytes: 100 },
 		{ cell: "ticker 100", measuredDurationMs: 10_000, messageBytes: 100 },
-		{ cell: "ticker 250", measuredDurationMs: 10_000, messageBytes: 100 },
 		{ cell: "chat 250", measuredDurationMs: 30_000, messageBytes: 128 },
 		{ cell: "chat 500", measuredDurationMs: 30_000, messageBytes: 128 },
 		{ cell: "chat 1k", measuredDurationMs: 30_000, messageBytes: 128 },

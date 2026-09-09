@@ -1439,7 +1439,7 @@ const SCENARIO_EXECUTOR_ENTRIES: readonly ScenarioExecutorEntry[] = [
 			name: "ticker-fanout",
 			parameters: {
 				scenarioId: "ticker-fanout",
-				ingressRatePerSecond: 250,
+				ingressRatePerSecond: 100,
 				publisherCount: 1,
 				subscriberCount: 100,
 				recordBytes: 100,
@@ -1450,7 +1450,7 @@ const SCENARIO_EXECUTOR_ENTRIES: readonly ScenarioExecutorEntry[] = [
 			legPlan: () =>
 				comparable({
 					deliveryKind: "reliable-message",
-					messageCount: 250 * 10,
+					messageCount: 100 * 10,
 					messageBytes: 100,
 				}),
 			async execute(input): Promise<MeasuredLeg> {

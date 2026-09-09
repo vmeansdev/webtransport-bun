@@ -85,9 +85,9 @@ import { reconstructCohortEvidenceOffline } from "./verify-artifact.ts";
 
 const CAMPAIGN = "fanout-canonical-r1";
 const FANOUT_CELLS = [
-	"ticker-fanout/rate-250",
-	"ticker-fanout/rate-50",
 	"ticker-fanout/rate-100",
+	"ticker-fanout/rate-25",
+	"ticker-fanout/rate-50",
 	"chat-fanout/subscribers-250",
 	"chat-fanout/subscribers-500",
 	"chat-fanout/subscribers-1000",
@@ -395,7 +395,7 @@ describe("B4 section 6: the promotion set gate", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Offline reconstruction fixtures: one honest ticker 250 cohort arm
+// Offline reconstruction fixtures: one honest ticker 100 cohort arm
 // ---------------------------------------------------------------------------
 
 const HEX = (character: string): string => character.repeat(64);
@@ -405,10 +405,10 @@ const MESSAGE_BYTES = 100 as const;
 const PUBLISHERS = 1;
 const SUBSCRIBERS = 100;
 const SHARDS = [13, 13, 13, 13, 12, 12, 12, 12] as const;
-/** ticker 250: 2,500 offered ingress over ten windows. */
-const INGRESS_PER_WINDOW = 250;
+/** ticker 100: 1,000 offered ingress over ten windows. */
+const INGRESS_PER_WINDOW = 100;
 const PER_SUBSCRIBER_DELIVERED = INGRESS_PER_WINDOW * WINDOWS;
-const COHORT_ID = "cohort-ticker-250";
+const COHORT_ID = "cohort-ticker-100";
 const START_NS = 4_000_000_000_000n;
 const NS_PER_MS = 1_000_000n;
 
@@ -450,7 +450,7 @@ function tickerDraft(): CrossSupervisorExecutionDraftV1 {
 		approvalRecordSha256: HEX("f"),
 		candidate: "cand",
 		campaignId: CAMPAIGN,
-		runId: `${CAMPAIGN}/ticker-fanout-250/ws/measured-1`,
+		runId: `${CAMPAIGN}/ticker-fanout-100/ws/measured-1`,
 		executionPurpose: "canonical",
 		cellId: CELL,
 		scenarioHash: HEX("1"),
@@ -464,7 +464,7 @@ function tickerDraft(): CrossSupervisorExecutionDraftV1 {
 		repetitionTotal: 5,
 		grantDeclaration: "fanout-expanded-deliveries",
 		// §4.1: the expansion, not the offered ingress. This fixture declared
-		// 2,500 -- a hundredth of what ticker 250 owes.
+		// 1,000 -- a hundredth of what ticker 100 owes.
 		declaredMessageCount: INGRESS_PER_WINDOW * WINDOWS * SUBSCRIBERS,
 		declaredMessageBytes: MESSAGE_BYTES,
 		requestedNotAfterMs: 17_000_000_000_000,
@@ -1471,14 +1471,14 @@ describe("B4 section 11: publisher-partial cardinality at reconstruction", () =>
 });
 
 describe("B4 section 12 #6: offline reconstruction of one cohort arm", () => {
-	test("an honest ticker 250 export reconstructs, closes both graphs, and is promotable", () => {
+	test("an honest ticker 100 export reconstructs, closes both graphs, and is promotable", () => {
 		const result = reconstruct();
 		if (!result.ok) throw new Error(`${result.code}: ${result.reason}`);
-		expect(result.cell).toBe("ticker 250");
+		expect(result.cell).toBe("ticker 100");
 		expect(result.receiptGraphComplete).toBe(true);
 		expect(result.promotionEligible).toBe(true);
-		expect(result.ledger.offeredIngress).toBe(2_500);
-		expect(result.ledger.delivered).toBe(250_000);
+		expect(result.ledger.offeredIngress).toBe(1_000);
+		expect(result.ledger.delivered).toBe(100_000);
 		expect(result.rateSeries.postStopDrainDelivered).toBe(0);
 		expect(result.tokenCommitmentRootSha256).toBe(LEAF_ROOT);
 	});
@@ -1550,8 +1550,8 @@ describe("B4 section 12 #6: offline reconstruction of one cohort arm", () => {
 				reconstruct({
 					evidence: honestEvidence({
 						grantOverride: {
-							expectedOfferedIngress: 2_500,
-							expectedExpandedDeliveries: 2_500,
+							expectedOfferedIngress: 1_000,
+							expectedExpandedDeliveries: 1_000,
 						},
 					}),
 				}),
@@ -1565,8 +1565,8 @@ describe("B4 section 12 #6: offline reconstruction of one cohort arm", () => {
 				reconstruct({
 					evidence: honestEvidence({
 						grantOverride: {
-							expectedOfferedIngress: 1_000,
-							expectedExpandedDeliveries: 100_000,
+							expectedOfferedIngress: 500,
+							expectedExpandedDeliveries: 50_000,
 						},
 					}),
 				}),
@@ -1593,8 +1593,8 @@ describe("B4 section 12 #6: offline reconstruction of one cohort arm", () => {
 								delivered: number;
 								deliveredBytes: number;
 							};
-							ledger.delivered = 249_000;
-							ledger.deliveredBytes = 249_000 * MESSAGE_BYTES;
+							ledger.delivered = 99_000;
+							ledger.deliveredBytes = 99_000 * MESSAGE_BYTES;
 						},
 					}),
 				}),
@@ -1689,10 +1689,10 @@ describe("B4 section 12 #6: offline reconstruction of one cohort arm", () => {
 		if (!result.ok) throw new Error(`${result.code}: ${result.reason}`);
 		expect(result.rateSeries.postStopDrainDelivered).toBe(5);
 		// The conservation total still accounts for every delivery...
-		expect(result.rateSeries.conservationDeliveredTotal).toBe(250_000);
+		expect(result.rateSeries.conservationDeliveredTotal).toBe(100_000);
 		// ...but the measured window is short by exactly the drain, and the arm
 		// is not promotable.
-		expect(result.rateSeries.measuredWindowDeliveredTotal).toBe(249_995);
+		expect(result.rateSeries.measuredWindowDeliveredTotal).toBe(99_995);
 		expect(result.promotionEligible).toBe(false);
 	});
 
@@ -1713,7 +1713,7 @@ describe("B4 section 12 #6: offline reconstruction of one cohort arm", () => {
 			});
 			if (!result.ok) throw new Error(`${result.code}: ${result.reason}`);
 			expect(result.receiptGraphComplete).toBe(true);
-			expect(result.ledger.delivered).toBe(250_000);
+			expect(result.ledger.delivered).toBe(100_000);
 			expect(result.promotionEligible).toBe(false);
 		});
 	}
@@ -1947,11 +1947,11 @@ describe("physical-budget amendment D6: the report reads an arm's topology and t
 			sessions: 101,
 		});
 		expect(accounting.totals).toEqual({
-			offeredIngress: 2_500,
-			acceptedIngress: 2_500,
-			relayWrites: 250_000,
-			delivered: 250_000,
-			deliveredBytes: 25_000_000,
+			offeredIngress: 1_000,
+			acceptedIngress: 1_000,
+			relayWrites: 100_000,
+			delivered: 100_000,
+			deliveredBytes: 10_000_000,
 			postStopDrain: 0,
 		});
 		// No server observation on this shape: the figures are absent, not
@@ -1962,7 +1962,7 @@ describe("physical-budget amendment D6: the report reads an arm's topology and t
 		expect(lines[0]).toBe(
 			"- Topology: 1 publisher / 8 workers / 100 subscribers / 101 sessions",
 		);
-		expect(lines[1]).toContain("delivered 250000");
+		expect(lines[1]).toContain("delivered 100000");
 		expect(lines.at(-1)).toBe(`- ${CLAIM_BOUNDARY_SENTENCE}`);
 	});
 });

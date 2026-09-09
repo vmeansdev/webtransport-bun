@@ -28,7 +28,7 @@ const exportObservations = new WeakMap<object, unknown>();
  * the bundle sits under them with room.
  *
  * The fixture is the `fanout-artifact.test.ts` honest-cohort builder scaled
- * from ticker 250 to chat 1k.  Nothing here is a hand-written digest.
+ * from ticker 100 to chat 1k.  Nothing here is a hand-written digest.
  */
 import { describe, expect, test } from "bun:test";
 import {

@@ -11,11 +11,19 @@
  * suite parses the table out of the amendment's own bytes and walks every
  * mirror against it, so a row cannot move in one copy without this going red.
  *
+ * D3's own rule retires a row whose D4 preflight reading exceeds the bound
+ * "without a new review of this amendment", so the amendment's bytes stay as
+ * approved and each retirement is recorded as a deviation note under
+ * `docs/superpowers/plans/deviations/` carrying an `action | cell id | ...`
+ * table. This suite applies those rows -- retire, add -- to the parsed D3
+ * table before walking the mirrors, so the amendment stays the source and the
+ * deviation is the recorded delta.
+ *
  * The retired ids are asserted unknown everywhere: refused by every lookup,
  * absent from every mirror's source text, never aliased.
  */
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
 	CONTROLLER_USAGE,
@@ -45,6 +53,7 @@ const AMENDMENT_PATH = join(
 	REPO_ROOT,
 	"docs/superpowers/plans/2026-09-08-physical-budget-amendment.md",
 );
+const DEVIATIONS_DIR = join(REPO_ROOT, "docs/superpowers/plans/deviations");
 
 function read(relative: string): string {
 	return readFileSync(join(REPO_ROOT, relative), "utf8");
@@ -112,8 +121,122 @@ function parseD3Table(markdown: string): D3Row[] {
 	return rows;
 }
 
+type DeviationRow =
+	| {
+			readonly action: "retire";
+			readonly cellId: string;
+			readonly label: string;
+	  }
+	| { readonly action: "add"; readonly row: D3Row };
+
+const DEVIATION_TABLE_HEADER =
+	"| action | cell id | label | pub | workers | subs | sessions | window | ingress | deliveries | bytes | readinessDeadlineMs |";
+
+/**
+ * The `action | cell id | ...` rows of one deviation note. A `retire` row
+ * names only the id and label; an `add` row carries the same columns as D3
+ * minus the model columns, and its deliveries-per-second and warmup rate are
+ * derived the way D3's own rows are checked below.
+ */
+function parseDeviationTable(markdown: string): DeviationRow[] {
+	const lines = markdown.split("\n");
+	const header = lines.indexOf(DEVIATION_TABLE_HEADER);
+	if (header < 0) return [];
+	const rows: DeviationRow[] = [];
+	for (const line of lines.slice(header + 2)) {
+		if (!line.startsWith("|")) break;
+		const cells = line
+			.split("|")
+			.slice(1, -1)
+			.map((cell) => cell.trim());
+		const action = cells[0] ?? "";
+		const cellId = (cells[1] ?? "").replace(/`/g, "");
+		const label = cells[2] ?? "";
+		if (action === "retire") {
+			rows.push({ action, cellId, label });
+			continue;
+		}
+		if (action !== "add") throw new Error(`unknown deviation action: ${line}`);
+		const window = /^(\d+) s$/.exec(cells[7] ?? "");
+		if (window === null) throw new Error(`unparseable deviation row: ${line}`);
+		const publisherCount = integer(cells[3] ?? "");
+		const subscriberCount = integer(cells[5] ?? "");
+		const windowSeconds = integer(window[1] ?? "");
+		const expandedDeliveries = integer(cells[9] ?? "");
+		rows.push({
+			action,
+			row: {
+				cellId,
+				label,
+				publisherCount,
+				workerCount: integer(cells[4] ?? ""),
+				subscriberCount,
+				sessionCount: integer(cells[6] ?? ""),
+				windowSeconds,
+				measuredIngress: integer(cells[8] ?? ""),
+				expandedDeliveries,
+				deliveriesPerSecond: expandedDeliveries / windowSeconds,
+				warmupDeliveriesPerSecond:
+					((WARMUP_MESSAGES_PER_PUBLISHER * publisherCount) /
+						((WARMUP_MESSAGES_PER_PUBLISHER * WARMUP_INTERVAL_MS) / 1_000)) *
+					subscriberCount,
+				messageBytes: integer(cells[10] ?? ""),
+				readinessDeadlineMs: integer(cells[11] ?? ""),
+			},
+		});
+	}
+	return rows;
+}
+
+/** Every recorded deviation, oldest first: the notes are dated by name. */
+const DEVIATION_ROWS: readonly DeviationRow[] = readdirSync(DEVIATIONS_DIR)
+	.filter((name) => name.endsWith(".md"))
+	.sort()
+	.flatMap((name) =>
+		parseDeviationTable(readFileSync(join(DEVIATIONS_DIR, name), "utf8")),
+	);
+
+function family(cellId: string): string {
+	return cellId.slice(0, cellId.indexOf("/"));
+}
+
+/**
+ * D3's rule, applied: a retired row leaves the table and an added row joins
+ * its ladder, each ladder sorted by load so "the next row down becomes the
+ * top" is a fact of the order and not of where the note put the row. The
+ * families keep D3's own order.
+ */
+function applyDeviations(
+	table: readonly D3Row[],
+	deviations: readonly DeviationRow[],
+): D3Row[] {
+	let rows = [...table];
+	for (const deviation of deviations) {
+		if (deviation.action === "retire") {
+			const index = rows.findIndex((row) => row.cellId === deviation.cellId);
+			if (index < 0)
+				throw new Error(`retire names no row: ${deviation.cellId}`);
+			if (rows[index]!.label !== deviation.label)
+				throw new Error(`retire mislabels ${deviation.cellId}`);
+			rows.splice(index, 1);
+		} else {
+			if (rows.some((row) => row.cellId === deviation.row.cellId))
+				throw new Error(`add duplicates ${deviation.row.cellId}`);
+			rows.push(deviation.row);
+		}
+	}
+	const families = [...new Set(table.map((row) => family(row.cellId)))];
+	rows = families.flatMap((name) =>
+		rows
+			.filter((row) => family(row.cellId) === name)
+			.sort((a, b) => a.expandedDeliveries - b.expandedDeliveries),
+	);
+	return rows;
+}
+
 const AMENDMENT = readFileSync(AMENDMENT_PATH, "utf8");
-const ROWS = parseD3Table(AMENDMENT);
+const D3_ROWS = parseD3Table(AMENDMENT);
+const ROWS = applyDeviations(D3_ROWS, DEVIATION_ROWS);
 const TICKER_ROWS = ROWS.filter((row) =>
 	row.cellId.startsWith("ticker-fanout/"),
 );
@@ -121,23 +244,28 @@ const CHAT_ROWS = ROWS.filter((row) => row.cellId.startsWith("chat-fanout/"));
 const CELL_IDS = ROWS.map((row) => row.cellId);
 
 /**
- * D3: "Retired ids, refused everywhere and never aliased". Written out in
- * full because the amendment abbreviates them in prose.
+ * D3: "Retired ids, refused everywhere and never aliased". The amendment's
+ * own retirements are written out in full because it abbreviates them in
+ * prose; every `retire` row of a deviation note joins them.
  */
-const RETIRED_CELL_IDS = [
-	"ticker-fanout/rate-10000",
-	"ticker-fanout/rate-50000",
-	"ticker-fanout/rate-100000",
-	"chat-fanout/subscribers-5000",
-	"chat-fanout/subscribers-10000",
+const RETIRED_BY_AMENDMENT = [
+	["ticker-fanout/rate-10000", "ticker 10k"],
+	["ticker-fanout/rate-50000", "ticker 50k"],
+	["ticker-fanout/rate-100000", "ticker 100k"],
+	["chat-fanout/subscribers-5000", "chat 5k"],
+	["chat-fanout/subscribers-10000", "chat 10k"],
 ] as const;
-const RETIRED_LABELS = [
-	"ticker 10k",
-	"ticker 50k",
-	"ticker 100k",
-	"chat 5k",
-	"chat 10k",
-] as const;
+const RETIRED_BY_DEVIATION = DEVIATION_ROWS.flatMap((row) =>
+	row.action === "retire" ? [[row.cellId, row.label] as const] : [],
+);
+const RETIRED_CELL_IDS: readonly string[] = [
+	...RETIRED_BY_AMENDMENT.map(([cellId]) => cellId),
+	...RETIRED_BY_DEVIATION.map(([cellId]) => cellId),
+];
+const RETIRED_LABELS: readonly string[] = [
+	...RETIRED_BY_AMENDMENT.map(([, label]) => label),
+	...RETIRED_BY_DEVIATION.map(([, label]) => label),
+];
 
 /** Every file D3 names as a mirror, read as text for the retired-id sweep. */
 const MIRROR_SOURCES = [
@@ -155,6 +283,58 @@ const MIRROR_SOURCES = [
 	"tools/compare/bin/frozen-run-section-9.7.fragment.sh",
 	"crates/native/src/secure_fs.rs",
 ] as const;
+
+describe("the recorded deviations", () => {
+	test("the 2026-09-09 preflight note retires the top ticker row and adds a bottom one", () => {
+		expect(DEVIATION_ROWS).toEqual([
+			{
+				action: "retire",
+				cellId: "ticker-fanout/rate-250",
+				label: "ticker 250",
+			},
+			{
+				action: "add",
+				row: {
+					cellId: "ticker-fanout/rate-25",
+					label: "ticker 25",
+					publisherCount: 1,
+					workerCount: 8,
+					subscriberCount: 100,
+					sessionCount: 101,
+					windowSeconds: 10,
+					measuredIngress: 250,
+					expandedDeliveries: 25_000,
+					deliveriesPerSecond: 2_500,
+					warmupDeliveriesPerSecond: 200,
+					messageBytes: 100,
+					readinessDeadlineMs: 30_000,
+				},
+			},
+		]);
+	});
+
+	test("every retired row was a D3 row, every added row is new, and the ladders keep three rungs", () => {
+		for (const [cellId] of RETIRED_BY_DEVIATION) {
+			expect(D3_ROWS.map((row) => row.cellId)).toContain(cellId);
+			expect(CELL_IDS).not.toContain(cellId);
+		}
+		for (const deviation of DEVIATION_ROWS) {
+			if (deviation.action !== "add") continue;
+			expect(D3_ROWS.map((row) => row.cellId)).not.toContain(
+				deviation.row.cellId,
+			);
+			expect(CELL_IDS).toContain(deviation.row.cellId);
+		}
+		expect(CELL_IDS).toEqual([
+			"ticker-fanout/rate-25",
+			"ticker-fanout/rate-50",
+			"ticker-fanout/rate-100",
+			"chat-fanout/subscribers-250",
+			"chat-fanout/subscribers-500",
+			"chat-fanout/subscribers-1000",
+		]);
+	});
+});
 
 describe("the D3 table itself", () => {
 	test("the six rows are internally consistent and name the two families", () => {
@@ -454,11 +634,19 @@ describe("frozen run fragments and stage timeouts (D5)", () => {
 		return value.toLocaleString("en-US").replace(/,/g, "_");
 	}
 
-	test("9.6 runs the B5 pilot cell the amendment names", () => {
+	test("9.6 runs the B5 pilot cell the amendment names, or the top of its ladder once that row is retired", () => {
 		const pilot = /\*\*B5\*\* pilot cell becomes `([^`]+)`/.exec(AMENDMENT);
 		if (pilot === null) throw new Error("D5 names no pilot cell");
-		const pilotCell = pilot[1]!;
+		const named = pilot[1]!;
+		expect(D3_ROWS.map((row) => row.cellId)).toContain(named);
+		// D3: "the next row down becomes the top of its ladder" -- the pilot
+		// follows the top row, which is the last of its family in table order.
+		const ladder = ROWS.filter((row) => family(row.cellId) === family(named));
+		const pilotCell = RETIRED_CELL_IDS.includes(named)
+			? ladder[ladder.length - 1]!.cellId
+			: named;
 		expect(CELL_IDS).toContain(pilotCell);
+		expect<readonly string[]>(PHASE4_GATE_CELLS).toContain(pilotCell);
 		expect(assignment(fragment96, "CELLS")).toBe(pilotCell);
 		expect(assignment(fragment96, "REPS")).toBe("1");
 		const pinned = pinnedTimeouts("B5");

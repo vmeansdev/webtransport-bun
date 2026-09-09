@@ -277,7 +277,7 @@ export type SealTransport = "ws" | "wt";
 /** Phase-4 first-honest gate cells (Task 4.1). Bulk first: proven Mbps seal path. */
 export const PHASE4_GATE_CELLS = [
 	"bulk-one-way/physical",
-	"ticker-fanout/rate-250",
+	"ticker-fanout/rate-100",
 ] as const;
 
 /** Path-safe cell id for official evidence layout. */
@@ -637,9 +637,9 @@ export class FanoutGrantDeclarationError extends Error {
  *
  * For the six fanout primaries this is the *expanded* delivery count from the
  * frozen §4.5 table — `offeredIngress * subscriberCount` — and not the offered
- * ingress. The difference is the whole point of the cell: a ticker 250 arm
- * offers 2,500 records and the relay owes 250,000 deliveries, and a grant
- * that authorised 2,500 would let a cohort that delivered a hundredth of
+ * ingress. The difference is the whole point of the cell: a ticker 100 arm
+ * offers 1,000 records and the relay owes 100,000 deliveries, and a grant
+ * that authorised 1,000 would let a cohort that delivered a hundredth of
  * what it owed present a series the supervisor had no reason to refuse.
  * `assertMeasuredArmIsGranted` compares the sealed series against exactly this
  * number, so declaring the unexpanded one is not a cosmetic understatement.
@@ -3285,7 +3285,7 @@ async function realRunBody(
 	// Phase 4+: per (cell × transport) — optional netem, start server, seal reps.
 	const netemDeadline = deadlines.get("netem-apply") ?? 5_000;
 	const serverStartDeadline = deadlines.get("server-start") ?? 30_000;
-	// Long legs (ticker 250 echoes, 100 MiB bulk) need a wide present budget;
+	// Long legs (ticker 100 echoes, 100 MiB bulk) need a wide present budget;
 	// the `evidence-write` deadline governs short control ops, not this.
 	const sealPresentDeadlineMs = 5 * 60 * 1000;
 	const serverPort = 4433;
@@ -4085,7 +4085,7 @@ SCP, netem, server, client, evidence, restore). Each step is bounded
 by a hard deadline; the controller fails closed with a typed error
 if any step exceeds its bound. With --staged-dir, real-run verifies
 the Phase 3.6.0 trust bootstrap against R1_CAMPAIGN_AUTHORITY_SHA256
-before any SSH/SCP work. --phase4 selects ticker-fanout/rate-250
+before any SSH/SCP work. --phase4 selects ticker-fanout/rate-100
 and bulk-one-way/physical with 3 reps (stage=phase4).
 --arm-kinds narrows the schedule to a subset of the registry's arm
 kinds; by default all three are scheduled. --resume carries forward
@@ -6916,9 +6916,9 @@ export function executableRoleEntrypoint(
 /** Physical-budget amendment D3: the per-cell readiness deadline, fixed by cell. */
 export function cohortReadinessDeadlineMs(cohortCellId: string): number {
 	switch (cohortCellId) {
+		case "ticker 25":
 		case "ticker 50":
 		case "ticker 100":
-		case "ticker 250":
 			return 30_000;
 		case "chat 250":
 		case "chat 500":

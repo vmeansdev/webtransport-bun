@@ -51,7 +51,7 @@ const MAC_NS: u64 = 5_000_000_000_000;
 const CAMPAIGN_ID: &str = "r1-cohort-completion";
 const CANDIDATE: &str = "candidate-cohort-completion";
 const CHAT_1K_CELL: &str = "chat-fanout/subscribers-1000";
-const TICKER_250_CELL: &str = "ticker-fanout/rate-250";
+const TICKER_100_CELL: &str = "ticker-fanout/rate-100";
 
 fn digest(tag: &str) -> String {
     sha256_hex(tag.as_bytes())
@@ -1369,7 +1369,7 @@ impl HonestEvidence {
         let MESSAGE_BYTES = cell.message_bytes;
         let publisher_count = publishers.as_array().expect("publishers").len() as u64;
         // Every publisher offers the same share of the cell's measured ingress
-        // in every window: one message for chat, 250 for ticker 250.
+        // in every window: one message for chat, 100 for ticker 100.
         let per_publisher_window = cell.measured_ingress / (publisher_count * WINDOWS as u64);
         assert_eq!(
             per_publisher_window * publisher_count * WINDOWS as u64,
@@ -4841,15 +4841,17 @@ const S3_VECTOR_CHAT_1K: (&str, u64, usize, &str, &str) = (
     "3f3d35f15bd314607ab41b63e6b47ed6ba6db9a32f8039381807b10019616d48",
 );
 
-/// S3-r8 vector 9: ticker 250, 1 publisher / 100 subscribers (re-pinned for
-/// `ticker-fanout/rate-250` when the physical-budget amendment retired the
-/// ticker-10k row; same shape, new cohort id).
-const S3_VECTOR_TICKER_250: (&str, u64, usize, &str, &str) = (
-    "cohort-vector-ticker-250",
+/// S3-r8 vector 9: ticker 100, 1 publisher / 100 subscribers (re-pinned for
+/// `ticker-fanout/rate-100` when the D4 preflight retired the 250 row,
+/// deviation 2026-09-09, and before that for the 250 row when the
+/// physical-budget amendment retired the ticker-10k row; same shape, new
+/// cohort id each time).
+const S3_VECTOR_TICKER_100: (&str, u64, usize, &str, &str) = (
+    "cohort-vector-ticker-100",
     101,
     25_949,
-    "511381fddae1d6e8eb176a73b582285221cd1d3dbf37e5b2a51da7f5bd999921",
-    "b2909f2096de0c0a5e3212c5c15f1fc28198c6ce8a78d6fd2331ae31f45c4191",
+    "d6c3ac9b2da9ab8e85891641860e923f534d6dd405f1321526f87d90b0720d5e",
+    "24d1a0e52aad22cfcf37d783f7d0f68167ed5075a2ac41884daeda36edfc448f",
 );
 
 /// The first and last canonical `token-commitment-leaf/v1` of each vector, in
@@ -4940,8 +4942,8 @@ fn the_verifier_recomputes_the_typescript_builders_root_for_chat_1k() {
 }
 
 #[test]
-fn the_verifier_recomputes_the_typescript_builders_root_for_ticker_250() {
-    assert_manifest_vector(S3_VECTOR_TICKER_250, TICKER_250_CELL, 1, 100);
+fn the_verifier_recomputes_the_typescript_builders_root_for_ticker_100() {
+    assert_manifest_vector(S3_VECTOR_TICKER_100, TICKER_100_CELL, 1, 100);
 }
 
 /// The verifier binds **its own** root, never the presented one. A manifest
@@ -5160,9 +5162,9 @@ fn the_six_cell_rows_match_the_typescript_tables() {
     assert_eq!(chat_1k.expanded_deliveries, 300_000);
     assert_eq!(chat_1k.readiness_deadline_ms, 90_000);
     for (cell_id, ingress, deliveries) in [
+        ("ticker-fanout/rate-25", 250, 25_000),
         ("ticker-fanout/rate-50", 500, 50_000),
         ("ticker-fanout/rate-100", 1_000, 100_000),
-        ("ticker-fanout/rate-250", 2_500, 250_000),
     ] {
         let ticker = cohort_cell(cell_id).expect("t");
         assert_eq!(ticker.publisher_count, 1, "{cell_id}");
@@ -5529,9 +5531,9 @@ fn the_chat_1k_evidence_vector_is_reproducible_and_pinned() {
 }
 
 #[test]
-fn the_ticker_250_evidence_vector_is_reproducible_and_pinned() {
-    let (evidence, _) = evidence_vector(TICKER_250_CELL);
-    let (again, _) = evidence_vector(TICKER_250_CELL);
+fn the_ticker_100_evidence_vector_is_reproducible_and_pinned() {
+    let (evidence, _) = evidence_vector(TICKER_100_CELL);
+    let (again, _) = evidence_vector(TICKER_100_CELL);
     assert_eq!(evidence, again, "deterministic end to end");
     let value = json_of(&evidence);
     assert_eq!(
@@ -5545,8 +5547,8 @@ fn the_ticker_250_evidence_vector_is_reproducible_and_pinned() {
         value["publisherPartials"].as_array().expect("array").len(),
         1
     );
-    assert_eq!(evidence.len(), TICKER_250_EVIDENCE_SIZE);
-    assert_eq!(sha256_hex(&evidence), TICKER_250_EVIDENCE_SHA256);
+    assert_eq!(evidence.len(), TICKER_100_EVIDENCE_SIZE);
+    assert_eq!(sha256_hex(&evidence), TICKER_100_EVIDENCE_SHA256);
 }
 
 /// Pinned 2026-09-05 from the deterministic lifecycle above, re-pinned the
@@ -5556,8 +5558,11 @@ fn the_ticker_250_evidence_vector_is_reproducible_and_pinned() {
 /// (G1), and again (v3) once every shard's commitment window became the span
 /// of its residue class (R-A: `shard_commitment_window_end`, chat-1k
 /// `[10 + w, 1003 + w)`, ticker `[1 + w, …)`).  The ticker vector was
-/// re-pinned 2026-09-08 for `ticker-fanout/rate-250` (same 1 x 8 x 100
-/// shape) when the physical-budget amendment retired the ticker-10k row.
+/// re-pinned 2026-09-08 for the 250 row (same 1 x 8 x 100 shape) when the
+/// physical-budget amendment retired the ticker-10k row, and again
+/// 2026-09-09 for `ticker-fanout/rate-100` (same shape) when the D4 preflight
+/// retired that row in turn (deviation 2026-09-09); the size held
+/// and the digest moved with the cell id and its counts.
 /// The chat-1k hex is under
 /// `.scratch/2026-09-05-cohort-completion/notes/vectors-v3/`; both are
 /// mirrored by the TS pins in `tools/compare/fixtures/cohort-evidence-vectors/`.
@@ -5568,9 +5573,9 @@ fn the_ticker_250_evidence_vector_is_reproducible_and_pinned() {
 const CHAT_1K_EVIDENCE_SIZE: usize = 507_198;
 const CHAT_1K_EVIDENCE_SHA256: &str =
     "f5de5f284adf873ef6c5c9d6d2bbac8850e039d3a802e78d84571be2add0819b";
-const TICKER_250_EVIDENCE_SIZE: usize = 133_171;
-const TICKER_250_EVIDENCE_SHA256: &str =
-    "58cbcb792d59d17f01d3a364a1713db605a7f075feeda0d69160edba9db900c5";
+const TICKER_100_EVIDENCE_SIZE: usize = 133_171;
+const TICKER_100_EVIDENCE_SHA256: &str =
+    "8ce99420ab36615d848356ef2f1b67b06a0f5fe015b317e58d29df900bf81101";
 
 /// The frame caps are per kind on both sides, and the ones that differ from
 /// the default differ in three directions: the open grew to 7 MiB for C1's

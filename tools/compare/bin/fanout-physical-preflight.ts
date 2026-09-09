@@ -149,7 +149,7 @@ export const PREFLIGHT_RECEIPT_SCHEMA =
 
 /** The top row of each ladder (D4): what the preflight is allowed to run. */
 export const PREFLIGHT_CELL_IDS = [
-	"ticker-fanout/rate-250",
+	"ticker-fanout/rate-100",
 	"chat-fanout/subscribers-1000",
 ] as const;
 export type PreflightCellId = (typeof PREFLIGHT_CELL_IDS)[number];
@@ -185,9 +185,9 @@ export interface PreflightOfferPlan {
 	readonly windowCount: number;
 	readonly measuredDurationMs: number;
 	readonly messageBytes: number;
-	/** The row's ingress per 1 s window: 250 (ticker), 10 (chat). */
+	/** The row's ingress per 1 s window: 100 (ticker), 10 (chat). */
 	readonly rowIngressPerWindow: number;
-	/** max(row, warmup epoch) per window: 250 (ticker), 20 (chat). */
+	/** max(row, warmup epoch) per window: 100 (ticker), 20 (chat). */
 	readonly bindingIngressPerWindow: number;
 	/** What every origin window must show as accepted. */
 	readonly requiredAcceptedPerWindow: number;

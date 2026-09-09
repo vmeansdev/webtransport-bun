@@ -94,29 +94,29 @@ function predicatesOf(input: PreflightPredicateInput): string[] {
 }
 
 describe("preflightOfferPlan: the offer each pass makes", () => {
-	it("ticker 1x paces at the cell's own rate and requires exactly 250 per window", () => {
-		const plan = preflightOfferPlan("ticker-fanout/rate-250", "1x");
-		expect(plan.cohortCell).toBe("ticker 250");
-		expect(plan.publisherRatePerSecond).toBe(250);
+	it("ticker 1x paces at the cell's own rate and requires exactly 100 per window", () => {
+		const plan = preflightOfferPlan("ticker-fanout/rate-100", "1x");
+		expect(plan.cohortCell).toBe("ticker 100");
+		expect(plan.publisherRatePerSecond).toBe(100);
 		expect(plan.pacingSource).toBe("cell");
 		expect(plan.preflightPublisherRatePerSecond).toBeNull();
-		expect(plan.requiredAcceptedPerWindow).toBe(250);
+		expect(plan.requiredAcceptedPerWindow).toBe(100);
 		expect(plan.acceptedPredicate).toBe("equals");
-		expect(plan.rowIngressPerWindow).toBe(250);
-		expect(plan.bindingIngressPerWindow).toBe(250);
+		expect(plan.rowIngressPerWindow).toBe(100);
+		expect(plan.bindingIngressPerWindow).toBe(100);
 		expect(plan.expectedWarmupDeliveries).toBe(1_000);
 		expect(plan.expectedWarmupIngress).toBe(10);
 		expect(plan.windowCount).toBe(10);
 	});
 
-	it("ticker 2x paces the one publisher at 500 through the preflight input and requires at least 500", () => {
-		const plan = preflightOfferPlan("ticker-fanout/rate-250", "2x");
-		expect(plan.publisherRatePerSecond).toBe(500);
+	it("ticker 2x paces the one publisher at 200 through the preflight input and requires at least 200", () => {
+		const plan = preflightOfferPlan("ticker-fanout/rate-100", "2x");
+		expect(plan.publisherRatePerSecond).toBe(200);
 		expect(plan.pacingSource).toBe("preflight-input");
-		expect(plan.preflightPublisherRatePerSecond).toBe(500);
-		expect(plan.requiredAcceptedPerWindow).toBe(500);
+		expect(plan.preflightPublisherRatePerSecond).toBe(200);
+		expect(plan.requiredAcceptedPerWindow).toBe(200);
 		expect(plan.acceptedPredicate).toBe("at-least");
-		expect(plan.offeredIngressPerSecond).toBe(500);
+		expect(plan.offeredIngressPerSecond).toBe(200);
 	});
 
 	it("chat 1x paces ten publishers at 1/s and requires exactly 10 per window", () => {
@@ -139,7 +139,7 @@ describe("preflightOfferPlan: the offer each pass makes", () => {
 
 	it("only the top row of each ladder is admitted", () => {
 		expect([...PREFLIGHT_CELL_IDS]).toEqual([
-			"ticker-fanout/rate-250",
+			"ticker-fanout/rate-100",
 			"chat-fanout/subscribers-1000",
 		]);
 	});
@@ -362,7 +362,7 @@ describe("evaluatePreflightPredicate: every D4 clause, one failure each", () => 
 });
 
 function syntheticReceipt(): PreflightReceiptV1 {
-	const windows = new Array<number>(10).fill(500);
+	const windows = new Array<number>(10).fill(200);
 	const cpu = (instrument: string) => ({
 		instrument,
 		processMs: 9_000,
@@ -380,10 +380,10 @@ function syntheticReceipt(): PreflightReceiptV1 {
 		campaignId: "fanout-pilot-r1",
 		mode: "physical",
 		transport: "wt",
-		cellId: "ticker-fanout/rate-250",
-		cohortCell: "ticker 250",
+		cellId: "ticker-fanout/rate-100",
+		cohortCell: "ticker 100",
 		pass: "2x",
-		runId: "fanout-pilot-r1/ticker-fanout/rate-250/wt/measured-1",
+		runId: "fanout-pilot-r1/ticker-fanout/rate-100/wt/measured-1",
 		generatedAtMs: 1,
 		macClockId: "m".repeat(64),
 		topology: {
@@ -397,11 +397,11 @@ function syntheticReceipt(): PreflightReceiptV1 {
 		},
 		offer: {
 			pacingSource: "preflight-input",
-			publisherRatePerSecond: 500,
-			offeredIngressPerSecond: 500,
-			rowIngressPerWindow: 250,
-			bindingIngressPerWindow: 250,
-			requiredAcceptedPerWindow: 500,
+			publisherRatePerSecond: 200,
+			offeredIngressPerSecond: 200,
+			rowIngressPerWindow: 100,
+			bindingIngressPerWindow: 100,
+			requiredAcceptedPerWindow: 200,
 			acceptedPredicate: "at-least",
 		},
 		preconditions: {
@@ -418,7 +418,7 @@ function syntheticReceipt(): PreflightReceiptV1 {
 			completed: true,
 			dispatchOk: false,
 			failureCode: "TRUST_PROTOCOL",
-			reason: "expectedOfferedIngress 2500 != 5000",
+			reason: "expectedOfferedIngress 1000 != 2000",
 			sealedPath: null,
 			campaignRootRecordsBefore: [],
 			campaignRootRecordsRemoved: ["execution-000001-ws.json"],
@@ -431,11 +431,11 @@ function syntheticReceipt(): PreflightReceiptV1 {
 			relayWritesCompletedByOriginWindow: windows.map((c) => c * 100),
 		},
 		totals: {
-			offered: 5_000,
-			accepted: 5_000,
-			delivered: 500_000,
-			deliveredBytes: 50_000_000,
-			expectedDelivered: 500_000,
+			offered: 2_000,
+			accepted: 2_000,
+			delivered: 200_000,
+			deliveredBytes: 20_000_000,
+			expectedDelivered: 200_000,
 			ingressRefusals: 0,
 		},
 		warmup: {
@@ -553,13 +553,13 @@ describe("parsePreflightReceipt: the D4 receipt's closed shape", () => {
 		expect(
 			parsePreflightReceipt({
 				...short,
-				windows: { ...short.windows, acceptedByOriginWindow: [500] },
+				windows: { ...short.windows, acceptedByOriginWindow: [200] },
 			}).ok,
 		).toBe(false);
 		expect(
 			parsePreflightReceipt({
 				...short,
-				offer: { ...short.offer, requiredAcceptedPerWindow: 250 },
+				offer: { ...short.offer, requiredAcceptedPerWindow: 100 },
 			}).ok,
 		).toBe(false);
 		expect(
@@ -733,7 +733,7 @@ describe("parsePreflightArgs", () => {
 				"--transport",
 				"ws",
 				"--cell",
-				"ticker-fanout/rate-250",
+				"ticker-fanout/rate-100",
 				"--pass",
 				"1x",
 				"--out",
@@ -758,7 +758,7 @@ describe("parsePreflightArgs", () => {
 				"--transport",
 				"ws",
 				"--cell",
-				"ticker-fanout/rate-250",
+				"ticker-fanout/rate-100",
 				"--pass",
 				"1x",
 				"--out",
@@ -797,7 +797,7 @@ describe("parsePreflightArgs", () => {
 		expect(
 			parsePreflightArgs([
 				"--transport=ws",
-				"--cell=ticker-fanout/rate-250",
+				"--cell=ticker-fanout/rate-100",
 				"--pass=1x",
 				"--out=/tmp/x",
 				"--loopback",
@@ -883,8 +883,8 @@ describe("the lease factory's preflight pacing input", () => {
 			staged,
 			transport: "ws",
 			serverPort: 44_100,
-			cell: cohortCellCardinality("ticker 250"),
-			grantParameters: cohortCellGrantParameters("ticker 250"),
+			cell: cohortCellCardinality("ticker 100"),
+			grantParameters: cohortCellGrantParameters("ticker 100"),
 			childStateFor: () => ({
 				plan,
 				pid: 1,
@@ -912,7 +912,7 @@ describe("the lease factory's preflight pacing input", () => {
 	}
 
 	it("without the input the child is paced at the cell's rate; with it, at the preflight's", () => {
-		expect(frameSourceWith(undefined).messageRatePerSecond).toBe(250);
+		expect(frameSourceWith(undefined).messageRatePerSecond).toBe(100);
 		expect(frameSourceWith(500).messageRatePerSecond).toBe(500);
 	});
 
@@ -925,7 +925,7 @@ describe("the lease factory's preflight pacing input", () => {
 /**
  * The tool, end to end, on this host: the local acceptance pair, the real
  * supervisors, the real server child and role children, the 2x ticker pass,
- * whose count predicate is the only proof the publisher was paced at 500/s.
+ * whose count predicate is the only proof the publisher was paced at 200/s.
  */
 describe("fanout-physical-preflight --loopback", () => {
 	it("runs the ticker 1x pass through the production lifecycle and writes a receipt that parses", async () => {
@@ -962,7 +962,7 @@ describe("fanout-physical-preflight --loopback", () => {
 				"--transport",
 				"ws",
 				"--cell",
-				"ticker-fanout/rate-250",
+				"ticker-fanout/rate-100",
 				"--pass",
 				"1x",
 				"--out",
@@ -976,7 +976,7 @@ describe("fanout-physical-preflight --loopback", () => {
 				outDir: out,
 				candidate: R1_CANDIDATE_ID,
 				transport: "ws",
-				cellId: "ticker-fanout/rate-250",
+				cellId: "ticker-fanout/rate-100",
 				pass: "1x",
 			});
 			const receiptJson = JSON.parse(readFileSync(path, "utf8")) as unknown;
@@ -986,22 +986,22 @@ describe("fanout-physical-preflight --loopback", () => {
 			expect(receipt.mode).toBe("loopback");
 			expect(receipt.preconditions.enforced).toBe(false);
 			expect(receipt.offer.pacingSource).toBe("cell");
-			expect(receipt.offer.publisherRatePerSecond).toBe(250);
+			expect(receipt.offer.publisherRatePerSecond).toBe(100);
 			expect(receipt.lifecycle.completed).toBe(true);
 			expect(receipt.lifecycle.campaignRootRecordsBefore).toEqual([]);
 			expect(receipt.lifecycle.campaignRootRecordsRemoved).toEqual([
 				"execution-000001-ws.json",
 			]);
 			expect(receipt.windows.offeredByOriginWindow).toEqual(
-				new Array<number>(10).fill(250),
+				new Array<number>(10).fill(100),
 			);
 			expect(receipt.windows.acceptedByOriginWindow).toEqual(
-				new Array<number>(10).fill(250),
+				new Array<number>(10).fill(100),
 			);
 			expect(receipt.windows.deliveredByOriginWindow).toEqual(
-				new Array<number>(10).fill(25_000),
+				new Array<number>(10).fill(10_000),
 			);
-			expect(receipt.totals.delivered).toBe(250_000);
+			expect(receipt.totals.delivered).toBe(100_000);
 			expect(receipt.warmup.macDelivered).toBe(1_000);
 			expect(receipt.warmup.relayDeliveries).toBe(1_000);
 			expect(receipt.faults).toEqual(NO_FAULTS);

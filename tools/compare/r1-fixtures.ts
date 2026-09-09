@@ -312,6 +312,19 @@ export const EXPECTED_CELL_CONTRACTS = Object.freeze<
 		armUnitCount: 2,
 	},
 	{
+		cellId: "ticker-fanout/rate-25",
+		scenarioId: "ticker-fanout",
+		warmupRepetitions: 1,
+		measuredRepetitions: 5,
+		readPathWarmupRepetitions: 1,
+		expectedStartTransport: "ws",
+		hasOverlay: false,
+		hasWsWorker: true,
+		hasWtStreamSink: true,
+		offLoopTier: true,
+		armUnitCount: 4,
+	},
+	{
 		cellId: "ticker-fanout/rate-50",
 		scenarioId: "ticker-fanout",
 		warmupRepetitions: 1,
@@ -326,19 +339,6 @@ export const EXPECTED_CELL_CONTRACTS = Object.freeze<
 	},
 	{
 		cellId: "ticker-fanout/rate-100",
-		scenarioId: "ticker-fanout",
-		warmupRepetitions: 1,
-		measuredRepetitions: 5,
-		readPathWarmupRepetitions: 1,
-		expectedStartTransport: "ws",
-		hasOverlay: false,
-		hasWsWorker: true,
-		hasWtStreamSink: true,
-		offLoopTier: true,
-		armUnitCount: 4,
-	},
-	{
-		cellId: "ticker-fanout/rate-250",
 		scenarioId: "ticker-fanout",
 		warmupRepetitions: 1,
 		measuredRepetitions: 5,
@@ -875,6 +875,44 @@ export const EXPECTED_CELL_TABLE = Object.freeze<readonly FixtureCellRow[]>([
 		},
 	},
 	{
+		cellId: "ticker-fanout/rate-25",
+		scenarioId: "ticker-fanout",
+		parameters: {
+			scenarioId: "ticker-fanout",
+			ingressRatePerSecond: 25,
+			publisherCount: 1,
+			subscriberCount: 100,
+			recordBytes: 100,
+			fanout: 100,
+			durationSeconds: 10,
+			delivery: "reliable",
+		},
+		macRoles: [
+			{ role: "publisher", count: 1, processModel: "dedicated" },
+			{ role: "subscriber", count: 100, processModel: "sharded" },
+		],
+		linuxRole: "reliable-relay",
+		direction: "mac-to-linux-to-mac",
+		channels: ["publisher-bidi", "server-opened-subscriber-uni"],
+		sharding: {
+			workerCount: 8,
+			strategy: "round-robin",
+			role: "subscriber",
+			count: 100,
+		},
+		processCohort: {
+			kind: "persistent",
+			processes: 1,
+			primeBeforeMeasurement: false,
+			measuredCycles: 1,
+		},
+		runPolicy: {
+			classification: "long",
+			warmupRepetitions: 1,
+			measuredRepetitions: 5,
+		},
+	},
+	{
 		cellId: "ticker-fanout/rate-50",
 		scenarioId: "ticker-fanout",
 		parameters: {
@@ -918,44 +956,6 @@ export const EXPECTED_CELL_TABLE = Object.freeze<readonly FixtureCellRow[]>([
 		parameters: {
 			scenarioId: "ticker-fanout",
 			ingressRatePerSecond: 100,
-			publisherCount: 1,
-			subscriberCount: 100,
-			recordBytes: 100,
-			fanout: 100,
-			durationSeconds: 10,
-			delivery: "reliable",
-		},
-		macRoles: [
-			{ role: "publisher", count: 1, processModel: "dedicated" },
-			{ role: "subscriber", count: 100, processModel: "sharded" },
-		],
-		linuxRole: "reliable-relay",
-		direction: "mac-to-linux-to-mac",
-		channels: ["publisher-bidi", "server-opened-subscriber-uni"],
-		sharding: {
-			workerCount: 8,
-			strategy: "round-robin",
-			role: "subscriber",
-			count: 100,
-		},
-		processCohort: {
-			kind: "persistent",
-			processes: 1,
-			primeBeforeMeasurement: false,
-			measuredCycles: 1,
-		},
-		runPolicy: {
-			classification: "long",
-			warmupRepetitions: 1,
-			measuredRepetitions: 5,
-		},
-	},
-	{
-		cellId: "ticker-fanout/rate-250",
-		scenarioId: "ticker-fanout",
-		parameters: {
-			scenarioId: "ticker-fanout",
-			ingressRatePerSecond: 250,
 			publisherCount: 1,
 			subscriberCount: 100,
 			recordBytes: 100,
@@ -2123,9 +2123,9 @@ export const EXPECTED_CELL_IDS = Object.freeze([
 	"chat-fanout/subscribers-250",
 	"chat-fanout/subscribers-500",
 	"chat-fanout/subscribers-1000",
+	"ticker-fanout/rate-25",
 	"ticker-fanout/rate-50",
 	"ticker-fanout/rate-100",
-	"ticker-fanout/rate-250",
 	"game-tick-loss/tick-20-loss-1-delay-20",
 	"game-tick-loss/tick-20-loss-1-delay-40",
 	"game-tick-loss/tick-20-loss-2.5-delay-20",
@@ -2164,6 +2164,10 @@ export const EXPECTED_ARM_IDS = Object.freeze([
 	"chat-fanout/subscribers-500/wt",
 	"chat-fanout/subscribers-1000/ws",
 	"chat-fanout/subscribers-1000/wt",
+	"ticker-fanout/rate-25/ws",
+	"ticker-fanout/rate-25/wt",
+	"ticker-fanout/rate-25/ws-worker",
+	"ticker-fanout/rate-25/wt-stream-sink",
 	"ticker-fanout/rate-50/ws",
 	"ticker-fanout/rate-50/wt",
 	"ticker-fanout/rate-50/ws-worker",
@@ -2172,10 +2176,6 @@ export const EXPECTED_ARM_IDS = Object.freeze([
 	"ticker-fanout/rate-100/wt",
 	"ticker-fanout/rate-100/ws-worker",
 	"ticker-fanout/rate-100/wt-stream-sink",
-	"ticker-fanout/rate-250/ws",
-	"ticker-fanout/rate-250/wt",
-	"ticker-fanout/rate-250/ws-worker",
-	"ticker-fanout/rate-250/wt-stream-sink",
 	"game-tick-loss/tick-20-loss-1-delay-20/ws",
 	"game-tick-loss/tick-20-loss-1-delay-20/wt",
 	"game-tick-loss/tick-20-loss-1-delay-20/ws-worker",
@@ -2611,7 +2611,7 @@ export const R1_ROLE_TUPLE_ORACLE_BYTES = canonicalBytes({
 	tuples: R1_ROLE_TUPLE_ORACLE,
 });
 export const R1_ROLE_TUPLE_ORACLE_SHA256 =
-	"4446db49ae328d3b20943d9df6e44a7ef81081eba2f546f733457b7e985b60dc" as const;
+	"76dab99630fd9c1990d07043e99846de629d242267291154dfefc79ff1566d6e" as const;
 
 export function measuredArtifactRecordFor(
 	entry: ManifestRunEntry,
@@ -3417,9 +3417,9 @@ export function representativeFixture(): RepresentativeFixture {
 	// projection above.  Keep its parent links literal so the fixture cannot
 	// silently inherit a self-derived lock/capability digest.
 	const manifestLockSha256 =
-		"ccf09f2cc2d6ce41f5512f5832353d5d04a5c3182852894ad564d2d7c420019c";
+		"3621785bd986f9c9470775500be24a7868b964c7506c600916094f7b7dfe3733";
 	const manifestCapabilitySha256 =
-		"0ff14ce64a1a2754f25428bcc0ec77b2de196d6832a6afc9e1b02b4ad4d960b4";
+		"1fb0720b78fe40b3867f31493ab4dc9a8898c49813808ce15380cd5f820e27bc";
 	const manifestScheduleHash = sha256Hex(
 		canonicalBytes(
 			runEntries.map((entry, cellIndex) => ({
@@ -3476,7 +3476,7 @@ export function representativeFixture(): RepresentativeFixture {
 		sshHostReceiptSha256:
 			"cc19343bae77f29243dd7d23bdfec452c53ff8376f0a94316b6e8b48ae76faf2",
 		stagedMetadataReceiptSetSha256:
-			"f94b7bb1b1280531b54e6057b8c420151d18347f5f94fa6cf880b97f3eb850bf",
+			"7c39a0e6a7043879b65bc9463f490e58bf5666f73d7bf78e89087e6ca73dd421",
 		supervisorObservationSetSha256:
 			"1114d6ee51ad9071cd3926192f5028a42b5542cffd3ee4974b34050fe371d9c5",
 		macRouteFactsSha256:
@@ -3486,13 +3486,13 @@ export function representativeFixture(): RepresentativeFixture {
 		serverPeerFactsSha256:
 			"df5f0dc7dce245991b309b45f4f140f2d0a6bd785722cc7efa815f8e0a4e5040",
 		qdiscFactsSha256:
-			"4b0881f05134a85c499642166a3606135d035df934b1ec9f553c80536259b979",
+			"11808e0093319863f2f50c4f0e4f8f2d49215a5832a41c7eaa12c35cb8f41af1",
 		tlsFactsSha256:
 			"21dbcadc8cae546e9e5633a7128856d88c22dc7f8963ca1fffc8fe189e43c4a9",
 		roleFactsSha256:
 			"22ee7412a6a434d56cf564bd497e5f70337dd942df21376ec5574b3983d388ad",
 		bunRoleLaunchReceiptSetSha256:
-			"96dd1b7a16a2710062aff2f347a6870f938fc2f07f76c47077124fb66ea3a398",
+			"c9e18bb955ff964af8c9fb7c708df46b7b481868cad6298cdddaabc698ed1e0f",
 		macRuntimeFactsSha256:
 			"9fe533277cc2aad6867f85f9c0a93e6923188ce261a0f3b92287b1f65d8bc058",
 		linuxRuntimeFactsSha256:
@@ -3502,9 +3502,9 @@ export function representativeFixture(): RepresentativeFixture {
 		telemetryFactsSha256:
 			"ff03038fe6ede4b65112df6ccef6773312cc992112c059603b3383a212da5621",
 		cleanupFactsSha256:
-			"fd133f7a7e0eb799930747b6ef8e0a032d05e3abcdb282163aa6984e5776773b",
+			"32730ccabf7dd685539e90ad79df2e84927aecf17f742c10f01d1d3ac90a399a",
 		runFactsSha256:
-			"30198e613b1d121f5586077893344f24e5082fced19ac82b37e0a4ba0d19bc13",
+			"08bbbe62a7800c557e4366be1d6a1436ffa62596e4974431b9c095e2a4549e15",
 		pathSnapshotCount: 70 as const,
 		runNetworkReceiptCount: 768 as const,
 		qdiscRunReceiptCount: 768 as const,
@@ -5140,7 +5140,7 @@ export const R1_CAMPAIGN_LOCK = Object.freeze({
 });
 export const R1_CAMPAIGN_LOCK_BYTES = canonicalBytes(R1_CAMPAIGN_LOCK);
 export const R1_CAMPAIGN_LOCK_SHA256 =
-	"ccf09f2cc2d6ce41f5512f5832353d5d04a5c3182852894ad564d2d7c420019c" as const;
+	"3621785bd986f9c9470775500be24a7868b964c7506c600916094f7b7dfe3733" as const;
 
 export const R1_HOST_SUBMISSION_BYTES = Object.freeze(
 	R1_HOST_SUBMISSIONS.map((submission) => canonicalBytes(submission)),
@@ -5196,7 +5196,7 @@ export const R1_STAGED_CAPABILITY_V1_BYTES = canonicalBytes(
 	R1_STAGED_CAPABILITY_V1,
 );
 export const R1_STAGED_CAPABILITY_V1_SHA256 =
-	"0ff14ce64a1a2754f25428bcc0ec77b2de196d6832a6afc9e1b02b4ad4d960b4" as const;
+	"1fb0720b78fe40b3867f31493ab4dc9a8898c49813808ce15380cd5f820e27bc" as const;
 
 /**
  * A complete per-host capability observation set, frozen for tests
@@ -5281,14 +5281,14 @@ export const R1_STAGED_METADATA_RECEIPT_SHA256S = Object.freeze(
 	R1_STAGED_METADATA_RECEIPT_BYTES.map((bytes) => sha256Hex(bytes)),
 );
 export const R1_STAGED_METADATA_RECEIPT_EXPECTED_SHA256S = Object.freeze([
-	"5d1c13ee80a59fc0dbb6b4c95cc5426f5c5bc8ce2c03d93243f3d92b120c7110",
-	"527d492ae4d8ec9513a97537f82b866287f7f64fe3392699e5564972ace3babf",
+	"28559c7251aa2595222335cb9cfe050b5a28c31bf1631c4e9bec6648feeeb463",
+	"b144d5fd1b96904bcc71c21fc7b88bc3c97ca3aa9da4ff7e6d67787e8361ed9e",
 ] as const);
 export const R1_STAGED_METADATA_RECEIPT_SET_BYTES = canonicalBytes(
 	R1_STAGED_METADATA_RECEIPTS,
 );
 export const R1_STAGED_METADATA_RECEIPT_SET_SHA256 =
-	"f94b7bb1b1280531b54e6057b8c420151d18347f5f94fa6cf880b97f3eb850bf" as const;
+	"7c39a0e6a7043879b65bc9463f490e58bf5666f73d7bf78e89087e6ca73dd421" as const;
 
 export const R1_DESCRIPTOR_ONLY_ROLE_LOADS = Object.freeze([
 	{
@@ -5391,7 +5391,7 @@ export const R1_BUN_ROLE_LAUNCH_RECEIPT_SET_BYTES = canonicalBytes(
 	R1_BUN_ROLE_LAUNCH_RECEIPT_SET,
 );
 export const R1_BUN_ROLE_LAUNCH_RECEIPT_SET_SHA256 =
-	"96dd1b7a16a2710062aff2f347a6870f938fc2f07f76c47077124fb66ea3a398" as const;
+	"c9e18bb955ff964af8c9fb7c708df46b7b481868cad6298cdddaabc698ed1e0f" as const;
 
 export const R1_OFFICIAL_CHILD_ROOTS = Object.freeze([
 	"tools/compare/run-campaign.ts",
@@ -5484,7 +5484,7 @@ export const R1_DIRECT_CABLE_RECEIPT_BYTES = canonicalBytes(
 	R1_DIRECT_CABLE_RECEIPTS,
 );
 export const R1_DIRECT_CABLE_RECEIPT_SHA256 =
-	"30198e613b1d121f5586077893344f24e5082fced19ac82b37e0a4ba0d19bc13" as const;
+	"08bbbe62a7800c557e4366be1d6a1436ffa62596e4974431b9c095e2a4549e15" as const;
 
 const r1PhysicalFixture = representativeFixture();
 export const R1_SUPERVISOR_COMMAND_RECEIPTS = Object.freeze([
@@ -5637,7 +5637,7 @@ export const R1_SUPERVISOR_PATH_RECEIPT_BYTES = canonicalBytes(
 	R1_SUPERVISOR_PATH_RECEIPTS,
 );
 export const R1_SUPERVISOR_PATH_RECEIPT_SHA256 =
-	"06e24b3b8c999266c77c682404bd64b9d10e7eefad4aa446bac0fb3c63c4cabd" as const;
+	"4babaebcdfbcf01a52b86dd00f54522e6a877083dc335390ce29ea41b775a5bf" as const;
 
 export const R1_SUPERVISOR_QDISC_RECEIPTS = Object.freeze(
 	r1PhysicalFixture.runEntries.map((entry) => ({
@@ -5677,7 +5677,7 @@ export const R1_SUPERVISOR_QDISC_RECEIPT_BYTES = canonicalBytes(
 	R1_SUPERVISOR_QDISC_RECEIPTS,
 );
 export const R1_SUPERVISOR_QDISC_RECEIPT_SHA256 =
-	"4b0881f05134a85c499642166a3606135d035df934b1ec9f553c80536259b979" as const;
+	"11808e0093319863f2f50c4f0e4f8f2d49215a5832a41c7eaa12c35cb8f41af1" as const;
 
 export const R1_SUPERVISOR_CLEANUP_RECEIPTS = Object.freeze(
 	r1PhysicalFixture.runEntries.map((entry) => ({
@@ -5701,7 +5701,7 @@ export const R1_SUPERVISOR_CLEANUP_RECEIPT_BYTES = canonicalBytes(
 	R1_SUPERVISOR_CLEANUP_RECEIPTS,
 );
 export const R1_SUPERVISOR_CLEANUP_RECEIPT_SHA256 =
-	"fd133f7a7e0eb799930747b6ef8e0a032d05e3abcdb282163aa6984e5776773b" as const;
+	"32730ccabf7dd685539e90ad79df2e84927aecf17f742c10f01d1d3ac90a399a" as const;
 
 export const R1_CAMPAIGN_MANIFEST_V1 = r1CampaignLockFixtureSource.manifest;
 // The closure's independently written attestation twin, exported so tooling
@@ -5712,7 +5712,7 @@ export const R1_CAMPAIGN_MANIFEST_V1_BYTES = canonicalBytes(
 	R1_CAMPAIGN_MANIFEST_V1,
 );
 export const R1_CAMPAIGN_MANIFEST_V1_SHA256 =
-	"cbe4837bf0809d10e2ac4a7f824d80b76c47e897fe505010299d574f50bcc553" as const;
+	"45ed8dca142b97c3e18ad8e52d39798f675226a84da12a5f947ecbcea667fbeb" as const;
 
 export const R1_SUPERVISOR_OBSERVATION_SET_SHA256 =
 	"1114d6ee51ad9071cd3926192f5028a42b5542cffd3ee4974b34050fe371d9c5" as const;
@@ -5768,7 +5768,7 @@ export const R1_OBSERVED_ATTESTATION_V1_BYTES = canonicalBytes(
 	R1_OBSERVED_ATTESTATION_V1,
 );
 export const R1_OBSERVED_ATTESTATION_V1_SHA256 =
-	"77e219f9a9c326a99144f6a91dbe617c016469a6b1693a931bdc534d592d58ff" as const;
+	"8dafa8c029410cd7935987c06141c586cd95e5bdc68646095e0f79f1ebf08b96" as const;
 
 export const R1_CAMPAIGN_VERIFIER_RESULT_V1 = Object.freeze({
 	schema: "campaign-verifier-result/v1" as const,
@@ -5789,7 +5789,7 @@ export const R1_CAMPAIGN_VERIFIER_RESULT_V1_BYTES = canonicalBytes(
 	R1_CAMPAIGN_VERIFIER_RESULT_V1,
 );
 export const R1_CAMPAIGN_VERIFIER_RESULT_V1_SHA256 =
-	"67101c694bcf50241c9b241de9a15c05031e5ee620c6a258b28e5c02cd49c458" as const;
+	"318999882512858f23c1bdc3c121dd42f5a9758944201ac123e5f5ff176d16b5" as const;
 
 export const R1_CAMPAIGN_REPORT_V1 = Object.freeze({
 	schema: "campaign-report/v1" as const,
@@ -5808,7 +5808,7 @@ export const R1_CAMPAIGN_REPORT_V1_BYTES = canonicalBytes(
 	R1_CAMPAIGN_REPORT_V1,
 );
 export const R1_CAMPAIGN_REPORT_V1_SHA256 =
-	"eac1b544111e7f5fc8823b6d3e42c876f0643f530d283b3e052e2054253c7868" as const;
+	"7e000e787a30badf086865f6c83c9ad9bedde6fcd55b7ff9f001db628a784583" as const;
 
 export const R1_SUPERVISOR_PHYSICAL_OBSERVATION = Object.freeze({
 	schema: "supervisor-physical-observation/v1" as const,
@@ -5863,7 +5863,7 @@ export const R1_SUPERVISOR_PHYSICAL_OBSERVATION_BYTES = canonicalBytes(
 	R1_SUPERVISOR_PHYSICAL_OBSERVATION,
 );
 export const R1_SUPERVISOR_PHYSICAL_OBSERVATION_SHA256 =
-	"bbd2485c3a7871d7dd50884531ef77ba399c8637c52528e6611169c66c9fc3dd" as const;
+	"33a1a2f2748fac499ff5c57ba51f415eba591c0ba626826c6efac9831dcf33ff" as const;
 export const R1_SUPERVISOR_PHYSICAL_OBSERVATION_ENVELOPE_V1 =
 	R1_SUPERVISOR_PHYSICAL_OBSERVATION;
 export const R1_SUPERVISOR_PHYSICAL_OBSERVATION_ENVELOPE_V1_BYTES =
@@ -5902,7 +5902,7 @@ export const R1_SUPERVISOR_INPUT_V1_BYTES = canonicalBytes(
 	R1_SUPERVISOR_INPUT_V1,
 );
 export const R1_SUPERVISOR_INPUT_V1_SHA256 =
-	"b7528d97ddac06ee6f97a824cabffc2af444a61b950959473992c22737a0509e" as const;
+	"7f3821b77968fda843255746330c2a19bb9e8d5cf347dc8e64c3c96d3444e13e" as const;
 export const R1_COMPARISON_SUPERVISOR_INPUT_V1 = R1_SUPERVISOR_INPUT_V1;
 export const R1_COMPARISON_SUPERVISOR_INPUT_V1_BYTES =
 	R1_SUPERVISOR_INPUT_V1_BYTES;
@@ -5931,7 +5931,7 @@ export const R1_SUPERVISOR_OUTPUT_V1_BYTES = canonicalBytes(
 	R1_SUPERVISOR_OUTPUT_V1,
 );
 export const R1_SUPERVISOR_OUTPUT_V1_SHA256 =
-	"c2803191bd2e6c2778a45f4d9af58ce515d811669d218428967b046125364658" as const;
+	"376a02f4b3f558935136e9ce75cdfd2d44c51ddeafae997e995140857b5c4cb0" as const;
 export const R1_COMPARISON_SUPERVISOR_OUTPUT_V1 = R1_SUPERVISOR_OUTPUT_V1;
 export const R1_COMPARISON_SUPERVISOR_OUTPUT_V1_BYTES =
 	R1_SUPERVISOR_OUTPUT_V1_BYTES;
