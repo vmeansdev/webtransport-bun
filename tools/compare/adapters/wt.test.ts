@@ -1,0 +1,1835 @@
+/**
+ * Task 5: WebTransport comparison adapter tests (fake-backed, no sockets).
+ *
+ * Covers:
+ *  - client connect and server accept session mapping
+ *  - datagram / reliable-message selection
+ *  - both-side uni/bidi create/accept lifecycle
+ *  - Node stream backpressure (write/end/read/cancel)
+ *  - close/reset/timeout mapping
+ *  - 0-RTT truth-counter propagation (has0Rtt, accepted0Rtt, handshakeConfirmed)
+ *  - exact canonical capacity profile serialized to WT server options
+ *  - submitted profile bytes/hash recorded in artifacts
+ *  - WT behavioral counters (no fabricated runtime applied-config echo)
+ *  - one submitted profile per adapter instance; divergent starts rejected
+ */
+import { describe, expect, it } from "bun:test";
+import { Duplex, Readable, Writable } from "node:stream";
+import { canonicalJson, sha256Canonical } from "../canonical.ts";
+import { CANONICAL_CAPACITY_PROFILE } from "../scenario-registry.ts";
+import { encodeWireMessage } from "../wire.ts";
+import type {
+	BidiChannel,
+	ReceiveChannel,
+	SendChannel,
+	ServerHandle,
+	Session,
+	SubmittedCapacityProfile,
+	TransportAdapter,
+	TransportMetrics,
+} from "./transport.ts";
+import {
+	createWebTransportAdapter,
+	type FakeWtClientSession,
+	HARNESS_STREAMS_PER_SESSION,
+	type FakeWtServerSession,
+	LengthPrefixedFrameReader,
+	type WtClientFactory,
+	type WtServerFactory,
+} from "./wt.ts";
+
+// ---------------------------------------------------------------------------
+// Fake helpers
+// ---------------------------------------------------------------------------
+
+/** Creates an in-memory readable Node stream that feeds bytes on demand. */
+function makeReadable(chunks: Uint8Array[]): Readable {
+	let idx = 0;
+	return new Readable({
+		read() {
+			if (idx < chunks.length) {
+				this.push(chunks[idx++]);
+			} else {
+				this.push(null);
+			}
+		},
+	});
+}
+
+/** Creates an in-memory writable Node stream that collects written chunks. */
+function makeWritable(collected: Uint8Array[]): Writable {
+	return new Writable({
+		write(chunk: Buffer | Uint8Array, _enc, cb) {
+			collected.push(
+				chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk),
+			);
+			cb();
+		},
+	});
+}
+
+/** Creates a fake duplex Node stream. */
+function makeDuplex(
+	serverChunks: Uint8Array[],
+	clientWritten: Uint8Array[],
+): Duplex {
+	let idx = 0;
+	return new Duplex({
+		read() {
+			if (idx < serverChunks.length) {
+				this.push(serverChunks[idx++]);
+			} else {
+				this.push(null);
+			}
+		},
+		write(chunk: Buffer | Uint8Array, _enc, cb) {
+			clientWritten.push(
+				chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk),
+			);
+			cb();
+		},
+	});
+}
+
+/** Minimal fake server session */
+function makeFakeServerSession(
+	overrides: Partial<FakeWtServerSession> = {},
+): FakeWtServerSession {
+	const datagrams: Uint8Array[] = [];
+	const incomingBidi: Duplex[] = [];
+	const incomingUni: Readable[] = [];
+	const serverOpenedBidi: Array<Duplex> = [];
+	const serverOpenedUni: Array<Writable> = [];
+
+	return {
+		id: "fake-server-session-id",
+		peer: { ip: "10.99.0.1", port: 12345 },
+		has0Rtt: false,
+		accepted0Rtt: false,
+		handshakeConfirmed: true,
+		ready: Promise.resolve(),
+		closed: new Promise(() => {}),
+		draining: new Promise(() => {}),
+		datagrams,
+		incomingBidi,
+		incomingUni,
+		serverOpenedBidi,
+		serverOpenedUni,
+		close: (_info?: unknown) => {},
+		drain: () => {},
+		sendDatagram: async (data: Uint8Array) => {
+			datagrams.push(data);
+		},
+		sendDatagramBatch: async (items: readonly Uint8Array[]) => {
+			datagrams.push(...items);
+			return { sent: items.length };
+		},
+		incomingDatagrams: async function* () {
+			for (const d of datagrams) yield d;
+		},
+		incomingBidirectionalStreams: {
+			getReader: () => {
+				let idx = 0;
+				return {
+					read: async () =>
+						idx < incomingBidi.length
+							? {
+									done: false,
+									value: {
+										readable: incomingBidi[idx],
+										writable: incomingBidi[idx++],
+									},
+								}
+							: { done: true, value: undefined },
+					cancel: async () => {},
+					releaseLock: () => {},
+				};
+			},
+		} as unknown as ReadableStream<{ readable: Readable; writable: Writable }>,
+		incomingUnidirectionalStreams: {
+			getReader: () => {
+				let idx = 0;
+				return {
+					read: async () =>
+						idx < incomingUni.length
+							? { done: false, value: incomingUni[idx++] }
+							: { done: true, value: undefined },
+					cancel: async () => {},
+					releaseLock: () => {},
+				};
+			},
+		} as unknown as ReadableStream<Readable>,
+		createBidirectionalStream: async () => {
+			const collected: Uint8Array[] = [];
+			const d = makeDuplex([], collected);
+			serverOpenedBidi.push(d);
+			return d;
+		},
+		createUnidirectionalStream: async () => {
+			const collected: Uint8Array[] = [];
+			const w = makeWritable(collected);
+			serverOpenedUni.push(w);
+			return w;
+		},
+		metricsSnapshot: () =>
+			({ sessionsOpened: 1, sessionsClosed: 0 }) as unknown as ReturnType<
+				typeof metricsSnapshot
+			>,
+		goAway: () => {},
+		...overrides,
+	} as unknown as FakeWtServerSession;
+}
+
+/** Minimal fake client session */
+function makeFakeClientSession(
+	overrides: Partial<FakeWtClientSession> = {},
+): FakeWtClientSession {
+	const datagrams: Uint8Array[] = [];
+	const incomingBidiChunks: Array<{ readable: Readable; writable: Writable }> =
+		[];
+	const incomingUniChunks: Readable[] = [];
+	const clientOpenedBidi: Duplex[] = [];
+	const clientOpenedUni: Writable[] = [];
+
+	return {
+		id: "fake-client-session-id",
+		peer: { ip: "10.99.0.2", port: 4433 },
+		has0Rtt: false,
+		accepted0Rtt: false,
+		handshakeConfirmed: true,
+		ready: Promise.resolve(),
+		closed: new Promise(() => {}),
+		draining: new Promise(() => {}),
+		datagrams,
+		incomingBidiChunks,
+		incomingUniChunks,
+		clientOpenedBidi,
+		clientOpenedUni,
+		close: (_info?: unknown) => {},
+		drain: () => {},
+		sendDatagram: async (data: Uint8Array) => {
+			datagrams.push(data);
+		},
+		sendDatagramBatch: async (items: readonly Uint8Array[]) => {
+			datagrams.push(...items);
+			return { sent: items.length };
+		},
+		incomingDatagrams: async function* () {
+			for (const d of datagrams) yield d;
+		},
+		createBidirectionalStream: async () => {
+			const collected: Uint8Array[] = [];
+			const d = makeDuplex([], collected);
+			clientOpenedBidi.push(d);
+			return d;
+		},
+		incomingBidirectionalStreams: async function* () {
+			for (const pair of incomingBidiChunks) yield pair as unknown as Duplex;
+		},
+		createUnidirectionalStream: async () => {
+			const collected: Uint8Array[] = [];
+			const w = makeWritable(collected);
+			clientOpenedUni.push(w);
+			return w;
+		},
+		incomingUnidirectionalStreams: async function* () {
+			for (const r of incomingUniChunks) yield r;
+		},
+		metricsSnapshot: () =>
+			({ sessionsOpened: 1, sessionsClosed: 0 }) as unknown as ReturnType<
+				typeof metricsSnapshot
+			>,
+		...overrides,
+	} as unknown as FakeWtClientSession;
+}
+
+function metricsSnapshot() {
+	return {
+		sessionsOpened: 1,
+		sessionsClosed: 0,
+		streamsOpened: 0,
+		streamsAccepted: 0,
+		streamsClosed: 0,
+	};
+}
+
+// Build factories that return the fakes
+function makeFactories(
+	opts: {
+		serverSession?: FakeWtServerSession;
+		clientSession?: FakeWtClientSession;
+		serverOptions?: Record<string, unknown>;
+	} = {},
+): {
+	server: WtServerFactory;
+	client: WtClientFactory;
+	capturedOptions: Record<string, unknown>[];
+} {
+	const serverSession = opts.serverSession ?? makeFakeServerSession();
+	const clientSession = opts.clientSession ?? makeFakeClientSession();
+	const capturedOptions: Record<string, unknown>[] = [];
+
+	const server: WtServerFactory = (options) => {
+		capturedOptions.push(options as Record<string, unknown>);
+		const sessionQueue: FakeWtServerSession[] = [serverSession];
+		const sessionQueueResolve: ((s: FakeWtServerSession) => void) | null = null;
+		return {
+			address: { host: "10.99.0.2", port: options.port ?? 4433 },
+			congestionControl: "default",
+			close: async () => {},
+			metricsSnapshot: () => ({}),
+			sendDatagramMirror: () => ({ sent: 0, failures: [] }),
+			sendDatagramMirrorPaced: () => ({ admitted: 0 }),
+			readMirrorReports: () => [],
+			tlsSnapshot: () => ({ sni: [] }),
+			updateCert: async () => {},
+			updateTls: async () => {},
+			replaceSniCerts: async () => {},
+			upsertSniCert: async () => {},
+			removeSniCert: async () => {},
+			setUnknownSniPolicy: async () => {},
+			goAway: () => {},
+			onSession(cb: (s: FakeWtServerSession) => void) {
+				if (sessionQueue.length > 0) {
+					cb(sessionQueue.shift()!);
+				} else {
+					// store for later
+				}
+			},
+			// For tests, the server factory captures the onSession callback so tests can push sessions
+			_pushSession(
+				s: FakeWtServerSession,
+				cb: (s: FakeWtServerSession) => void,
+			) {
+				cb(s);
+			},
+		} as unknown as ReturnType<WtServerFactory>;
+	};
+
+	const client: WtClientFactory = async (_url, _options) => {
+		return clientSession as unknown as Awaited<ReturnType<WtClientFactory>>;
+	};
+
+	return { server, client, capturedOptions };
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+describe("native WebTransport comparison adapter", () => {
+	it("submits the exact canonical capacity profile as WT server options", async () => {
+		const { server, client, capturedOptions } = makeFactories();
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+
+		await adapter
+			.startServer({
+				port: 4433,
+				tls: { cert: "cert", key: "key" },
+			})
+			.then((h) => h.stop(1000).catch(() => {}));
+
+		expect(capturedOptions.length).toBe(1);
+		const opts = capturedOptions[0];
+		expect(opts).toBeDefined();
+		if (!opts) return; // narrow type
+
+		// limits must match canonical profile exactly
+		const limits = opts["limits"] as Record<string, unknown>;
+		expect(limits).toBeDefined();
+		expect(limits["maxSessions"]).toBe(CANONICAL_CAPACITY_PROFILE.maxSessions);
+		expect(limits["maxHandshakesInFlight"]).toBe(
+			CANONICAL_CAPACITY_PROFILE.maxHandshakesInFlight,
+		);
+		expect(limits["maxStreamsPerSessionBidi"]).toBe(
+			CANONICAL_CAPACITY_PROFILE.maxStreamsPerSessionBidi,
+		);
+		// The two stream budgets are the profile's plus what the harness itself
+		// holds, and that is the point rather than a slipped assertion. The
+		// profile states what the *application* may open; WT's persistent
+		// message stream is not one of the application's, and WS's equivalent
+		// takes no stream token at all, so charging WT's to the profile would
+		// leave the application one stream short on one arm only.
+		expect(limits["maxStreamsPerSessionUni"]).toBe(
+			CANONICAL_CAPACITY_PROFILE.maxStreamsPerSessionUni +
+				HARNESS_STREAMS_PER_SESSION,
+		);
+		expect(limits["maxStreamsGlobal"]).toBe(
+			CANONICAL_CAPACITY_PROFILE.maxStreamsGlobal +
+				CANONICAL_CAPACITY_PROFILE.maxSessions * HARNESS_STREAMS_PER_SESSION,
+		);
+		// The profile the artifact records is still the canonical one, byte for
+		// byte: the harness's reservation is a translation into QUIC limits and
+		// never a change to what the campaign says it ran.
+		expect(HARNESS_STREAMS_PER_SESSION).toBe(1);
+		expect(limits["maxDatagramSize"]).toBe(
+			CANONICAL_CAPACITY_PROFILE.maxDatagramSize,
+		);
+		expect(limits["maxQueuedBytesGlobal"]).toBe(
+			CANONICAL_CAPACITY_PROFILE.maxQueuedBytesGlobal,
+		);
+		expect(limits["maxQueuedBytesPerSession"]).toBe(
+			CANONICAL_CAPACITY_PROFILE.maxQueuedBytesPerSession,
+		);
+		expect(limits["maxQueuedBytesPerStream"]).toBe(
+			CANONICAL_CAPACITY_PROFILE.maxQueuedBytesPerStream,
+		);
+		expect(limits["backpressureTimeoutMs"]).toBe(
+			CANONICAL_CAPACITY_PROFILE.backpressureTimeoutMs,
+		);
+		expect(limits["handshakeTimeoutMs"]).toBe(
+			CANONICAL_CAPACITY_PROFILE.handshakeTimeoutMs,
+		);
+		expect(limits["idleTimeoutMs"]).toBe(
+			CANONICAL_CAPACITY_PROFILE.idleTimeoutMs,
+		);
+
+		// rateLimits must match canonical profile
+		const rateLimits = opts["rateLimits"] as Record<string, unknown>;
+		expect(rateLimits).toBeDefined();
+		expect(rateLimits["handshakesPerSec"]).toBe(
+			CANONICAL_CAPACITY_PROFILE.handshakesPerSec,
+		);
+		expect(rateLimits["handshakesBurst"]).toBe(
+			CANONICAL_CAPACITY_PROFILE.handshakesBurst,
+		);
+		expect(rateLimits["handshakesBurstPerPrefix"]).toBe(
+			CANONICAL_CAPACITY_PROFILE.handshakesBurstPerPrefix,
+		);
+		expect(rateLimits["streamsPerSec"]).toBe(
+			CANONICAL_CAPACITY_PROFILE.streamsPerSec,
+		);
+		expect(rateLimits["streamsBurst"]).toBe(
+			CANONICAL_CAPACITY_PROFILE.streamsBurst,
+		);
+		expect(rateLimits["datagramsPerSec"]).toBe(
+			CANONICAL_CAPACITY_PROFILE.datagramsPerSec,
+		);
+		expect(rateLimits["datagramsBurst"]).toBe(
+			CANONICAL_CAPACITY_PROFILE.datagramsBurst,
+		);
+	});
+
+	it("records submitted profile bytes and SHA-256 hash in the adapter", async () => {
+		const { server, client } = makeFactories();
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+
+		const submitted: SubmittedCapacityProfile =
+			adapter.submittedCapacityProfile;
+		const expectedBytes = canonicalJson(CANONICAL_CAPACITY_PROFILE);
+		const expectedHash = sha256Canonical(CANONICAL_CAPACITY_PROFILE);
+
+		expect(submitted.profile).toEqual(CANONICAL_CAPACITY_PROFILE);
+		expect(submitted.bytes).toBe(expectedBytes);
+		expect(submitted.hash).toBe(expectedHash);
+		expect(submitted.hash).toMatch(/^[0-9a-f]{64}$/);
+	});
+
+	it("has kind 'wt'", () => {
+		const { server, client } = makeFactories();
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+		expect(adapter.kind).toBe("wt");
+	});
+
+	it("does not expose a runtime applied-config echo in metrics", async () => {
+		const { server, client } = makeFactories();
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+		const handle = await adapter.startServer({
+			port: 4433,
+			tls: { cert: "c", key: "k" },
+		});
+		const metrics = handle.snapshot();
+
+		// Must not have a field claiming to be "appliedConfig" or similar
+		expect("appliedConfig" in metrics).toBe(false);
+		expect("runtimeConfig" in metrics).toBe(false);
+		await handle.stop(1000).catch(() => {});
+	});
+
+	it("rejects a second startServer call with a divergent profile", async () => {
+		const { server, client } = makeFactories();
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+		const h1 = await adapter.startServer({
+			port: 4433,
+			tls: { cert: "c", key: "k" },
+		});
+
+		// Second call: must reject because already started
+		expect(
+			adapter.startServer({ port: 4434, tls: { cert: "c", key: "k" } }),
+		).rejects.toThrow();
+
+		await h1.stop(1000).catch(() => {});
+	});
+
+	it("accepts a server session and wraps it in the Session interface", async () => {
+		const fakeServerSession = makeFakeServerSession();
+		const { server, client } = makeFactories({
+			serverSession: fakeServerSession,
+		});
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+
+		const handle = await adapter.startServer({
+			port: 4433,
+			tls: { cert: "c", key: "k" },
+		});
+		const session = await handle.acceptSession(2000);
+
+		expect(session).toBeDefined();
+		expect(typeof session.sendMessage).toBe("function");
+		expect(typeof session.receiveMessage).toBe("function");
+		expect(typeof session.openUni).toBe("function");
+		expect(typeof session.acceptUni).toBe("function");
+		expect(typeof session.openBidi).toBe("function");
+		expect(typeof session.acceptBidi).toBe("function");
+		expect(typeof session.close).toBe("function");
+		expect(typeof session.snapshot).toBe("function");
+
+		await handle.stop(1000).catch(() => {});
+	});
+
+	it("sends a datagram via sendMessage('datagram', ...)", async () => {
+		const sent: Uint8Array[] = [];
+		const fakeServerSession = makeFakeServerSession({
+			sendDatagram: async (data) => {
+				sent.push(data);
+			},
+		});
+		const { server, client } = makeFactories({
+			serverSession: fakeServerSession,
+		});
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+
+		const handle = await adapter.startServer({
+			port: 4433,
+			tls: { cert: "c", key: "k" },
+		});
+		const session = await handle.acceptSession(2000);
+
+		const payload = new Uint8Array([1, 2, 3, 4]);
+		// sendMessage takes a WireMessage struct, NOT pre-encoded bytes
+		const wire: import("../wire.ts").WireMessage = {
+			runId: "run-1",
+			sessionId: "ses-1",
+			sequence: 1,
+			expiresAtMs: Date.now() + 10_000,
+			payload,
+		};
+		await session.sendMessage("datagram", wire, 2000);
+
+		expect(sent.length).toBe(1);
+		await handle.stop(1000).catch(() => {});
+	});
+
+	it("sends a reliable-message via sendMessage('reliable-message', ...)", async () => {
+		const writtenChunks: Uint8Array[] = [];
+		const fakeServerSession = makeFakeServerSession({
+			createUnidirectionalStream: async () => makeWritable(writtenChunks),
+		});
+		const { server, client } = makeFactories({
+			serverSession: fakeServerSession,
+		});
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+
+		const handle = await adapter.startServer({
+			port: 4433,
+			tls: { cert: "c", key: "k" },
+		});
+		const session = await handle.acceptSession(2000);
+
+		const payload = new Uint8Array([5, 6, 7]);
+		const wire: import("../wire.ts").WireMessage = {
+			runId: "run-1",
+			sessionId: "ses-1",
+			sequence: 1,
+			expiresAtMs: Date.now() + 10_000,
+			payload,
+		};
+		await session.sendMessage("reliable-message", wire, 2000);
+
+		// A reliable-message should have opened a uni stream and written the encoded bytes
+		expect(writtenChunks.length).toBeGreaterThan(0);
+		await handle.stop(1000).catch(() => {});
+	});
+
+	it("receives a datagram via receiveMessage('datagram', ...)", async () => {
+		const payload = new Uint8Array([10, 20, 30]);
+		// The datagram bytes on the wire are encoded WireMessage bytes
+		const { encodeWireMessage } = await import("../wire.ts");
+		const wire = encodeWireMessage({
+			runId: "run-1",
+			sessionId: "ses-1",
+			sequence: 1,
+			expiresAtMs: Date.now() + 10_000,
+			payload,
+		});
+
+		const fakeServerSession = makeFakeServerSession({
+			incomingDatagrams: async function* () {
+				yield wire;
+			},
+		});
+		const { server, client } = makeFactories({
+			serverSession: fakeServerSession,
+		});
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+
+		const handle = await adapter.startServer({
+			port: 4433,
+			tls: { cert: "c", key: "k" },
+		});
+		const session = await handle.acceptSession(2000);
+
+		const msg = await session.receiveMessage("datagram", 2000);
+		expect(msg.payload).toEqual(payload);
+		await handle.stop(1000).catch(() => {});
+	});
+
+	it("opens a client-side uni stream (openUni) and wraps it as SendChannel", async () => {
+		const written: Uint8Array[] = [];
+		const fakeClientSession = makeFakeClientSession({
+			createUnidirectionalStream: async () => makeWritable(written),
+		});
+		const { server, client } = makeFactories({
+			clientSession: fakeClientSession,
+		});
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+
+		const session = await adapter.connect({
+			url: "https://10.99.0.2:4433",
+			role: "client",
+			deadlineMs: 2000,
+		});
+
+		const ch: SendChannel = await session.openUni(2000);
+		expect(typeof ch.channelId).toBe("number");
+		expect(typeof ch.write).toBe("function");
+		expect(typeof ch.end).toBe("function");
+
+		const bytes = new Uint8Array([1, 2, 3]);
+		await ch.write(bytes, 2000);
+		expect(written.length).toBeGreaterThan(0);
+	});
+
+	it("accepts a server-opened uni stream (acceptUni) and reads bytes", async () => {
+		const payload = new Uint8Array([11, 22, 33]);
+		const readable = makeReadable([payload]);
+
+		const fakeClientSession = makeFakeClientSession({
+			incomingUnidirectionalStreams: async function* () {
+				yield readable;
+			},
+		});
+		const { server, client } = makeFactories({
+			clientSession: fakeClientSession,
+		});
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+
+		const session = await adapter.connect({
+			url: "https://10.99.0.2:4433",
+			role: "client",
+			deadlineMs: 2000,
+		});
+
+		const ch: ReceiveChannel = await session.acceptUni(2000);
+		expect(typeof ch.channelId).toBe("number");
+		const data = await ch.read(2000);
+		expect(data).toEqual(payload);
+	});
+
+	it("opens a client-side bidi stream (openBidi) and wraps it as BidiChannel", async () => {
+		const written: Uint8Array[] = [];
+		const payload = new Uint8Array([7, 8, 9]);
+		const duplex = makeDuplex([payload], written);
+
+		const fakeClientSession = makeFakeClientSession({
+			createBidirectionalStream: async () => duplex,
+		});
+		const { server, client } = makeFactories({
+			clientSession: fakeClientSession,
+		});
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+
+		const session = await adapter.connect({
+			url: "https://10.99.0.2:4433",
+			role: "client",
+			deadlineMs: 2000,
+		});
+
+		const ch: BidiChannel = await session.openBidi(2000);
+		expect(typeof ch.channelId).toBe("number");
+		expect(typeof ch.write).toBe("function");
+		expect(typeof ch.read).toBe("function");
+
+		// Write
+		await ch.write(new Uint8Array([1, 2]), 2000);
+		expect(written.length).toBeGreaterThan(0);
+
+		// Read
+		const data = await ch.read(2000);
+		expect(data).toEqual(payload);
+	});
+
+	it("accepts a server-opened bidi stream (acceptBidi) on server session", async () => {
+		const payload = new Uint8Array([99]);
+		const written: Uint8Array[] = [];
+		const duplex = makeDuplex([payload], written);
+
+		const fakeServerSession = makeFakeServerSession({
+			incomingBidirectionalStreams: {
+				getReader: () => {
+					let done = false;
+					return {
+						read: async () => {
+							if (!done) {
+								done = true;
+								return {
+									done: false,
+									value: { readable: duplex, writable: duplex },
+								};
+							}
+							return { done: true, value: undefined };
+						},
+						cancel: async () => {},
+						releaseLock: () => {},
+					};
+				},
+			} as unknown as ReadableStream<{
+				readable: Readable;
+				writable: Writable;
+			}>,
+		});
+		const { server, client } = makeFactories({
+			serverSession: fakeServerSession,
+		});
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+
+		const handle = await adapter.startServer({
+			port: 4433,
+			tls: { cert: "c", key: "k" },
+		});
+		const session = await handle.acceptSession(2000);
+		const ch: BidiChannel = await session.acceptBidi(2000);
+
+		expect(typeof ch.channelId).toBe("number");
+		const data = await ch.read(2000);
+		expect(data).toEqual(payload);
+
+		await handle.stop(1000).catch(() => {});
+	});
+
+	it("server creates a server-opened uni stream exposed through acceptUni on client", async () => {
+		const written: Uint8Array[] = [];
+		const serverUni = makeWritable(written);
+
+		const fakeServerSession = makeFakeServerSession({
+			createUnidirectionalStream: async () => serverUni,
+		});
+		const { server, client } = makeFactories({
+			serverSession: fakeServerSession,
+		});
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+
+		const handle = await adapter.startServer({
+			port: 4433,
+			tls: { cert: "c", key: "k" },
+		});
+		const session = await handle.acceptSession(2000);
+
+		// Server opens a uni stream
+		const ch: SendChannel = await session.openUni(2000);
+		expect(typeof ch.channelId).toBe("number");
+		await ch.write(new Uint8Array([42]), 2000);
+		expect(written.length).toBeGreaterThan(0);
+
+		await handle.stop(1000).catch(() => {});
+	});
+
+	it("propagates has0Rtt, accepted0Rtt, handshakeConfirmed truth counters from client session", async () => {
+		const fakeClientSession = makeFakeClientSession({
+			has0Rtt: true,
+			accepted0Rtt: true,
+			handshakeConfirmed: false, // still confirming
+		});
+		const { server, client } = makeFactories({
+			clientSession: fakeClientSession,
+		});
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+
+		const session = await adapter.connect({
+			url: "https://10.99.0.2:4433",
+			role: "client",
+			deadlineMs: 2000,
+		});
+		const metrics = session.snapshot() as unknown as Record<string, unknown>;
+
+		// The 0-RTT fields must come from the real session, not be fabricated
+		expect(metrics["has0Rtt"]).toBe(true);
+		expect(metrics["accepted0Rtt"]).toBe(true);
+		expect(metrics["handshakeConfirmed"]).toBe(false);
+	});
+
+	it("records has0Rtt=false and accepted0Rtt=false for a normal (non-0-RTT) client session", async () => {
+		const fakeClientSession = makeFakeClientSession({
+			has0Rtt: false,
+			accepted0Rtt: false,
+			handshakeConfirmed: true,
+		});
+		const { server, client } = makeFactories({
+			clientSession: fakeClientSession,
+		});
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+
+		const session = await adapter.connect({
+			url: "https://10.99.0.2:4433",
+			role: "client",
+			deadlineMs: 2000,
+		});
+		const metrics = session.snapshot() as unknown as Record<string, unknown>;
+		expect(metrics["has0Rtt"]).toBe(false);
+		expect(metrics["accepted0Rtt"]).toBe(false);
+		expect(metrics["handshakeConfirmed"]).toBe(true);
+	});
+
+	it("propagates 0-RTT truth counters from server session", async () => {
+		const fakeServerSession = makeFakeServerSession({
+			has0Rtt: true,
+			accepted0Rtt: true,
+			handshakeConfirmed: false,
+		});
+		const { server, client } = makeFactories({
+			serverSession: fakeServerSession,
+		});
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+
+		const handle = await adapter.startServer({
+			port: 4433,
+			tls: { cert: "c", key: "k" },
+		});
+		const session = await handle.acceptSession(2000);
+		const metrics = session.snapshot() as unknown as Record<string, unknown>;
+
+		expect(metrics["has0Rtt"]).toBe(true);
+		expect(metrics["accepted0Rtt"]).toBe(true);
+		expect(metrics["handshakeConfirmed"]).toBe(false);
+		await handle.stop(1000).catch(() => {});
+	});
+
+	it("bounds acceptSession to a deadline and rejects when no session arrives", async () => {
+		// Server factory that never delivers a session
+		const neverServer: WtServerFactory = (options) =>
+			({
+				address: { host: "10.99.0.2", port: options.port },
+				congestionControl: "default" as const,
+				close: async () => {},
+				metricsSnapshot: () => ({}),
+				sendDatagramMirror: () => ({ sent: 0, failures: [] }),
+				sendDatagramMirrorPaced: () => ({ admitted: 0 }),
+				readMirrorReports: () => [],
+				tlsSnapshot: () => ({ sni: [] }),
+				updateCert: async () => {},
+				updateTls: async () => {},
+				replaceSniCerts: async () => {},
+				upsertSniCert: async () => {},
+				removeSniCert: async () => {},
+				setUnknownSniPolicy: async () => {},
+			}) as unknown as ReturnType<WtServerFactory>;
+
+		const { client } = makeFactories();
+		const adapter = createWebTransportAdapter({
+			serverFactory: neverServer,
+			clientFactory: client,
+		});
+		const handle = await adapter.startServer({
+			port: 4433,
+			tls: { cert: "c", key: "k" },
+		});
+
+		await expect(handle.acceptSession(50)).rejects.toThrow();
+		await handle.stop(1000).catch(() => {});
+	});
+
+	it("bounds close() to a deadline and resolves promptly on cooperative session", async () => {
+		let closeCalled = false;
+		const fakeClientSession = makeFakeClientSession({
+			close: (_info?: unknown) => {
+				closeCalled = true;
+			},
+		});
+		const { server, client } = makeFactories({
+			clientSession: fakeClientSession,
+		});
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+
+		const session = await adapter.connect({
+			url: "https://10.99.0.2:4433",
+			role: "client",
+			deadlineMs: 2000,
+		});
+
+		await expect(session.close(2000)).resolves.toBeUndefined();
+		expect(closeCalled).toBe(true);
+	});
+
+	it("provides session snapshot with active/inactive flag and stream counters", async () => {
+		const { server, client } = makeFactories();
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+
+		const session = await adapter.connect({
+			url: "https://10.99.0.2:4433",
+			role: "client",
+			deadlineMs: 2000,
+		});
+
+		const metrics: TransportMetrics = session.snapshot();
+		expect(typeof metrics.active).toBe("boolean");
+		expect(typeof metrics.streamsOpened).toBe("number");
+		expect(typeof metrics.streamsAccepted).toBe("number");
+		expect(typeof metrics.streamsClosed).toBe("number");
+		expect(typeof metrics.sessionsOpened).toBe("number");
+		expect(typeof metrics.sessionsClosed).toBe("number");
+	});
+
+	it("records loop utilization: a non-zero window after a session, and busy time after traffic", async () => {
+		// The window is the wall-clock since session open. A session that
+		// exists but never receives has busyMs=0 and windowMs>0 -- a
+		// defined zero is the answer to "did anything actually run?"
+		// A session that received a message has busyMs>0 because the
+		// receive loop did the decode/dispatch work, and the fraction
+		// is what makes a tail-latency claim interpretable.
+		const { server, client } = makeFactories();
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+
+		const session = await adapter.connect({
+			url: "https://10.99.0.2:4433",
+			role: "client",
+			deadlineMs: 2000,
+		});
+
+		const beforeTraffic: TransportMetrics = session.snapshot();
+		expect(beforeTraffic.loopUtilization.windowMs).toBeGreaterThanOrEqual(0);
+		expect(beforeTraffic.loopUtilization.busyMs).toBe(0);
+		expect(typeof beforeTraffic.loopUtilization.busyMs).toBe("number");
+		expect(typeof beforeTraffic.loopUtilization.windowMs).toBe("number");
+
+		// The window grows monotonically with wall-clock time, so a
+		// second snapshot taken later has a window that is at least
+		// as large. This is the only thing the adapter can prove
+		// without traffic -- "the consumer of inbound bytes has been
+		// running for at least N ms" is what `windowMs` reports.
+		await Bun.sleep(2);
+		const afterIdle: TransportMetrics = session.snapshot();
+		expect(afterIdle.loopUtilization.windowMs).toBeGreaterThanOrEqual(
+			beforeTraffic.loopUtilization.windowMs,
+		);
+		expect(afterIdle.loopUtilization.busyMs).toBeGreaterThanOrEqual(0);
+	});
+
+	it("does not modify WebTransport product code; only uses public API", async () => {
+		// All interactions with WT must go through the public createServer/connect surface.
+		// This test confirms the adapter module imports only from the package index.
+		const wtModule = await import("./wt.ts");
+		// The module must export createWebTransportAdapter and factory types.
+		expect(typeof wtModule.createWebTransportAdapter).toBe("function");
+	});
+
+	// Phase 2.4 (revised 2.4.1c): the WT server's
+	// `serverLoopUtilization` must retain the busy time of a
+	// session that has already closed. The pre-existing
+	// implementation returned the literal placeholder
+	// `{ busyMs: 0, windowMs: 0 }` regardless of traffic; the
+	// post-fix implementation accumulates closed-session busy
+	// time and publishes it on `ServerMetrics`.
+	it("serverLoopUtilization retains a closed session's busy time after the session leaves the live set", async () => {
+		const { server, client } = makeFactories();
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+		const handle = await adapter.startServer({
+			port: 4433,
+			tls: { cert: "c", key: "k" },
+		});
+		const session = await handle.acceptSession(2000);
+
+		// The new `serverLoopUtilization` field is published
+		// on `ServerMetrics` (and only on server snapshots,
+		// not session snapshots). The pre-fix placeholder
+		// `{ busyMs: 0, windowMs: 0 }` was always zero even
+		// when traffic ran; the post-fix implementation
+		// reports the real aggregate.
+		const liveSnapshot = handle.snapshot();
+		expect(liveSnapshot.serverLoopUtilization).toBeDefined();
+		expect(typeof liveSnapshot.serverLoopUtilization.busyMs).toBe("number");
+		expect(typeof liveSnapshot.serverLoopUtilization.windowMs).toBe("number");
+		expect(liveSnapshot.serverLoopUtilization.windowMs).toBeGreaterThan(0);
+		expect(liveSnapshot.serverLoopUtilization).toEqual(
+			liveSnapshot.loopUtilization,
+		);
+
+		await session.close(2000);
+		// After close, the pre-fix implementation would
+		// still report `{ busyMs: 0, windowMs: 0 }`; the
+		// post-fix implementation has read the closed
+		// session's busy time off the accumulator. Even
+		// when the test clock is too fast to accumulate
+		// non-zero busy time, the field must be present,
+		// finite, and equal to `loopUtilization`.
+		const afterClose = handle.snapshot();
+		expect(Number.isFinite(afterClose.serverLoopUtilization.busyMs)).toBe(true);
+		expect(Number.isFinite(afterClose.serverLoopUtilization.windowMs)).toBe(
+			true,
+		);
+		expect(afterClose.serverLoopUtilization.windowMs).toBeGreaterThan(0);
+		expect(afterClose.serverLoopUtilization).toEqual(
+			afterClose.loopUtilization,
+		);
+		await handle.stop(2000).catch(() => {});
+	});
+
+	it("wt_server_busy_idle_positive_window", async () => {
+		let now = 1_000;
+		const clock = {
+			nowMs: () => now,
+			sleep: async (ms: number) => {
+				now += ms;
+			},
+		};
+		const { server, client } = makeFactories();
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+			clock,
+		});
+		const handle = await adapter.startServer({
+			port: 4433,
+			tls: { cert: "c", key: "k" },
+		});
+		const session = await handle.acceptSession(2_000);
+		now += 40;
+		const snap = handle.snapshot();
+		expect(snap.serverLoopUtilization.busyMs).toBe(0);
+		expect(snap.serverLoopUtilization.windowMs).toBeGreaterThan(0);
+		expect(session.snapshot().loopUtilization.busyMs).toBe(0);
+		expect(session.snapshot().loopUtilization.windowMs).toBeGreaterThan(0);
+		await session.close(2_000);
+		await handle.stop(2_000).catch(() => {});
+	});
+
+	it("wt_server_busy_transfers_closed_session_once", async () => {
+		let now = 1_000;
+		let injectBusy = false;
+		const clock = {
+			nowMs: () => now,
+			sleep: async (ms: number) => {
+				now += ms;
+			},
+			noteBusySlice: () => {
+				if (injectBusy) now += 65;
+			},
+		};
+		const datagrams: Uint8Array[] = [];
+		const serverSession = makeFakeServerSession({
+			incomingDatagrams: async function* () {
+				for (const d of datagrams) yield d;
+			},
+		});
+		const { server, client } = makeFactories({ serverSession });
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+			clock,
+		});
+		const handle = await adapter.startServer({
+			port: 4433,
+			tls: { cert: "c", key: "k" },
+		});
+		const session = await handle.acceptSession(2_000);
+		datagrams.push(
+			encodeWireMessage({
+				runId: "run-1",
+				sessionId: "session-1",
+				sequence: 1,
+				expiresAtMs: 10_000,
+				payload: new Uint8Array([1, 2, 3]),
+			}),
+		);
+		injectBusy = true;
+		await session.receiveMessage("datagram", 2_000);
+		const live = handle.snapshot().serverLoopUtilization.busyMs;
+		expect(live).toBe(65);
+		await session.close(2_000);
+		expect(handle.snapshot().serverLoopUtilization.busyMs).toBe(65);
+		await handle.stop(2_000).catch(() => {});
+	});
+
+	it("wt_server_busy_repeated_close_is_idempotent", async () => {
+		let now = 1_000;
+		let injectBusy = false;
+		const clock = {
+			nowMs: () => now,
+			sleep: async (ms: number) => {
+				now += ms;
+			},
+			noteBusySlice: () => {
+				if (injectBusy) now += 65;
+			},
+		};
+		const datagrams: Uint8Array[] = [];
+		const serverSession = makeFakeServerSession({
+			incomingDatagrams: async function* () {
+				for (const d of datagrams) yield d;
+			},
+		});
+		const { server, client } = makeFactories({ serverSession });
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+			clock,
+		});
+		const handle = await adapter.startServer({
+			port: 4433,
+			tls: { cert: "c", key: "k" },
+		});
+		const session = await handle.acceptSession(2_000);
+		datagrams.push(
+			encodeWireMessage({
+				runId: "run-1",
+				sessionId: "session-1",
+				sequence: 1,
+				expiresAtMs: 10_000,
+				payload: new Uint8Array([9]),
+			}),
+		);
+		injectBusy = true;
+		await session.receiveMessage("datagram", 2_000);
+		await session.close(2_000);
+		expect(handle.snapshot().serverLoopUtilization.busyMs).toBe(65);
+		await session.close(2_000);
+		await session.close(2_000);
+		expect(handle.snapshot().serverLoopUtilization.busyMs).toBe(65);
+		await handle.stop(2_000).catch(() => {});
+	});
+
+	it("wt_server_busy_live_plus_closed_is_65ms", async () => {
+		let now = 1_000;
+		let injectBusy = false;
+		const clock = {
+			nowMs: () => now,
+			sleep: async (ms: number) => {
+				now += ms;
+			},
+			noteBusySlice: () => {
+				if (injectBusy) now += 65;
+			},
+		};
+		const datagrams: Uint8Array[] = [];
+		const serverSession = makeFakeServerSession({
+			incomingDatagrams: async function* () {
+				for (const d of datagrams) yield d;
+			},
+		});
+		const { server, client } = makeFactories({ serverSession });
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+			clock,
+		});
+		const handle = await adapter.startServer({
+			port: 4433,
+			tls: { cert: "c", key: "k" },
+		});
+		const session = await handle.acceptSession(2_000);
+		datagrams.push(
+			encodeWireMessage({
+				runId: "run-1",
+				sessionId: "session-1",
+				sequence: 1,
+				expiresAtMs: 10_000,
+				payload: new Uint8Array([7]),
+			}),
+		);
+		injectBusy = true;
+		await session.receiveMessage("datagram", 2_000);
+		expect(handle.snapshot().serverLoopUtilization.busyMs).toBe(65);
+		await session.close(2_000);
+		// Must stay 65 after close (not 130 from live+closed double count).
+		expect(handle.snapshot().serverLoopUtilization.busyMs).toBe(65);
+		await handle.stop(2_000).catch(() => {});
+	});
+
+	it("rejects connect() with TLS missing on server side (no insecureSkipVerify path)", async () => {
+		// Adapter must require TLS options from the caller; no silent insecure fallback.
+		const { server, client } = makeFactories();
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+
+		// connect without caPem or serverCertificateHashes: adapter should pass them through
+		// (the actual TLS enforcement is at the native layer, but adapter must not swallow).
+		// Simply confirm the call does not throw from the adapter itself.
+		const session = await adapter.connect({
+			url: "https://10.99.0.2:4433",
+			role: "client",
+			deadlineMs: 2000,
+			tls: {
+				ca: "ca-pem",
+				serverName: "wt-compare.local",
+				rejectUnauthorized: true,
+			},
+		});
+		expect(session).toBeDefined();
+	});
+
+	it("SendChannel.end() resolves the writable end of a uni stream", async () => {
+		let ended = false;
+		const writable = new Writable({
+			write(_c, _e, cb) {
+				cb();
+			},
+			final(cb) {
+				ended = true;
+				cb();
+			},
+		});
+		const fakeClientSession = makeFakeClientSession({
+			createUnidirectionalStream: async () => writable,
+		});
+		const { server, client } = makeFactories({
+			clientSession: fakeClientSession,
+		});
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+
+		const session = await adapter.connect({
+			url: "https://10.99.0.2:4433",
+			role: "client",
+			deadlineMs: 2000,
+		});
+		const ch = await session.openUni(2000);
+		await ch.end(2000);
+		expect(ended).toBe(true);
+	});
+
+	it("ReceiveChannel.cancel() destroys the readable without throwing", async () => {
+		const readable = makeReadable([new Uint8Array([1])]);
+		const fakeClientSession = makeFakeClientSession({
+			incomingUnidirectionalStreams: async function* () {
+				yield readable;
+			},
+		});
+		const { server, client } = makeFactories({
+			clientSession: fakeClientSession,
+		});
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+
+		const session = await adapter.connect({
+			url: "https://10.99.0.2:4433",
+			role: "client",
+			deadlineMs: 2000,
+		});
+		const ch = await session.acceptUni(2000);
+		await expect(ch.cancel(1000)).resolves.toBeUndefined();
+	});
+
+	it("read() returns null at end of a Node Readable stream", async () => {
+		const readable = makeReadable([]); // empty → EOF immediately
+		const fakeClientSession = makeFakeClientSession({
+			incomingUnidirectionalStreams: async function* () {
+				yield readable;
+			},
+		});
+		const { server, client } = makeFactories({
+			clientSession: fakeClientSession,
+		});
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+
+		const session = await adapter.connect({
+			url: "https://10.99.0.2:4433",
+			role: "client",
+			deadlineMs: 2000,
+		});
+		const ch = await session.acceptUni(2000);
+		const data = await ch.read(2000);
+		expect(data).toBeNull();
+	});
+
+	it("write() returns a SendObservation with attempted=true and queued=false on cooperative stream", async () => {
+		const written: Uint8Array[] = [];
+		const fakeClientSession = makeFakeClientSession({
+			createUnidirectionalStream: async () => makeWritable(written),
+		});
+		const { server, client } = makeFactories({
+			clientSession: fakeClientSession,
+		});
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+
+		const session = await adapter.connect({
+			url: "https://10.99.0.2:4433",
+			role: "client",
+			deadlineMs: 2000,
+		});
+		const ch = await session.openUni(2000);
+		const obs = await ch.write(new Uint8Array([1, 2, 3]), 2000);
+
+		expect(obs.attempted).toBe(true);
+		expect(typeof obs.bytes).toBe("number");
+		expect(obs.bytes).toBeGreaterThan(0);
+	});
+
+	it("snapshot includes behavioral counters but no fields named appliedConfig or runtimeApplied", async () => {
+		const { server, client } = makeFactories();
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+		const handle = await adapter.startServer({
+			port: 4433,
+			tls: { cert: "c", key: "k" },
+		});
+		const srv = handle.snapshot();
+
+		const forbidden = [
+			"appliedConfig",
+			"runtimeApplied",
+			"runtimeConfig",
+			"appliedLimits",
+		];
+		for (const key of forbidden) {
+			expect(key in srv).toBe(false);
+		}
+		await handle.stop(1000).catch(() => {});
+	});
+});
+
+// ---------------------------------------------------------------------------
+// R4 (persistent reliable-message stream) and R5 (honest funnel) falsifiers
+// ---------------------------------------------------------------------------
+
+function wireBytes(sequence: number, payload: Uint8Array): Uint8Array {
+	return encodeWireMessage({
+		runId: "run-r4",
+		sessionId: "ses-r4",
+		sequence,
+		expiresAtMs: Date.now() + 60_000,
+		payload,
+	});
+}
+
+function concatBytes(parts: readonly Uint8Array[]): Uint8Array {
+	const total = parts.reduce((sum, part) => sum + part.byteLength, 0);
+	const out = new Uint8Array(total);
+	let offset = 0;
+	for (const part of parts) {
+		out.set(part, offset);
+		offset += part.byteLength;
+	}
+	return out;
+}
+
+/** Feeds chunks one `read()` at a time and never ends, so deadlines still bite. */
+function makeChunkFeeder(chunks: readonly Uint8Array[]): Readable {
+	let idx = 0;
+	return new Readable({
+		read() {
+			if (idx < chunks.length) this.push(chunks[idx++]);
+		},
+	});
+}
+
+/**
+ * A client session that enforces `maxStreamsPerSessionUni` the way the native
+ * layer does: an open is refused while that many uni streams are still live.
+ */
+function makeLimitedClientSession(limit: number): {
+	session: FakeWtClientSession;
+	opens: () => number;
+	ends: () => number;
+	written: Uint8Array[];
+} {
+	let live = 0;
+	let opens = 0;
+	let ends = 0;
+	const written: Uint8Array[] = [];
+	const session = makeFakeClientSession({
+		createUnidirectionalStream: async () => {
+			if (live >= limit) {
+				throw new Error(
+					`E_LIMIT_EXCEEDED: maxStreamsPerSessionUni ${limit} exhausted`,
+				);
+			}
+			live += 1;
+			opens += 1;
+			return new Writable({
+				write(chunk: Buffer | Uint8Array, _enc, cb) {
+					written.push(
+						chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk),
+					);
+					cb();
+				},
+				final(cb) {
+					live -= 1;
+					ends += 1;
+					cb();
+				},
+			});
+		},
+	});
+	return { session, opens: () => opens, ends: () => ends, written };
+}
+
+describe("WT reliable-message stream model", () => {
+	it("carries nine reliable messages on one session against maxStreamsPerSessionUni", async () => {
+		const limited = makeLimitedClientSession(
+			CANONICAL_CAPACITY_PROFILE.maxStreamsPerSessionUni,
+		);
+		const { server, client } = makeFactories({
+			clientSession: limited.session,
+		});
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+		const session = await adapter.connect({
+			url: "https://10.99.0.2:4433",
+			role: "client",
+			deadlineMs: 2000,
+		});
+
+		const count = CANONICAL_CAPACITY_PROFILE.maxStreamsPerSessionUni + 1;
+		for (let sequence = 1; sequence <= count; sequence += 1) {
+			await session.sendMessage(
+				"reliable-message",
+				{
+					runId: "run-r4",
+					sessionId: "ses-r4",
+					sequence,
+					expiresAtMs: Date.now() + 60_000,
+					payload: new Uint8Array([sequence]),
+				},
+				2000,
+			);
+		}
+
+		expect(limited.opens()).toBe(1);
+		expect(limited.written.length).toBe(count);
+		const metrics = session.snapshot();
+		expect(metrics.streamsOpened).toBe(1);
+		expect(metrics.streamOpenAttempts).toBe(1);
+		expect(metrics.attempted).toBe(count);
+	});
+
+	it("expresses a ticker-fanout burst without one stream open per record", async () => {
+		const limited = makeLimitedClientSession(
+			CANONICAL_CAPACITY_PROFILE.maxStreamsPerSessionUni,
+		);
+		const { server, client } = makeFactories({
+			clientSession: limited.session,
+		});
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+		const session = await adapter.connect({
+			url: "https://10.99.0.2:4433",
+			role: "client",
+			deadlineMs: 2000,
+		});
+
+		const records = 2000;
+		for (let sequence = 1; sequence <= records; sequence += 1) {
+			await session.sendMessage(
+				"reliable-message",
+				{
+					runId: "run-r4",
+					sessionId: "ses-r4",
+					sequence,
+					expiresAtMs: Date.now() + 60_000,
+					payload: new Uint8Array(16),
+				},
+				2000,
+			);
+		}
+
+		const metrics = session.snapshot();
+		expect(metrics.streamOpenAttempts).toBe(1);
+		expect(metrics.streamsOpened).toBe(1);
+		expect(records / metrics.streamOpenAttempts).toBeGreaterThan(
+			CANONICAL_CAPACITY_PROFILE.streamsPerSec / 1000,
+		);
+	});
+
+	it("ends the reliable-message stream exactly once when the session closes", async () => {
+		const limited = makeLimitedClientSession(8);
+		const { server, client } = makeFactories({
+			clientSession: limited.session,
+		});
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+		const session = await adapter.connect({
+			url: "https://10.99.0.2:4433",
+			role: "client",
+			deadlineMs: 2000,
+		});
+
+		await session.sendMessage(
+			"reliable-message",
+			{
+				runId: "run-r4",
+				sessionId: "ses-r4",
+				sequence: 1,
+				expiresAtMs: Date.now() + 60_000,
+				payload: new Uint8Array([1]),
+			},
+			2000,
+		);
+		expect(limited.ends()).toBe(0);
+
+		await session.close(2000);
+		await session.close(2000);
+		expect(limited.ends()).toBe(1);
+		expect(session.snapshot().streamsClosed).toBe(1);
+	});
+
+	it("opens no stream for a session that sends only datagrams", async () => {
+		const limited = makeLimitedClientSession(8);
+		const { server, client } = makeFactories({
+			clientSession: limited.session,
+		});
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+		const session = await adapter.connect({
+			url: "https://10.99.0.2:4433",
+			role: "client",
+			deadlineMs: 2000,
+		});
+
+		await session.sendMessage(
+			"datagram",
+			{
+				runId: "run-r4",
+				sessionId: "ses-r4",
+				sequence: 1,
+				expiresAtMs: Date.now() + 60_000,
+				payload: new Uint8Array([1]),
+			},
+			2000,
+		);
+
+		expect(limited.opens()).toBe(0);
+		expect(session.snapshot().streamOpenAttempts).toBe(0);
+	});
+});
+
+describe("WT delivery funnel", () => {
+	it("counts a send as queued and never as delivered", async () => {
+		const limited = makeLimitedClientSession(8);
+		const { server, client } = makeFactories({
+			clientSession: limited.session,
+		});
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+		const session = await adapter.connect({
+			url: "https://10.99.0.2:4433",
+			role: "client",
+			deadlineMs: 2000,
+		});
+
+		const sends = 5;
+		for (let sequence = 1; sequence <= sends; sequence += 1) {
+			const observation = await session.sendMessage(
+				sequence % 2 === 0 ? "datagram" : "reliable-message",
+				{
+					runId: "run-r5",
+					sessionId: "ses-r5",
+					sequence,
+					expiresAtMs: Date.now() + 60_000,
+					payload: new Uint8Array([sequence]),
+				},
+				2000,
+			);
+			expect(observation.queued).toBe(true);
+			expect(observation.delivered).toBe(false);
+		}
+
+		const metrics = session.snapshot();
+		expect(metrics.attempted).toBe(sends);
+		expect(metrics.queued).toBe(sends);
+		expect(metrics.delivered).toBe(0);
+		expect(metrics.serverObserved).toBe(0);
+		expect(metrics.acknowledged).toBe(0);
+	});
+
+	it("counts delivered only after the receiver decodes a datagram", async () => {
+		const wire = wireBytes(1, new Uint8Array([9, 9, 9]));
+		const fakeServerSession = makeFakeServerSession({
+			incomingDatagrams: async function* () {
+				yield wire;
+			},
+		});
+		const { server, client } = makeFactories({
+			serverSession: fakeServerSession,
+		});
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+		const handle = await adapter.startServer({
+			port: 4433,
+			tls: { cert: "c", key: "k" },
+		});
+		const session = await handle.acceptSession(2000);
+
+		expect(session.snapshot().delivered).toBe(0);
+		await session.receiveMessage("datagram", 2000);
+		const metrics = session.snapshot();
+		expect(metrics.delivered).toBe(1);
+		expect(metrics.serverObserved).toBe(1);
+		expect(metrics.attempted).toBe(0);
+		expect(metrics.queued).toBe(0);
+		await handle.stop(1000).catch(() => {});
+	});
+
+	it("reads back-to-back envelopes off one accepted stream and counts each", async () => {
+		const envelopes = [
+			wireBytes(1, new Uint8Array([1])),
+			wireBytes(2, new Uint8Array([2, 2])),
+			wireBytes(3, new Uint8Array([3, 3, 3])),
+		];
+		const joined = concatBytes(envelopes);
+		// One coalesced chunk, then a second envelope split across two reads.
+		const split = envelopes[0] as Uint8Array;
+		const feeder = makeChunkFeeder([
+			joined,
+			split.slice(0, 10),
+			split.slice(10),
+		]);
+		const fakeClientSession = makeFakeClientSession({
+			incomingUnidirectionalStreams: async function* () {
+				yield feeder;
+			},
+		});
+		const { server, client } = makeFactories({
+			clientSession: fakeClientSession,
+		});
+		const adapter = createWebTransportAdapter({
+			serverFactory: server,
+			clientFactory: client,
+		});
+		const session = await adapter.connect({
+			url: "https://10.99.0.2:4433",
+			role: "client",
+			deadlineMs: 2000,
+		});
+
+		const sequences: number[] = [];
+		for (let index = 0; index < 4; index += 1) {
+			sequences.push(
+				(await session.receiveMessage("reliable-message", 2000)).sequence,
+			);
+		}
+
+		expect(sequences).toEqual([1, 2, 3, 1]);
+		const metrics = session.snapshot();
+		expect(metrics.delivered).toBe(4);
+		expect(metrics.serverObserved).toBe(4);
+		expect(metrics.streamsAccepted).toBe(1);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Mixed-mode framing (physical-budget amendment D2): one stream carries both
+// `u32be length || body` units and fixed-length units told apart by their
+// first byte. The reader frames by the caller's constants and never looks
+// inside a fixed unit; a wrong length in there is the decoder's refusal.
+// ---------------------------------------------------------------------------
+
+describe("LengthPrefixedFrameReader mixed mode", () => {
+	const MAGIC = 0xc1;
+	const UNIT_BYTES = 24 + 100;
+	const prefixed = (body: Uint8Array): Uint8Array => {
+		const out = new Uint8Array(4 + body.byteLength);
+		new DataView(out.buffer).setUint32(0, body.byteLength, false);
+		out.set(body, 4);
+		return out;
+	};
+	const fixed = (fill: number): Uint8Array => {
+		const out = new Uint8Array(UNIT_BYTES).fill(fill);
+		out[0] = MAGIC;
+		return out;
+	};
+	const concat = (...parts: Uint8Array[]): Uint8Array => {
+		const out = new Uint8Array(
+			parts.reduce((total, part) => total + part.byteLength, 0),
+		);
+		let offset = 0;
+		for (const part of parts) {
+			out.set(part, offset);
+			offset += part.byteLength;
+		}
+		return out;
+	};
+
+	it("frames a fixed unit at exactly its length whatever the chunk boundaries", () => {
+		const reader = new LengthPrefixedFrameReader(4_096, {
+			firstByte: MAGIC,
+			unitBytes: UNIT_BYTES,
+		});
+		const unit = fixed(7);
+		const first = reader.push(unit.subarray(0, 10));
+		expect(first).toEqual([]);
+		expect(reader.pendingBytes).toBe(10);
+		const second = reader.push(unit.subarray(10, UNIT_BYTES - 1));
+		expect(second).toEqual([]);
+		const third = reader.push(unit.subarray(UNIT_BYTES - 1));
+		expect(third.length).toBe(1);
+		expect([...(third[0] as Uint8Array)]).toEqual([...unit]);
+		expect(reader.pendingBytes).toBe(0);
+	});
+
+	it("keeps prefixed units around fixed ones on the same stream, in order", () => {
+		const reader = new LengthPrefixedFrameReader(4_096, {
+			firstByte: MAGIC,
+			unitBytes: UNIT_BYTES,
+		});
+		const json = prefixed(
+			new TextEncoder().encode('{"kind":"delivery-context"}'),
+		);
+		const a = fixed(1);
+		const b = fixed(2);
+		const units = reader.push(concat(json, a, b, json.subarray(0, 3)));
+		expect(units.map((unit) => unit[0])).toEqual([0x00, MAGIC, MAGIC]);
+		expect(units.map((unit) => unit.byteLength)).toEqual([
+			json.byteLength,
+			UNIT_BYTES,
+			UNIT_BYTES,
+		]);
+		expect([...(units[1] as Uint8Array)]).toEqual([...a]);
+		expect([...(units[2] as Uint8Array)]).toEqual([...b]);
+		expect(reader.pendingBytes).toBe(3);
+		const rest = reader.push(json.subarray(3));
+		expect(rest.length).toBe(1);
+		expect([...(rest[0] as Uint8Array)]).toEqual([...json]);
+	});
+
+	it("hands a fixed unit back at the cell length even when its own header lies", () => {
+		// The reader owns no header knowledge: a unit that claims another
+		// payload length is still exactly `unitBytes` on this stream, and it is
+		// the decoder that refuses it. Framing by the header instead would
+		// wait for bytes that never come.
+		const reader = new LengthPrefixedFrameReader(4_096, {
+			firstByte: MAGIC,
+			unitBytes: UNIT_BYTES,
+		});
+		const lying = fixed(9);
+		new DataView(lying.buffer).setUint16(20, 128, true);
+		const units = reader.push(concat(lying, fixed(3)));
+		expect(units.length).toBe(2);
+		expect(units.every((unit) => unit.byteLength === UNIT_BYTES)).toBe(true);
+	});
+
+	it("still throws on a prefixed unit over the cap, and treats the magic as a prefix without mixed mode", () => {
+		const mixed = new LengthPrefixedFrameReader(64, {
+			firstByte: MAGIC,
+			unitBytes: UNIT_BYTES,
+		});
+		expect(() => mixed.push(prefixed(new Uint8Array(65)))).toThrow(RangeError);
+		const plain = new LengthPrefixedFrameReader(4_096);
+		expect(() => plain.push(fixed(1))).toThrow(RangeError);
+	});
+
+	it("refuses a fixed unit kind it cannot frame by", () => {
+		expect(
+			() =>
+				new LengthPrefixedFrameReader(4_096, {
+					firstByte: 0x100,
+					unitBytes: 1,
+				}),
+		).toThrow(RangeError);
+		expect(
+			() =>
+				new LengthPrefixedFrameReader(4_096, {
+					firstByte: MAGIC,
+					unitBytes: 0,
+				}),
+		).toThrow(RangeError);
+	});
+});

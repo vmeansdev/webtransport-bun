@@ -1,0 +1,265 @@
+{
+  "schema": "fanout-physical-preflight-receipt/v1",
+  "candidate": "b3c71552af22d4691ff809eefe3231cb6791c3f9",
+  "campaignId": "fanout-pilot-r1",
+  "mode": "physical",
+  "transport": "ws",
+  "cellId": "ticker-fanout/rate-250",
+  "cohortCell": "ticker 250",
+  "pass": "1x",
+  "generatedAtMs": 1788895251775,
+  "topology": {
+    "publisherCount": 1,
+    "workerCount": 8,
+    "subscriberCount": 100,
+    "sessionCount": 101,
+    "windowCount": 10,
+    "measuredDurationMs": 10000,
+    "messageBytes": 100
+  },
+  "offer": {
+    "pacingSource": "cell",
+    "publisherRatePerSecond": 250,
+    "offeredIngressPerSecond": 250,
+    "rowIngressPerWindow": 250,
+    "bindingIngressPerWindow": 250,
+    "requiredAcceptedPerWindow": 250,
+    "acceptedPredicate": "equals"
+  },
+  "preconditions": {
+    "macLoad1": 3.44091796875,
+    "macLoadBound": 4,
+    "rigLoad1": 0,
+    "rigLoadBound": 0.5,
+    "rigIsThisHost": false,
+    "enforced": true,
+    "failures": [],
+    "ok": true
+  },
+  "runId": "fanout-pilot-r1/ticker-fanout/rate-250/ws/measured-1",
+  "macClockId": "a860c6101fba540f2b7689bcedc68f8f81dfa67b8b7e349db07a876a6f705f51",
+  "lifecycle": {
+    "completed": true,
+    "dispatchOk": true,
+    "failureCode": null,
+    "reason": null,
+    "sealedPath": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/.claude/worktrees/ws-scenario-comparison/.release-evidence/transport-comparison/preflight/b3c71552af22d4691ff809eefe3231cb6791c3f9/scratch/ws-ticker-fanout_rate-250-1x/rep-1.sealed.json"
+  },
+  "windows": {
+    "note": "origin-window counts: offered from the publisher partials, accepted from the Linux relay observation, delivered from the eight worker partials; never wall-clock samples",
+    "offeredByOriginWindow": [
+      250,
+      250,
+      250,
+      250,
+      250,
+      250,
+      250,
+      250,
+      250,
+      250
+    ],
+    "acceptedByOriginWindow": [
+      250,
+      250,
+      250,
+      250,
+      250,
+      250,
+      250,
+      250,
+      250,
+      250
+    ],
+    "deliveredByOriginWindow": [
+      25000,
+      25000,
+      25000,
+      25000,
+      25000,
+      25000,
+      25000,
+      25000,
+      25000,
+      25000
+    ],
+    "relayWritesCompletedByOriginWindow": [
+      25000,
+      25000,
+      25000,
+      25000,
+      25000,
+      25000,
+      25000,
+      25000,
+      25000,
+      25000
+    ]
+  },
+  "totals": {
+    "offered": 2500,
+    "accepted": 2500,
+    "delivered": 250000,
+    "deliveredBytes": 25000000,
+    "expectedDelivered": 250000,
+    "ingressRefusals": 0
+  },
+  "warmup": {
+    "epochMs": 5000,
+    "expectedIngress": 10,
+    "expectedDeliveries": 1000,
+    "macOffered": 10,
+    "macDelivered": 1000,
+    "relayIngress": 10,
+    "relayDeliveries": 1000
+  },
+  "faults": {
+    "relayQueueDrops": 0,
+    "relayWriteTimeouts": 0,
+    "relayDisconnectUndelivered": 0,
+    "relayMalformedIngress": 0,
+    "relayDuplicateIngress": 0,
+    "relayReorderedIngress": 0,
+    "workerMalformed": 0,
+    "workerDuplicate": 0,
+    "workerReorder": 0,
+    "workerDisconnect": 0
+  },
+  "queue": {
+    "relayQueueItemsPeak": 100,
+    "relayQueueBytesPeak": 47290,
+    "perSubscriberCap": 64,
+    "note": "relay-wide queued-item peak over the window (an upper bound on any one subscriber's depth); the relay keeps no per-subscriber peak"
+  },
+  "relayBusy": {
+    "instrument": "onRelayWork spans (server child busyMs on server-loop-utilization/v1)",
+    "busyMs": 3958,
+    "windowMs": 10257,
+    "fraction": 0.38588281173832506
+  },
+  "serverChildCpu": {
+    "measured": {
+      "instrument": "rig supervisor serverChildCpu on rig-server-snapshot-receipt/v1: /proc/<pid>/task/<pid>/stat and /proc/<pid>/stat at measure-start ack and capture ack",
+      "processMs": 6780,
+      "mainThreadMs": 4860,
+      "intervalMs": 10267,
+      "processCore": 0.6603681698646148,
+      "mainThreadCore": 0.4733612545047239,
+      "bound": 0.5,
+      "sampleCount": 2,
+      "covered": true
+    },
+    "warmup": {
+      "instrument": "preflight sampler: /proc/<pid>/stat and /proc/<pid>/task/<pid>/stat over ssh to hermes-admin@10.99.0.2",
+      "processMs": null,
+      "mainThreadMs": null,
+      "intervalMs": 4775.379083,
+      "processCore": null,
+      "mainThreadCore": null,
+      "bound": 0.5,
+      "sampleCount": 0,
+      "covered": false
+    },
+    "perSecondNote": "main-thread core per wall-clock second from the barrier's measure start, from the preflight sampler; recorded, not gated",
+    "perSecondMainThreadCore": null,
+    "perSecondMainThreadCoreMax": null,
+    "sampler": {
+      "instrument": "preflight sampler: /proc/<pid>/stat and /proc/<pid>/task/<pid>/stat over ssh to hermes-admin@10.99.0.2",
+      "cadenceMs": 200,
+      "sampleCount": 0,
+      "pid": 217601,
+      "capturePid": 217601,
+      "pidMatchesCapture": true
+    }
+  },
+  "rig": {
+    "coreMhz": {
+      "warmupStart": null,
+      "warmupEnd": null,
+      "measureStart": null,
+      "measureStop": null
+    },
+    "rssKb": {
+      "warmupStart": null,
+      "measureStop": null,
+      "peak": null
+    },
+    "nofile": {
+      "soft": 524288,
+      "hard": 524288
+    }
+  },
+  "mac": {
+    "load1AtStart": 3.44091796875,
+    "load1Peak": 3.908203125,
+    "workers": [
+      {
+        "childId": "subscriber-worker-0",
+        "workerIndex": 0,
+        "pid": 17369,
+        "cpuMsOverMeasuredWindow": 1548.995217580592,
+        "cpuCore": 0.1548995217580592
+      },
+      {
+        "childId": "subscriber-worker-1",
+        "workerIndex": 1,
+        "pid": 17370,
+        "cpuMsOverMeasuredWindow": 1531.9241306105498,
+        "cpuCore": 0.153192413061055
+      },
+      {
+        "childId": "subscriber-worker-2",
+        "workerIndex": 2,
+        "pid": 17371,
+        "cpuMsOverMeasuredWindow": 1538.995217580592,
+        "cpuCore": 0.1538995217580592
+      },
+      {
+        "childId": "subscriber-worker-3",
+        "workerIndex": 3,
+        "pid": 17372,
+        "cpuMsOverMeasuredWindow": 1528.995217580592,
+        "cpuCore": 0.1528995217580592
+      },
+      {
+        "childId": "subscriber-worker-4",
+        "workerIndex": 4,
+        "pid": 17373,
+        "cpuMsOverMeasuredWindow": 1478.995217580592,
+        "cpuCore": 0.1478995217580592
+      },
+      {
+        "childId": "subscriber-worker-5",
+        "workerIndex": 5,
+        "pid": 17374,
+        "cpuMsOverMeasuredWindow": 1468.995217580592,
+        "cpuCore": 0.1468995217580592
+      },
+      {
+        "childId": "subscriber-worker-6",
+        "workerIndex": 6,
+        "pid": 17375,
+        "cpuMsOverMeasuredWindow": 1461.9241306105498,
+        "cpuCore": 0.146192413061055
+      },
+      {
+        "childId": "subscriber-worker-7",
+        "workerIndex": 7,
+        "pid": 17376,
+        "cpuMsOverMeasuredWindow": 1441.9241306105498,
+        "cpuCore": 0.14419241306105499
+      }
+    ]
+  },
+  "verdict": "FAIL",
+  "failedPredicates": [
+    {
+      "predicate": "CPU_SERIES_COVERED",
+      "detail": "the sampler did not cover the whole warmup epoch"
+    },
+    {
+      "predicate": "WARMUP_MAIN_THREAD_CPU",
+      "detail": "no warmup-epoch main-thread reading"
+    }
+  ]
+}

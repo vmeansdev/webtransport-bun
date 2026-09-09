@@ -499,8 +499,10 @@ mod tests {
     }
 
     fn client_config_with_tls(tls: rustls::ClientConfig) -> wtransport::ClientConfig {
+        // Every URL below is `https://127.0.0.1:<port>`; bind in that family for the
+        // same reason `client_bind_config` does (see `client.rs`).
         wtransport::ClientConfig::builder()
-            .with_bind_default()
+            .with_bind_config(wtransport::config::IpBindConfig::InAddrAnyV4)
             .with_custom_tls_and_transport(tls, wtransport::config::QuicTransportConfig::default())
             .enable_0rtt(true)
             .build()

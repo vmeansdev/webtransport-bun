@@ -1,0 +1,1 @@
+{"campaignId":"fanout-attested-r1","campaignStatus":"FAIL","candidate":"88b14a03fb01883f765aba3dae80b8cd19c3158c","controllerExitCode":5,"executionPurpose":"canonical","failureCode":"CHILD_LIFECYCLE","refusalCode":null,"schema":"controller-terminal/v1","terminalKind":"FAIL","trafficStarted":true,"writtenAtMs":1788927700661}

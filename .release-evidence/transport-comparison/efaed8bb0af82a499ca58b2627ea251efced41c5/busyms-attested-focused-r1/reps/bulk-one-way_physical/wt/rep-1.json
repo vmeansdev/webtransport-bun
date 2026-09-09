@@ -1,0 +1,116 @@
+{
+  "sampleUnit": "Mbps",
+  "samples": [
+    295.57832,
+    316.54848,
+    292.92032,
+    327.4096,
+    338.76896,
+    322.9792,
+    320.25056,
+    321.88992,
+    309.16368,
+    349.28992,
+    341.268,
+    349.06352,
+    344.97008,
+    359.856,
+    354.40192,
+    361.21968,
+    367.69232,
+    370.83024,
+    359.05712,
+    366.96848,
+    358.83232,
+    322.11264,
+    337.92896,
+    348.76736,
+    377.08593579453077
+  ],
+  "percentiles": {
+    "p1": 293.55824,
+    "p50": 344.97008,
+    "p95": 370.202656,
+    "p99": 375.58456880384335
+  },
+  "ledger": {
+    "attempted": 1600,
+    "queued": 1600,
+    "serverObserved": 1600,
+    "acknowledged": 1600,
+    "delivered": 1600,
+    "dropped": 0,
+    "expired": 0,
+    "harnessOverheadBytes": 0,
+    "histogram": {
+      "unit": "Mbps",
+      "boundaries": [
+        0,
+        1,
+        2,
+        5,
+        10,
+        20,
+        50,
+        100,
+        200,
+        500,
+        1000
+      ],
+      "counts": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        25,
+        0,
+        0
+      ]
+    }
+  },
+  "admissionCounters": {
+    "schemaVersion": "v1",
+    "handshakes": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "sessions": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "activePeak": 1
+    },
+    "streams": {
+      "attempted": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "datagrams": {
+      "attempted": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "rateLimited": 0
+    }
+  },
+  "provenance": {
+    "attestation": "dm1-d985598947cc47fc970958fe1d25213c",
+    "driverRunId": "busyms-attested-focused-r1/bulk-one-way/physical/wt/measured-1",
+    "clockMethod": "performance.timeOrigin+performance.now",
+    "sampleCount": 25,
+    "firstSampleAtMs": 1788855149597.627,
+    "lastSampleAtMs": 1788855152064.1477
+  },
+  "loopUtilization": {
+    "busyMs": 117.118896484375,
+    "windowMs": 2529.2041015625
+  },
+  "roundTrips": [],
+  "deliveredBytes": 104857600
+}

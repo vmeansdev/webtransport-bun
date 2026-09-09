@@ -71,7 +71,13 @@ scripts/mempal-sync-codex-convos.sh
 packages/webtransport/wasm-dist/
 
 # Generated release evidence artifacts
-.release-evidence/
+.release-evidence/*
+# The transport-comparison evidence root is policy-mandated
+# (`output-policy.ts:OFFICIAL_COMPARISON_OUTPUT_ROOT`) and must be
+# tracked so a real rig run is reproducible from committed artifacts.
+# See docs/superpowers/plans/2026-08-28-ws-wt-real-number.md Phase 3.4.
+!.release-evidence/transport-comparison/
+!.release-evidence/transport-comparison/**
 
 # Local planning/tracker scratch files — never committed
 /.scratch/

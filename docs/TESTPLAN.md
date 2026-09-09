@@ -272,3 +272,16 @@ in the code under test.
   sessions)"** — opens >512 sessions and asserts closed-event delivery within a
   handshake-timeout window; misses the window under CPU contention. No GOAWAY or
   capsule path is involved. Observed intermittently 2026-07-30.
+
+## Transport comparison harness (Mac ↔ Linux cable)
+
+The comparative benchmark harness evaluates Bun-native WebSocket against native WebTransport over the dedicated direct-cable physical link:
+- **Mac Controller**: darwin-arm64, `10.99.0.1/en8`
+- **Linux Server**: linux-x86_64, `10.99.0.2/eno1`
+- **Tooling**: `tools/compare/`
+  - **Official comparison filesystem I/O is R1-deferred: compare:run, compare:verify, and compare:report are non-operational until validated staging supplies a trusted boundary.**
+  - `bun run compare:run`: intended future multi-scenario campaign entrypoint; currently fails closed with `OUTPUT_TRUST_BOUNDARY_UNAVAILABLE`.
+  - `bun run compare:verify`: intended future artifact-verification entrypoint; currently fails closed with `OUTPUT_TRUST_BOUNDARY_UNAVAILABLE`.
+  - `bun run compare:report`: intended future markdown-report entrypoint; currently fails closed with `OUTPUT_TRUST_BOUNDARY_UNAVAILABLE`.
+  - `bun run test:compare`: runs pure-driver and fake-backed test suite.
+- **Fail-closed guarantees**: Loopback, mismatched routes, invalid MTU, unequal capacity profiles, or corrupted digests immediately reject and suppress delta computation.

@@ -1,0 +1,70 @@
+{
+  "schema": "campaign-index/v2",
+  "campaignRunId": "fanout-pilot-r1",
+  "stage": "full",
+  "candidate": "1b9e80923a290dd328550d684e5033c5c5e1441d",
+  "campaignId": "fanout-pilot-r1",
+  "approvedPlanSha256": "c98fdb39f6a05cdd473b88a3dcaac943ed3e6fd809593e1898e9f992d5d6d073",
+  "approvalRecordSha256": "0e54de0824a9a0623cf319b8b4dd0f6596ce849565aad62b46d2f9857898cabd",
+  "stagedCapabilitySha256": "c2224a9a0c9d9227626171f0448a4ce4a5f15eed68d870c3d650e5917500a3d8",
+  "sourceArchiveSha256": "e4b5c7c58cd4dff7352b43dcf7d9be477436eb46a28ba45ec08242486093181e",
+  "executionPurpose": "pilot",
+  "stagedDir": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/.claude/worktrees/ws-scenario-comparison/.release-evidence/transport-comparison/.trust-staging/1b9e80923a290dd328550d684e5033c5c5e1441d/fanout-pilot-r1",
+  "cells": [
+    "ticker-fanout/rate-100"
+  ],
+  "arms": [
+    "ws",
+    "wt"
+  ],
+  "armKinds": [
+    "primary"
+  ],
+  "warmupRepetitions": 1,
+  "measuredRepetitions": 1,
+  "scheduledMeasuredArms": 2,
+  "entries": [
+    {
+      "schema": "campaign-index-entry/v2",
+      "cellId": "ticker-fanout/rate-100",
+      "armId": "ticker-fanout/rate-100/ws",
+      "transport": "ws",
+      "armKind": "primary",
+      "armTransport": "ws",
+      "impairment": "none",
+      "executionPurpose": "pilot",
+      "repetitionKind": "measured",
+      "repetitionIndex": 1,
+      "repetitionTotal": 1,
+      "status": "PASS",
+      "promotable": false,
+      "failureCode": null,
+      "refusalCode": null,
+      "sealedPath": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/.claude/worktrees/ws-scenario-comparison/.release-evidence/transport-comparison/1b9e80923a290dd328550d684e5033c5c5e1441d/fanout-pilot-r1/reps/ticker-fanout_rate-100/ws/rep-1.sealed.json",
+      "artifactSha256": "0a74bac7d93c1868be5042938af7414cbae51c1833168a02377af57a1c63282b",
+      "primaryMetricP50": 10000,
+      "readPath": null
+    },
+    {
+      "schema": "campaign-index-entry/v2",
+      "cellId": "ticker-fanout/rate-100",
+      "armId": "ticker-fanout/rate-100/wt",
+      "transport": "wt",
+      "armKind": "primary",
+      "armTransport": "wt",
+      "impairment": "none",
+      "executionPurpose": "pilot",
+      "repetitionKind": "measured",
+      "repetitionIndex": 1,
+      "repetitionTotal": 1,
+      "status": "PASS",
+      "promotable": false,
+      "failureCode": null,
+      "refusalCode": null,
+      "sealedPath": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/.claude/worktrees/ws-scenario-comparison/.release-evidence/transport-comparison/1b9e80923a290dd328550d684e5033c5c5e1441d/fanout-pilot-r1/reps/ticker-fanout_rate-100/wt/rep-1.sealed.json",
+      "artifactSha256": "cea087d3d439b8b57681ca97475b85af24a1eb3d8a4dae6527da9dd5beb70ab2",
+      "primaryMetricP50": 10000,
+      "readPath": null
+    }
+  ]
+}
