@@ -569,6 +569,17 @@ impl ResidentLoop {
             spawner,
             child,
         } = cohort;
+        // The PASS arm's last frame is answered by the runtime, not the
+        // session: the answer ends the execution, and the runtime is the
+        // owner that can release the session it ends.  A session can no more
+        // remove itself from the map it was borrowed out of than it can
+        // accept the next execution, and that was the release run #1 lacked.
+        if kind == "rig-teardown-server-request" {
+            let mut reaper = secure_fs::cohort::LibcProcessGroupReaper::default();
+            return runtime
+                .teardown_server(&execution_sha256, payload, child.as_mut(), &mut reaper)
+                .map_err(ArmRefusal::from);
+        }
         let session = runtime
             .session_mut(&execution_sha256)
             .map_err(ArmRefusal::from)?;
@@ -582,10 +593,6 @@ impl ResidentLoop {
             }
             "rig-stop-and-capture-request" => {
                 session.stop_and_capture(payload, child.as_mut(), now_ms)
-            }
-            "rig-teardown-server-request" => {
-                let mut reaper = secure_fs::cohort::LibcProcessGroupReaper::default();
-                session.teardown_server(payload, child.as_mut(), &mut reaper)
             }
             _ => return Err(ArmRefusal::of("TRUST_CHILD_FRAME_INVALID")),
         };
@@ -4962,7 +4969,8 @@ mod resident_loop_tests {
 mod cohort_dispatch_tests {
     use super::*;
     use secure_fs::cohort::rig::{
-        AbsentServerChild, RigCohortRuntime, ServerSpawner, SpawnServerRequest, SpawnedServerChild,
+        AbsentServerChild, ChildBaseline, ChildCapture, ChildCpuSample, RigCohortRuntime,
+        ServerChildChannel, ServerSpawner, SpawnServerRequest, SpawnedServerChild,
         COHORT_REQUEST_KINDS,
     };
     use secure_fs::cohort::{
@@ -5879,6 +5887,360 @@ mod cohort_dispatch_tests {
             "macExecutionGrantSignatureBase64": base64(signature),
         }))
         .expect("canonical request")
+    }
+
+    /// A process group no host can have allocated (pids stop at 99,999 on
+    /// macOS and 4,194,304 on Linux), so the loop's production reaper finds it
+    /// gone on its first probe and the teardown answers `reaped: true` over a
+    /// group that was never anyone's.
+    const ABSENT_PGID: i32 = 2_000_000_000;
+
+    /// A spawner that launches nothing and reports the absent group.
+    struct AbsentGroupSpawner;
+
+    impl ServerSpawner for AbsentGroupSpawner {
+        fn spawn(
+            &mut self,
+            _request: &SpawnServerRequest,
+        ) -> Result<SpawnedServerChild, CohortRefusal> {
+            Ok(SpawnedServerChild {
+                pid: ABSENT_PGID,
+                pgid: ABSENT_PGID,
+                instance_nonce_sha256: digest("server-instance"),
+                ready_frame_sha256: digest("server-ready-frame"),
+            })
+        }
+    }
+
+    /// The ordinary arm's server child over the loop: it answers the
+    /// baseline, the capture and the teardown with the records a
+    /// `--mode=bulk-source` child sends, naming the execution the Mac opened,
+    /// and refuses every cohort transition.
+    struct OrdinaryChild {
+        execution_sha256: String,
+    }
+
+    impl ServerChildChannel for OrdinaryChild {
+        fn warmup_start(&mut self, _: &[u8], _: &[u8]) -> Result<Vec<u8>, CohortRefusal> {
+            Err(CohortRefusal::NotReady("no warmup on an ordinary arm"))
+        }
+
+        fn drain_warmup(&mut self, _: &str, _: &[u8]) -> Result<Vec<u8>, CohortRefusal> {
+            Err(CohortRefusal::NotReady("no warmup on an ordinary arm"))
+        }
+
+        fn measure_start_baseline(
+            &mut self,
+            warmup_complete_sha256: Option<&str>,
+        ) -> Result<ChildBaseline, CohortRefusal> {
+            assert_eq!(warmup_complete_sha256, None);
+            Ok(ChildBaseline {
+                busy_ms: 11,
+                at_linux_ns: 6_200_000_000,
+                response_sequence: 1,
+                cpu: ChildCpuSample {
+                    process_ms: 1_000,
+                    main_thread_ms: 400,
+                    at_ns: 6_200_000_000,
+                },
+            })
+        }
+
+        fn present_start_barrier(&mut self, _: &[u8], _: &[u8]) -> Result<Vec<u8>, CohortRefusal> {
+            Err(CohortRefusal::NotReady("no barrier on an ordinary arm"))
+        }
+
+        fn stop_and_capture(
+            &mut self,
+            cohort_start_barrier_sha256: Option<&str>,
+            _drain_deadline_ms: u64,
+        ) -> Result<ChildCapture, CohortRefusal> {
+            assert_eq!(cohort_start_barrier_sha256, None);
+            let snapshot = canonical_bytes(&json!({
+                "schema": "server-loop-utilization/v1",
+                "executionSha256": self.execution_sha256,
+                "cellId": "bulk-one-way/physical",
+                "scenarioHash": digest("scenario"),
+                "cohortGrantSha256": Value::Null,
+                "cohortStartBarrierSha256": Value::Null,
+                "roleTokenCommitmentRootSha256": Value::Null,
+                "transport": "ws",
+                "repetitionKind": "measured",
+                "repetitionIndex": 1,
+                "repetitionTotal": 1,
+                "childPid": ABSENT_PGID,
+                "childPgid": ABSENT_PGID,
+                "childInstanceNonce": digest("server-instance"),
+                "baselineBusyMs": 11,
+                "finalBusyMs": 2_011,
+                "busyMs": 2_000,
+                "baselineAtLinuxNs": "6200000000",
+                "finalSnapshotAtLinuxNs": "16200000000",
+                "windowMs": 10_000,
+                "linuxClockId": "clock-monotonic-boot-b",
+                "allMeasuredSessionsClosed": true,
+                "bulkSourceCompletion": {
+                    "schema": "bulk-source-completion/v1",
+                    "executionSha256": self.execution_sha256,
+                    "direction": "linux-to-mac",
+                    "serverRole": "bulk-source",
+                    "channelMapping": "server-opened-uni",
+                    "scheduledChunkCount": 1_600,
+                    "chunksWritten": 1_600,
+                    "chunkBytes": 65_536,
+                    "bytesWritten": 104_857_600,
+                    "payloadSha256": digest("payload"),
+                    "firstWriteAtLinuxNs": "6300000000",
+                    "channelEndedAtLinuxNs": "16100000000",
+                    "linuxClockId": "clock-monotonic-boot-b",
+                    "channelEnded": true,
+                },
+            }))?;
+            let capture_ack = canonical_bytes(&json!({
+                "schema": "server-capture-ack/v1",
+                "sequence": 3,
+                "executionSha256": self.execution_sha256,
+                "snapshotFrameBase64": base64(&snapshot),
+                "linuxRelayObservationBase64": Value::Null,
+            }))?;
+            Ok(ChildCapture {
+                capture_ack,
+                request_sequence: 3,
+                response_sequence: 3,
+                cpu: ChildCpuSample {
+                    process_ms: 8_000,
+                    main_thread_ms: 3_500,
+                    at_ns: 16_200_000_000,
+                },
+            })
+        }
+
+        fn teardown(&mut self) -> Result<Vec<u8>, CohortRefusal> {
+            canonical_bytes(&json!({
+                "schema": "server-stopped/v1",
+                "sequence": 4,
+                "executionSha256": self.execution_sha256,
+                "exitCode": 0,
+                "allSessionsClosed": true,
+            }))
+        }
+
+        fn abandon(&mut self) {}
+    }
+
+    const BULK_WS_ARGV: &[&str] = &["server.ts", "--transport=ws", "--mode=bulk-source"];
+
+    /// The ordinary arm's four controller -> rig frames after the accept, each
+    /// naming the execution the session is bound to.
+    fn ordinary_spawn_request(execution_sha256: &str, seq: u64) -> Vec<u8> {
+        let launch_record = canonical_bytes(&json!({
+            "schema": "staged-server-launch-record/v1",
+            "stageReceiptSha256": digest("stage-receipt"),
+            "serverEntrypointSha256": digest("server.ts"),
+            "bunSha256": digest("bun"),
+            "addonSha256": digest("addon"),
+            "bindAddress": "10.99.0.2",
+            "bindPort": 4433,
+            "advertisedHost": "10.99.0.2",
+            "tlsServerName": "wt-compare.local",
+            "tlsCertificateSha256": digest("staged-server-tls.crt"),
+            "tlsPrivateKeySha256": digest("staged-server-tls.key"),
+            "transport": "ws",
+            "argv": BULK_WS_ARGV,
+            "allowedEnvironment": [],
+        }))
+        .expect("canonical launch record");
+        canonical_bytes(&json!({
+            "schema": "rig-spawn-server-request/v1",
+            "requestSeq": seq,
+            "executionSha256": execution_sha256,
+            "cohortGrantSha256": Value::Null,
+            "serverEntrypointSha256": digest("server.ts"),
+            "bunSha256": digest("bun"),
+            "addonSha256": digest("addon"),
+            "stagedServerLaunchRecordBase64": base64(&launch_record),
+            "stagedServerLaunchRecordSha256": sha256_hex(&launch_record),
+            "stagedServerLaunchRecordSize": launch_record.len() as u64,
+            "bindAddress": "10.99.0.2",
+            "bindPort": 4433,
+            "advertisedHost": "10.99.0.2",
+            "tlsServerName": "wt-compare.local",
+            "transport": "ws",
+            "serverArgv": BULK_WS_ARGV,
+        }))
+        .expect("canonical spawn request")
+    }
+
+    fn ordinary_measure_start_request(execution_sha256: &str, seq: u64) -> Vec<u8> {
+        canonical_bytes(&json!({
+            "schema": "rig-measure-start-request/v1",
+            "requestSeq": seq,
+            "executionSha256": execution_sha256,
+            "cohortGrantSha256": Value::Null,
+            "warmupCompleteSha256": Value::Null,
+            "rigWarmupDrainedReceiptSha256": Value::Null,
+        }))
+        .expect("canonical baseline request")
+    }
+
+    fn ordinary_capture_request(execution_sha256: &str, seq: u64) -> Vec<u8> {
+        canonical_bytes(&json!({
+            "schema": "rig-stop-and-capture-request/v1",
+            "requestSeq": seq,
+            "executionSha256": execution_sha256,
+            "cohortStartBarrierSha256": Value::Null,
+            "macStopIssuedAtNs": "20000000000",
+            "drainDeadlineMs": 10_000,
+        }))
+        .expect("canonical capture request")
+    }
+
+    fn teardown_request(execution_sha256: &str, seq: u64) -> Vec<u8> {
+        canonical_bytes(&json!({
+            "schema": "rig-teardown-server-request/v1",
+            "requestSeq": seq,
+            "executionSha256": execution_sha256,
+        }))
+        .expect("canonical teardown request")
+    }
+
+    /// A Mac-signed execution receipt for a further execution of the same
+    /// campaign, in the shape the Mac supervisor mints at open, valid from
+    /// now: the loop reads the wall clock when it accepts.
+    fn mac_execution_receipt(
+        mac: &secure_fs::cross_supervisor::Ed25519KeyPair,
+        execution_sha256: &str,
+        index: u64,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let grant = canonical_bytes(&json!({
+            "schema": "measurement-grant/v1",
+            "execution": index,
+        }))
+        .expect("canonical grant");
+        let now_ms = secure_fs::measurement::now_epoch_millis().max(0.0) as u64;
+        let receipt = canonical_bytes(&json!({
+            "schema": "mac-execution-grant-receipt/v1",
+            "execution": { "index": index },
+            "executionSha256": execution_sha256,
+            "measurementGrantSha256": sha256_hex(&grant),
+            "approvedPlanSha256": digest("approved-plan"),
+            "approvalRecordSha256": digest("approval-record"),
+            "macSupervisorExecutableSha256": digest("mac-executable"),
+            "macSupervisorInstanceNonce": digest("mac-instance"),
+            "signingPublicKeySha256": public_key_sha256(&mac.public_raw32),
+            "receiptSequence": index,
+            "issuedAtMs": now_ms,
+            "notAfterMs": now_ms + 600_000,
+        }))
+        .expect("canonical receipt");
+        let raw = sign_bytes(&mac.private_pkcs8_der, &receipt).expect("sign");
+        let signature = canonical_bytes(&json!({
+            "schema": "mac-receipt-signature/v1",
+            "algorithm": "Ed25519",
+            "signedSchema": "mac-execution-grant-receipt/v1",
+            "signedBytesSha256": sha256_hex(&receipt),
+            "signingPublicKeySha256": public_key_sha256(&mac.public_raw32),
+            "signatureBase64": base64(&raw),
+        }))
+        .expect("canonical signature record");
+        (grant, receipt, signature)
+    }
+
+    /// The PASS arm's terminal path over the loop's own dispatch: the Mac
+    /// opens the execution, and on one channel the rig accepts it, spawns,
+    /// mints the baseline, captures, tears the server down through the
+    /// production reaper, and then accepts the next execution.  Nothing is
+    /// refused, so `close_all` is never reached.  After the stopped ack the
+    /// runtime holds no session for the finished arm and its acceptance
+    /// stays on the ledger; the next execution is accepted into the map it
+    /// vacated.
+    ///
+    /// Run #1 of `fanout-attested-r1` had 64 such arms resident when the 65th
+    /// was refused `overflow`: the loop dispatched the teardown to the session,
+    /// which cannot release itself.
+    #[test]
+    fn a_pass_arm_torn_down_over_the_loop_releases_its_session_and_the_next_execution_is_accepted()
+    {
+        let (mut resident, mac, rig_keys, grant, receipt, signature, execution_sha256) =
+            opened_on_the_mac();
+        resident
+            .install_cohort_runtime(CohortRuntime {
+                runtime: rig_runtime_for(&mac, &rig_keys),
+                spawner: Box::new(AbsentGroupSpawner),
+                child: Box::new(OrdinaryChild {
+                    execution_sha256: execution_sha256.clone(),
+                }),
+            })
+            .expect("one cohort per session");
+        let second = digest("execution-2");
+        let (grant_2, receipt_2, signature_2) = mac_execution_receipt(&mac, &second, 2);
+
+        let mut session = framed(
+            "rig-accept-execution-request",
+            &accept_execution_request(0, &grant, &receipt, &signature),
+        );
+        session.extend_from_slice(&framed(
+            "rig-spawn-server-request",
+            &ordinary_spawn_request(&execution_sha256, 1),
+        ));
+        session.extend_from_slice(&framed(
+            "rig-measure-start-request",
+            &ordinary_measure_start_request(&execution_sha256, 2),
+        ));
+        session.extend_from_slice(&framed(
+            "rig-stop-and-capture-request",
+            &ordinary_capture_request(&execution_sha256, 3),
+        ));
+        session.extend_from_slice(&framed(
+            "rig-teardown-server-request",
+            &teardown_request(&execution_sha256, 4),
+        ));
+        session.extend_from_slice(&framed(
+            "rig-accept-execution-request",
+            &accept_execution_request(5, &grant_2, &receipt_2, &signature_2),
+        ));
+        let mut written = Vec::new();
+        let mut sink = NullSink;
+        let summary = resident
+            .serve(&mut session.as_slice(), &mut written, &mut sink)
+            .expect("the resident serves the whole arm and the next accept");
+        assert_eq!(summary.refused, 0);
+
+        let answered = answers(&written);
+        let kinds: Vec<&str> = answered.iter().map(|(kind, _)| kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "rig-execution-accepted-ack",
+                "rig-server-ready-ack",
+                "rig-measure-started-ack",
+                "rig-capture-complete-ack",
+                "rig-server-stopped-ack",
+                "rig-execution-accepted-ack",
+            ]
+        );
+        let stopped = &answered[4].1;
+        assert_eq!(stopped["schema"], "rig-server-stopped-ack/v1");
+        assert_eq!(stopped["executionSha256"], execution_sha256);
+        assert_eq!(stopped["ackRequestSeq"], 4);
+        assert_eq!(stopped["reaped"], true);
+        assert_eq!(answered[5].1["executionSha256"], second);
+        assert_eq!(answered[5].1["responseSeq"], 0, "its own answer stream");
+
+        let runtime = &mut resident.cohort.as_mut().expect("cohort").runtime;
+        assert_eq!(
+            runtime.session_count(),
+            1,
+            "the finished arm released its session; only execution 2 is live"
+        );
+        assert!(runtime.session_mut(&execution_sha256).is_err());
+        assert!(runtime.session_mut(&second).is_ok());
+        assert_eq!(
+            runtime.accepted_count(),
+            2,
+            "both acceptances stay on the ledger"
+        );
+        assert!(runtime.accepted_execution(&execution_sha256).is_some());
     }
 
     /// §5 RIG_EXECUTION_ACCEPTED over the real frames: the Mac opens the

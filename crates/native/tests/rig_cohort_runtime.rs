@@ -353,10 +353,30 @@ fn spawn_request_with(
     argv: &[&str],
     bind_port: u64,
 ) -> Vec<u8> {
+    spawn_request_bound(
+        &digest("execution"),
+        grant_sha256,
+        launch_record,
+        transport,
+        argv,
+        bind_port,
+    )
+}
+
+/// The same spawn request naming the execution the caller's session is bound
+/// to, for the arms a campaign runs after its first.
+fn spawn_request_bound(
+    execution_sha256: &str,
+    grant_sha256: Option<&str>,
+    launch_record: &[u8],
+    transport: &str,
+    argv: &[&str],
+    bind_port: u64,
+) -> Vec<u8> {
     canonical_bytes(&json!({
         "schema": "rig-spawn-server-request/v1",
         "requestSeq": 2,
-        "executionSha256": digest("execution"),
+        "executionSha256": execution_sha256,
         "cohortGrantSha256": match grant_sha256 {
             Some(digest) => Value::from(digest),
             None => Value::Null,
@@ -827,12 +847,24 @@ impl Rig {
     /// The same accept frame over a caller-supplied grant, so a test can
     /// present a *replacement* attempt rather than this rig's first one.
     fn accept_payload_for(&self, grant: &Value) -> Vec<u8> {
-        let bytes = canonical_bytes(grant).expect("canonical grant");
-        let signature = mac_signature_record(&self.mac, "cohort-grant/v1", &bytes);
         let acceptance =
             canonical_bytes(&acceptance_value(&self.rig_keys)).expect("canonical acceptance");
         let acceptance_signature =
             rig_signature_record(&self.rig_keys, "rig-execution-acceptance/v1", &acceptance);
+        self.accept_payload_carrying(grant, &acceptance, &acceptance_signature)
+    }
+
+    /// The accept frame over a caller-supplied grant *and* acceptance: the
+    /// shape a campaign-scoped runtime demands after it minted the acceptance
+    /// itself at RIG_EXECUTION_ACCEPTED.
+    fn accept_payload_carrying(
+        &self,
+        grant: &Value,
+        acceptance: &[u8],
+        acceptance_signature: &[u8],
+    ) -> Vec<u8> {
+        let bytes = canonical_bytes(grant).expect("canonical grant");
+        let signature = mac_signature_record(&self.mac, "cohort-grant/v1", &bytes);
         canonical_bytes(&json!({
             "schema": "rig-accept-cohort-request/v1",
             "requestSeq": 1,
@@ -874,9 +906,16 @@ impl Rig {
             .as_str()
             .expect("grant digest")
             .to_owned();
+        self.spawn_and_ready(&grant_sha256);
+        grant_sha256
+    }
+
+    /// From an accepted grant to a ready cohort: the server child, the role
+    /// children, every registration, and the readiness mark.
+    fn spawn_and_ready(&mut self, grant_sha256: &str) {
         let mut spawner = RecordingSpawner::default();
         self.session
-            .spawn_server(&spawn_request_payload(&grant_sha256), &mut spawner)
+            .spawn_server(&spawn_request_payload(grant_sha256), &mut spawner)
             .expect("the server child spawns");
         self.session
             .spawn_role_child(
@@ -903,7 +942,7 @@ impl Rig {
             let proof = self.commitment.proof(index);
             self.session
                 .admit_role_registration(
-                    &grant_sha256,
+                    grant_sha256,
                     &leaf,
                     index,
                     &proof,
@@ -915,7 +954,6 @@ impl Rig {
         self.session
             .mark_ready()
             .expect("a complete cohort is ready");
-        grant_sha256
     }
 }
 
@@ -3061,10 +3099,14 @@ fn attempt_grant_value(key_sha256: &str, commitment: &Commitment, attempt: u64) 
 }
 
 fn teardown_payload(request_seq: u64) -> Vec<u8> {
+    teardown_payload_for(&digest("execution"), request_seq)
+}
+
+fn teardown_payload_for(execution_sha256: &str, request_seq: u64) -> Vec<u8> {
     canonical_bytes(&json!({
         "schema": "rig-teardown-server-request/v1",
         "requestSeq": request_seq,
-        "executionSha256": digest("execution"),
+        "executionSha256": execution_sha256,
     }))
     .expect("canonical teardown request")
 }
@@ -3198,10 +3240,10 @@ const BULK_WS_ARGV: &[&str] = &["server.ts", "--transport=ws", "--mode=bulk-sour
 
 /// The `server-loop-utilization/v1` an ordinary bulk child answers with: the
 /// three cohort joins null, and the bulk completion the fanout arm has null.
-fn ordinary_snapshot_frame() -> Vec<u8> {
+fn ordinary_snapshot_frame(execution_sha256: &str) -> Vec<u8> {
     canonical_bytes(&json!({
         "schema": "server-loop-utilization/v1",
-        "executionSha256": digest("execution"),
+        "executionSha256": execution_sha256,
         "cellId": "bulk-one-way/physical",
         "scenarioHash": digest("scenario"),
         "cohortGrantSha256": Value::Null,
@@ -3224,7 +3266,7 @@ fn ordinary_snapshot_frame() -> Vec<u8> {
         "allMeasuredSessionsClosed": true,
         "bulkSourceCompletion": {
             "schema": "bulk-source-completion/v1",
-            "executionSha256": digest("execution"),
+            "executionSha256": execution_sha256,
             "direction": "linux-to-mac",
             "serverRole": "bulk-source",
             "channelMapping": "server-opened-uni",
@@ -3245,13 +3287,32 @@ fn ordinary_snapshot_frame() -> Vec<u8> {
 /// The ordinary arm's server child: it answers the two transitions §5 asks of
 /// it and refuses every cohort one, which is what a `--mode=bulk-source` child
 /// is (no warmup epoch, no barrier).
-#[derive(Default)]
 struct OrdinaryServerChild {
+    /// The execution every frame this child answers with names.
+    execution_sha256: String,
     baseline_reads: u64,
     captures: u64,
     teardowns: u64,
     /// The capture reading this channel reports; `None` is the honest one.
     cpu_at_capture: Option<ChildCpuSample>,
+}
+
+impl Default for OrdinaryServerChild {
+    fn default() -> Self {
+        Self::for_execution(&digest("execution"))
+    }
+}
+
+impl OrdinaryServerChild {
+    fn for_execution(execution_sha256: &str) -> Self {
+        Self {
+            execution_sha256: execution_sha256.to_owned(),
+            baseline_reads: 0,
+            captures: 0,
+            teardowns: 0,
+            cpu_at_capture: None,
+        }
+    }
 }
 
 impl ServerChildChannel for OrdinaryServerChild {
@@ -3294,8 +3355,8 @@ impl ServerChildChannel for OrdinaryServerChild {
         let capture_ack = canonical_bytes(&json!({
             "schema": "server-capture-ack/v1",
             "sequence": 3,
-            "executionSha256": digest("execution"),
-            "snapshotFrameBase64": b64(&ordinary_snapshot_frame()),
+            "executionSha256": self.execution_sha256,
+            "snapshotFrameBase64": b64(&ordinary_snapshot_frame(&self.execution_sha256)),
             "linuxRelayObservationBase64": Value::Null,
         }))?;
         Ok(ChildCapture {
@@ -3311,7 +3372,7 @@ impl ServerChildChannel for OrdinaryServerChild {
         canonical_bytes(&json!({
             "schema": "server-stopped/v1",
             "sequence": 4,
-            "executionSha256": digest("execution"),
+            "executionSha256": self.execution_sha256,
             "exitCode": 0,
             "allSessionsClosed": true,
         }))
@@ -3362,7 +3423,12 @@ fn ordinary_rig() -> Rig {
 }
 
 fn ordinary_spawn_payload() -> Vec<u8> {
-    spawn_request_with(
+    ordinary_spawn_payload_for(&digest("execution"))
+}
+
+fn ordinary_spawn_payload_for(execution_sha256: &str) -> Vec<u8> {
+    spawn_request_bound(
+        execution_sha256,
         None,
         &staged_launch_record("ws", BULK_WS_ARGV),
         "ws",
@@ -3372,10 +3438,14 @@ fn ordinary_spawn_payload() -> Vec<u8> {
 }
 
 fn ordinary_measure_start_payload(request_seq: u64) -> Vec<u8> {
+    ordinary_measure_start_payload_for(&digest("execution"), request_seq)
+}
+
+fn ordinary_measure_start_payload_for(execution_sha256: &str, request_seq: u64) -> Vec<u8> {
     canonical_bytes(&json!({
         "schema": "rig-measure-start-request/v1",
         "requestSeq": request_seq,
-        "executionSha256": digest("execution"),
+        "executionSha256": execution_sha256,
         "cohortGrantSha256": Value::Null,
         "warmupCompleteSha256": Value::Null,
         "rigWarmupDrainedReceiptSha256": Value::Null,
@@ -3384,10 +3454,14 @@ fn ordinary_measure_start_payload(request_seq: u64) -> Vec<u8> {
 }
 
 fn ordinary_capture_payload(request_seq: u64) -> Vec<u8> {
+    ordinary_capture_payload_for(&digest("execution"), request_seq)
+}
+
+fn ordinary_capture_payload_for(execution_sha256: &str, request_seq: u64) -> Vec<u8> {
     canonical_bytes(&json!({
         "schema": "rig-stop-and-capture-request/v1",
         "requestSeq": request_seq,
-        "executionSha256": digest("execution"),
+        "executionSha256": execution_sha256,
         "cohortStartBarrierSha256": Value::Null,
         "macStopIssuedAtNs": ns(20_000_000_000),
         "drainDeadlineMs": 10_000,
@@ -3564,7 +3638,7 @@ fn the_ordinary_arm_runs_the_signed_server_lifecycle_with_no_cohort() {
     assert_eq!(receipt["addonSha256"], digest("addon"));
     assert_eq!(
         receipt["snapshotFrameSha256"],
-        sha256_hex(&ordinary_snapshot_frame())
+        sha256_hex(&ordinary_snapshot_frame(&digest("execution")))
     );
     // The ordinary arm attests the same CPU window as the fanout arm.
     assert_eq!(
@@ -3738,7 +3812,8 @@ fn an_ordinary_capture_frame_that_states_a_cohort_is_refused() {
             _: u64,
         ) -> Result<ChildCapture, CohortRefusal> {
             let mut frame: Value =
-                serde_json::from_slice(&ordinary_snapshot_frame()).expect("frame json");
+                serde_json::from_slice(&ordinary_snapshot_frame(&digest("execution")))
+                    .expect("frame json");
             frame["cohortGrantSha256"] = Value::from(digest("some-grant"));
             let frame = canonical_bytes(&frame)?;
             let capture_ack = canonical_bytes(&json!({
@@ -3783,6 +3858,17 @@ fn an_ordinary_capture_frame_that_states_a_cohort_is_refused() {
 /// `mac-execution-grant-receipt/v1` naming a fresh execution digest and the
 /// grant it covers, exactly as the controller presents it.
 fn execution_accept_request(rig: &Rig, index: u64, seq: u64) -> Vec<u8> {
+    execution_accept_request_for(rig, &digest(&format!("execution-{index}")), index, seq)
+}
+
+/// RIG_EXECUTION_ACCEPTED for the named execution: a Mac-signed receipt over
+/// a grant, the frame the controller presents once per execution.
+fn execution_accept_request_for(
+    rig: &Rig,
+    execution_sha256: &str,
+    index: u64,
+    seq: u64,
+) -> Vec<u8> {
     let grant = canonical_bytes(&json!({
         "schema": "measurement-grant/v1",
         "execution": index,
@@ -3791,7 +3877,7 @@ fn execution_accept_request(rig: &Rig, index: u64, seq: u64) -> Vec<u8> {
     let receipt = canonical_bytes(&json!({
         "schema": "mac-execution-grant-receipt/v1",
         "execution": { "index": index },
-        "executionSha256": digest(&format!("execution-{index}")),
+        "executionSha256": execution_sha256,
         "measurementGrantSha256": sha256_hex(&grant),
         "approvedPlanSha256": digest("approved-plan"),
         "approvalRecordSha256": digest("approval-record"),
@@ -3833,54 +3919,105 @@ fn the_acceptance_ledger_is_bounded_by_the_frozen_schedule_not_the_session_bound
     );
 }
 
+/// One ordinary PASS arm for `execution-{index}` over the runtime's own
+/// calls, the way `cohort_request` reaches them: RIG_EXECUTION_ACCEPTED, the
+/// signed server lifecycle through `session_mut`, and the teardown the
+/// binary dispatches to the runtime.  Nothing here calls `close_all`.
+fn run_ordinary_pass_arm(
+    rig: &Rig,
+    runtime: &mut RigCohortRuntime,
+    index: u64,
+    reaper: &mut RecordingReaper,
+) {
+    let execution = digest(&format!("execution-{index}"));
+    let ack = runtime
+        .accept_execution(&execution_accept_request(rig, index, 0), NOW_MS)
+        .unwrap_or_else(|refusal| panic!("execution {index} refused: {refusal:?}"));
+    assert_eq!(json_of(&ack)["executionSha256"], execution);
+    let mut spawner = RecordingSpawner::default();
+    let mut child = OrdinaryServerChild::for_execution(&execution);
+    let session = runtime
+        .session_mut(&execution)
+        .expect("an accepted execution");
+    session
+        .spawn_server(&ordinary_spawn_payload_for(&execution), &mut spawner)
+        .expect("the server child spawns");
+    session
+        .measure_start(
+            &ordinary_measure_start_payload_for(&execution, 3),
+            &mut child,
+            NOW_MS,
+        )
+        .expect("the baseline is minted");
+    session
+        .stop_and_capture(
+            &ordinary_capture_payload_for(&execution, 4),
+            &mut child,
+            NOW_MS,
+        )
+        .expect("the capture completes");
+    let stopped = runtime
+        .teardown_server(
+            &execution,
+            &teardown_payload_for(&execution, 5),
+            &mut child,
+            reaper,
+        )
+        .expect("the server child is torn down");
+    assert_eq!(json_of(&stopped)["schema"], "rig-server-stopped-ack/v1");
+    assert_eq!(child.teardowns, 1);
+}
+
 /// The controller's own rhythm over a whole canonical campaign: accept an
-/// execution, run the arm, close it (`close_arm` -> `close_all`), accept the
-/// next.  Every execution of the largest frozen schedule is accepted with one
-/// live session at a time; a replay of an execution closed long ago is still
-/// a duplicate; and the first execution past the bound is the overflow.
+/// execution, run the arm to its stopped ack, accept the next.  Every
+/// execution of the largest frozen schedule is accepted with the session
+/// bound never approached, because each PASS arm's teardown released its own
+/// session; a replay of an execution that ended long ago is still a
+/// duplicate; and the first execution past the ledger is the overflow.
+///
+/// Run #1 of `fanout-attested-r1` is the shape this pins: 64 PASS arms and no
+/// refusal, so `close_all` never ran, and the 65th was refused on
+/// `MAX_SESSIONS_PER_CAMPAIGN` with the ledger untouched.  An earlier
+/// version of this test called `close_all` between executions — the refusal
+/// path's release — and so stated the input the production path lacked.
 #[test]
-fn one_campaign_accepts_the_largest_frozen_schedule_with_teardown_between_executions() {
+fn one_campaign_accepts_the_largest_frozen_schedule_with_a_pass_arm_per_execution() {
     let rig = Rig::new();
     let mut runtime = runtime_for(&rig);
     let mut reaper = RecordingReaper::default();
-    let mut accept = |runtime: &mut RigCohortRuntime, index: u64| {
-        let ack = runtime
-            .accept_execution(&execution_accept_request(&rig, index, 0), NOW_MS)
-            .unwrap_or_else(|refusal| panic!("execution {index} refused: {refusal:?}"));
-        assert_eq!(
-            json_of(&ack)["executionSha256"],
-            digest(&format!("execution-{index}"))
-        );
-        assert_eq!(runtime.session_count(), 1, "one live session at a time");
-        assert_eq!(runtime.accepted_count(), index as usize);
-        runtime.close_all(&mut reaper).expect("a bounded close");
-        assert_eq!(runtime.session_count(), 0, "the arm released its session");
-    };
+    assert!(LARGEST_FROZEN_SCHEDULE_EXECUTIONS > MAX_SESSIONS_PER_CAMPAIGN);
     // Section 9.7, execution by execution: the whole schedule is accepted,
     // the 65th included, with the margin untouched.
     for index in 1..=LARGEST_FROZEN_SCHEDULE_EXECUTIONS as u64 {
-        accept(&mut runtime, index);
+        run_ordinary_pass_arm(&rig, &mut runtime, index, &mut reaper);
+        assert_eq!(
+            runtime.session_count(),
+            0,
+            "execution {index} released its session on its own stopped ack"
+        );
+        assert_eq!(runtime.accepted_count(), index as usize);
     }
     assert_eq!(runtime.accepted_count(), 72);
     // The margin: one re-opened execution per arm, still accepted.
     for index in
         LARGEST_FROZEN_SCHEDULE_EXECUTIONS as u64 + 1..=MAX_ACCEPTED_EXECUTIONS_PER_CAMPAIGN as u64
     {
-        accept(&mut runtime, index);
+        run_ordinary_pass_arm(&rig, &mut runtime, index, &mut reaper);
+        assert_eq!(runtime.session_count(), 0);
     }
-    assert!(
-        reaper.reaped.is_empty(),
-        "an accepted execution owns no process group yet"
-    );
+    // Every arm reaped the one server group it spawned, on its own teardown.
+    assert_eq!(reaper.reaped.len(), MAX_ACCEPTED_EXECUTIONS_PER_CAMPAIGN);
+    assert!(reaper.reaped.iter().all(|pgid| *pgid == 4_242));
 
-    // Closed executions stay on the ledger: the seventh execution, closed
-    // long ago, is a duplicate rather than a fresh arm.
+    // Ended executions stay on the ledger: the seventh, torn down long ago,
+    // is a duplicate rather than a fresh arm, and no frame can reach it.
     let replay = runtime
         .accept_execution(&execution_accept_request(&rig, 7, 1), NOW_MS)
-        .expect_err("a closed execution is terminal for the campaign");
+        .expect_err("an ended execution is terminal for the campaign");
     assert_eq!(replay, CohortRefusal::Duplicate(digest("execution-7")));
+    assert!(runtime.session_mut(&digest("execution-7")).is_err());
 
-    // The first distinct execution past the bound is the overflow, and it
+    // The first distinct execution past the ledger is the overflow, and it
     // mints nothing.
     let over = MAX_ACCEPTED_EXECUTIONS_PER_CAMPAIGN as u64 + 1;
     let refusal = runtime
@@ -3895,5 +4032,231 @@ fn one_campaign_accepts_the_largest_frozen_schedule_with_teardown_between_execut
         runtime.accepted_count(),
         MAX_ACCEPTED_EXECUTIONS_PER_CAMPAIGN
     );
+    assert_eq!(runtime.session_count(), 0);
+}
+
+/// Run #1's exact shape, on the fixed runtime: 64 PASS arms and no refusal,
+/// so `close_all` never runs, then the 65th.  The only thing this test
+/// states is that the 65th is accepted; with the release gone it is refused
+/// `overflow` on `MAX_SESSIONS_PER_CAMPAIGN` with the ledger at 64 < 84.
+#[test]
+fn the_65th_execution_is_accepted_after_64_pass_arms_and_no_refusal() {
+    let rig = Rig::new();
+    let mut runtime = runtime_for(&rig);
+    let mut reaper = RecordingReaper::default();
+    for index in 1..=MAX_SESSIONS_PER_CAMPAIGN as u64 {
+        run_ordinary_pass_arm(&rig, &mut runtime, index, &mut reaper);
+    }
+    assert_eq!(runtime.accepted_count(), 64);
+    assert!(runtime.accepted_count() < MAX_ACCEPTED_EXECUTIONS_PER_CAMPAIGN);
+    runtime
+        .accept_execution(&execution_accept_request(&rig, 65, 0), NOW_MS)
+        .expect("the 65th execution is accepted: the 64 PASS arms released their sessions");
+    assert_eq!(runtime.session_count(), 1);
+    assert_eq!(runtime.accepted_count(), 65);
+}
+
+/// The fanout PASS arm's terminal path through the runtime the binary
+/// dispatches to: RIG_EXECUTION_ACCEPTED, COHORT_GRANTED over the acceptance
+/// minted there, spawn, readiness, warmup, drain, barrier, capture, and the
+/// teardown that answers `rig-server-stopped-ack/v1`.  `close_all` is never
+/// called.  After the ack the session is gone and the acceptance is not: the
+/// execution is closed to every frame that names it, and the campaign
+/// accepts the next one.
+#[test]
+fn a_pass_arms_server_teardown_releases_its_session_and_keeps_its_acceptance() {
+    let mut rig = Rig::new();
+    let mut runtime = runtime_for(&rig);
+    let execution = digest("execution");
+    let accept = execution_accept_request_for(&rig, &execution, 1, 0);
+    let ack = json_of(
+        &runtime
+            .accept_execution(&accept, NOW_MS)
+            .expect("the execution is accepted"),
+    );
+    assert_eq!(runtime.session_count(), 1);
+    assert_eq!(runtime.accepted_count(), 1);
+
+    // COHORT_GRANTED must carry the acceptance minted above, over a grant
+    // naming the receipt that acceptance was minted for.
+    let receipt_sha256 = sha256_hex(&unb64(
+        json_of(&accept)["macExecutionGrantReceiptBase64"]
+            .as_str()
+            .expect("receipt"),
+    ));
+    let mut grant = grant_value(&rig.key_sha256(), &rig.commitment);
+    grant["macExecutionGrantReceiptSha256"] = json!(receipt_sha256);
+    let cohort = rig.accept_payload_carrying(
+        &grant,
+        &unb64(
+            ack["rigExecutionAcceptanceBase64"]
+                .as_str()
+                .expect("acceptance"),
+        ),
+        &unb64(
+            ack["rigExecutionAcceptanceSignatureBase64"]
+                .as_str()
+                .expect("acceptance signature"),
+        ),
+    );
+    let granted = json_of(
+        &runtime
+            .accept_cohort(&cohort, NOW_MS)
+            .expect("the minted acceptance binds the cohort"),
+    );
+    let grant_sha256 = granted["cohortGrantSha256"]
+        .as_str()
+        .expect("grant digest")
+        .to_owned();
+    assert_eq!(runtime.session_count(), 1, "the cohort took the session on");
+
+    // Everything between the accept and the teardown is the session's own
+    // transition, reached through `session_mut` exactly as the binary reaches
+    // it; the harness drives the runtime's session, not one of its own.
+    std::mem::swap(
+        &mut rig.session,
+        runtime.session_mut(&execution).expect("a live session"),
+    );
+    let mut child = ScriptedServerChild::new();
+    rig.spawn_and_ready(&grant_sha256);
+    child.grant_sha256 = grant_sha256.clone();
+    child.root_sha256 = rig.commitment.root_hex.clone();
+    let (acceptance, baseline, manifest, manifest_signature, drained) =
+        drive_to_drained(&mut rig, &grant_sha256, &mut child);
+    let barrier = barrier_value(
+        &grant_sha256,
+        &acceptance,
+        &baseline,
+        &manifest,
+        &manifest_signature,
+        &drained,
+        &rig.key_sha256(),
+    );
+    rig.session
+        .present_start_barrier(
+            &rig.signed_request(
+                "rig-present-start-barrier-request/v1",
+                5,
+                "cohortStartBarrier",
+                &barrier,
+            ),
+            &mut child,
+            NOW_MS,
+        )
+        .expect("the barrier is presented");
+    let barrier_sha256 = child.barrier_sha256.clone();
+    rig.session
+        .stop_and_capture(
+            &stop_and_capture_payload(&barrier_sha256),
+            &mut child,
+            NOW_MS,
+        )
+        .expect("the capture completes");
+    assert_eq!(rig.session.stage(), RigCohortStage::Captured);
+    std::mem::swap(
+        &mut rig.session,
+        runtime.session_mut(&execution).expect("a live session"),
+    );
+
+    // The terminal frame, through the runtime.
+    let mut reaper = RecordingReaper::default();
+    let stopped = json_of(
+        &runtime
+            .teardown_server(&execution, &teardown_payload(7), &mut child, &mut reaper)
+            .expect("the server child is torn down"),
+    );
+    assert_eq!(stopped["schema"], "rig-server-stopped-ack/v1");
+    assert_eq!(stopped["executionSha256"], execution);
+    assert_eq!(stopped["reaped"], true);
+    assert!(
+        !reaper.reaped.is_empty(),
+        "the teardown reaped the groups the session owned"
+    );
+    assert_eq!(
+        runtime.session_count(),
+        0,
+        "the PASS arm released its session"
+    );
+    assert_eq!(
+        runtime.accepted_count(),
+        1,
+        "the acceptance is the campaign's"
+    );
+
+    // Closed: no frame reaches the ended execution, and neither of its two
+    // accepts can rebuild it.
+    assert!(runtime.session_mut(&execution).is_err());
+    assert_eq!(
+        runtime
+            .accept_execution(
+                &execution_accept_request_for(&rig, &execution, 1, 8),
+                NOW_MS
+            )
+            .expect_err("an ended execution is a duplicate"),
+        CohortRefusal::Duplicate(execution.clone())
+    );
+    assert_eq!(
+        runtime
+            .accept_cohort(&cohort, NOW_MS)
+            .expect_err("the cohort cannot be rebuilt from the minted acceptance"),
+        CohortRefusal::Duplicate(execution.clone())
+    );
+
+    // And the campaign goes on: the next execution is accepted into a map
+    // the finished arm no longer occupies.
+    runtime
+        .accept_execution(&execution_accept_request(&rig, 2, 9), NOW_MS)
+        .expect("the next execution is accepted");
+    assert_eq!(runtime.session_count(), 1);
+    assert_eq!(runtime.accepted_count(), 2);
+    // What `serve` runs at EOF finds nothing of the finished arm to reap.
+    let before = reaper.reaped.len();
+    runtime.teardown_all(&mut reaper);
+    assert_eq!(reaper.reaped.len(), before);
+}
+
+/// A teardown the session refuses releases nothing: the runtime still holds
+/// the session, so the refusal path's `close_all` is what ends the arm.
+#[test]
+fn a_refused_teardown_keeps_the_session_for_the_refusal_path_to_release() {
+    let rig = Rig::new();
+    let mut runtime = runtime_for(&rig);
+    runtime
+        .accept_execution(&execution_accept_request(&rig, 1, 0), NOW_MS)
+        .expect("accepted");
+    let execution = digest("execution-1");
+    let mut child = OrdinaryServerChild::for_execution(&execution);
+    let mut reaper = RecordingReaper::default();
+    // Nothing was spawned: the teardown is out of state.
+    let refusal = runtime
+        .teardown_server(
+            &execution,
+            &teardown_payload_for(&execution, 2),
+            &mut child,
+            &mut reaper,
+        )
+        .expect_err("a teardown before any server is refused");
+    assert_eq!(refusal.code(), "COHORT_NOT_READY");
+    assert_eq!(
+        runtime.session_count(),
+        1,
+        "the refused arm still holds its session"
+    );
+    assert!(runtime.session_mut(&execution).is_ok());
+    // And a frame for an execution this runtime never accepted is refused
+    // without touching the one it holds.
+    let stranger = runtime
+        .teardown_server(
+            &digest("execution-9"),
+            &teardown_payload_for(&digest("execution-9"), 2),
+            &mut child,
+            &mut reaper,
+        )
+        .expect_err("no session for a stranger");
+    assert_eq!(stranger.code(), "COHORT_NOT_READY");
+    assert_eq!(runtime.session_count(), 1);
+    runtime
+        .close_all(&mut reaper)
+        .expect("the refusal path releases");
     assert_eq!(runtime.session_count(), 0);
 }
