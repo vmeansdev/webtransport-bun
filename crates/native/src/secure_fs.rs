@@ -18101,8 +18101,14 @@ pub mod cohort {
         /// The most executions one campaign-scoped rig process will hold
         /// *live* sessions for.  §3.2's schedule is four; the bound exists so a
         /// controller cannot grow this process's memory one accepted cohort at
-        /// a time.  Sessions are released on every arm's terminal path
-        /// (`close_all`), so this is a bound on concurrency, not on a campaign.
+        /// a time.  Sessions are released on every arm's terminal path — a
+        /// PASS arm's server teardown (`teardown_server`, once the child is
+        /// reaped and `rig-server-stopped-ack/v1` is minted) and a refused
+        /// arm's `close_all` — so this is a bound on concurrency, not on a
+        /// campaign.  Run #1 of `fanout-attested-r1` (2026-09-09) was refused
+        /// at execution 65 because the first of those releases did not exist:
+        /// 64 passing arms left 64 resident sessions and the acceptance
+        /// ledger, raised to 84 for the same run, never tripped.
         pub const MAX_SESSIONS_PER_CAMPAIGN: usize = 64;
 
         /// The warmup executions one arm runs before its measured set.
@@ -18159,12 +18165,13 @@ pub mod cohort {
             /// accept must carry these bytes, not a lookalike.
             accepted: std::collections::BTreeMap<String, AcceptedRigExecution>,
             sessions: std::collections::BTreeMap<String, RigCohortSession>,
-            /// Executions whose arm ended on a refusal.  A closed execution
-            /// is terminal for this campaign: its acceptance stays in
-            /// `accepted` so `accept_execution` refuses it as a duplicate,
-            /// and its digest is kept here so `accept_cohort` cannot rebuild
-            /// the session from the acceptance it once minted (plan 241:
-            /// duplicate or cross-execution substitution fails).
+            /// Executions whose arm ended — on the PASS arm's server
+            /// teardown or on a refusal.  A closed execution is terminal for
+            /// this campaign: its acceptance stays in `accepted` so
+            /// `accept_execution` refuses it as a duplicate, and its digest is
+            /// kept here so `accept_cohort` cannot rebuild the session from
+            /// the acceptance it once minted (plan 241: duplicate or
+            /// cross-execution substitution fails).
             closed: std::collections::BTreeSet<String>,
         }
 
@@ -18527,6 +18534,40 @@ pub mod cohort {
                 self.sessions
                     .get_mut(execution_sha256)
                     .ok_or(CohortRefusal::NotReady("no cohort for this execution"))
+            }
+
+            /// RIG_TEARDOWN_SERVER for one execution: the session answers,
+            /// and when its answer ends the execution the runtime releases it.
+            ///
+            /// The PASS arm's terminal path.  `RigCohortSession::teardown_server`
+            /// has two legal shapes, and only the second ends the execution:
+            /// plan 2210's pre-readiness replacement returns the session to
+            /// `AwaitingGrant` and keeps it; after the measurement the child
+            /// is reaped, the ack is minted and the session is at
+            /// `ServerStopped`, having said everything it can.  That session
+            /// leaves `sessions` — so `MAX_SESSIONS_PER_CAMPAIGN` bounds live
+            /// arms, as its comment claims, and not the campaign — and its
+            /// execution is recorded as closed, so a later frame naming it is
+            /// refused as the replay it is.  The acceptance stays on the
+            /// ledger: the execution re-presented is a duplicate.
+            ///
+            /// A refused teardown releases nothing.  The session still owns
+            /// whatever the reap could not bound, and the refusal path's
+            /// `close_all` is what ends it.
+            pub fn teardown_server(
+                &mut self,
+                execution_sha256: &str,
+                payload: &[u8],
+                child: &mut dyn ServerChildChannel,
+                reaper: &mut dyn ProcessGroupReaper,
+            ) -> CohortResult<Vec<u8>> {
+                let session = self.session_mut(execution_sha256)?;
+                let ack = session.teardown_server(payload, child, reaper)?;
+                if session.stage() == RigCohortStage::ServerStopped {
+                    self.sessions.remove(execution_sha256);
+                    self.closed.insert(execution_sha256.to_owned());
+                }
+                Ok(ack)
             }
 
             /// Reap every process group every session owns.  Idempotent, and
