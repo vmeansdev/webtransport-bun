@@ -588,6 +588,11 @@ run_measured_campaign() {
       || SUCCESS_RC=$?
     if [ "$SUCCESS_RC" -eq 0 ]; then
       if [ "$RENDER_MODE" = promoted ]; then
+        # The promoted render exits 3 (RENDER_REFUSED_EXIT_CODE) when a cohort
+        # cell could not be verified for want of its signing leaves, and 4
+        # (RENDER_INCOMPATIBLE_EXIT_CODE) when every flat verified and a pair
+        # still did not compare. Both land in RENDER_RC; the report is written
+        # either way so the refusal or rejection row is readable.
         "$MAC_BUN" tools/compare/bin/render-campaign-report.ts \
           --candidate="$CANDIDATE" --campaign-id="$CAMPAIGN_ID" \
           --campaign-root="$OUT" --output="$OUT/campaign-report.md" \
@@ -597,7 +602,14 @@ run_measured_campaign() {
         # plus sealed artifacts), or the two flat counters disagree and a clean run
         # fails on the wrapper.
         test "$(find "$OUT" -maxdepth 1 -type f -name '*.json' ! -name '*.sealed.json' ! -name 'campaign-index.json' ! -name 'manifest.json' ! -name 'controller-terminal.json' | wc -l | tr -d ' ')" = "$EXPECTED_FLATS" || COUNT_RC=$?
-        test "$(rg -c '^### (WS|WT) attested arm' "$OUT/campaign-report.md")" = 12 || COUNT_RC=$?
+        # The report's own rows, counted against the section's cell list rather
+        # than a literal: every promoted cell heads two attested-arm sections
+        # and files one **COMPATIBLE** row. The second count is the stop gate's
+        # "every cell comparable" clause in the wrapper's own terms; an
+        # INCOMPATIBLE or REFUSED row is a cell short.
+        CELL_COUNT=$(printf '%s\n' "$CELLS" | tr ',' '\n' | grep -c .)
+        test "$(rg -c '^### (WS|WT) attested arm' "$OUT/campaign-report.md")" = "$((CELL_COUNT * 2))" || COUNT_RC=$?
+        test "$(rg -c '^\| `[^`]*` \| \*\*COMPATIBLE\*\* ' "$OUT/campaign-report.md")" = "$CELL_COUNT" || COUNT_RC=$?
       else
         # Focused/pilot: zero flats; render from sealed index (not promoted flats).
         "$MAC_BUN" tools/compare/bin/render-campaign-report.ts \

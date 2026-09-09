@@ -1292,6 +1292,48 @@ export function verifyCampaignIndex(args: {
 				`stale echo flat for ${cellId}: ${gate.refusals.map((r) => r.code).join("; ")}`,
 			);
 		}
+		// The gate says the cell may be promoted and which repetition is its
+		// median. A promoted flat is that seal's bytes under the cell's name,
+		// so the flat on disk is bound to the entry the gate selected -- same
+		// bytes, hence same cell, transport and repetition -- rather than to
+		// whichever seal of this campaign sits under the filename. Without
+		// this, two WT flats swapped across cells, or one replaced by another
+		// repetition of its own arm, verify as seals and count as a pair.
+		const median = gate.median;
+		if (median === undefined) {
+			return reject(
+				"TRUST_PROTOCOL",
+				`promotion gate for ${cellId} is promotable but names no median`,
+			);
+		}
+		for (const transport of ["ws", "wt"] as const) {
+			const flatName = `${safeCellName(cellId)}-${transport}.json`;
+			if (!flatNames.includes(flatName)) continue;
+			const sealedPath =
+				transport === "ws" ? median.wsSealedPath : median.wtSealedPath;
+			const promoted = gateEntries.find(
+				(gateEntry) =>
+					gateEntry.cellId === cellId &&
+					gateEntry.transport === transport &&
+					gateEntry.armKind === "primary" &&
+					gateEntry.sealedPath === sealedPath,
+			);
+			if (promoted === undefined || promoted.artifactSha256 === null) {
+				return reject(
+					"PROMOTED_FLAT_MISMATCH",
+					`${flatName}: the promotion gate selected ${sealedPath} for ${cellId} ${transport}, which no verified index entry names`,
+				);
+			}
+			const flatSha256 = sha256Bytes(
+				new Uint8Array(readFileSync(join(args.campaignRoot, flatName))),
+			);
+			if (flatSha256 !== promoted.artifactSha256) {
+				return reject(
+					"PROMOTED_FLAT_MISMATCH",
+					`${flatName} is not the artifact the promotion gate selected for ${cellId} ${transport} (rep ${median.repetitionIndex}, ${promoted.artifactSha256}): found ${flatSha256}`,
+				);
+			}
+		}
 	}
 
 	// The §6 rule 4 completion answer. Computed for canonical indices whose

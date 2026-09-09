@@ -5,6 +5,7 @@
  */
 import { describe, expect, it } from "bun:test";
 import {
+	copyFileSync,
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
@@ -27,6 +28,7 @@ import {
 	INCOMPLETE_ATTESTATION_CAVEAT,
 	main,
 	purposeLabel,
+	RENDER_INCOMPATIBLE_EXIT_CODE,
 	RENDER_REFUSED_EXIT_CODE,
 	renderArmAccounting,
 	SERVER_AGGREGATE_LABEL,
@@ -701,6 +703,30 @@ describe("render-campaign-report promoted flats", () => {
 		expect(md).not.toContain("INCOMPATIBLE");
 	});
 
+	it("exits non-zero when a verified pair does not compare, with the INCOMPATIBLE row written", () => {
+		// Run #1's real bytes had this shape after a WT flat was replaced by
+		// another repetition: every flat verified, one pair rejected, the
+		// report read 4/5 comparable and the render exited 0. Here the WS
+		// seal sits under the WT name, so both verify and the pair cannot
+		// compare; the row is in the report and the exit code is not 0 --
+		// and not the leaves refusal either.
+		const { dir, campaignId } = sealedBulkRoot("render-incompatible-", {
+			leaves: "present",
+		});
+		copyFileSync(
+			join(dir, "bulk-one-way_physical-ws.json"),
+			join(dir, "bulk-one-way_physical-wt.json"),
+		);
+		const { code, md, err } = renderPromoted(dir, campaignId);
+		expect(code).toBe(RENDER_INCOMPATIBLE_EXIT_CODE);
+		expect(code).not.toBe(RENDER_REFUSED_EXIT_CODE);
+		expect(md).toContain("| *INCOMPATIBLE* |");
+		expect(md).toContain("0/1 cells comparable");
+		expect(err).toContain(
+			"RENDER_INCOMPATIBLE: 1 of 1 promoted cell not comparable",
+		);
+	});
+
 	it("still compares a non-cohort pair without the leaves, and says it had none", () => {
 		// A bulk seal carries no export receipt to authenticate, so the missing
 		// leaves are a fact the report states, not a refusal it issues.
@@ -783,7 +809,11 @@ describe("render-campaign-report promoted flats", () => {
 			`--campaign-root=${dir}`,
 			`--output=${report}`,
 		]);
-		expect(code).toBe(0);
+		// The shaped pair carries the attestation graphs the labels read and
+		// nothing a formal comparison can pair on, so the render files it as
+		// INCOMPATIBLE and says so in its exit code; the headings under test
+		// are written regardless.
+		expect(code).toBe(RENDER_INCOMPATIBLE_EXIT_CODE);
 		const md = readFileSync(report, "utf8");
 		// The frozen run wrapper counts exactly these headings.
 		expect(md).toMatch(/^### WS attested arm/m);
@@ -801,7 +831,9 @@ describe("render-campaign-report promoted flats", () => {
 			`--campaign-root=${dir}`,
 			`--output=${report}`,
 		]);
-		expect(code).toBe(0);
+		// As above: the shaped pair is not comparable, and the caveat is the
+		// subject.
+		expect(code).toBe(RENDER_INCOMPATIBLE_EXIT_CODE);
 		const md = readFileSync(report, "utf8");
 		expect(md).toMatch(/^### WS unattested arm/m);
 		expect(md).toContain(INCOMPLETE_ATTESTATION_CAVEAT);
