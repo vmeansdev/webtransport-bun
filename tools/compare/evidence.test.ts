@@ -11,6 +11,8 @@ import {
 	addRejection,
 	balancedArmOrder,
 	canonicalDigest,
+	cohortPairIdentityRejections,
+	cohortPairingRunKey,
 	compareRunArtifacts,
 	EXPECTED_MTU,
 	EXPECTED_NETEM_LIMIT_PACKETS,
@@ -19,6 +21,7 @@ import {
 	metricContractHash,
 	metricContractHashMatches,
 	PRIMARY_METRIC_CONTRACTS,
+	pairCompatibilityRejections,
 	pairingRunKey,
 	type RawSidecarDigests,
 	type RunArtifact,
@@ -32,7 +35,10 @@ import {
 	CANONICAL_SCENARIO_REGISTRY,
 	getScenarioCell,
 } from "./scenario-registry.ts";
+import { sha256CanonicalRecord } from "./cross-supervisor-protocol.ts";
+import { retainCanonicalBytes } from "./server-observation-artifact.ts";
 import { percentile } from "./stats.ts";
+import { cohortPairIdentityOf } from "./verify-artifact.ts";
 
 const fixture = (name: string): Uint8Array =>
 	new Uint8Array(readFileSync(join(import.meta.dir, "fixtures", name)));
@@ -2016,3 +2022,286 @@ function findBytes(haystack: Uint8Array, needle: Uint8Array): number {
 	}
 	return -1;
 }
+
+describe("cohort pair identity", () => {
+	// A Phase-B pair is two executions of one cell (base plan §5: every cohort
+	// run id is `<campaignRunId>/<cellId>/<transport>/measured-<n>`), so the
+	// bulk rule -- one run id sealed twice, one set of shared sidecars -- can
+	// never hold for it.  No unit fixture yields a PASS canonical cohort seal;
+	// the rule is proved here on shaped artifacts carrying the pinned
+	// ticker-100 evidence vector's real grant, re-signed for each arm's slot.
+	const vectorEvidence = JSON.parse(
+		Buffer.from(
+			readFileSync(
+				join(
+					import.meta.dir,
+					"fixtures",
+					"cohort-evidence-vectors",
+					"cohort-observation-evidence.ticker-fanout_rate-100.hex",
+				),
+				"utf8",
+			).trim(),
+			"hex",
+		).toString("utf8"),
+	) as { cohortGrant: { bytesBase64: string } };
+	const vectorGrant = JSON.parse(
+		Buffer.from(vectorEvidence.cohortGrant.bytesBase64, "base64").toString(
+			"utf8",
+		),
+	) as Record<string, unknown> & {
+		execution: Record<string, unknown>;
+	};
+
+	type Grant = typeof vectorGrant;
+	const CAMPAIGN = "fanout-attested-test";
+	const CELL = "ticker-fanout/rate-100";
+
+	function grantFor(
+		transport: "ws" | "wt",
+		mutate: (grant: Grant) => void = () => {},
+	): Grant {
+		const grant = structuredClone(vectorGrant);
+		grant.execution = {
+			...grant.execution,
+			campaignId: CAMPAIGN,
+			cellId: CELL,
+			transport,
+			executionPurpose: "canonical",
+			repetitionKind: "measured",
+			repetitionIndex: 3,
+			repetitionTotal: 5,
+			runId: `${CAMPAIGN}/${CELL}/${transport}/measured-3`,
+		};
+		grant.transport = transport;
+		mutate(grant);
+		// Every mutation re-signs the execution digest so the grant still
+		// parses: the refusal under test is the pair's, not the parser's.
+		grant.executionSha256 = sha256CanonicalRecord(grant.execution as never);
+		return grant;
+	}
+
+	function cohortArm(
+		transport: "ws" | "wt",
+		options: {
+			readonly grant?: (grant: Grant) => void;
+			readonly artifact?: (artifact: RunArtifact) => void;
+		} = {},
+	): RunArtifact {
+		const grant = grantFor(transport, options.grant);
+		const artifact = fixtureObject(transport === "ws" ? wsBytes : wtBytes);
+		const execution = grant.execution as {
+			runId: string;
+			cellId: string;
+			executionPurpose: "focused" | "pilot" | "canonical";
+			repetitionKind: "measured";
+			repetitionIndex: number;
+			repetitionTotal: number;
+		};
+		// The arm's own declaration follows its grant; a test that wants the
+		// two apart mutates the artifact afterwards.
+		artifact.artifactKind = "measured";
+		artifact.executionPurpose = execution.executionPurpose;
+		artifact.promotable = true;
+		artifact.runId = execution.runId;
+		artifact.scenario.cellId = execution.cellId;
+		artifact.repetitionKind = execution.repetitionKind;
+		artifact.repetitionIndex = execution.repetitionIndex;
+		artifact.repetitionTotal = execution.repetitionTotal;
+		artifact.scenario.repetition = { index: 3, total: 5 } as never;
+		// Each execution records its own topology/impairment/cleanup sidecars.
+		const own = transport === "ws" ? "a" : "b";
+		artifact.rawSidecarDigests.topology = own.repeat(64);
+		artifact.rawSidecarDigests.impairment = own.repeat(64);
+		artifact.rawSidecarDigests.cleanup = own.repeat(64);
+		artifact.attestationEvidence = {
+			...artifact.attestationEvidence,
+			cohortObservationEvidence: { cohortGrant: retainCanonicalBytes(grant) },
+		};
+		options.artifact?.(artifact);
+		return artifact;
+	}
+
+	const codesOf = (rejections: readonly { code: string }[]): string[] =>
+		rejections.map(({ code }) => code);
+
+	test("folds a cohort run id on the arm's own transport segment only", () => {
+		expect(cohortPairingRunKey(`${CAMPAIGN}/${CELL}/ws/measured-3`, "ws")).toBe(
+			cohortPairingRunKey(`${CAMPAIGN}/${CELL}/wt/measured-3`, "wt"),
+		);
+		expect(cohortPairingRunKey(`${CAMPAIGN}/${CELL}/ws/measured-3`, "ws")).toBe(
+			`${CAMPAIGN}/${CELL}/measured-3`,
+		);
+		expect(
+			cohortPairingRunKey(`${CAMPAIGN}/${CELL}/ws/measured-3`, "wt"),
+		).not.toBe(cohortPairingRunKey(`${CAMPAIGN}/${CELL}/wt/measured-3`, "wt"));
+		expect(cohortPairingRunKey("different-run", "ws")).toBe("different-run");
+	});
+
+	test("reads the pair identity from the retained grant", () => {
+		const identity = cohortPairIdentityOf(cohortArm("ws"));
+		expect(identity.ok).toBe(true);
+		if (!identity.ok) return;
+		expect(identity.value).toMatchObject({
+			campaignId: CAMPAIGN,
+			cellId: CELL,
+			candidate: vectorGrant.execution.candidate,
+			sourceArchiveSha256: vectorGrant.execution.sourceArchiveSha256,
+			stagedCapabilitySha256: vectorGrant.execution.stagedCapabilitySha256,
+			repetitionIndex: 3,
+			scenarioHash: vectorGrant.scenarioHash,
+			publisherCount: 1,
+			subscriberCount: 100,
+			transport: "ws",
+			runId: `${CAMPAIGN}/${CELL}/ws/measured-3`,
+		});
+		const bulk = cohortPairIdentityOf(fixtureObject(wsBytes));
+		expect(bulk.ok).toBe(false);
+	});
+
+	test("pairs two cohort arms with distinct run ids and distinct sidecar digests on their signed identity", () => {
+		const ws = cohortArm("ws");
+		const wt = cohortArm("wt");
+		expect(ws.runId).not.toBe(wt.runId);
+		expect(ws.rawSidecarDigests.topology).not.toBe(
+			wt.rawSidecarDigests.topology,
+		);
+		expect(cohortPairIdentityRejections(ws, wt)).toEqual([]);
+		const codes = codesOf(pairCompatibilityRejections(ws, wt));
+		expect(codes).not.toContain("RUN_ID_MISMATCH");
+		expect(codes).not.toContain("RAW_SIDECAR_DIGEST_MISMATCH");
+		expect(codes).not.toContain("COHORT_PAIR_IDENTITY_MISMATCH");
+		expect(codes).toEqual([]);
+	});
+
+	test("refuses a cohort pair on every identity field its grants disagree on", () => {
+		const cases: readonly [string, (grant: Grant) => void][] = [
+			["campaignId", (g) => (g.execution.campaignId = "another-campaign")],
+			["candidate", (g) => (g.execution.candidate = "another-candidate")],
+			[
+				"sourceArchiveSha256",
+				(g) => (g.execution.sourceArchiveSha256 = "1".repeat(64)),
+			],
+			[
+				"stagedCapabilitySha256",
+				(g) => (g.execution.stagedCapabilitySha256 = "2".repeat(64)),
+			],
+			["cellId", (g) => (g.execution.cellId = "ticker-fanout/rate-50")],
+			["executionPurpose", (g) => (g.execution.executionPurpose = "pilot")],
+			["repetitionKind", (g) => (g.execution.repetitionKind = "warmup")],
+			["repetitionIndex", (g) => (g.execution.repetitionIndex = 4)],
+			["repetitionTotal", (g) => (g.execution.repetitionTotal = 1)],
+			[
+				"scenarioHash",
+				(g) => {
+					g.scenarioHash = "3".repeat(64);
+					g.execution.scenarioHash = "3".repeat(64);
+				},
+			],
+			[
+				"expectedOfferedIngress",
+				(g) => {
+					g.expectedOfferedIngress = 2000;
+					g.expectedExpandedDeliveries = 200_000;
+				},
+			],
+			["messageBytes", (g) => (g.messageBytes = 128)],
+			["measuredDurationMs", (g) => (g.measuredDurationMs = 30000)],
+		];
+		for (const [field, mutate] of cases) {
+			const ws = cohortArm("ws");
+			// The wt arm's own declaration follows its mutated grant, so the
+			// only disagreement left is between the two grants.
+			const wt = cohortArm("wt", { grant: mutate });
+			const rejections = cohortPairIdentityRejections(ws, wt);
+			expect(codesOf(rejections), field).toContain(
+				"COHORT_PAIR_IDENTITY_MISMATCH",
+			);
+			expect(
+				rejections.some((r) => r.path?.endsWith(`.${field}`)),
+				field,
+			).toBe(true);
+			expect(new Set(codesOf(rejections)).size, field).toBe(1);
+		}
+	});
+
+	test("refuses a cohort arm whose own declaration is not the slot its grant was signed for", () => {
+		const ws = cohortArm("ws");
+		const cases: readonly [string, (artifact: RunArtifact) => void][] = [
+			["$.runId", (a) => (a.runId = `${CAMPAIGN}/${CELL}/wt/measured-4`)],
+			["$.transport", (a) => (a.transport = "ws")],
+			[
+				"$.scenario.cellId",
+				(a) => (a.scenario.cellId = "chat-fanout/subscribers-250"),
+			],
+			["$.repetitionIndex", (a) => (a.repetitionIndex = 2)],
+			["$.executionPurpose", (a) => (a.executionPurpose = "pilot")],
+		];
+		for (const [path, mutate] of cases) {
+			const wt = cohortArm("wt", { artifact: mutate });
+			const rejections = cohortPairIdentityRejections(ws, wt);
+			expect(codesOf(rejections), path).toContain(
+				"COHORT_PAIR_IDENTITY_MISMATCH",
+			);
+			expect(
+				rejections.some((r) => r.path === path),
+				path,
+			).toBe(true);
+		}
+	});
+
+	test("refuses two grants of one wire, and run ids that do not fold to one slot", () => {
+		const ws = cohortArm("ws");
+		const wsAgain = cohortArm("wt", {
+			grant: (g) => {
+				g.execution.transport = "ws";
+				g.transport = "ws";
+			},
+			artifact: (a) => (a.transport = "ws"),
+		});
+		expect(codesOf(cohortPairIdentityRejections(ws, wsAgain))).toContain(
+			"COHORT_PAIR_IDENTITY_MISMATCH",
+		);
+		const elsewhere = cohortArm("wt", {
+			grant: (g) => (g.execution.runId = `other-run/${CELL}/wt/measured-3`),
+			artifact: (a) => (a.runId = `other-run/${CELL}/wt/measured-3`),
+		});
+		const rejections = cohortPairIdentityRejections(ws, elsewhere);
+		expect(codesOf(rejections)).toEqual(["COHORT_PAIR_IDENTITY_MISMATCH"]);
+		expect(rejections[0]?.path).toBe("$.runId");
+	});
+
+	test("refuses a pair in which only one arm carries a cohort receipt graph", () => {
+		const ws = cohortArm("ws");
+		const wt = fixtureObject(wtBytes);
+		wt.artifactKind = "measured";
+		wt.executionPurpose = "canonical";
+		wt.promotable = true;
+		wt.runId = ws.runId.replace("/ws/", "/wt/");
+		wt.scenario.cellId = CELL;
+		const codes = codesOf(pairCompatibilityRejections(ws, wt));
+		expect(codes).toContain("COHORT_PAIR_IDENTITY_MISMATCH");
+		expect(codes).not.toContain("RUN_ID_MISMATCH");
+	});
+
+	test("keeps the run-id and shared-sidecar rules for a bulk pair", () => {
+		// The historical bulk campaigns pair one run id sealed twice under one
+		// set of sidecars; a cohort receipt graph is what selects the other rule.
+		const ws = bulkArtifactObject(wsBytes);
+		const wt = bulkArtifactObject(wtBytes);
+		expect(codesOf(pairCompatibilityRejections(ws, wt))).toEqual([]);
+		const otherRun = bulkArtifactObject(wtBytes);
+		otherRun.runId = "different-run";
+		const runCodes = codesOf(pairCompatibilityRejections(ws, otherRun));
+		expect(runCodes).toContain("RUN_ID_MISMATCH");
+		expect(runCodes).not.toContain("COHORT_PAIR_IDENTITY_MISMATCH");
+		const otherSidecars = bulkArtifactObject(wtBytes);
+		otherSidecars.rawSidecarDigests.topology = "b".repeat(64);
+		expect(codesOf(pairCompatibilityRejections(ws, otherSidecars))).toContain(
+			"RAW_SIDECAR_DIGEST_MISMATCH",
+		);
+		// And through the sealed path, as the render does it.
+		expect(compareCode((a) => (a.runId = "different-run"))).toContain(
+			"RUN_ID_MISMATCH",
+		);
+	});
+});

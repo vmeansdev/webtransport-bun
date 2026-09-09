@@ -24,6 +24,9 @@ import {
 	CANONICAL_SCENARIO_REGISTRY,
 } from "./scenario-registry.ts";
 import {
+	carriesCohortObservationEvidence,
+	type CohortPairIdentity,
+	cohortPairIdentityOf,
 	trustContextForArtifact,
 	verifyRunArtifact,
 	verifyRunArtifactObject,
@@ -282,7 +285,135 @@ export function pairingRunKey(runId: string): string {
 	return runId.replace(/-\d{13}(?=-rep-\d+$)/, "");
 }
 
-function compatibilityRejections(
+/**
+ * Pairing key for a Phase-B cohort run id.
+ *
+ * Every cohort execution is its own run (base plan §5: `<campaignRunId>/
+ * <cellId>/<transport>/measured-<n>`), so the two arms of one pair never share
+ * a run id.  What they share is the slot around the arm's own transport
+ * segment; folding that segment out is the whole of the run-id rule for a
+ * cohort pair, and the rest of the identity comes from the signed grant.
+ */
+export function cohortPairingRunKey(
+	runId: string,
+	transport: "ws" | "wt",
+): string {
+	return runId.replace(`/${transport}/`, "/");
+}
+
+const COHORT_PAIR_IDENTITY_FIELDS: readonly (keyof Omit<
+	CohortPairIdentity,
+	"transport" | "runId"
+>)[] = [
+	"campaignId",
+	"candidate",
+	"sourceArchiveSha256",
+	"stagedCapabilitySha256",
+	"cellId",
+	"executionPurpose",
+	"repetitionKind",
+	"repetitionIndex",
+	"repetitionTotal",
+	"scenarioHash",
+	"publisherCount",
+	"subscriberCount",
+	"workerCount",
+	"expectedOfferedIngress",
+	"expectedExpandedDeliveries",
+	"messageBytes",
+	"measuredDurationMs",
+];
+
+/**
+ * The pair rule for two cohort arms (base plan §6: one promoted cell is one
+ * WS flat and one WT flat of the same campaign, cell and complete repetition
+ * set; §11 names cross-execution pairing as an adversarial seam).
+ *
+ * The identity is read from each arm's signed cohort grant, so a flat cannot
+ * pair on what it says about itself: every field of
+ * `COHORT_PAIR_IDENTITY_FIELDS` must agree across the arms, each arm's own
+ * declared slot (`runId`, `transport`, cell, repetition) must be the one its
+ * grant was signed for, and the two run ids must fold to one key on their
+ * transport segment.  The execution digest, the sidecar digests and the
+ * clocks are one execution's own and are not compared here; each arm's
+ * attested graph already binds its sidecars.
+ */
+export function cohortPairIdentityRejections(
+	ws: RunArtifact,
+	wt: RunArtifact,
+): ArtifactRejection[] {
+	const rejections: ArtifactRejection[] = [];
+	const arms = [["ws", ws] as const, ["wt", wt] as const];
+	const identities: CohortPairIdentity[] = [];
+	for (const [label, artifact] of arms) {
+		const identity = cohortPairIdentityOf(artifact);
+		if (!identity.ok) {
+			addRejection(
+				rejections,
+				"COHORT_PAIR_IDENTITY_MISMATCH",
+				`the ${label} arm's pair identity is unreadable: ${identity.reason}`,
+				"$.attestationEvidence.cohortObservationEvidence.cohortGrant",
+			);
+			continue;
+		}
+		const value = identity.value;
+		const declared: readonly [string, unknown, unknown][] = [
+			["$.runId", artifact.runId, value.runId],
+			["$.transport", artifact.transport, value.transport],
+			["$.scenario.cellId", artifact.scenario.cellId, value.cellId],
+			["$.repetitionKind", artifact.repetitionKind, value.repetitionKind],
+			["$.repetitionIndex", artifact.repetitionIndex, value.repetitionIndex],
+			["$.repetitionTotal", artifact.repetitionTotal, value.repetitionTotal],
+			["$.executionPurpose", artifact.executionPurpose, value.executionPurpose],
+		];
+		for (const [path, own, granted] of declared) {
+			if (own !== granted)
+				addRejection(
+					rejections,
+					"COHORT_PAIR_IDENTITY_MISMATCH",
+					`the ${label} arm declares ${path.slice(2)} ${JSON.stringify(own)} but its signed grant names ${JSON.stringify(granted)}`,
+					path,
+				);
+		}
+		identities.push(value);
+	}
+	if (identities.length !== 2) return rejections;
+	const [a, b] = identities as [CohortPairIdentity, CohortPairIdentity];
+	for (const key of COHORT_PAIR_IDENTITY_FIELDS) {
+		if (a[key] !== b[key])
+			addRejection(
+				rejections,
+				"COHORT_PAIR_IDENTITY_MISMATCH",
+				`WS and WT cohort grants differ on ${key}: ${JSON.stringify(a[key])} vs ${JSON.stringify(b[key])}`,
+				`$.attestationEvidence.cohortObservationEvidence.cohortGrant.${key}`,
+			);
+	}
+	if (a.transport !== "ws" || b.transport !== "wt")
+		addRejection(
+			rejections,
+			"COHORT_PAIR_IDENTITY_MISMATCH",
+			`a cohort pair is one ws grant and one wt grant; found ${a.transport} and ${b.transport}`,
+			"$.attestationEvidence.cohortObservationEvidence.cohortGrant.transport",
+		);
+	if (
+		cohortPairingRunKey(a.runId, a.transport) !==
+		cohortPairingRunKey(b.runId, b.transport)
+	)
+		addRejection(
+			rejections,
+			"COHORT_PAIR_IDENTITY_MISMATCH",
+			`WS and WT run ids do not fold to one pair slot: ${a.runId} vs ${b.runId}`,
+			"$.runId",
+		);
+	return rejections;
+}
+
+/**
+ * The formal pair rule over two verified arms.  Exported at the parsed level:
+ * no unit fixture yields a PASS canonical cohort seal, so the cohort branch
+ * is proved on shaped artifacts that carry a real retained grant.
+ */
+export function pairCompatibilityRejections(
 	ws: RunArtifact,
 	wt: RunArtifact,
 ): ArtifactRejection[] {
@@ -294,7 +425,22 @@ function compatibilityRejections(
 			"WS and WT comparison IDs differ",
 			"$.comparisonId",
 		);
-	if (pairingRunKey(ws.runId) !== pairingRunKey(wt.runId))
+	// A cohort pair is two executions and pairs on its signed identity; a
+	// bulk pair is one run sealed twice and pairs on the run id itself.
+	const wsCohort = carriesCohortObservationEvidence(ws);
+	const wtCohort = carriesCohortObservationEvidence(wt);
+	const cohortPair = wsCohort && wtCohort;
+	if (wsCohort !== wtCohort)
+		addRejection(
+			rejections,
+			"COHORT_PAIR_IDENTITY_MISMATCH",
+			`only the ${wsCohort ? "WS" : "WT"} arm carries a cohort receipt graph`,
+			"$.attestationEvidence.cohortObservationEvidence",
+		);
+	else if (cohortPair)
+		for (const rejection of cohortPairIdentityRejections(ws, wt))
+			rejections.push(rejection);
+	else if (pairingRunKey(ws.runId) !== pairingRunKey(wt.runId))
 		addRejection(
 			rejections,
 			"RUN_ID_MISMATCH",
@@ -663,10 +809,14 @@ function compatibilityRejections(
 			);
 		}
 	}
+	// A bulk pair is one run's shared sidecars sealed twice.  A cohort pair
+	// records topology/impairment/cleanup per execution, and each arm's
+	// attested graph binds its own, so the pair does not require equality.
 	if (
-		ws.rawSidecarDigests.topology !== wt.rawSidecarDigests.topology ||
-		ws.rawSidecarDigests.impairment !== wt.rawSidecarDigests.impairment ||
-		ws.rawSidecarDigests.cleanup !== wt.rawSidecarDigests.cleanup
+		!cohortPair &&
+		(ws.rawSidecarDigests.topology !== wt.rawSidecarDigests.topology ||
+			ws.rawSidecarDigests.impairment !== wt.rawSidecarDigests.impairment ||
+			ws.rawSidecarDigests.cleanup !== wt.rawSidecarDigests.cleanup)
 	)
 		addRejection(
 			rejections,
@@ -740,7 +890,7 @@ export function compareRunArtifacts(
 			rejections,
 		};
 	}
-	const compatibility = compatibilityRejections(ws.artifact, wt.artifact);
+	const compatibility = pairCompatibilityRejections(ws.artifact, wt.artifact);
 	for (const rejection of compatibility) rejections.push(rejection);
 	if (compatibility.length > 0 || rejections.length > 0) {
 		const blockedWt: ArmComparisonResult =

@@ -690,6 +690,13 @@ describe("render-campaign-report promoted flats", () => {
 		);
 		expect(md).toMatch(/^### WS attested arm/m);
 		expect(md).toMatch(/^### WT attested arm/m);
+		// Each arm prints its own sidecar digests; a cohort pair's differ and
+		// are never asserted equal, so the report shows both.
+		expect(
+			md.match(
+				/^- Raw sidecar digests \(this execution's own\): topology [0-9a-f]{64}, impairment [0-9a-f]{64}, cleanup [0-9a-f]{64}$/gm,
+			)?.length,
+		).toBe(2);
 		expect(md).not.toContain(SIGNING_LEAVES_UNRESOLVED);
 		expect(md).not.toContain("INCOMPATIBLE");
 	});

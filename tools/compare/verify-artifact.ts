@@ -4258,6 +4258,124 @@ function verifyCohortPresence(
 	}
 }
 
+/**
+ * The identity a Phase-B pair shares, read from the signed cohort grant each
+ * arm retains (base plan §3.1 `CrossSupervisorExecutionV1`, §4.1
+ * `CohortGrantV1`): the campaign, candidate, source archive, staged
+ * capability, cell, purpose, repetition slot, scenario hash and the grant's
+ * fixed cardinalities.  What the two arms of a pair may legitimately hold
+ * apart is not here: the execution digest, the run id's transport segment,
+ * the per-execution sidecar digests and every clock are one execution's own,
+ * and so are the role-plan hash and its wrapper digest, since the role plan
+ * (base plan §2 `CanonicalRolePlanPreimageV1`) names the channel mapping of
+ * one transport.
+ *
+ * `runId` and `transport` are carried so the pair rule can fold the run id
+ * on the arm's own transport segment and bind the artifact's self-declared
+ * slot to the grant that was signed for it.
+ */
+export interface CohortPairIdentity {
+	readonly campaignId: string;
+	readonly candidate: string;
+	readonly sourceArchiveSha256: string;
+	readonly stagedCapabilitySha256: string;
+	readonly cellId: string;
+	readonly executionPurpose: string;
+	readonly repetitionKind: string;
+	readonly repetitionIndex: number;
+	readonly repetitionTotal: number;
+	readonly scenarioHash: string;
+	readonly publisherCount: number;
+	readonly subscriberCount: number;
+	readonly workerCount: number;
+	readonly expectedOfferedIngress: number;
+	readonly expectedExpandedDeliveries: number;
+	readonly messageBytes: number;
+	readonly measuredDurationMs: number;
+	readonly transport: "ws" | "wt";
+	readonly runId: string;
+}
+
+/** Whether the artifact carries a cohort receipt graph at all. */
+export function carriesCohortObservationEvidence(
+	artifact: Pick<RunArtifact, "attestationEvidence">,
+): boolean {
+	return artifact.attestationEvidence.cohortObservationEvidence != null;
+}
+
+/**
+ * Read the pair identity out of an arm's retained cohort grant.
+ *
+ * Reads only the grant member and trusts no signature: the pair rule runs
+ * after both arms verified PASS, where `reconstructCohortEvidenceOffline`
+ * closed the whole graph -- this re-decodes the one member the pair is keyed
+ * on.  A grant that does not decode or parse is a refusal, never a default.
+ */
+export function cohortPairIdentityOf(
+	artifact: Pick<RunArtifact, "attestationEvidence">,
+):
+	| { readonly ok: true; readonly value: CohortPairIdentity }
+	| {
+			readonly ok: false;
+			readonly reason: string;
+	  } {
+	const evidence = record(
+		artifact.attestationEvidence.cohortObservationEvidence,
+	);
+	const member = record(field(evidence, "cohortGrant"));
+	if (
+		!evidence ||
+		!member ||
+		member.schema !== "retained-canonical-bytes/v1" ||
+		typeof member.bytesBase64 !== "string" ||
+		!isSha256(member.sha256)
+	) {
+		return {
+			ok: false,
+			reason: "the cohort observation evidence retains no cohort grant",
+		};
+	}
+	const decoded = retainedJson(member as unknown as RetainedCanonicalBytesV1);
+	if (!decoded) {
+		return {
+			ok: false,
+			reason: "the retained cohort grant does not decode to its own digest",
+		};
+	}
+	const grant = parseCohortGrant(decoded.json);
+	if (!grant.ok) {
+		return {
+			ok: false,
+			reason: `the retained cohort grant does not parse: ${grant.message ?? grant.code}`,
+		};
+	}
+	const { execution } = grant.value;
+	return {
+		ok: true,
+		value: {
+			campaignId: execution.campaignId,
+			candidate: execution.candidate,
+			sourceArchiveSha256: execution.sourceArchiveSha256,
+			stagedCapabilitySha256: execution.stagedCapabilitySha256,
+			cellId: execution.cellId,
+			executionPurpose: execution.executionPurpose,
+			repetitionKind: execution.repetitionKind,
+			repetitionIndex: execution.repetitionIndex,
+			repetitionTotal: execution.repetitionTotal,
+			scenarioHash: grant.value.scenarioHash,
+			publisherCount: grant.value.publisherCount,
+			subscriberCount: grant.value.subscriberCount,
+			workerCount: grant.value.workerCount,
+			expectedOfferedIngress: grant.value.expectedOfferedIngress,
+			expectedExpandedDeliveries: grant.value.expectedExpandedDeliveries,
+			messageBytes: grant.value.messageBytes,
+			measuredDurationMs: grant.value.measuredDurationMs,
+			transport: grant.value.transport,
+			runId: execution.runId,
+		},
+	};
+}
+
 export function trustContextForArtifact(
 	artifact: RunArtifact,
 ): ArtifactTrustContext {
