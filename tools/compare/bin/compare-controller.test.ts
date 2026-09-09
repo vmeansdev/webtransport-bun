@@ -2943,9 +2943,11 @@ import { sha256Canonical as sha256CanonicalP } from "../canonical.ts";
 import { sealRunArtifact as sealRunArtifactP } from "../compare.ts";
 import type { RunArtifact as RunArtifactP } from "../evidence.ts";
 import {
-	readStagedCohortMaterial as readStagedCohortMaterialP,
 	readStagedSigningLeaves,
 	resolveStagedSigningLeaves,
+} from "../output-policy.ts";
+import {
+	readStagedCohortMaterial as readStagedCohortMaterialP,
 	sealClosesReceiptGraph,
 } from "./compare-controller.ts";
 

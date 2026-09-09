@@ -15,23 +15,28 @@ import {
 } from "./adapters/transport.ts";
 import { compareRunArtifacts, trustContextForArtifact } from "./compare.ts";
 import {
+	type ArtifactTrustContext,
 	assertSupportedPlatform,
 	ComparisonCliError,
 	comparisonErrorCode,
 	metricContractForScenario,
 	parseRecoveryMode,
 	parseStagedTrustArgv,
+	requiresCohortObservationEvidence,
 	type RunArtifact,
+	sha256HexOfBytes,
 	type StagedTrustArgs,
 	validateFixtureOnlyEntrypoint,
 	validateOfficialEntrypointContract,
 } from "./evidence.ts";
 import {
 	assertOfficialComparisonIoAvailable,
+	campaignIndexSigningLeaves,
 	checkPromotionQuarantine,
 	readOfficialComparisonFile,
 	resolveOfficialComparisonOutputDir,
 	resolveOfficialComparisonOutputFile,
+	type StagedSigningLeavesResult,
 	writeOfficialComparisonFile,
 } from "./output-policy.ts";
 import { CANONICAL_SCENARIO_REGISTRY } from "./scenario-registry.ts";
@@ -67,7 +72,15 @@ export type LoopUtilizationScopes = {
 export interface CellComparison {
 	readonly cellId: string;
 	readonly scenarioId: string;
-	readonly status: "COMPATIBLE" | "INCOMPATIBLE";
+	/**
+	 * `REFUSED` is the renderer's own verdict, not the verifier's: the cell was
+	 * never handed to `compareRunArtifacts` because the report could not build
+	 * the trust context its flats need. It is named so that a cell whose seals
+	 * are valid is never filed as INCOMPATIBLE for a key the report did not
+	 * find.
+	 */
+	readonly status: "COMPATIBLE" | "INCOMPATIBLE" | "REFUSED";
+	readonly refusalCode?: string;
 	readonly primaryMetricName?: string;
 	readonly metricUnit?: string;
 	readonly metricDirection?: "higher" | "lower";
@@ -95,8 +108,74 @@ export interface ComparisonSummary {
 	readonly totalCells: number;
 	readonly comparableCells: number;
 	readonly rejectedCells: number;
+	/** Cells the report refused to compare (see `CellComparison.status`). */
+	readonly refusedCells?: number;
 	readonly comparisons: readonly CellComparison[];
 	readonly headerNote?: string;
+	/** Where this report's signing leaves came from, or why it has none. */
+	readonly signingLeavesNote?: string;
+}
+
+/** The refusal a cohort flat gets when the report holds no signing leaves. */
+export const SIGNING_LEAVES_UNRESOLVED = "SIGNING_LEAVES_UNRESOLVED";
+
+/**
+ * The line every report prints about its signing leaves. A cohort flat's
+ * export receipt and issuer graphs verify only under the two staged leaves,
+ * so a report that could not find them says so at the top, where a reader
+ * checking "0/5 comparable" looks first.
+ */
+export function describeSigningLeaves(
+	leaves: StagedSigningLeavesResult,
+): string {
+	if (!leaves.ok) {
+		return `NOT RESOLVED (${leaves.code}: ${leaves.message}); cohort flats are refused as ${SIGNING_LEAVES_UNRESOLVED}, not compared`;
+	}
+	return `resolved from the campaign index's stagedDir (mac ${sha256HexOfBytes(leaves.value.stagedMacPublicRaw32)}, rig ${sha256HexOfBytes(leaves.value.stagedRigPublicRaw32)})`;
+}
+
+/**
+ * The trust contexts for one promoted pair, or the refusal the pair gets
+ * instead. A cohort cell without the leaves is refused by name rather than
+ * verified into `COHORT_EXPORT_RECEIPT_INVALID`; a non-cohort cell verifies
+ * without them, as its seals carry no export receipt to authenticate.
+ */
+export function pairTrustContexts(input: {
+	readonly cellId: string;
+	readonly scenarioId: string;
+	readonly wsArtifact: RunArtifact;
+	readonly wtArtifact: RunArtifact;
+	readonly leaves: StagedSigningLeavesResult;
+}):
+	| {
+			readonly ok: true;
+			readonly ws: ArtifactTrustContext;
+			readonly wt: ArtifactTrustContext;
+	  }
+	| { readonly ok: false; readonly refusal: CellComparison } {
+	const extra = input.leaves.ok ? input.leaves.value : {};
+	if (
+		!input.leaves.ok &&
+		requiresCohortObservationEvidence(input.cellId, "primary")
+	) {
+		return {
+			ok: false,
+			refusal: {
+				cellId: input.cellId,
+				scenarioId: input.scenarioId,
+				status: "REFUSED",
+				refusalCode: SIGNING_LEAVES_UNRESOLVED,
+				rejectionReason: `cohort flats verify only under the staged signing leaves, which this report could not resolve: ${input.leaves.message}`,
+				wsLoopUtilization: input.wsArtifact.loopUtilization,
+				wtLoopUtilization: input.wtArtifact.loopUtilization,
+			},
+		};
+	}
+	return {
+		ok: true,
+		ws: { ...trustContextForArtifact(input.wsArtifact), ...extra },
+		wt: { ...trustContextForArtifact(input.wtArtifact), ...extra },
+	};
 }
 
 /** Escape characters with Markdown table meaning. */
@@ -168,10 +247,19 @@ export function renderMarkdownReport(summary: ComparisonSummary): string {
 		"# WebTransport vs WebSocket Comparison Report",
 		"",
 		`> **Campaign ID**: \`${escapeMarkdown(summary.campaignId)}\` | **Generated**: ${summary.generatedAt}`,
-		`> **Comparison status**: ${summary.comparableCells}/${summary.totalCells} cells comparable; ${summary.rejectedCells} rejected or quarantined`,
+		`> **Comparison status**: ${summary.comparableCells}/${summary.totalCells} cells comparable; ${summary.rejectedCells} rejected or quarantined${
+			summary.refusedCells !== undefined && summary.refusedCells > 0
+				? `; ${summary.refusedCells} refused (${SIGNING_LEAVES_UNRESOLVED})`
+				: ""
+		}`,
 	];
 	if (summary.headerNote !== undefined && summary.headerNote.length > 0) {
 		lines.push(`> **Note**: ${escapeMarkdown(summary.headerNote)}`);
+	}
+	if (summary.signingLeavesNote !== undefined) {
+		lines.push(
+			`> **Signing leaves**: ${escapeMarkdown(summary.signingLeavesNote)}`,
+		);
 	}
 	lines.push(
 		"",
@@ -215,6 +303,10 @@ export function renderMarkdownReport(summary: ComparisonSummary): string {
 				caveats.length === 0 ? "-" : escapeMarkdown(caveats.join("; "));
 			lines.push(
 				`| \`${scenario}\` | **COMPATIBLE** | ${metric} | ${ws} | ${wt} | ${delta} | ${comparison.winner?.toUpperCase() ?? "-"} | ${loopCell} | ${notes} |`,
+			);
+		} else if (comparison.status === "REFUSED") {
+			lines.push(
+				`| \`${scenario}\` | **REFUSED** | - | - | - | - | - | ${loopCell} | ${escapeMarkdown(`${comparison.refusalCode ?? SIGNING_LEAVES_UNRESOLVED}: ${comparison.rejectionReason ?? "refused"}`)} |`,
 			);
 		} else {
 			lines.push(
@@ -279,6 +371,7 @@ export function requireExistingReportEvidenceDir(
 }
 
 const CAMPAIGN_MANIFEST_FILE = "manifest.json";
+const CAMPAIGN_INDEX_FILE = "campaign-index.json";
 
 /**
  * The artifact leaf names a campaign manifest publishes. Each must be a plain
@@ -380,9 +473,32 @@ export function generateReport(identity?: ReportIdentity): void {
 		if (quarantine.promotable) artifactMap.set(file, artifact);
 	}
 
+	// The staged signing leaves every cohort flat verifies under, located
+	// through the `stagedDir` the campaign index records. The index is read
+	// through the same boundary as the flats; a campaign root without one, or
+	// with one that names no stage, gets its cohort cells refused by name.
+	const indexPath = join(officialDir, CAMPAIGN_INDEX_FILE);
+	let campaignIndex: unknown;
+	if (existsSync(indexPath)) {
+		campaignIndex = JSON.parse(
+			new TextDecoder().decode(
+				readOfficialComparisonFile(
+					resolveOfficialComparisonOutputFile({
+						candidate,
+						campaignId,
+						outputDir: officialDir,
+						outputFile: indexPath,
+					}),
+				),
+			),
+		);
+	}
+	const leaves = campaignIndexSigningLeaves(campaignIndex);
+
 	const comparisons: CellComparison[] = [];
 	let comparableCount = 0;
 	let rejectedCount = 0;
+	let refusedCount = 0;
 
 	const cellFilter =
 		identity.cells !== undefined && identity.cells.length > 0
@@ -426,9 +542,21 @@ export function generateReport(identity?: ReportIdentity): void {
 		});
 		const wsBytes = readOfficialComparisonFile(wsPath);
 		const wtBytes = readOfficialComparisonFile(wtPath);
+		const trust = pairTrustContexts({
+			cellId: cell.cellId,
+			scenarioId: cell.scenarioId,
+			wsArtifact,
+			wtArtifact,
+			leaves,
+		});
+		if (!trust.ok) {
+			comparisons.push(trust.refusal);
+			refusedCount++;
+			continue;
+		}
 		const result = compareRunArtifacts(wsBytes, wtBytes, {
-			ws: trustContextForArtifact(wsArtifact),
-			wt: trustContextForArtifact(wtArtifact),
+			ws: trust.ws,
+			wt: trust.wt,
 		});
 
 		if (result.evidenceStatus === "PASS" && result.delta !== "not computed") {
@@ -484,14 +612,19 @@ export function generateReport(identity?: ReportIdentity): void {
 		totalCells: reportCells.length,
 		comparableCells: comparableCount,
 		rejectedCells: rejectedCount,
+		refusedCells: refusedCount,
 		comparisons,
 		...(identity.headerNote !== undefined
 			? { headerNote: identity.headerNote }
 			: {}),
+		signingLeavesNote: describeSigningLeaves(leaves),
 	};
 	const markdown = renderMarkdownReport(summary);
 	writeOfficialComparisonFile(reportPath, markdown);
 	console.log(
-		`[report] Generated Markdown report at '${reportPath}' (${markdown.length} bytes, ${summary.comparableCells}/${summary.totalCells} cells comparable).`,
+		`[report] Generated Markdown report at '${reportPath}' (${markdown.length} bytes, ${summary.comparableCells}/${summary.totalCells} cells comparable${refusedCount > 0 ? `, ${refusedCount} refused ${SIGNING_LEAVES_UNRESOLVED}` : ""}).`,
 	);
+	if (refusedCount > 0) {
+		throw new ComparisonCliError("report", "REPORT_SIGNING_LEAVES_UNRESOLVED");
+	}
 }

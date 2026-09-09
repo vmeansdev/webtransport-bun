@@ -13,8 +13,12 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { sha256Canonical } from "../canonical.ts";
 import { mintPhaseAAttestationFixture } from "../cohort-fixture-signing.ts";
+import { sealRunArtifact } from "../compare.ts";
 import { FANOUT_COHORT_CELL_IDS, type RunArtifact } from "../evidence.ts";
+import { SIGNING_LEAVES_UNRESOLVED } from "../render-report.ts";
+import { sha256HexOfBytes } from "../secure-fs.ts";
 import {
 	armAccountingFromArtifact,
 	CLAIM_BOUNDARY_SENTENCE,
@@ -23,11 +27,33 @@ import {
 	INCOMPLETE_ATTESTATION_CAVEAT,
 	main,
 	purposeLabel,
+	RENDER_REFUSED_EXIT_CODE,
 	renderArmAccounting,
 	SERVER_AGGREGATE_LABEL,
 } from "./render-campaign-report.ts";
 
 const CANDIDATE = "a".repeat(40);
+
+const MAC_LEAF = new Uint8Array(32).fill(7);
+const RIG_LEAF = new Uint8Array(32).fill(9);
+
+/** A staged dir holding exactly what a renderer reads: receipt + leaves. */
+function stagedLeavesDir(macKey: Uint8Array, rigKey: Uint8Array): string {
+	const stagedDir = mkdtempSync(join(tmpdir(), "render-staged-"));
+	const stagingRootDir = join(stagedDir, "staging-root");
+	mkdirSync(stagingRootDir, { recursive: true });
+	writeFileSync(join(stagingRootDir, "mac-supervisor-ed25519.pub"), macKey);
+	writeFileSync(join(stagingRootDir, "rig-supervisor-ed25519.pub"), rigKey);
+	writeFileSync(
+		join(stagedDir, "stage-receipt.json"),
+		JSON.stringify({
+			schema: "live-stage-receipt/v1",
+			macSigningPublicKeySha256: sha256HexOfBytes(macKey),
+			rigSigningPublicKeySha256: sha256HexOfBytes(rigKey),
+		}),
+	);
+	return stagedDir;
+}
 
 /** A sealed artifact reduced to the fields the report reads. */
 function seal(partial: {
@@ -298,6 +324,11 @@ describe("render-campaign-report sealed-index", () => {
 		expect(md).not.toContain(INCOMPLETE_ATTESTATION_CAVEAT);
 		expect(md).toContain(SERVER_AGGREGATE_LABEL);
 		expect(md).toContain("focused probe");
+		// The diagnostic re-verifies nothing, and says where its leaves stand.
+		expect(md).toContain(
+			"- Signing leaves: NOT RESOLVED (STALE_OR_INVALID_STAGING: campaign index records no stagedDir",
+		);
+		expect(md).toContain("this diagnostic reads seals and re-verifies none");
 		expect(md).toContain("NOT A CANONICAL FANOUT RESULT");
 	});
 
@@ -512,23 +543,229 @@ describe("render-campaign-report promoted flats", () => {
 		});
 	}
 
-	function promotedRoot(prefix: string, opts: { readonly cohort: boolean }) {
+	/**
+	 * A promoted cohort-cell root. The flats are shaped, not sealed, so the
+	 * verifier turns them back either way; what these roots exercise is the
+	 * renderer's own refusal, which runs before the verifier is asked. The
+	 * staged leaves are present unless a test drops or spoils them.
+	 */
+	function promotedRoot(
+		prefix: string,
+		opts: {
+			readonly cohort: boolean;
+			readonly leaves?: "present" | "absent" | "stale";
+		},
+	) {
 		const dir = campaignRoot(prefix);
 		const cellId = FANOUT_COHORT_CELL_IDS[0]!;
 		const safe = cellId.replace(/[/:]/g, "_");
-		writeFileSync(join(dir, `${safe}-ws.json`), flat({ p50: 1, ...opts }));
-		writeFileSync(join(dir, `${safe}-wt.json`), flat({ p50: 2, ...opts }));
+		writeFileSync(
+			join(dir, `${safe}-ws.json`),
+			flat({ p50: 1, cohort: opts.cohort }),
+		);
+		writeFileSync(
+			join(dir, `${safe}-wt.json`),
+			flat({ p50: 2, cohort: opts.cohort }),
+		);
+		const leaves = opts.leaves ?? "present";
+		const stagedDir = stagedLeavesDir(MAC_LEAF, RIG_LEAF);
+		if (leaves === "stale") {
+			writeFileSync(
+				join(stagedDir, "staging-root", "rig-supervisor-ed25519.pub"),
+				new Uint8Array(32).fill(1),
+			);
+		}
 		writeIndex(dir, {
 			schema: "campaign-index/v2",
 			campaignId: "promoted-campaign",
 			candidate: CANDIDATE,
 			executionPurpose: "canonical",
 			stage: "full",
+			...(leaves === "absent" ? {} : { stagedDir }),
 			cells: [cellId],
 			entries: [],
 		});
 		return { dir, cellId };
 	}
+
+	/**
+	 * One fixture-signed measured seal on the bulk cell, the same Phase-A
+	 * fixture the controller's promotion test seals: no unit fixture yields a
+	 * PASS canonical *cohort* seal, so the pair that proves the render passes
+	 * under the leaves is a bulk pair, and the cohort refusal is proved on
+	 * shaped cohort flats (above) and on the run's own bytes.
+	 */
+	function attestedFlat(transport: "ws" | "wt"): Uint8Array {
+		const artifact = JSON.parse(
+			readFileSync(
+				join(import.meta.dir, "..", "fixtures", `valid-${transport}-run.json`),
+				"utf8",
+			),
+		) as RunArtifact & Record<string, unknown>;
+		artifact.artifactKind = "measured";
+		artifact.cohortEvidenceExport = null;
+		artifact.executionPurpose = "canonical";
+		artifact.repetitionKind = "measured";
+		artifact.repetitionIndex = 3;
+		artifact.repetitionTotal = 5;
+		artifact.promotable = true;
+		const fx = mintPhaseAAttestationFixture({
+			executionPurpose: "canonical",
+			repetitionKind: "measured",
+			repetitionIndex: 3,
+			repetitionTotal: 5,
+			transport,
+			cellId: "bulk-one-way/physical",
+			campaignId: artifact.comparisonId,
+			candidate: artifact.source.sourceSha,
+			runId: artifact.runId,
+		});
+		artifact.attestationEvidence = fx.attestation;
+		artifact.rawSidecarDigests = {
+			...artifact.rawSidecarDigests,
+			client: fx.observation.admittedClientSeriesSha256,
+			server: fx.observation.snapshotFrameSha256,
+		};
+		artifact.rawSidecarBindingSha256 = sha256Canonical({
+			comparisonId: artifact.comparisonId,
+			runId: artifact.runId,
+			transport: artifact.transport,
+			sourceBindingSha256: artifact.source.bindingSha256,
+			scenarioHash: artifact.scenario.scenarioHash,
+			metricContractHash: artifact.metricContractHash,
+			rawSidecarDigests: artifact.rawSidecarDigests,
+		});
+		return sealRunArtifact(artifact);
+	}
+
+	function sealedBulkRoot(
+		prefix: string,
+		opts: { readonly leaves: "present" | "absent" },
+	): { readonly dir: string; readonly campaignId: string } {
+		const dir = campaignRoot(prefix);
+		const ws = attestedFlat("ws");
+		const campaignId = (JSON.parse(new TextDecoder().decode(ws)) as RunArtifact)
+			.comparisonId;
+		writeFileSync(join(dir, "bulk-one-way_physical-ws.json"), ws);
+		writeFileSync(
+			join(dir, "bulk-one-way_physical-wt.json"),
+			attestedFlat("wt"),
+		);
+		writeIndex(dir, {
+			schema: "campaign-index/v2",
+			campaignId,
+			candidate: CANDIDATE,
+			executionPurpose: "canonical",
+			stage: "full",
+			...(opts.leaves === "present"
+				? { stagedDir: stagedLeavesDir(MAC_LEAF, RIG_LEAF) }
+				: {}),
+			cells: ["bulk-one-way/physical"],
+			entries: [],
+		});
+		return { dir, campaignId };
+	}
+
+	function renderPromoted(dir: string, campaignId = "promoted-campaign") {
+		const report = join(dir, "campaign-report.md");
+		const run = runMain([
+			`--campaign-id=${campaignId}`,
+			`--candidate=${CANDIDATE}`,
+			`--campaign-root=${dir}`,
+			`--output=${report}`,
+		]);
+		return { ...run, md: readFileSync(report, "utf8") };
+	}
+
+	it("verifies a fixture-signed pair under the staged leaves and compares it", () => {
+		const { dir, campaignId } = sealedBulkRoot("render-sealed-bulk-", {
+			leaves: "present",
+		});
+		const { code, out, md } = renderPromoted(dir, campaignId);
+		expect(code).toBe(0);
+		expect(out).toContain("formalComparable=1/1 refused=0");
+		expect(md).toContain("1/1 cells comparable; 0 rejected or quarantined");
+		expect(md).toContain(
+			`**Signing leaves**: resolved from the campaign index's stagedDir (mac ${sha256HexOfBytes(MAC_LEAF)}, rig ${sha256HexOfBytes(RIG_LEAF)})`,
+		);
+		expect(md).toMatch(/^### WS attested arm/m);
+		expect(md).toMatch(/^### WT attested arm/m);
+		expect(md).not.toContain(SIGNING_LEAVES_UNRESOLVED);
+		expect(md).not.toContain("INCOMPATIBLE");
+	});
+
+	it("still compares a non-cohort pair without the leaves, and says it had none", () => {
+		// A bulk seal carries no export receipt to authenticate, so the missing
+		// leaves are a fact the report states, not a refusal it issues.
+		const { dir, campaignId } = sealedBulkRoot("render-sealed-bulk-keyless-", {
+			leaves: "absent",
+		});
+		const { code, md } = renderPromoted(dir, campaignId);
+		expect(code).toBe(0);
+		expect(md).toContain("1/1 cells comparable");
+		expect(md).toContain(
+			"**Signing leaves**: NOT RESOLVED (STALE_OR_INVALID_STAGING: campaign index records no stagedDir",
+		);
+	});
+
+	it("refuses a cohort cell by name when the index records no stagedDir, and exits non-zero", () => {
+		// fanout-attested-r1 (2026-09-09): the render verified five valid cohort
+		// pairs without the staged leaves and filed every one as INCOMPATIBLE
+		// ("0/5 cells comparable"). A cohort cell the report cannot key is now
+		// refused under its own name, before the verifier is asked.
+		const { dir, cellId } = promotedRoot("render-promoted-keyless-", {
+			cohort: true,
+			leaves: "absent",
+		});
+		const { code, out, err, md } = renderPromoted(dir);
+		expect(code).toBe(RENDER_REFUSED_EXIT_CODE);
+		expect(out).toContain("formalComparable=0/1 refused=1");
+		expect(err).toContain(
+			`${SIGNING_LEAVES_UNRESOLVED}: 1 cohort cell refused`,
+		);
+		expect(md).toContain(
+			`0/1 cells comparable; 0 rejected or quarantined; 1 refused (${SIGNING_LEAVES_UNRESOLVED})`,
+		);
+		expect(md).toContain(`| \`${cellId}\` | **REFUSED** | - | - | - | - | - |`);
+		expect(md).toContain(
+			`${SIGNING_LEAVES_UNRESOLVED}: cohort flats verify only under the staged signing leaves, which this report could not resolve: campaign index records no stagedDir`,
+		);
+		expect(md).not.toContain("INCOMPATIBLE");
+		expect(md).toContain("**Signing leaves**: NOT RESOLVED");
+		// The report is still written whole: the arm sections are there to read.
+		expect(md).toMatch(/^### WS attested arm/m);
+		expect(md).toMatch(/^### WT attested arm/m);
+	});
+
+	it("refuses a cohort cell when a staged leaf does not match the stage receipt", () => {
+		const { dir } = promotedRoot("render-promoted-stale-", {
+			cohort: true,
+			leaves: "stale",
+		});
+		const { code, md } = renderPromoted(dir);
+		expect(code).toBe(RENDER_REFUSED_EXIT_CODE);
+		expect(md).toContain("**REFUSED**");
+		expect(md).toContain("staged rig public key does not match the receipt");
+		expect(md).not.toContain("INCOMPATIBLE");
+	});
+
+	it("does not fall back to the diagnostic view when a promoted render is refused", () => {
+		const { dir } = promotedRoot("render-promoted-nofallback-", {
+			cohort: true,
+			leaves: "absent",
+		});
+		const report = join(dir, "campaign-report.md");
+		const { code } = runMain([
+			"--campaign-id=promoted-campaign",
+			`--candidate=${CANDIDATE}`,
+			`--campaign-root=${dir}`,
+			`--output=${report}`,
+			"--allow-non-promotable",
+		]);
+		expect(code).toBe(RENDER_REFUSED_EXIT_CODE);
+		expect(readFileSync(report, "utf8")).toContain("**REFUSED**");
+		expect(readdirSync(dir)).not.toContain("diagnostic-report.md");
+	});
 
 	it("promoted_report_heads_one_section_per_arm_with_its_attestation_label", () => {
 		const { dir } = promotedRoot("render-promoted-", { cohort: true });

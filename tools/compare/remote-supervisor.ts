@@ -233,6 +233,7 @@ import {
 	verifyRigReceiptSignature,
 } from "./cross-supervisor-protocol.ts";
 import { parseMeasurementGrant } from "./evidence.ts";
+import { TRUST_BOOTSTRAP_STAGING_ROOT } from "./output-policy.ts";
 import {
 	canonicalRecordBytes,
 	parseStrictJsonBytes,
@@ -2215,7 +2216,7 @@ export function resolveSupervisorBunPath(
 export const TRUST_BOOTSTRAP_AUTHORITY_LEAF = "authority.json";
 export const TRUST_BOOTSTRAP_AUTHORITY_DIGEST_LEAF = "authority-digest.bin";
 export const TRUST_BOOTSTRAP_CAMPAIGN_ROOT = "campaign-root";
-export const TRUST_BOOTSTRAP_STAGING_ROOT = "staging-root";
+export { TRUST_BOOTSTRAP_STAGING_ROOT };
 export const TRUST_BOOTSTRAP_LOCK_LEAF = "campaign-lock.json";
 export const TRUST_BOOTSTRAP_CAPABILITY_LEAF = "staged-capability.json";
 export const TRUST_BOOTSTRAP_MANIFEST_LEAF = "manifest.json";

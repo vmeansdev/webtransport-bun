@@ -34,6 +34,7 @@ import {
 	evaluateCanonicalFanoutCompletion,
 	evaluateCellPromotionGate,
 	type PromotionGateEntry,
+	readSigningLeafPairFlags,
 } from "../output-policy.ts";
 import { parseStrictJsonBytes } from "../secure-fs.ts";
 import {
@@ -734,49 +735,18 @@ export function verifyCampaignIndex(args: {
 			"externalTrustBoundSha256 must be a sha-256 hex digest",
 		);
 	}
-	for (const [flag, path] of [
-		["mac-public-key", args.macPublicKeyPath],
-		["rig-public-key", args.rigPublicKeyPath],
-	] as const) {
-		if (path === undefined) continue;
-		if (!existsSync(path) || !lstatSync(path).isFile()) {
-			return reject(
-				"TRUST_PROTOCOL",
-				`--${flag} does not name a readable regular file: ${path}`,
-			);
-		}
-	}
 	// The staged keys are the raw 32-byte Ed25519 public keys the stage tool
 	// writes as `mac-supervisor-ed25519.pub` / `rig-supervisor-ed25519.pub`.
 	// Both or neither: half the trust material verifies half the graph, which is
 	// exactly the shape of a flag that reads as evidence and proves nothing.
+	// `readSigningLeafPairFlags` is the one reading of the pair, shared with
+	// `bin/verify-artifact.ts`.
+	const leafFlags = readSigningLeafPairFlags(args);
+	if (!leafFlags.ok) return reject(leafFlags.code, leafFlags.message);
 	let attestationTrust: AttestationTrustMaterial | null = null;
-	if (
-		(args.macPublicKeyPath === undefined) !==
-		(args.rigPublicKeyPath === undefined)
-	) {
-		return reject(
-			"TRUST_PROTOCOL",
-			"--mac-public-key and --rig-public-key must be supplied together",
-		);
-	}
-	if (
-		args.macPublicKeyPath !== undefined &&
-		args.rigPublicKeyPath !== undefined
-	) {
-		const macPublicRaw32 = new Uint8Array(readFileSync(args.macPublicKeyPath));
-		const rigPublicRaw32 = new Uint8Array(readFileSync(args.rigPublicKeyPath));
-		for (const [flag, raw] of [
-			["mac-public-key", macPublicRaw32],
-			["rig-public-key", rigPublicRaw32],
-		] as const) {
-			if (raw.byteLength !== 32) {
-				return reject(
-					"TRUST_PROTOCOL",
-					`--${flag} must be a raw 32-byte Ed25519 public key, got ${raw.byteLength} bytes`,
-				);
-			}
-		}
+	if (leafFlags.value !== null) {
+		const macPublicRaw32 = leafFlags.value.stagedMacPublicRaw32;
+		const rigPublicRaw32 = leafFlags.value.stagedRigPublicRaw32;
 		attestationTrust = {
 			macPublicRaw32,
 			rigPublicRaw32,
