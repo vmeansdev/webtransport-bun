@@ -1,0 +1,10 @@
+{
+  "ackRequestSeq": 8,
+  "cohortObservationEvidenceSha256": "ab501ee45621f4beeb26994c46a04776c016e32cb83214118986041f88a054ee",
+  "cohortObservationEvidenceSignatureBase64": "WvbxFFVxKBJq4S1OCcfWuWZPLK2HROrL+Qy0FXYGfe0lIYYfaUjcG1Ec9qDfvNNrolZFlpEBzbQ5MSF7KY1/Dw==",
+  "cohortObservationEvidenceSize": 257325,
+  "executionSha256": "12895ad2eaafb9c44a58c375f384222aeb9dc538743f1c5537623a74e0871ebc",
+  "responseSeq": 8,
+  "schema": "mac-cohort-evidence-exported-ack/v1",
+  "terminalExport": true
+}

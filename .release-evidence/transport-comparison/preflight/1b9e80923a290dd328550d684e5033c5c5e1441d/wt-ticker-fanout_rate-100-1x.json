@@ -1,0 +1,308 @@
+{
+  "schema": "fanout-physical-preflight-receipt/v1",
+  "candidate": "1b9e80923a290dd328550d684e5033c5c5e1441d",
+  "campaignId": "fanout-pilot-r1",
+  "mode": "physical",
+  "transport": "wt",
+  "cellId": "ticker-fanout/rate-100",
+  "cohortCell": "ticker 100",
+  "pass": "1x",
+  "generatedAtMs": 1788915589596,
+  "topology": {
+    "publisherCount": 1,
+    "workerCount": 8,
+    "subscriberCount": 100,
+    "sessionCount": 101,
+    "windowCount": 10,
+    "measuredDurationMs": 10000,
+    "messageBytes": 100
+  },
+  "offer": {
+    "pacingSource": "cell",
+    "publisherRatePerSecond": 100,
+    "offeredIngressPerSecond": 100,
+    "rowIngressPerWindow": 100,
+    "bindingIngressPerWindow": 100,
+    "requiredAcceptedPerWindow": 100,
+    "acceptedPredicate": "equals"
+  },
+  "preconditions": {
+    "macLoad1": 3.0244140625,
+    "macLoadBound": 4,
+    "rigLoad1": 0.28,
+    "rigLoadBound": 0.5,
+    "rigIsThisHost": false,
+    "enforced": true,
+    "failures": [],
+    "ok": true
+  },
+  "runId": "fanout-pilot-r1/ticker-fanout/rate-100/wt/measured-1",
+  "macClockId": "a860c6101fba540f2b7689bcedc68f8f81dfa67b8b7e349db07a876a6f705f51",
+  "lifecycle": {
+    "completed": true,
+    "dispatchOk": true,
+    "failureCode": null,
+    "reason": null,
+    "sealedPath": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/.claude/worktrees/ws-scenario-comparison/.release-evidence/transport-comparison/preflight/1b9e80923a290dd328550d684e5033c5c5e1441d/scratch/wt-ticker-fanout_rate-100-1x/rep-1.sealed.json",
+    "campaignRootRecordsBefore": [],
+    "campaignRootRecordsRemoved": [
+      "execution-000001-wt.json"
+    ]
+  },
+  "windows": {
+    "note": "origin-window counts: offered from the publisher partials, accepted from the Linux relay observation, delivered from the eight worker partials; never wall-clock samples",
+    "offeredByOriginWindow": [
+      100,
+      100,
+      100,
+      100,
+      100,
+      100,
+      100,
+      100,
+      100,
+      100
+    ],
+    "acceptedByOriginWindow": [
+      100,
+      100,
+      100,
+      100,
+      100,
+      100,
+      100,
+      100,
+      100,
+      100
+    ],
+    "deliveredByOriginWindow": [
+      10000,
+      10000,
+      10000,
+      10000,
+      10000,
+      10000,
+      10000,
+      10000,
+      10000,
+      10000
+    ],
+    "relayWritesCompletedByOriginWindow": [
+      10000,
+      10000,
+      10000,
+      10000,
+      10000,
+      10000,
+      10000,
+      10000,
+      10000,
+      10000
+    ]
+  },
+  "totals": {
+    "offered": 1000,
+    "accepted": 1000,
+    "delivered": 100000,
+    "deliveredBytes": 10000000,
+    "expectedDelivered": 100000,
+    "ingressRefusals": 0
+  },
+  "warmup": {
+    "epochMs": 5000,
+    "expectedIngress": 10,
+    "expectedDeliveries": 1000,
+    "macOffered": 10,
+    "macDelivered": 1000,
+    "relayIngress": 10,
+    "relayDeliveries": 1000
+  },
+  "faults": {
+    "relayQueueDrops": 0,
+    "relayWriteTimeouts": 0,
+    "relayDisconnectUndelivered": 0,
+    "relayMalformedIngress": 0,
+    "relayDuplicateIngress": 0,
+    "relayReorderedIngress": 0,
+    "workerMalformed": 0,
+    "workerDuplicate": 0,
+    "workerReorder": 0,
+    "workerDisconnect": 0
+  },
+  "queue": {
+    "relayQueueItemsPeak": 100,
+    "relayQueueBytesPeak": 47690,
+    "perSubscriberCap": 64,
+    "note": "relay-wide queued-item peak over the window (an upper bound on any one subscriber's depth); the relay keeps no per-subscriber peak"
+  },
+  "relayBusy": {
+    "instrument": "onRelayWork spans (server child busyMs on server-loop-utilization/v1)",
+    "busyMs": 1524,
+    "windowMs": 10258,
+    "fraction": 0.14856697211932152
+  },
+  "serverChildCpu": {
+    "measured": {
+      "instrument": "rig supervisor serverChildCpu on rig-server-snapshot-receipt/v1: /proc/<pid>/task/<pid>/stat and /proc/<pid>/stat at measure-start ack and capture ack",
+      "processMs": 10800,
+      "mainThreadMs": 2700,
+      "intervalMs": 10271,
+      "processCore": 1.0515042352253918,
+      "mainThreadCore": 0.26287605880634796,
+      "bound": 0.5,
+      "sampleCount": 2,
+      "covered": true
+    },
+    "warmup": {
+      "instrument": "preflight sampler: /proc/<pid>/stat and /proc/<pid>/task/<pid>/stat over ssh to hermes-admin@10.99.0.2",
+      "processMs": 483.13324216394653,
+      "mainThreadMs": 128.39746707183104,
+      "intervalMs": 4784.01175,
+      "processCore": 0.10098914204463369,
+      "mainThreadCore": 0.026838869505667717,
+      "bound": 0.5,
+      "sampleCount": 21,
+      "covered": true
+    },
+    "perSecondNote": "main-thread core per wall-clock second from the barrier's measure start, from the preflight sampler; recorded, not gated",
+    "perSecondMainThreadCore": [
+      0.2876411093467811,
+      0.26493189050220145,
+      0.26600479536364835,
+      0.27800655164780735,
+      0.2588763278642789,
+      0.2549768651370798,
+      0.2744135967455268,
+      0.26479960778943906,
+      0.26452660734723304,
+      0.2554113408772282
+    ],
+    "perSecondMainThreadCoreMax": 0.2876411093467811,
+    "sampler": {
+      "instrument": "preflight sampler: /proc/<pid>/stat and /proc/<pid>/task/<pid>/stat over ssh to hermes-admin@10.99.0.2",
+      "cadenceMs": 200,
+      "sampleCount": 70,
+      "stderrTail": "",
+      "pid": 333501,
+      "capturePid": 333501,
+      "pidMatchesCapture": true
+    }
+  },
+  "rig": {
+    "coreMhz": {
+      "warmupStart": [
+        3674.407,
+        3673.244,
+        3603.713,
+        3645.958,
+        3680.015,
+        3680.013,
+        3692.887,
+        3637.38
+      ],
+      "warmupEnd": [
+        3694.774,
+        2100,
+        2768.76,
+        2432.254,
+        2433.3,
+        2431.805,
+        3648.605,
+        2100
+      ],
+      "measureStart": [
+        2463.482,
+        3700.104,
+        2959.991,
+        3701.814,
+        2959.004,
+        2959.782,
+        2465.203,
+        3700.04
+      ],
+      "measureStop": [
+        3699.799,
+        3699.743,
+        2960.027,
+        2921.058,
+        3690.335,
+        3682.723,
+        3699.302,
+        3700.021
+      ]
+    },
+    "rssKb": {
+      "warmupStart": 111176,
+      "measureStop": 116116,
+      "peak": 129676
+    },
+    "nofile": {
+      "soft": 524288,
+      "hard": 524288
+    }
+  },
+  "mac": {
+    "load1AtStart": 3.0244140625,
+    "load1Peak": 4.43701171875,
+    "workers": [
+      {
+        "childId": "subscriber-worker-0",
+        "workerIndex": 0,
+        "pid": 95643,
+        "cpuMsOverMeasuredWindow": 1677.1572291329312,
+        "cpuCore": 0.16771572291329312
+      },
+      {
+        "childId": "subscriber-worker-1",
+        "workerIndex": 1,
+        "pid": 95644,
+        "cpuMsOverMeasuredWindow": 1677.1572291329312,
+        "cpuCore": 0.16771572291329312
+      },
+      {
+        "childId": "subscriber-worker-2",
+        "workerIndex": 2,
+        "pid": 95645,
+        "cpuMsOverMeasuredWindow": 1677.1572291329312,
+        "cpuCore": 0.16771572291329312
+      },
+      {
+        "childId": "subscriber-worker-3",
+        "workerIndex": 3,
+        "pid": 95646,
+        "cpuMsOverMeasuredWindow": 1657.1572291329312,
+        "cpuCore": 0.16571572291329312
+      },
+      {
+        "childId": "subscriber-worker-4",
+        "workerIndex": 4,
+        "pid": 95647,
+        "cpuMsOverMeasuredWindow": 1567.1572291329312,
+        "cpuCore": 0.1567157229132931
+      },
+      {
+        "childId": "subscriber-worker-5",
+        "workerIndex": 5,
+        "pid": 95648,
+        "cpuMsOverMeasuredWindow": 1557.1572291329312,
+        "cpuCore": 0.1557157229132931
+      },
+      {
+        "childId": "subscriber-worker-6",
+        "workerIndex": 6,
+        "pid": 95649,
+        "cpuMsOverMeasuredWindow": 1559.6773921251117,
+        "cpuCore": 0.15596773921251117
+      },
+      {
+        "childId": "subscriber-worker-7",
+        "workerIndex": 7,
+        "pid": 95650,
+        "cpuMsOverMeasuredWindow": 1559.6773921251117,
+        "cpuCore": 0.15596773921251117
+      }
+    ]
+  },
+  "verdict": "PASS",
+  "failedPredicates": []
+}
