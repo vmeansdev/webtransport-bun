@@ -40,6 +40,7 @@ import {
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	readdirSync,
 	readFileSync,
 	rmSync,
 	writeFileSync,
@@ -553,6 +554,10 @@ export interface PreflightReceiptV1 {
 		readonly failureCode: string | null;
 		readonly reason: string | null;
 		readonly sealedPath: string | null;
+		/** Execution records found in the campaign root before the pass (always empty: a consumed root is refused). */
+		readonly campaignRootRecordsBefore: readonly string[];
+		/** The records this pass committed and removed again, so the staged root is as the stage left it. */
+		readonly campaignRootRecordsRemoved: readonly string[];
 	};
 	readonly windows: {
 		readonly note: string;
@@ -1231,7 +1236,50 @@ interface PreflightPair {
 	readonly runtimeRoot: string;
 	readonly rigIsThisHost: boolean;
 	readonly rigSsh: RigSsh | null;
+	/** The Mac supervisor commits one execution record per arm into this directory. */
+	readonly campaignRootDir: string;
+	readonly hygiene: CampaignRootHygiene;
 	readonly cleanup: () => Promise<void>;
+}
+
+/**
+ * The Mac supervisor commits `execution-NNNNNN-<transport>.json` into the
+ * campaign root with O_EXCL and refuses to start over a root that already
+ * holds one, so a preflight that left its record behind would poison every
+ * later pass and the frozen run itself. A preflight therefore never starts
+ * on a root that holds records (it will not delete another run's evidence),
+ * and removes the records it made before it returns.
+ */
+export interface CampaignRootHygiene {
+	readonly recordsBefore: readonly string[];
+	recordsRemoved: readonly string[];
+}
+
+const EXECUTION_RECORD_RE = /^execution-\d{6}-(?:ws|wt)\.json$/;
+
+export function listExecutionRecords(campaignRootDir: string): string[] {
+	return readdirSync(campaignRootDir)
+		.filter((name) => EXECUTION_RECORD_RE.test(name))
+		.sort();
+}
+
+export function consumedCampaignRootReason(
+	records: readonly string[],
+): string | null {
+	if (records.length === 0) return null;
+	return `the campaign root already holds execution records (${records.join(", ")}); a preflight never runs on a consumed root and never removes another run's records`;
+}
+
+function removeExecutionRecords(
+	campaignRootDir: string,
+	hygiene: CampaignRootHygiene,
+): void {
+	const present = listExecutionRecords(campaignRootDir).filter(
+		(name) => !hygiene.recordsBefore.includes(name),
+	);
+	for (const name of present)
+		rmSync(join(campaignRootDir, name), { force: true });
+	hygiene.recordsRemoved = present;
 }
 
 function chooseLocalAcceptanceServerPort(): number {
@@ -1543,6 +1591,10 @@ async function stageLoopbackPair(args: {
 	const macClockId = observeMacClockIdentity();
 	if (!macClockId.ok) throw new Error(macClockId.message);
 	const runtimeRoot = mkdtempSync(join(tmpdir(), "fanout-preflight-runtime-"));
+	const loopbackHygiene: CampaignRootHygiene = {
+		recordsBefore: listExecutionRecords(verified.paths.campaignRootDir),
+		recordsRemoved: [],
+	};
 	return {
 		mode: "loopback",
 		staged: material.value,
@@ -1556,9 +1608,12 @@ async function stageLoopbackPair(args: {
 		runtimeRoot,
 		rigIsThisHost: true,
 		rigSsh: null,
+		campaignRootDir: verified.paths.campaignRootDir,
+		hygiene: loopbackHygiene,
 		cleanup: async () => {
 			await stopSupervisor(rigSupervisor, 5_000);
 			await stopSupervisor(macSpawned.handle, 5_000);
+			removeExecutionRecords(verified.paths.campaignRootDir, loopbackHygiene);
 			rmSync(runtimeRoot, { recursive: true, force: true });
 			rmSync(root, { recursive: true, force: true });
 		},
@@ -1616,6 +1671,10 @@ async function openPhysicalPair(args: {
 			`${MAC_SIGNING_KEY_ENV} is not set; the Mac signer cannot sign`,
 		);
 	}
+	const recordsBefore = listExecutionRecords(verified.paths.campaignRootDir);
+	const consumed = consumedCampaignRootReason(recordsBefore);
+	if (consumed !== null) throw new Error(consumed);
+	const hygiene: CampaignRootHygiene = { recordsBefore, recordsRemoved: [] };
 	const targetUser =
 		process.env[MAC_SUPERVISOR_USER_ENV] ?? MAC_SUPERVISOR_DEFAULT_USER;
 	let controllerUidSeam: { readonly campaignScratchRoot: string } | undefined;
@@ -1767,9 +1826,12 @@ async function openPhysicalPair(args: {
 		runtimeRoot,
 		rigIsThisHost: false,
 		rigSsh,
+		campaignRootDir: verified.paths.campaignRootDir,
+		hygiene,
 		cleanup: async () => {
 			await stopSupervisor(rigSpawned.handle, 5_000);
 			await stopSupervisor(macSpawned.handle, 5_000);
+			removeExecutionRecords(verified.paths.campaignRootDir, hygiene);
 			rmSync(runtimeRoot, { recursive: true, force: true });
 		},
 	};
@@ -2259,6 +2321,8 @@ export async function runPreflight(
 				failureCode: null,
 				reason: "not run: operator precondition failed",
 				sealedPath: null,
+				campaignRootRecordsBefore: [],
+				campaignRootRecordsRemoved: [],
 			},
 			windows: {
 				note: "origin-window counts from the partials and the Linux observation",
@@ -2770,6 +2834,8 @@ export async function runPreflight(
 				dispatchResult !== null && dispatchResult.ok
 					? dispatchResult.sealedPath
 					: null,
+			campaignRootRecordsBefore: pair.hygiene.recordsBefore,
+			campaignRootRecordsRemoved: pair.hygiene.recordsRemoved,
 		},
 		windows: {
 			note: "origin-window counts: offered from the publisher partials, accepted from the Linux relay observation, delivered from the eight worker partials; never wall-clock samples",
