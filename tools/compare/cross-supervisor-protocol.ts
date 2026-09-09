@@ -182,7 +182,7 @@ export interface FanoutExpandedDeclaration {
  *
  * `declaredMessageCount` is the *expanded* delivery count -- the D3 measured
  * ingress multiplied by that cell's subscriber count -- and never the offered
- * ingress: a ticker 250 arm offers 2,500 records and owes 250,000
+ * ingress: a ticker 100 arm offers 1,000 records and owes 100,000
  * deliveries. `declaredMessageBytes` is the frozen per-message size (100 for
  * ticker, 128 for chat), which is what the rig verifies each delivery against.
  *
@@ -194,16 +194,16 @@ export interface FanoutExpandedDeclaration {
 export const FANOUT_EXPANDED_DECLARATION_BY_CELL_ID: Readonly<
 	Record<string, FanoutExpandedDeclaration>
 > = Object.freeze({
+	"ticker-fanout/rate-25": Object.freeze({
+		declaredMessageCount: 25_000,
+		declaredMessageBytes: 100,
+	}),
 	"ticker-fanout/rate-50": Object.freeze({
 		declaredMessageCount: 50_000,
 		declaredMessageBytes: 100,
 	}),
 	"ticker-fanout/rate-100": Object.freeze({
 		declaredMessageCount: 100_000,
-		declaredMessageBytes: 100,
-	}),
-	"ticker-fanout/rate-250": Object.freeze({
-		declaredMessageCount: 250_000,
 		declaredMessageBytes: 100,
 	}),
 	"chat-fanout/subscribers-250": Object.freeze({
@@ -518,7 +518,7 @@ export function parseCrossSupervisorExecutionDraft(
  *
  * Both branches matter. The Phase A branch pins the completed-transfer literals;
  * the fanout branch pins the expanded delivery count, so a draft that declared
- * the offered ingress -- a hundredth of what the relay owes for ticker 250 --
+ * the offered ingress -- a hundredth of what the relay owes for ticker 100 --
  * is refused here, on the wire, and not only by the controller that built it
  * and the reconstruction that reads it back.
  */

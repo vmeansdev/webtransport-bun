@@ -1176,7 +1176,7 @@ describe("fail-closed comparison evidence", () => {
 		expect(verifyRunArtifactObject(nonScale).evidenceStatus).toBe("PASS");
 		const ordinaryTicker = roleScaleArtifactObject(
 			wsBytes,
-			"ticker-fanout/rate-250",
+			"ticker-fanout/rate-100",
 		);
 		ordinaryTicker.capacityProof.mac.fd.effectiveChildLimit = 1_024;
 		ordinaryTicker.capacityProof.linux.fd.effectiveChildLimit = 1_024;
@@ -1830,12 +1830,12 @@ describe("fail-closed comparison evidence", () => {
 
 	test("pairingRunKey ignores resume cohort timestamps within the same cell/rep", () => {
 		const ws =
-			"ws-wt-r0-campaign-r0-full-1788052520-ticker-fanout_rate-250-1788052609019-rep-2";
+			"ws-wt-r0-campaign-r0-full-1788052520-ticker-fanout_rate-100-1788052609019-rep-2";
 		const wt =
-			"ws-wt-r0-campaign-r0-full-1788052520-ticker-fanout_rate-250-1788052962572-rep-2";
+			"ws-wt-r0-campaign-r0-full-1788052520-ticker-fanout_rate-100-1788052962572-rep-2";
 		expect(pairingRunKey(ws)).toBe(pairingRunKey(wt));
 		expect(pairingRunKey(ws)).toBe(
-			"ws-wt-r0-campaign-r0-full-1788052520-ticker-fanout_rate-250-rep-2",
+			"ws-wt-r0-campaign-r0-full-1788052520-ticker-fanout_rate-100-rep-2",
 		);
 		expect(pairingRunKey(ws)).not.toBe(pairingRunKey(`${ws.slice(0, -1)}3`));
 		expect(pairingRunKey("different-run")).toBe("different-run");

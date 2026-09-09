@@ -151,9 +151,9 @@ export type ArmKind = "primary" | "read-path" | "overlay";
  */
 export const FANOUT_COHORT_CELL_BY_ID: Readonly<Record<string, string>> =
 	Object.freeze({
+		"ticker-fanout/rate-25": "ticker 25",
 		"ticker-fanout/rate-50": "ticker 50",
 		"ticker-fanout/rate-100": "ticker 100",
-		"ticker-fanout/rate-250": "ticker 250",
 		"chat-fanout/subscribers-250": "chat 250",
 		"chat-fanout/subscribers-500": "chat 500",
 		"chat-fanout/subscribers-1000": "chat 1k",

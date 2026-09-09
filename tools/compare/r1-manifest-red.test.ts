@@ -1371,7 +1371,7 @@ describe("R1 RED: the second tier is counted but never ranked with the first", (
 		expect(
 			issue({
 				transport: "wt",
-				armId: "ticker-fanout/rate-250/wt-stream-sink",
+				armId: "ticker-fanout/rate-100/wt-stream-sink",
 				armTransport: "wt-stream-sink",
 				armKind: "primary",
 			}),
@@ -1380,7 +1380,7 @@ describe("R1 RED: the second tier is counted but never ranked with the first", (
 		expect(
 			issue({
 				transport: "ws",
-				armId: "ticker-fanout/rate-250/ws",
+				armId: "ticker-fanout/rate-100/ws",
 				armTransport: "ws-worker",
 				armKind: "read-path",
 			}),
@@ -1389,7 +1389,7 @@ describe("R1 RED: the second tier is counted but never ranked with the first", (
 		expect(
 			issue({
 				transport: "ws",
-				armId: "ticker-fanout/rate-250/wt-stream-sink",
+				armId: "ticker-fanout/rate-100/wt-stream-sink",
 				armTransport: "wt-stream-sink",
 				armKind: "read-path",
 			}),
@@ -1414,7 +1414,7 @@ describe("R1 RED: the second tier is counted but never ranked with the first", (
 			expect(
 				issue({
 					transport: wire,
-					armId: `ticker-fanout/rate-250/${armTransport}`,
+					armId: `ticker-fanout/rate-100/${armTransport}`,
 					armTransport,
 					armKind,
 				}),

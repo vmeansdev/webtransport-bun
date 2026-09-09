@@ -1,7 +1,7 @@
 test "$CAMPAIGN_ID" = fanout-pilot-r1
 test "$EXECUTION_PURPOSE" = pilot
 cd "$REPO"
-CELLS=ticker-fanout/rate-250
+CELLS=ticker-fanout/rate-100
 REPS=1
 PURPOSE=pilot
 CAMPAIGN_TIMEOUT_MS=1800000

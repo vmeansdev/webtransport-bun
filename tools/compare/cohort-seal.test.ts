@@ -84,8 +84,8 @@ import { verifyRunArtifact } from "./verify-artifact.ts";
 
 const HEX = (character: string): string => character.repeat(64);
 
-/** ticker-fanout/rate-250: one publisher, eight workers, 100 subscribers. */
-const FANOUT_CELL = "ticker-fanout/rate-250";
+/** ticker-fanout/rate-100: one publisher, eight workers, 100 subscribers. */
+const FANOUT_CELL = "ticker-fanout/rate-100";
 const EXECUTION = {
 	campaignId: "fanout-b3-r1",
 	runId: "fanout-b3-r1-run",
@@ -666,7 +666,7 @@ const SERVER_SNAPSHOT: ServerSnapshotRecord = {
 	runId: "fanout-b3-r1-run",
 	executionIndex: 1,
 	transport: "ws",
-	legId: "ticker-fanout/rate-250#ws",
+	legId: "ticker-fanout/rate-100#ws",
 	sequence: 1,
 	capturedAtMs: 1_700_000_000_000,
 	loopUtilization: { busyMs: 4_210, windowMs: 10_000 },

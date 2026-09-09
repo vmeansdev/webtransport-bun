@@ -19619,7 +19619,9 @@ pub mod cohort {
         //   (`evidence.ts`);
         // - `readinessDeadlineMs`, D3: all three ticker cells 30,000; all
         //   three chat cells 90,000.  The `cohort-cells.conformance.test.ts`
-        //   suite reads this table textually against the amendment's D3 rows.
+        //   suite reads this table textually against the amendment's D3 rows
+        //   with the recorded deviations applied (2026-09-09: the top ticker
+        //   row retired by the D4 preflight, a bottom row added).
         //
         // **This is a second reader of a frozen table, not a second encoder.**
         // A table is data; §4's vector rule is about bytes, and no record's
@@ -19648,6 +19650,19 @@ pub mod cohort {
 
         pub const COHORT_CELLS: &[CohortCell] = &[
             CohortCell {
+                cell_id: "ticker-fanout/rate-25",
+                cell: "ticker 25",
+                publisher_count: 1,
+                worker_count: SUBSCRIBER_SHARD_MODULUS,
+                subscriber_count: 100,
+                session_count: 101,
+                measured_ingress: 250,
+                expanded_deliveries: 25_000,
+                measured_duration_ms: 10_000,
+                message_bytes: 100,
+                readiness_deadline_ms: 30_000,
+            },
+            CohortCell {
                 cell_id: "ticker-fanout/rate-50",
                 cell: "ticker 50",
                 publisher_count: 1,
@@ -19669,19 +19684,6 @@ pub mod cohort {
                 session_count: 101,
                 measured_ingress: 1_000,
                 expanded_deliveries: 100_000,
-                measured_duration_ms: 10_000,
-                message_bytes: 100,
-                readiness_deadline_ms: 30_000,
-            },
-            CohortCell {
-                cell_id: "ticker-fanout/rate-250",
-                cell: "ticker 250",
-                publisher_count: 1,
-                worker_count: SUBSCRIBER_SHARD_MODULUS,
-                subscriber_count: 100,
-                session_count: 101,
-                measured_ingress: 2_500,
-                expanded_deliveries: 250_000,
                 measured_duration_ms: 10_000,
                 message_bytes: 100,
                 readiness_deadline_ms: 30_000,

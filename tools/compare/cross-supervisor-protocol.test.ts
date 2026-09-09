@@ -228,11 +228,11 @@ describe("cross-supervisor-protocol A2", () => {
 	});
 
 	test("rejects_unexpanded_fanout_declared_count_or_bytes", () => {
-		// The offered ingress for ticker 250, not the 250,000 deliveries owed.
+		// The offered ingress for ticker 100, not the 100,000 deliveries owed.
 		const unexpanded = sampleDraft({
-			cellId: "ticker-fanout/rate-250",
+			cellId: "ticker-fanout/rate-100",
 			grantDeclaration: "fanout-expanded-deliveries",
-			declaredMessageCount: 2_500,
+			declaredMessageCount: 1_000,
 			declaredMessageBytes: 100,
 		});
 		expect(refusalCode(parseCrossSupervisorExecutionDraft(unexpanded))).toBe(
@@ -249,9 +249,9 @@ describe("cross-supervisor-protocol A2", () => {
 			refusalCode(parseCrossSupervisorExecutionDraft(wrongCellCount)),
 		).toBe("CROSS_SUPERVISOR_MISMATCH");
 		const wrongBytes = sampleDraft({
-			cellId: "ticker-fanout/rate-250",
+			cellId: "ticker-fanout/rate-100",
 			grantDeclaration: "fanout-expanded-deliveries",
-			declaredMessageCount: 250_000,
+			declaredMessageCount: 100_000,
 			declaredMessageBytes: 128,
 		});
 		expect(refusalCode(parseCrossSupervisorExecutionDraft(wrongBytes))).toBe(
@@ -1751,20 +1751,20 @@ const S3_R8_MANIFEST_VECTORS = [
 			"7b226368696c644964223a22737562736372696265722d776f726b65722d37222c22636f686f72744964223a22636f686f72742d766563746f722d636861742d316b222c22726f6c65223a2273756273637269626572222c22726f6c654964223a22737562736372696265722d303030393939222c22736368656d61223a22746f6b656e2d636f6d6d69746d656e742d6c6561662f7631222c22746f6b656e536861323536223a2231623663616163343433323966626161646365323463393935353337323730333966636361633466373839393432646164333632626232343836383862646464222c22776f726b6572496e646578223a377d0a",
 	},
 	{
-		cell: "ticker 250",
-		cohortId: "cohort-vector-ticker-250",
+		cell: "ticker 100",
+		cohortId: "cohort-vector-ticker-100",
 		publisherCount: 1,
 		subscriberCount: 100,
 		leafCount: 101,
 		manifestSize: 25949,
 		manifestSha256:
-			"511381fddae1d6e8eb176a73b582285221cd1d3dbf37e5b2a51da7f5bd999921",
+			"d6c3ac9b2da9ab8e85891641860e923f534d6dd405f1321526f87d90b0720d5e",
 		rootSha256:
-			"b2909f2096de0c0a5e3212c5c15f1fc28198c6ce8a78d6fd2331ae31f45c4191",
+			"24d1a0e52aad22cfcf37d783f7d0f68167ed5075a2ac41884daeda36edfc448f",
 		firstLeafHex:
-			"7b226368696c644964223a227075626c69736865722d6368696c642d30222c22636f686f72744964223a22636f686f72742d766563746f722d7469636b65722d323530222c22726f6c65223a227075626c6973686572222c22726f6c654964223a227075626c69736865722d303030303030222c22736368656d61223a22746f6b656e2d636f6d6d69746d656e742d6c6561662f7631222c22746f6b656e536861323536223a2264623135623230313262663039626362353366336365643461623037396365633861613836363765363038363563353231343661346664333133393836323236222c22776f726b6572496e646578223a6e756c6c7d0a",
+			"7b226368696c644964223a227075626c69736865722d6368696c642d30222c22636f686f72744964223a22636f686f72742d766563746f722d7469636b65722d313030222c22726f6c65223a227075626c6973686572222c22726f6c654964223a227075626c69736865722d303030303030222c22736368656d61223a22746f6b656e2d636f6d6d69746d656e742d6c6561662f7631222c22746f6b656e536861323536223a2236643731643939666631343536313364633564346534663835353536653733626535323737346230326561623361356364343030666563336338656632656363222c22776f726b6572496e646578223a6e756c6c7d0a",
 		lastLeafHex:
-			"7b226368696c644964223a22737562736372696265722d776f726b65722d33222c22636f686f72744964223a22636f686f72742d766563746f722d7469636b65722d323530222c22726f6c65223a2273756273637269626572222c22726f6c654964223a22737562736372696265722d303030303939222c22736368656d61223a22746f6b656e2d636f6d6d69746d656e742d6c6561662f7631222c22746f6b656e536861323536223a2238336364623531373031663833316664656362643864613832653735663237616632613766303833366234383735616661383433376135373138336232396136222c22776f726b6572496e646578223a337d0a",
+			"7b226368696c644964223a22737562736372696265722d776f726b65722d33222c22636f686f72744964223a22636f686f72742d766563746f722d7469636b65722d313030222c22726f6c65223a2273756273637269626572222c22726f6c654964223a22737562736372696265722d303030303939222c22736368656d61223a22746f6b656e2d636f6d6d69746d656e742d6c6561662f7631222c22746f6b656e536861323536223a2237383533313736373861386662353264613433353436376664363034363133343661323031393264313664393664316235336535663161373232346264373530222c22776f726b6572496e646578223a337d0a",
 	},
 ] as const;
 
@@ -2378,13 +2378,14 @@ test("chat-10k production-length cohort ID fits the bounded open carrier", () =>
 });
 
 // ---------------------------------------------------------------------------
-// Amendment C3: the chat-1k and ticker-250 full observation encodings, pinned
+// Amendment C3: the chat-1k and ticker-100 full observation encodings, pinned
 // independently in both production encoders (the ticker vector was re-pinned
-// for `ticker-fanout/rate-250` when the physical-budget amendment retired the
-// ticker-10k row; same 1 x 8 x 100 shape).
+// for the 250 row when the physical-budget amendment retired the ticker-10k
+// row, and again for `ticker-fanout/rate-100` when the D4 preflight retired
+// the 250 row, deviation 2026-09-09; same 1 x 8 x 100 shape).
 //
 // The Rust side (`the_chat_1k_evidence_vector_is_reproducible_and_pinned`,
-// `the_ticker_250_evidence_vector_is_reproducible_and_pinned`,
+// `the_ticker_100_evidence_vector_is_reproducible_and_pinned`,
 // crates/native/tests/mac_cohort_runtime.rs:5139/:5166) runs one deterministic
 // lifecycle per cell, digests and signs the 33-member
 // `cohort-observation-evidence/v1` it assembled, and pins size + digest. The
@@ -2414,8 +2415,8 @@ const EVIDENCE_VECTOR_DIR = join(
 );
 
 /**
- * `CHAT_1K_EVIDENCE_*` / `TICKER_250_EVIDENCE_*`, mac_cohort_runtime.rs
- * `CHAT_1K_EVIDENCE_*`/`TICKER_250_EVIDENCE_*` consts. Re-pinned 2026-09-08
+ * `CHAT_1K_EVIDENCE_*` / `TICKER_100_EVIDENCE_*`, mac_cohort_runtime.rs
+ * `CHAT_1K_EVIDENCE_*`/`TICKER_100_EVIDENCE_*` consts. Re-pinned 2026-09-08
  * when `rig-server-snapshot-receipt/v1` gained `serverChildCpu` (physical-budget
  * amendment D6): the sizes held, the digests moved through the admission
  * receipt's binding of the snapshot receipt.
@@ -2431,10 +2432,10 @@ const EVIDENCE_VECTORS = [
 		roleWarmupCompletes: 18,
 	},
 	{
-		cellId: "ticker-fanout/rate-250",
-		file: "ticker-fanout_rate-250",
+		cellId: "ticker-fanout/rate-100",
+		file: "ticker-fanout_rate-100",
 		size: 133_171,
-		sha256: "58cbcb792d59d17f01d3a364a1713db605a7f075feeda0d69160edba9db900c5",
+		sha256: "8ce99420ab36615d848356ef2f1b67b06a0f5fe015b317e58d29df900bf81101",
 		publisherCount: 1,
 		subscriberCount: 100,
 		roleWarmupCompletes: 9,

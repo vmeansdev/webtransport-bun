@@ -253,7 +253,7 @@ function chatCell(subscriberCount: 250 | 500 | 1_000): ScenarioCell {
 	);
 }
 
-function tickerCell(ingressRatePerSecond: 50 | 100 | 250): ScenarioCell {
+function tickerCell(ingressRatePerSecond: 25 | 50 | 100): ScenarioCell {
 	const parameters: TickerParameters = {
 		scenarioId: "ticker-fanout",
 		ingressRatePerSecond,
@@ -513,7 +513,7 @@ function buildCanonicalCells(): ScenarioCell[] {
 	for (const subscriberCount of [250, 500, 1_000] as const) {
 		cells.push(chatCell(subscriberCount));
 	}
-	for (const rate of [50, 100, 250] as const) {
+	for (const rate of [25, 50, 100] as const) {
 		cells.push(tickerCell(rate));
 	}
 	for (const tickHz of [20, 60] as const) {

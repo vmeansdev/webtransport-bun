@@ -39,9 +39,9 @@ const EXPECTED_PRIMARY_CELL_IDS: string[] = [
 	"chat-fanout/subscribers-250",
 	"chat-fanout/subscribers-500",
 	"chat-fanout/subscribers-1000",
+	"ticker-fanout/rate-25",
 	"ticker-fanout/rate-50",
 	"ticker-fanout/rate-100",
-	"ticker-fanout/rate-250",
 	"game-tick-loss/tick-20-loss-1-delay-20",
 	"game-tick-loss/tick-20-loss-1-delay-40",
 	"game-tick-loss/tick-20-loss-2.5-delay-20",
@@ -187,9 +187,9 @@ describe("frozen v1 comparison scenario registry", () => {
 			durationSeconds: 30,
 			delivery: "reliable",
 		});
-		expect(cell("ticker-fanout/rate-250").parameters).toEqual({
+		expect(cell("ticker-fanout/rate-100").parameters).toEqual({
 			scenarioId: "ticker-fanout",
-			ingressRatePerSecond: 250,
+			ingressRatePerSecond: 100,
 			publisherCount: 1,
 			subscriberCount: 100,
 			recordBytes: 100,
@@ -295,7 +295,7 @@ describe("frozen v1 comparison scenario registry", () => {
 				1_000,
 			],
 			[
-				"ticker-fanout/rate-250",
+				"ticker-fanout/rate-100",
 				"mac-to-linux-to-mac",
 				"reliable-relay",
 				"subscriber",
@@ -850,7 +850,7 @@ describe("frozen v1 comparison scenario registry", () => {
 		const structuralOverrides: readonly [string, string, unknown][] = [
 			["chat-fanout/subscribers-1000", "subscriberCount", 999],
 			["chat-fanout/subscribers-1000", "publisherCount", 9],
-			["ticker-fanout/rate-250", "fanout", 99],
+			["ticker-fanout/rate-100", "fanout", 99],
 			["game-tick-loss/tick-20-loss-1-delay-20", "receiverCount", 99],
 			["reconnect-storm/cold-full", "clientCount", 99],
 			["ai-token-stream/chunk-32", "sessionCount", 99],

@@ -54,7 +54,7 @@ function retained(value: Record<string, unknown>): unknown {
 function cohortEvidence(): CohortObservationEvidenceV1 {
 	return {
 		schema: "cohort-observation-evidence/v1",
-		cohortGrant: retained({ schema: "cohort-grant/v1", cell: "ticker 250" }),
+		cohortGrant: retained({ schema: "cohort-grant/v1", cell: "ticker 100" }),
 		observedProcessProof: retained({
 			schema: "observed-process-proof/v1",
 			observedPublisherCount: 1,
@@ -442,8 +442,8 @@ describe("server-observation-artifact: cohort shape by cell identity", () => {
 			cellId: COHORT_CELL,
 			grantDeclaration: "fanout-expanded-deliveries",
 		});
-		// The first table id is ticker 50: 500 offered, expanded to 100 subscribers.
-		expect(fx.grant.declaredMessageCount).toBe(50_000);
+		// The first table id is ticker 25: 250 offered, expanded to 100 subscribers.
+		expect(fx.grant.declaredMessageCount).toBe(25_000);
 		const withCohort = {
 			...cloneAttestation(fx.attestation),
 			cohortObservationEvidence: cohortEvidence(),

@@ -215,8 +215,8 @@ import {
 } from "./supervisor-client.ts";
 
 /** The cohort cell this suite drives. */
-const CELL_ID = "ticker-fanout/rate-250";
-const COHORT_CELL = "ticker 250";
+const CELL_ID = "ticker-fanout/rate-100";
+const COHORT_CELL = "ticker 100";
 
 /** Repo root: this file lives at `<root>/tools/compare/`. */
 const REPO_ROOT = resolve(import.meta.dir, "..", "..");
@@ -1258,7 +1258,7 @@ describe("B3.5 e2e: the production cohort dispatch for chat 1k over the staged p
 	it(
 		"a_role_child_that_never_reaches_readiness_fails_the_arm_by_its_closed_code_and_leaves_no_file",
 		async () => {
-			// The same campaign, one more execution (ticker 250: a 30 s readiness
+			// The same campaign, one more execution (ticker 100: a 30 s readiness
 			// deadline), with the first role child the supervisor spawns stopped
 			// before it can answer. The production driver times it out, the
 			// dispatch files the arm FAIL under the closed set, the lease's
@@ -1527,7 +1527,7 @@ describe("B3.5 e2e: the real fanout-cohort server process", () => {
 		"the_child_serves_the_cohort_relay_and_stays_alive_until_it_is_told_to_stop",
 		async () => {
 			// Topology: the smallest cohort that is still a cohort. The rung is
-			// reduced (this is a unit-scale relay, not ticker 250); the *shape* --
+			// reduced (this is a unit-scale relay, not ticker 100); the *shape* --
 			// many publishers expanded to a full worker fan-out -- is not.
 			const HEX = (character: string): Sha256Hex =>
 				character.repeat(64) as Sha256Hex;
@@ -1617,7 +1617,7 @@ describe("B3.5 e2e: the real fanout-cohort server process", () => {
 						repetitionIndex: 1,
 						repetitionTotal: 1,
 						grantDeclaration: "fanout-expanded-deliveries",
-						declaredMessageCount: 250_000,
+						declaredMessageCount: 100_000,
 						declaredMessageBytes: MESSAGE_BYTES,
 						requestedNotAfterMs: notAfterMs,
 					},
