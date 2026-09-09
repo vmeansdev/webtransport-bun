@@ -22,6 +22,7 @@
 import { afterAll, describe, expect, it, mock } from "bun:test";
 import { createHash } from "node:crypto";
 import {
+	copyFileSync,
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
@@ -245,7 +246,12 @@ function canonicalRoot(
 					refusalCode: null,
 					sealedPath,
 					artifactSha256: H("placeholder"),
-					primaryMetricP50: 10 + ((repetitionIndex * 3) % 5),
+					// Ascending in the repetition index on both wires, so the gate's
+					// own rank (mean p50 ascending, lower middle of five) selects
+					// rep 3 -- the seal the fixture then writes as the flat. The
+					// verifier binds each flat to the entry the gate selected, so a
+					// fixture whose flat is not the gate's median refuses itself.
+					primaryMetricP50: 10 + repetitionIndex,
 					readPath: null,
 				};
 				const mutated = options.mutateEntry?.(entry, seal);
@@ -461,6 +467,50 @@ describe("verify-campaign-index: the canonical 60/12/6 claim", () => {
 		expect(stale.message).toContain(`stale echo flat for ${DEMOTED}`);
 		expect(stale.message).toContain("PROMOTION_ENTRY_NOT_PROMOTABLE");
 		rmSync(echoed.root, { recursive: true, force: true });
+	});
+
+	it("a_flat_that_is_another_repetition_of_its_own_arm_refuses_the_claim", () => {
+		// Run #1's real bytes, recipe: rate-25's WT flat replaced by rep 1 of
+		// the same arm. Every seal verifies and the pair count is unchanged;
+		// only the binding to the gate's median says the flat is not the
+		// promoted artifact.
+		const staged = canonicalRoot();
+		const cell = "ticker-fanout/rate-25";
+		copyFileSync(
+			join(staged.root, "reps", safeCellName(cell), "wt", "rep-1.sealed.json"),
+			join(staged.root, `${safeCellName(cell)}-wt.json`),
+		);
+		const bad = refusal(verify(frozenArgv(staged)));
+		expect(bad.code).toBe("PROMOTED_FLAT_MISMATCH");
+		expect(bad.message).toContain(
+			`${safeCellName(cell)}-wt.json is not the artifact the promotion gate selected for ${cell} wt (rep 3,`,
+		);
+		rmSync(staged.root, { recursive: true, force: true });
+	});
+
+	it("wt_flats_swapped_across_two_cells_refuse_the_claim", () => {
+		// Run #1's real bytes, recipe: rate-25's and subscribers-250's WT flats
+		// exchanged. Both are this campaign's promoted seals under the other
+		// cell's name; the filename pairing counts six pairs, the binding
+		// refuses the first cell it reaches.
+		const staged = canonicalRoot();
+		const a = join(
+			staged.root,
+			`${safeCellName("ticker-fanout/rate-25")}-wt.json`,
+		);
+		const b = join(
+			staged.root,
+			`${safeCellName("chat-fanout/subscribers-250")}-wt.json`,
+		);
+		const bytesA = readFileSync(a);
+		copyFileSync(b, a);
+		writeFileSync(b, bytesA);
+		const bad = refusal(verify(frozenArgv(staged)));
+		expect(bad.code).toBe("PROMOTED_FLAT_MISMATCH");
+		expect(bad.message).toMatch(
+			/-wt\.json is not the artifact the promotion gate selected for (ticker-fanout\/rate-25|chat-fanout\/subscribers-250) wt/,
+		);
+		rmSync(staged.root, { recursive: true, force: true });
 	});
 
 	it("one_missing_flat_refuses_the_claim", () => {

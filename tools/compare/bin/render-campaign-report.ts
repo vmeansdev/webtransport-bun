@@ -853,11 +853,30 @@ function renderFromFlats(args: {
 		);
 		return RENDER_REFUSED_EXIT_CODE;
 	}
+	// The same rule for a cell the renderer could verify and then could not
+	// compare: the report carries the INCOMPATIBLE row and its reason, and the
+	// exit code says the promoted claim ("every cell comparable") does not
+	// hold. A wrapper reading exit 0 above a 3/5 report is what the stop gate
+	// cannot afford.
+	if (rejected > 0) {
+		process.stderr.write(
+			`RENDER_INCOMPATIBLE: ${rejected} of ${cells.length} promoted cell${cells.length === 1 ? "" : "s"} not comparable\n`,
+		);
+		return RENDER_INCOMPATIBLE_EXIT_CODE;
+	}
 	return 0;
 }
 
 /** Exit code of a promoted render that refused a cohort cell for want of its leaves. */
 export const RENDER_REFUSED_EXIT_CODE = 3;
+
+/**
+ * Exit code of a promoted render whose flats all verified and at least one
+ * pair did not compare (an INCOMPATIBLE row: identity, contract or evidence
+ * rejection). Distinct from `RENDER_REFUSED_EXIT_CODE` so a wrapper can tell
+ * "could not verify" from "verified, not comparable".
+ */
+export const RENDER_INCOMPATIBLE_EXIT_CODE = 4;
 
 export const RENDER_CAMPAIGN_REPORT_USAGE =
 	"usage: render-campaign-report.ts <campaignId> [candidate]\n" +

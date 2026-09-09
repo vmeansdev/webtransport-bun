@@ -1085,14 +1085,32 @@ describe("frozen run wrapper argv", () => {
 			seedOut: seedPromotedCampaignRoot,
 		});
 		expect(run.exitCode).toBe(0);
-		// sealed count, flat count, attested-heading count -- in wrapper order.
-		const last3 = run.countChecks.slice(-3);
-		expect(last3.length).toBe(3);
-		const flats = last3[1]!;
+		// sealed count, flat count, attested-heading count, comparable-row
+		// count -- in wrapper order.
+		const last4 = run.countChecks.slice(-4);
+		expect(last4.length).toBe(4);
+		const flats = last4[1]!;
 		expect(flats.slice(1)).toEqual(["=", "12"]);
 		// 12 promoted flats sit beside campaign-index.json, manifest.json and
 		// controller-terminal.json; counting the last one made this 13.
 		expect(flats[0]).toBe("12");
+	});
+
+	it("wrapper_report_counts_derive_from_the_sections_cell_list", async () => {
+		const run = await runFrozenWrapper({
+			section: "9.7",
+			campaignId: "fanout-attested-r1",
+			executionPurpose: "canonical",
+			seedOut: seedPromotedCampaignRoot,
+		});
+		expect(run.exitCode).toBe(0);
+		const [headings, comparable] = run.countChecks.slice(-2);
+		// Six cells in the 9.7 fragment: two attested-arm headings each, and
+		// one **COMPATIBLE** row each -- the stop gate's "6/6 comparable" in
+		// the wrapper's own terms. The seeded report has 5 headings and 4
+		// comparable rows, so neither count reads as the other's literal.
+		expect(headings).toEqual(["5", "=", "12"]);
+		expect(comparable).toEqual(["4", "=", "6"]);
 	});
 });
 
@@ -1104,11 +1122,22 @@ function seedPromotedCampaignRoot(out: string): void {
 		writeFileSync(join(out, `cell-${i}-ws.json`), "{}\n");
 		writeFileSync(join(out, `cell-${i}-wt.json`), "{}\n");
 	}
-	// Deliberately not 12, so the heading check cannot be mistaken for the flats
-	// check when both compare against the same literal.
+	// Deliberately neither 12 nor 6, so the heading check and the comparable
+	// row check cannot be mistaken for the flats check or for each other.
+	// The rows are shaped as `renderMarkdownReport` prints a COMPATIBLE cell;
+	// the fifth is INCOMPATIBLE and must not count.
 	writeFileSync(
 		join(out, "campaign-report.md"),
-		`${Array.from({ length: 5 }, () => "### WS attested arm").join("\n")}\n`,
+		[
+			...Array.from({ length: 5 }, () => "### WS attested arm"),
+			...Array.from(
+				{ length: 4 },
+				(_, i) =>
+					`| \`cell-${i + 1}\` | **COMPATIBLE** | p50 | 1 | 2 | 3 | WS | - | - |`,
+			),
+			"| `cell-5` | *INCOMPATIBLE* | - | - | - | - | - | - | rejected |",
+			"",
+		].join("\n"),
 	);
 }
 
