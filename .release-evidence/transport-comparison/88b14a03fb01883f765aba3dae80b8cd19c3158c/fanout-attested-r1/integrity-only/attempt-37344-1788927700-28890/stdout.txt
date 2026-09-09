@@ -1,0 +1,1 @@
+VERIFY_CAMPAIGN_INDEX_OK pass=53 fail=7 refused=0 promotable=0 sealed=53 flats=0 pairs=0 promotedCells=0 canonicalFanoutComplete=false integrityOnly=true attestationsVerified=0
