@@ -46,6 +46,7 @@ import {
 	FANOUT_COHORT_CELL_BY_ID,
 	FANOUT_COHORT_CELL_IDS,
 } from "./evidence.ts";
+import { CANONICAL_MEASURED_REPETITIONS } from "./output-policy.ts";
 import { CANONICAL_SCENARIO_REGISTRY } from "./scenario-registry.ts";
 
 const REPO_ROOT = resolve(import.meta.dir, "..", "..");
@@ -57,6 +58,13 @@ const DEVIATIONS_DIR = join(REPO_ROOT, "docs/superpowers/plans/deviations");
 
 function read(relative: string): string {
 	return readFileSync(join(REPO_ROOT, relative), "utf8");
+}
+
+/** `NAME=value` as a frozen run fragment states it. */
+function assignment(fragment: string, name: string): string {
+	const match = new RegExp(`^${name}=(.*)$`, "m").exec(fragment);
+	if (match === null) throw new Error(`${name} is not assigned`);
+	return match[1]!;
 }
 
 interface D3Row {
@@ -606,12 +614,6 @@ describe("frozen run fragments and stage timeouts (D5)", () => {
 	);
 	const stage = read("tools/compare/bin/stage-live-campaign.ts");
 
-	function assignment(fragment: string, name: string): string {
-		const match = new RegExp(`^${name}=(.*)$`, "m").exec(fragment);
-		if (match === null) throw new Error(`${name} is not assigned`);
-		return match[1]!;
-	}
-
 	/** The `CAMPAIGN_TIMEOUT_MS` / `RUN_TIMEOUT_MS` pair the D5 bullet pins. */
 	function pinnedTimeouts(bullet: "B5" | "B6"): {
 		campaignTimeoutMs: number;
@@ -728,6 +730,57 @@ describe("crates/native/src/secure_fs.rs mirror", () => {
 			);
 		}
 		expect(source).toContain("pub const SUBSCRIBER_SHARD_MODULUS: u64 = 8;");
+	});
+
+	test("the rig accepts every execution of every frozen schedule", () => {
+		// The rig's replay guard is never evicted, so its bound is the bound
+		// on a campaign's executions. It was `MAX_SESSIONS_PER_CAMPAIGN` (64)
+		// until fanout-attested-r1's 65th execution was refused with
+		// `COHORT_PROTOCOL: overflow` on 2026-09-09; it is now derived from
+		// the frozen table the rig binary carries, and this pin is what keeps
+		// the TS side's largest schedule inside it.
+		const source = read("crates/native/src/secure_fs.rs");
+		expect(source).toContain(
+			"pub const WARMUP_REPETITIONS_PER_ARM: usize = 1;",
+		);
+		expect(source).toContain(
+			`pub const CANONICAL_MEASURED_REPETITIONS: usize = ${CANONICAL_MEASURED_REPETITIONS};`,
+		);
+		const bound =
+			/pub const MAX_ACCEPTED_EXECUTIONS_PER_CAMPAIGN: usize = super::mac::COHORT_CELLS\.len\(\)\s*\* 2\s*\* \(WARMUP_REPETITIONS_PER_ARM \+ CANONICAL_MEASURED_REPETITIONS \+ (\d+)\);/.exec(
+				source,
+			);
+		if (bound === null) {
+			throw new Error(
+				"MAX_ACCEPTED_EXECUTIONS_PER_CAMPAIGN is not derived from COHORT_CELLS",
+			);
+		}
+		const marginPerArm = Number(bound[1]);
+		const rigBound =
+			ROWS.length * 2 * (1 + CANONICAL_MEASURED_REPETITIONS + marginPerArm);
+		expect(rigBound).toBe(84);
+		expect(rigBound).toBeGreaterThan(64);
+		// Every frozen schedule, as the fragments state it: cells x two wires x
+		// (one warmup + REPS measured), and the section 9.7 count is the one
+		// the old bound refused.
+		const schedules = [
+			"tools/compare/bin/frozen-run-section-9.5.fragment.sh",
+			"tools/compare/bin/frozen-run-section-9.6.fragment.sh",
+			"tools/compare/bin/frozen-run-section-9.7.fragment.sh",
+		].map((relative) => {
+			const fragment = read(relative);
+			const cells = assignment(fragment, "CELLS").split(",").length;
+			const reps = Number(assignment(fragment, "REPS"));
+			return { relative, executions: cells * 2 * (1 + reps) };
+		});
+		expect(
+			schedules.find((schedule) =>
+				schedule.relative.endsWith("9.7.fragment.sh"),
+			)?.executions,
+		).toBe(72);
+		for (const schedule of schedules) {
+			expect(schedule.executions).toBeLessThanOrEqual(rigBound);
+		}
 	});
 });
 

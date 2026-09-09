@@ -18099,10 +18099,37 @@ pub mod cohort {
         }
 
         /// The most executions one campaign-scoped rig process will hold
-        /// sessions for.  §3.2's schedule is four; the bound exists so a
+        /// *live* sessions for.  §3.2's schedule is four; the bound exists so a
         /// controller cannot grow this process's memory one accepted cohort at
-        /// a time.
+        /// a time.  Sessions are released on every arm's terminal path
+        /// (`close_all`), so this is a bound on concurrency, not on a campaign.
         pub const MAX_SESSIONS_PER_CAMPAIGN: usize = 64;
+
+        /// The warmup executions one arm runs before its measured set.
+        pub const WARMUP_REPETITIONS_PER_ARM: usize = 1;
+
+        /// The measured executions one canonical arm runs
+        /// (`CANONICAL_MEASURED_REPETITIONS`, `output-policy.ts`).
+        pub const CANONICAL_MEASURED_REPETITIONS: usize = 5;
+
+        /// The distinct executions one campaign-scoped rig process will accept
+        /// over its whole life.
+        ///
+        /// `accepted` is the campaign's replay guard: an execution digest this
+        /// process minted an acceptance for stays refused as a duplicate until
+        /// the process ends, so the map is never evicted and needs its own
+        /// bound.  That bound is the campaign's own schedule, not the session
+        /// bound above: the largest frozen schedule (`frozen-run-section-9.7`)
+        /// opens every cohort row on both wires, one warmup plus five measured
+        /// executions each — 72 for the six rows — and `MAX_SESSIONS_PER_CAMPAIGN`
+        /// capped it at 64, refusing `fanout-attested-r1`'s 65th execution with
+        /// `COHORT_PROTOCOL: overflow` (2026-09-09, chat 1k ws rep 4).  The
+        /// margin is one further execution per arm, for a controller that
+        /// re-opens an arm under a fresh execution after a pre-measurement
+        /// failure; a refused acceptance mints nothing and consumes none of it.
+        pub const MAX_ACCEPTED_EXECUTIONS_PER_CAMPAIGN: usize = super::mac::COHORT_CELLS.len()
+            * 2
+            * (WARMUP_REPETITIONS_PER_ARM + CANONICAL_MEASURED_REPETITIONS + 1);
 
         /// One campaign's rig supervisor: the key material it holds for the
         /// whole campaign, and one `RigCohortSession` per execution.
@@ -18290,7 +18317,7 @@ pub mod cohort {
                 if self.accepted.contains_key(&execution_sha256) {
                     return Err(CohortRefusal::Duplicate(execution_sha256));
                 }
-                if self.accepted.len() >= MAX_SESSIONS_PER_CAMPAIGN {
+                if self.accepted.len() >= MAX_ACCEPTED_EXECUTIONS_PER_CAMPAIGN {
                     return Err(CohortRefusal::Overflow);
                 }
 
@@ -18404,6 +18431,12 @@ pub mod cohort {
 
             pub fn session_count(&self) -> usize {
                 self.sessions.len()
+            }
+
+            /// How many distinct executions this process has accepted over
+            /// the campaign: the replay guard's size, never evicted.
+            pub fn accepted_count(&self) -> usize {
+                self.accepted.len()
             }
 
             /// COHORT_GRANTED for one execution: build that execution's

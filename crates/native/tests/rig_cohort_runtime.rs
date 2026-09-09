@@ -15,10 +15,13 @@
 mod secure_fs;
 
 use base64::Engine as _;
+use secure_fs::cohort::mac::COHORT_CELLS;
 use secure_fs::cohort::rig::{
     AbsentServerChild, ChildBaseline, ChildCapture, ChildCpuSample, RigCohortRuntime,
     RigCohortSession, RigCohortStage, RigExecutionAcceptanceInputs, RigExecutionBinding,
     RigIdentity, ServerChildChannel, ServerSpawner, SpawnServerRequest, SpawnedServerChild,
+    CANONICAL_MEASURED_REPETITIONS, MAX_ACCEPTED_EXECUTIONS_PER_CAMPAIGN,
+    MAX_SESSIONS_PER_CAMPAIGN, WARMUP_REPETITIONS_PER_ARM,
 };
 use secure_fs::cohort::{
     canonical_bytes, merkle_proof, merkle_root, ordered_leaf_nodes, sha256_hex, CohortPhase,
@@ -3772,4 +3775,125 @@ fn an_ordinary_capture_frame_that_states_a_cohort_is_refused() {
         .stop_and_capture(&ordinary_capture_payload(4), &mut child, NOW_MS)
         .expect_err("a child cannot name a cohort the rig has not accepted");
     assert_eq!(refusal, CohortRefusal::BindingMismatch("cohortGrantSha256"));
+}
+
+// --- the campaign-long acceptance ledger -------------------------------------
+
+/// The §5 RIG_EXECUTION_ACCEPTED frame for execution `index`: a Mac-signed
+/// `mac-execution-grant-receipt/v1` naming a fresh execution digest and the
+/// grant it covers, exactly as the controller presents it.
+fn execution_accept_request(rig: &Rig, index: u64, seq: u64) -> Vec<u8> {
+    let grant = canonical_bytes(&json!({
+        "schema": "measurement-grant/v1",
+        "execution": index,
+    }))
+    .expect("canonical grant");
+    let receipt = canonical_bytes(&json!({
+        "schema": "mac-execution-grant-receipt/v1",
+        "execution": { "index": index },
+        "executionSha256": digest(&format!("execution-{index}")),
+        "measurementGrantSha256": sha256_hex(&grant),
+        "approvedPlanSha256": digest("approved-plan"),
+        "approvalRecordSha256": digest("approval-record"),
+        "macSupervisorExecutableSha256": digest("mac-executable"),
+        "macSupervisorInstanceNonce": digest("mac-instance"),
+        "signingPublicKeySha256": rig.key_sha256(),
+        "receiptSequence": index,
+        "issuedAtMs": NOW_MS,
+        "notAfterMs": NOW_MS + 600_000,
+    }))
+    .expect("canonical receipt");
+    let signature = mac_signature_record(&rig.mac, "mac-execution-grant-receipt/v1", &receipt);
+    canonical_bytes(&json!({
+        "schema": "rig-accept-execution-request/v1",
+        "requestSeq": seq,
+        "measurementGrantBase64": b64(&grant),
+        "macExecutionGrantReceiptBase64": b64(&receipt),
+        "macExecutionGrantSignatureBase64": b64(&signature),
+    }))
+    .expect("canonical accept-execution request")
+}
+
+/// The largest frozen schedule: `frozen-run-section-9.7.fragment.sh` opens
+/// every cohort row on both wires, one warmup plus five measured executions
+/// each.
+const LARGEST_FROZEN_SCHEDULE_EXECUTIONS: usize =
+    COHORT_CELLS.len() * 2 * (WARMUP_REPETITIONS_PER_ARM + CANONICAL_MEASURED_REPETITIONS);
+
+#[test]
+fn the_acceptance_ledger_is_bounded_by_the_frozen_schedule_not_the_session_bound() {
+    // Six rows, two wires, one warmup and five measured each: 72, which the
+    // old session-sized ledger refused at 65 (fanout-attested-r1, 2026-09-09).
+    assert_eq!(LARGEST_FROZEN_SCHEDULE_EXECUTIONS, 72);
+    assert!(LARGEST_FROZEN_SCHEDULE_EXECUTIONS > MAX_SESSIONS_PER_CAMPAIGN);
+    assert_eq!(
+        MAX_ACCEPTED_EXECUTIONS_PER_CAMPAIGN,
+        LARGEST_FROZEN_SCHEDULE_EXECUTIONS + COHORT_CELLS.len() * 2,
+        "the margin is one further execution per arm"
+    );
+}
+
+/// The controller's own rhythm over a whole canonical campaign: accept an
+/// execution, run the arm, close it (`close_arm` -> `close_all`), accept the
+/// next.  Every execution of the largest frozen schedule is accepted with one
+/// live session at a time; a replay of an execution closed long ago is still
+/// a duplicate; and the first execution past the bound is the overflow.
+#[test]
+fn one_campaign_accepts_the_largest_frozen_schedule_with_teardown_between_executions() {
+    let rig = Rig::new();
+    let mut runtime = runtime_for(&rig);
+    let mut reaper = RecordingReaper::default();
+    let mut accept = |runtime: &mut RigCohortRuntime, index: u64| {
+        let ack = runtime
+            .accept_execution(&execution_accept_request(&rig, index, 0), NOW_MS)
+            .unwrap_or_else(|refusal| panic!("execution {index} refused: {refusal:?}"));
+        assert_eq!(
+            json_of(&ack)["executionSha256"],
+            digest(&format!("execution-{index}"))
+        );
+        assert_eq!(runtime.session_count(), 1, "one live session at a time");
+        assert_eq!(runtime.accepted_count(), index as usize);
+        runtime.close_all(&mut reaper).expect("a bounded close");
+        assert_eq!(runtime.session_count(), 0, "the arm released its session");
+    };
+    // Section 9.7, execution by execution: the whole schedule is accepted,
+    // the 65th included, with the margin untouched.
+    for index in 1..=LARGEST_FROZEN_SCHEDULE_EXECUTIONS as u64 {
+        accept(&mut runtime, index);
+    }
+    assert_eq!(runtime.accepted_count(), 72);
+    // The margin: one re-opened execution per arm, still accepted.
+    for index in
+        LARGEST_FROZEN_SCHEDULE_EXECUTIONS as u64 + 1..=MAX_ACCEPTED_EXECUTIONS_PER_CAMPAIGN as u64
+    {
+        accept(&mut runtime, index);
+    }
+    assert!(
+        reaper.reaped.is_empty(),
+        "an accepted execution owns no process group yet"
+    );
+
+    // Closed executions stay on the ledger: the seventh execution, closed
+    // long ago, is a duplicate rather than a fresh arm.
+    let replay = runtime
+        .accept_execution(&execution_accept_request(&rig, 7, 1), NOW_MS)
+        .expect_err("a closed execution is terminal for the campaign");
+    assert_eq!(replay, CohortRefusal::Duplicate(digest("execution-7")));
+
+    // The first distinct execution past the bound is the overflow, and it
+    // mints nothing.
+    let over = MAX_ACCEPTED_EXECUTIONS_PER_CAMPAIGN as u64 + 1;
+    let refusal = runtime
+        .accept_execution(&execution_accept_request(&rig, over, 2), NOW_MS)
+        .expect_err("the ledger is bounded");
+    assert_eq!(refusal, CohortRefusal::Overflow);
+    assert_eq!(refusal.code(), "COHORT_PROTOCOL");
+    assert!(runtime
+        .accepted_execution(&digest(&format!("execution-{over}")))
+        .is_none());
+    assert_eq!(
+        runtime.accepted_count(),
+        MAX_ACCEPTED_EXECUTIONS_PER_CAMPAIGN
+    );
+    assert_eq!(runtime.session_count(), 0);
 }
