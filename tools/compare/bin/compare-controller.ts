@@ -167,7 +167,10 @@ import {
 	evaluateCellPromotionGate,
 	type PromotionGateEntry,
 	type PromotionGateRefusalCode,
+	readStagedSigningLeaves,
 	resolveOfficialComparisonOutputDir,
+	resolveStagedSigningLeaves,
+	type StagedSigningLeaves,
 } from "../output-policy.ts";
 import {
 	CohortRigChannel,
@@ -208,7 +211,6 @@ import {
 	stopSupervisor,
 	TRUST_BOOTSTRAP_AUTHORITY_DIGEST_LEAF,
 	TRUST_BOOTSTRAP_AUTHORITY_LEAF,
-	TRUST_BOOTSTRAP_STAGING_ROOT,
 	verifyStagedTrustBootstrap,
 } from "../remote-supervisor.ts";
 import { buildMeasuredArmArtifact } from "../run-campaign.ts";
@@ -1027,54 +1029,6 @@ export function sealClosesReceiptGraph(
 	} catch {
 		return false;
 	}
-}
-
-/** The two staged Ed25519 public leaves, raw 32 bytes each. */
-export interface StagedSigningLeaves {
-	readonly stagedMacPublicRaw32: Uint8Array;
-	readonly stagedRigPublicRaw32: Uint8Array;
-}
-
-/**
- * The staged signing leaves a campaign's promotion closes each seal's receipt
- * graph against, read from `<stagedDir>/staging-root/` through the stage
- * receipt's digests -- the one reader (`readStagedSigningLeaves`) the
- * execution draft uses too. A campaign with no staged dir has no leaves and
- * therefore no promotion; that is a named refusal here, not a false the gate
- * turns into fifty-three `PROMOTION_RECEIPT_GRAPH_INCOMPLETE` rows.
- */
-export function resolveStagedSigningLeaves(
-	spec: Pick<RunSpec, "stagedDir">,
-): ProtocolResult<StagedSigningLeaves> {
-	if (spec.stagedDir === undefined) {
-		return stageFail(
-			"promotion needs --staged-dir: a receipt graph closes only against the staged signing leaves",
-		);
-	}
-	const receiptPath = join(spec.stagedDir, "stage-receipt.json");
-	let receipt: Record<string, unknown>;
-	try {
-		receipt = JSON.parse(readFileSync(receiptPath, "utf8")) as Record<
-			string,
-			unknown
-		>;
-	} catch {
-		return stageFail(`stage receipt unreadable at ${receiptPath}`);
-	}
-	const macSigningPublicKeySha256 = receipt.macSigningPublicKeySha256;
-	const rigSigningPublicKeySha256 = receipt.rigSigningPublicKeySha256;
-	if (
-		typeof macSigningPublicKeySha256 !== "string" ||
-		!HEX_64.test(macSigningPublicKeySha256) ||
-		typeof rigSigningPublicKeySha256 !== "string" ||
-		!HEX_64.test(rigSigningPublicKeySha256)
-	) {
-		return stageFail("stage receipt does not name both signing key digests");
-	}
-	return readStagedSigningLeaves(
-		join(spec.stagedDir, TRUST_BOOTSTRAP_STAGING_ROOT),
-		{ macSigningPublicKeySha256, rigSigningPublicKeySha256 },
-	);
 }
 
 export interface CampaignFlatPromotionInput {
@@ -4310,45 +4264,6 @@ function readBytesOrNull(path: string): Uint8Array | null {
 	} catch {
 		return null;
 	}
-}
-
-/**
- * Read the two staged Ed25519 public leaves under `stagingRootDir`, each
- * checked against the digest the stage receipt states for it. Both leaves or
- * a refusal: half the trust material verifies half a receipt graph, which is
- * the shape of a flag that reads as evidence and proves nothing. The one
- * reader for the execution draft (`readStagedCohortMaterial`) and for
- * promotion (`resolveStagedSigningLeaves`).
- */
-export function readStagedSigningLeaves(
-	stagingRootDir: string,
-	receipt: {
-		readonly macSigningPublicKeySha256: string;
-		readonly rigSigningPublicKeySha256: string;
-	},
-): ProtocolResult<StagedSigningLeaves> {
-	const macKey = readBytesOrNull(
-		join(stagingRootDir, "mac-supervisor-ed25519.pub"),
-	);
-	if (macKey === null || macKey.byteLength !== 32) {
-		return stageFail("staged Mac public key is not 32 raw bytes");
-	}
-	if (sha256HexOfBytes(macKey) !== receipt.macSigningPublicKeySha256) {
-		return stageFail("staged Mac public key does not match the receipt");
-	}
-	const rigKey = readBytesOrNull(
-		join(stagingRootDir, "rig-supervisor-ed25519.pub"),
-	);
-	if (rigKey === null || rigKey.byteLength !== 32) {
-		return stageFail("staged rig public key is not 32 raw bytes");
-	}
-	if (sha256HexOfBytes(rigKey) !== receipt.rigSigningPublicKeySha256) {
-		return stageFail("staged rig public key does not match the receipt");
-	}
-	return {
-		ok: true,
-		value: { stagedMacPublicRaw32: macKey, stagedRigPublicRaw32: rigKey },
-	};
 }
 
 /**

@@ -1311,3 +1311,217 @@ export function evaluateCanonicalFanoutCompletion(input: {
 		refusals,
 	};
 }
+
+/** The directory under a staged dir that holds the two signing leaves. */
+export const TRUST_BOOTSTRAP_STAGING_ROOT = "staging-root";
+
+/** The two staged Ed25519 public leaves, raw 32 bytes each. */
+export interface StagedSigningLeaves {
+	readonly stagedMacPublicRaw32: Uint8Array;
+	readonly stagedRigPublicRaw32: Uint8Array;
+}
+
+export type StagedSigningLeavesResult =
+	| { readonly ok: true; readonly value: StagedSigningLeaves }
+	| {
+			readonly ok: false;
+			readonly code: "STALE_OR_INVALID_STAGING";
+			readonly message: string;
+	  };
+
+function stagedLeavesFail(message: string): StagedSigningLeavesResult {
+	return { ok: false, code: "STALE_OR_INVALID_STAGING", message };
+}
+
+function readBytesOrNull(path: string): Uint8Array | null {
+	try {
+		return new Uint8Array(readFileSync(path));
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Read the two staged Ed25519 public leaves under `stagingRootDir`, each
+ * checked against the digest the stage receipt states for it. Both leaves or
+ * a refusal: half the trust material verifies half a receipt graph, which is
+ * the shape of a flag that reads as evidence and proves nothing.
+ *
+ * The one reader. The controller's execution draft
+ * (`readStagedCohortMaterial`), its promotion gate
+ * (`sealClosesReceiptGraph`) and every renderer that verifies a cohort flat
+ * get the leaves from here: a canonical cohort seal carries a Mac-signed
+ * export receipt and both issuer graphs, and the artifact verifier refuses
+ * the receipt it cannot authenticate (`COHORT_EXPORT_RECEIPT_INVALID`) rather
+ * than closing the graph -- which is how fanout-attested-r1 (2026-09-09)
+ * first promoted nothing and then rendered five valid cells as INCOMPATIBLE.
+ */
+export function readStagedSigningLeaves(
+	stagingRootDir: string,
+	receipt: {
+		readonly macSigningPublicKeySha256: string;
+		readonly rigSigningPublicKeySha256: string;
+	},
+): StagedSigningLeavesResult {
+	const paths = pathSemantics(HOST_PATH_PLATFORM);
+	const macKey = readBytesOrNull(
+		paths.join(stagingRootDir, "mac-supervisor-ed25519.pub"),
+	);
+	if (macKey === null || macKey.byteLength !== 32) {
+		return stagedLeavesFail("staged Mac public key is not 32 raw bytes");
+	}
+	if (sha256HexOfBytes(macKey) !== receipt.macSigningPublicKeySha256) {
+		return stagedLeavesFail("staged Mac public key does not match the receipt");
+	}
+	const rigKey = readBytesOrNull(
+		paths.join(stagingRootDir, "rig-supervisor-ed25519.pub"),
+	);
+	if (rigKey === null || rigKey.byteLength !== 32) {
+		return stagedLeavesFail("staged rig public key is not 32 raw bytes");
+	}
+	if (sha256HexOfBytes(rigKey) !== receipt.rigSigningPublicKeySha256) {
+		return stagedLeavesFail("staged rig public key does not match the receipt");
+	}
+	return {
+		ok: true,
+		value: { stagedMacPublicRaw32: macKey, stagedRigPublicRaw32: rigKey },
+	};
+}
+
+/**
+ * The staged signing leaves under `<stagedDir>/staging-root/`, read through
+ * the digests `<stagedDir>/stage-receipt.json` states for them. A campaign
+ * with no staged dir has no leaves; that is a named refusal, not a false a
+ * gate turns into fifty-three `PROMOTION_RECEIPT_GRAPH_INCOMPLETE` rows or a
+ * report turns into five INCOMPATIBLE cells.
+ */
+export function resolveStagedSigningLeaves(spec: {
+	readonly stagedDir?: string;
+}): StagedSigningLeavesResult {
+	if (spec.stagedDir === undefined) {
+		return stagedLeavesFail(
+			"promotion needs --staged-dir: a receipt graph closes only against the staged signing leaves",
+		);
+	}
+	const paths = pathSemantics(HOST_PATH_PLATFORM);
+	const receiptPath = paths.join(spec.stagedDir, "stage-receipt.json");
+	let receipt: Record<string, unknown>;
+	try {
+		receipt = JSON.parse(readFileSync(receiptPath, "utf8")) as Record<
+			string,
+			unknown
+		>;
+	} catch {
+		return stagedLeavesFail(`stage receipt unreadable at ${receiptPath}`);
+	}
+	const macSigningPublicKeySha256 = receipt.macSigningPublicKeySha256;
+	const rigSigningPublicKeySha256 = receipt.rigSigningPublicKeySha256;
+	if (
+		!isHex64(macSigningPublicKeySha256) ||
+		!isHex64(rigSigningPublicKeySha256)
+	) {
+		return stagedLeavesFail(
+			"stage receipt does not name both signing key digests",
+		);
+	}
+	return readStagedSigningLeaves(
+		paths.join(spec.stagedDir, TRUST_BOOTSTRAP_STAGING_ROOT),
+		{ macSigningPublicKeySha256, rigSigningPublicKeySha256 },
+	);
+}
+
+/**
+ * The leaves a campaign root's flats verify under, found through the
+ * `stagedDir` its `campaign-index.json` records. The frozen promoted render
+ * argv names only the campaign root, so the index is where a renderer learns
+ * which stage sealed the campaign; an index that records no staged dir is
+ * refused by name.
+ */
+export function campaignIndexSigningLeaves(
+	index: unknown,
+): StagedSigningLeavesResult {
+	if (index === undefined) {
+		return stagedLeavesFail(
+			"campaign root has no campaign-index.json: the staged signing leaves cannot be located",
+		);
+	}
+	if (typeof index !== "object" || index === null || Array.isArray(index)) {
+		return stagedLeavesFail("campaign index is not a record");
+	}
+	const stagedDir = (index as { readonly stagedDir?: unknown }).stagedDir;
+	if (stagedDir === undefined) {
+		return stagedLeavesFail(
+			"campaign index records no stagedDir: the staged signing leaves cannot be located",
+		);
+	}
+	if (!isNonEmptyString(stagedDir)) {
+		return stagedLeavesFail("campaign index stagedDir is not a path");
+	}
+	return resolveStagedSigningLeaves({ stagedDir });
+}
+
+export type SigningLeafPairFlagsResult =
+	| { readonly ok: true; readonly value: StagedSigningLeaves | null }
+	| {
+			readonly ok: false;
+			readonly code: "TRUST_PROTOCOL";
+			readonly message: string;
+	  };
+
+/**
+ * `--mac-public-key` / `--rig-public-key` as the verifier CLIs take them:
+ * both or neither, each a readable regular file holding a raw 32-byte
+ * Ed25519 public key. `null` when neither was given -- the caller says what
+ * it verified without them. Shared by `bin/verify-campaign-index.ts` and
+ * `bin/verify-artifact.ts` so the two CLIs cannot drift on the one flag pair.
+ */
+export function readSigningLeafPairFlags(args: {
+	readonly macPublicKeyPath?: string;
+	readonly rigPublicKeyPath?: string;
+}): SigningLeafPairFlagsResult {
+	const reject = (message: string): SigningLeafPairFlagsResult => ({
+		ok: false,
+		code: "TRUST_PROTOCOL",
+		message,
+	});
+	for (const [flag, path] of [
+		["mac-public-key", args.macPublicKeyPath],
+		["rig-public-key", args.rigPublicKeyPath],
+	] as const) {
+		if (path === undefined) continue;
+		if (!existsSync(path) || !lstatSync(path).isFile()) {
+			return reject(`--${flag} does not name a readable regular file: ${path}`);
+		}
+	}
+	if (
+		(args.macPublicKeyPath === undefined) !==
+		(args.rigPublicKeyPath === undefined)
+	) {
+		return reject(
+			"--mac-public-key and --rig-public-key must be supplied together",
+		);
+	}
+	if (
+		args.macPublicKeyPath === undefined ||
+		args.rigPublicKeyPath === undefined
+	) {
+		return { ok: true, value: null };
+	}
+	const stagedMacPublicRaw32 = new Uint8Array(
+		readFileSync(args.macPublicKeyPath),
+	);
+	const stagedRigPublicRaw32 = new Uint8Array(
+		readFileSync(args.rigPublicKeyPath),
+	);
+	for (const [flag, raw] of [
+		["mac-public-key", stagedMacPublicRaw32],
+		["rig-public-key", stagedRigPublicRaw32],
+	] as const) {
+		if (raw.byteLength !== 32) {
+			return reject(
+				`--${flag} must be a raw 32-byte Ed25519 public key, got ${raw.byteLength} bytes`,
+			);
+		}
+	}
+	return { ok: true, value: { stagedMacPublicRaw32, stagedRigPublicRaw32 } };
+}

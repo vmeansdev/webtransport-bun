@@ -22,7 +22,7 @@ import {
 	recomputeCohortOriginConservation,
 	type RetainedCanonicalBytesV1,
 } from "../cohort-protocol.ts";
-import { compareRunArtifacts, trustContextForArtifact } from "../compare.ts";
+import { compareRunArtifacts } from "../compare.ts";
 import {
 	cohortCellForArm,
 	FANOUT_COHORT_CELL_IDS,
@@ -34,10 +34,15 @@ import {
 import {
 	CANONICAL_FANOUT_CELL_COUNT,
 	CANONICAL_FANOUT_MEASURED_SEAL_COUNT,
+	campaignIndexSigningLeaves,
+	type StagedSigningLeavesResult,
 } from "../output-policy.ts";
 import {
+	describeSigningLeaves,
 	escapeMarkdown,
+	pairTrustContexts,
 	renderMarkdownReport,
+	SIGNING_LEAVES_UNRESOLVED,
 	type CellComparison,
 	type ComparisonSummary,
 } from "../render-report.ts";
@@ -391,9 +396,32 @@ type CampaignIndex = {
 	readonly candidate?: string;
 	readonly executionPurpose?: string;
 	readonly stage?: string;
+	readonly stagedDir?: string;
 	readonly cells?: readonly string[];
 	readonly entries?: readonly IndexEntry[];
 };
+
+/**
+ * The staged signing leaves for a campaign root, through the `stagedDir` its
+ * `campaign-index.json` records. Every render path reads them from here and
+ * prints `describeSigningLeaves` of the result, so a report that could not
+ * find its leaves says so instead of filing valid seals as INCOMPATIBLE.
+ */
+function campaignRootSigningLeaves(dir: string): StagedSigningLeavesResult {
+	const indexPath = join(dir, "campaign-index.json");
+	if (!existsSync(indexPath)) return campaignIndexSigningLeaves(undefined);
+	let index: unknown;
+	try {
+		index = JSON.parse(readFileSync(indexPath, "utf8"));
+	} catch (error) {
+		return {
+			ok: false,
+			code: "STALE_OR_INVALID_STAGING",
+			message: `campaign index unreadable: ${String(error)}`,
+		};
+	}
+	return campaignIndexSigningLeaves(index);
+}
 
 function renderSealedIndexDiagnostic(args: {
 	readonly dir: string;
@@ -415,6 +443,10 @@ function renderSealedIndexDiagnostic(args: {
 		return 1;
 	}
 	const entries = Array.isArray(index.entries) ? index.entries : [];
+	// The diagnostic reads seals and re-verifies none, so the leaves decide
+	// nothing here; they are still resolved and named, because a campaign whose
+	// stage cannot be found is a fact the reader of this report needs.
+	const leaves = campaignIndexSigningLeaves(index);
 	const rows: string[] = [];
 	const armSections: string[] = [];
 	let unattestedPrimaries = 0;
@@ -496,6 +528,7 @@ function renderSealedIndexDiagnostic(args: {
 		`- Execution purpose: \`${escapeMarkdown(purpose)}\` (${purposeLabel(purpose)})`,
 		`- Index stage: \`${escapeMarkdown(stage)}\``,
 		`- Flats: none required (sealed-index diagnostic; allowNonPromotable=${args.allowNonPromotable})`,
+		`- Signing leaves: ${describeSigningLeaves(leaves)}; this diagnostic reads seals and re-verifies none`,
 		`- serverAggregate: ${SERVER_AGGREGATE_LABEL}`,
 		``,
 		canonicalFanoutLanguage({
@@ -573,9 +606,11 @@ function renderFromFlats(args: {
 		return 1;
 	}
 
+	const leaves = campaignRootSigningLeaves(args.dir);
 	const comparisons: CellComparison[] = [];
 	let comparable = 0;
 	let rejected = 0;
+	let refused = 0;
 	const sealedRows: string[] = [];
 	const armSections: string[] = [];
 	let unattestedPrimaries = 0;
@@ -672,9 +707,21 @@ function renderFromFlats(args: {
 			`| \`${escapeMarkdown(cellId)}\` | ${escapeMarkdown(contract?.unit ?? "?")} | ${wsP50 ?? "-"} | ${wtP50 ?? "-"} | ${wsArtifact.metrics?.samples?.length ?? "-"} | ${wtArtifact.metrics?.samples?.length ?? "-"} | ${wsAttestation} | ${wtAttestation} |`,
 		);
 
+		const trust = pairTrustContexts({
+			cellId,
+			scenarioId: cell.scenarioId,
+			wsArtifact,
+			wtArtifact,
+			leaves,
+		});
+		if (!trust.ok) {
+			comparisons.push(trust.refusal);
+			refused++;
+			continue;
+		}
 		const result = compareRunArtifacts(wsFile, wtFile, {
-			ws: trustContextForArtifact(wsArtifact),
-			wt: trustContextForArtifact(wtArtifact),
+			ws: trust.ws,
+			wt: trust.wt,
 		});
 		if (result.evidenceStatus === "PASS" && result.delta !== "not computed") {
 			const delta = result.delta;
@@ -744,11 +791,13 @@ function renderFromFlats(args: {
 		totalCells: cells.length,
 		comparableCells: comparable,
 		rejectedCells: rejected,
+		refusedCells: refused,
 		comparisons,
 		headerNote:
 			`${stageNote} Execution purpose: ${purposeLabel(indexPurpose)}. ` +
 			`serverAggregate: ${SERVER_AGGREGATE_LABEL}. ` +
 			`Sealed p50 table below is the honest measured view when formal compare is blocked.`,
+		signingLeavesNote: describeSigningLeaves(leaves),
 	};
 	let md = renderMarkdownReport(summary);
 	// The caveat is a top-level statement about the whole document, so it goes
@@ -779,10 +828,23 @@ function renderFromFlats(args: {
 
 	writeFileSync(args.outputPath, md);
 	process.stdout.write(
-		`wrote ${args.outputPath} (${md.length} bytes) formalComparable=${comparable}/${cells.length}\n`,
+		`wrote ${args.outputPath} (${md.length} bytes) formalComparable=${comparable}/${cells.length} refused=${refused}\n`,
 	);
+	// The report is written either way, so the refusal is readable; the exit
+	// code is what the frozen run wrapper reads, and a promoted render that
+	// could not verify its cohort flats is a failed render, not a report with
+	// five INCOMPATIBLE rows.
+	if (refused > 0) {
+		process.stderr.write(
+			`${SIGNING_LEAVES_UNRESOLVED}: ${refused} cohort cell${refused === 1 ? "" : "s"} refused; ${leaves.ok ? "" : leaves.message}\n`,
+		);
+		return RENDER_REFUSED_EXIT_CODE;
+	}
 	return 0;
 }
+
+/** Exit code of a promoted render that refused a cohort cell for want of its leaves. */
+export const RENDER_REFUSED_EXIT_CODE = 3;
 
 export const RENDER_CAMPAIGN_REPORT_USAGE =
 	"usage: render-campaign-report.ts <campaignId> [candidate]\n" +
@@ -850,7 +912,9 @@ export function main(argv: readonly string[]): number {
 	let code = renderFromFlats({ dir, campaignId, outputPath });
 	// Focused/pilot may still invoke positional argv with EXPECTED_FLATS=0.
 	// Prefer sealed-index diagnostic over failing a valid zero-flat campaign.
-	if (code !== 0 && existsSync(join(dir, "campaign-index.json"))) {
+	// Only the no-pairs exit falls back: a refused render found its pairs and
+	// could not verify them, which no diagnostic view may paper over.
+	if (code === 1 && existsSync(join(dir, "campaign-index.json"))) {
 		let purpose: string | undefined;
 		try {
 			const idx = JSON.parse(

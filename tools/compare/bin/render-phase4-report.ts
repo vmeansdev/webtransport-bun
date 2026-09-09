@@ -5,13 +5,17 @@
  * an honest sealed-metrics table (p50 side-by-side) and name the blockers
  * (runId / sample-count) instead of inventing a delta.
  */
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { compareRunArtifacts, trustContextForArtifact } from "../compare.ts";
+import { compareRunArtifacts } from "../compare.ts";
 import { metricContractForScenario, type RunArtifact } from "../evidence.ts";
+import { campaignIndexSigningLeaves } from "../output-policy.ts";
 import {
+	describeSigningLeaves,
 	escapeMarkdown,
+	pairTrustContexts,
 	renderMarkdownReport,
+	SIGNING_LEAVES_UNRESOLVED,
 	type CellComparison,
 	type ComparisonSummary,
 } from "../render-report.ts";
@@ -29,9 +33,20 @@ const dir = join(
 	campaignId,
 );
 
+// The staged signing leaves the cohort flats verify under, through the
+// stagedDir the campaign index records; a root without them refuses its
+// cohort cells by name instead of verifying them into INCOMPATIBLE.
+const indexPath = join(dir, "campaign-index.json");
+const leaves = campaignIndexSigningLeaves(
+	existsSync(indexPath)
+		? (JSON.parse(readFileSync(indexPath, "utf8")) as unknown)
+		: undefined,
+);
+
 const comparisons: CellComparison[] = [];
 let comparable = 0;
 let rejected = 0;
+let refused = 0;
 const sealedRows: string[] = [];
 
 for (const cellId of cells) {
@@ -55,9 +70,21 @@ for (const cellId of cells) {
 		`| \`${escapeMarkdown(cellId)}\` | ${escapeMarkdown(contract?.unit ?? "?")} | ${wsP50 ?? "-"} | ${wtP50 ?? "-"} | ${wsArtifact.metrics?.samples?.length ?? "-"} | ${wtArtifact.metrics?.samples?.length ?? "-"} |`,
 	);
 
+	const trust = pairTrustContexts({
+		cellId,
+		scenarioId: cell.scenarioId,
+		wsArtifact,
+		wtArtifact,
+		leaves,
+	});
+	if (!trust.ok) {
+		comparisons.push(trust.refusal);
+		refused++;
+		continue;
+	}
 	const result = compareRunArtifacts(wsFile, wtFile, {
-		ws: trustContextForArtifact(wsArtifact),
-		wt: trustContextForArtifact(wtArtifact),
+		ws: trust.ws,
+		wt: trust.wt,
 	});
 	if (result.evidenceStatus === "PASS" && result.delta !== "not computed") {
 		const delta = result.delta;
@@ -126,9 +153,11 @@ const summary: ComparisonSummary = {
 	totalCells: cells.length,
 	comparableCells: comparable,
 	rejectedCells: rejected,
+	refusedCells: refused,
 	comparisons,
 	headerNote:
 		"Phase-4 gate subset (not a failed full 35-cell matrix). serverAggregate loop utilization unobserved / non-claim. Formal pair deltas require matching runId + sample counts; sealed p50 table below is the honest measured view when compare is blocked.",
+	signingLeavesNote: describeSigningLeaves(leaves),
 };
 let md = renderMarkdownReport(summary);
 md += [
@@ -146,5 +175,11 @@ md += [
 const out = join(dir, "report.md");
 writeFileSync(out, md);
 process.stdout.write(
-	`wrote ${out} (${md.length} bytes) formalComparable=${comparable}/${cells.length}\n`,
+	`wrote ${out} (${md.length} bytes) formalComparable=${comparable}/${cells.length} refused=${refused}\n`,
 );
+if (refused > 0) {
+	process.stderr.write(
+		`${SIGNING_LEAVES_UNRESOLVED}: ${refused} cohort cell${refused === 1 ? "" : "s"} refused; ${leaves.ok ? "" : leaves.message}\n`,
+	);
+	process.exit(3);
+}
