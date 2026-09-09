@@ -7,11 +7,16 @@
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { canonicalJson } from "../canonical.ts";
 import { cohortCellCardinality } from "../cohort-protocol.ts";
-import type {
-	CampaignFailureCode,
-	CampaignRefusalCode,
-	ExecutionPurpose,
+import {
+	type CampaignFailureCode,
+	type CampaignRefusalCode,
+	EXTERNAL_TRUST_BOUND_PREIMAGE_FIELDS,
+	EXTERNAL_TRUST_BOUND_SCHEMA,
+	type ExecutionPurpose,
+	type ExternalTrustBoundPreimageV1,
+	externalTrustBoundSha256,
 } from "../cross-supervisor-protocol.ts";
 import {
 	type ArmKind,
@@ -25,10 +30,12 @@ import {
 	CANONICAL_FANOUT_CELL_COUNT,
 	CANONICAL_FANOUT_MEASURED_SEAL_COUNT,
 	checkPromotionQuarantine,
+	type ExternalTrustBoundValidation,
 	evaluateCanonicalFanoutCompletion,
 	evaluateCellPromotionGate,
 	type PromotionGateEntry,
 } from "../output-policy.ts";
+import { parseStrictJsonBytes } from "../secure-fs.ts";
 import {
 	type ArmAttestationEvidenceV2,
 	type AttestationTrustMaterial,
@@ -511,6 +518,134 @@ export function proveRegisteredTopology(
 }
 
 /**
+ * The digest the frozen run command carries as `--external-trust-bound-sha256`
+ * is minted by the stage tool over the staged material
+ * (`external-trust-bound/v1`). Until it is recomputed it is a marker, and a
+ * marker is what the quarantine refuses. The verifier holds every preimage
+ * field at verification time: the candidate, campaign, capability and archive
+ * digests from the index it is proving, both signing leaves from the flags it
+ * opens the signature graph with, and the authority, lock and directory
+ * identities from the stage receipt the frozen command names. The receipt's
+ * own copies of the shared fields are held to the index and the leaves, so a
+ * receipt from another stage is named rather than averaged in.
+ */
+export function validateExternalTrustBound(args: {
+	readonly stageReceiptPath: string;
+	readonly externalTrustBoundSha256: string;
+	readonly index: Pick<
+		CampaignIndexV2,
+		| "candidate"
+		| "campaignId"
+		| "stagedCapabilitySha256"
+		| "sourceArchiveSha256"
+	>;
+	readonly macPublicKeySha256: string;
+	readonly rigPublicKeySha256: string;
+}):
+	| { readonly ok: true; readonly validation: ExternalTrustBoundValidation }
+	| { readonly ok: false; readonly code: string; readonly message: string } {
+	const mismatch = (message: string) => ({
+		ok: false as const,
+		code: "EXTERNAL_TRUST_BOUND_MISMATCH",
+		message,
+	});
+	let st: ReturnType<typeof lstatSync>;
+	try {
+		st = lstatSync(args.stageReceiptPath);
+	} catch {
+		return mismatch(`stage receipt is absent: ${args.stageReceiptPath}`);
+	}
+	if (!st.isFile()) {
+		return mismatch(
+			`stage receipt is not a regular file: ${args.stageReceiptPath}`,
+		);
+	}
+	const bytes = new Uint8Array(readFileSync(args.stageReceiptPath));
+	const parsed = parseStrictJsonBytes(bytes);
+	if (!parsed.ok) {
+		return mismatch(`stage receipt is not strict JSON: ${parsed.reason}`);
+	}
+	if (`${canonicalJson(parsed.value)}\n` !== new TextDecoder().decode(bytes)) {
+		return mismatch("stage receipt is not the stage tool's canonical bytes");
+	}
+	if (
+		parsed.value === null ||
+		typeof parsed.value !== "object" ||
+		Array.isArray(parsed.value)
+	) {
+		return mismatch("stage receipt is not a live-stage-receipt/v1 record");
+	}
+	const receipt = parsed.value as Record<string, unknown>;
+	if (receipt.schema !== "live-stage-receipt/v1") {
+		return mismatch("stage receipt is not a live-stage-receipt/v1 record");
+	}
+	for (const field of [
+		...EXTERNAL_TRUST_BOUND_PREIMAGE_FIELDS,
+		"externalTrustBoundSha256",
+	] as const) {
+		const value = receipt[field];
+		const wellFormed =
+			field === "candidate" || field === "campaignId"
+				? typeof value === "string" && value.length > 0
+				: typeof value === "string" && SHA256_HEX.test(value);
+		if (!wellFormed) {
+			return mismatch(`stage receipt field ${field} is missing or malformed`);
+		}
+	}
+	if (receipt.externalTrustBoundSha256 !== args.externalTrustBoundSha256) {
+		return mismatch(
+			`stage receipt was minted for bound ${String(receipt.externalTrustBoundSha256)}, the command carries ${args.externalTrustBoundSha256}`,
+		);
+	}
+	// The fields the verifier already holds are taken from where it holds
+	// them; the receipt must merely agree.
+	const held: Pick<
+		ExternalTrustBoundPreimageV1,
+		| "candidate"
+		| "campaignId"
+		| "capabilitySha256"
+		| "archiveSha256"
+		| "macSigningPublicKeySha256"
+		| "rigSigningPublicKeySha256"
+	> = {
+		candidate: args.index.candidate,
+		campaignId: args.index.campaignId,
+		capabilitySha256: args.index.stagedCapabilitySha256,
+		archiveSha256: args.index.sourceArchiveSha256,
+		macSigningPublicKeySha256: args.macPublicKeySha256,
+		rigSigningPublicKeySha256: args.rigPublicKeySha256,
+	};
+	for (const [field, value] of Object.entries(held)) {
+		if (receipt[field] !== value) {
+			return mismatch(
+				`stage receipt ${field} ${String(receipt[field])} is not the verifier's ${value}`,
+			);
+		}
+	}
+	const recomputedSha256 = externalTrustBoundSha256({
+		...held,
+		authoritySha256: receipt.authoritySha256 as string,
+		lockSha256: receipt.lockSha256 as string,
+		macDirectoryIdentitySha256: receipt.macDirectoryIdentitySha256 as string,
+		linuxDirectoryIdentitySha256:
+			receipt.linuxDirectoryIdentitySha256 as string,
+	});
+	if (recomputedSha256 !== args.externalTrustBoundSha256) {
+		return mismatch(
+			`${EXTERNAL_TRUST_BOUND_SCHEMA} recomputed as ${recomputedSha256}, the command carries ${args.externalTrustBoundSha256}`,
+		);
+	}
+	return {
+		ok: true,
+		validation: {
+			sha256: args.externalTrustBoundSha256,
+			recomputedSha256,
+			method: `${EXTERNAL_TRUST_BOUND_SCHEMA} recomputed from the campaign index, the staged public leaves and the stage receipt`,
+		},
+	};
+}
+
+/**
  * The index entry reduced to what the §6 set gate reads.
  *
  * `receiptGraphComplete` is the artifact verifier's answer, not a default: it
@@ -551,6 +686,12 @@ export function verifyCampaignIndex(args: {
 	readonly externalTrustBoundSha256: string;
 	readonly macPublicKeyPath?: string;
 	readonly rigPublicKeyPath?: string;
+	/**
+	 * The stage receipt the bound was minted from. With it and both leaves the
+	 * bound is recomputed (`validateExternalTrustBound`); without it no entry
+	 * can be promotable, because a bound nobody recomputed is a marker.
+	 */
+	readonly stageReceiptPath?: string;
 	/**
 	 * Test seam: observe (and return) the trust context each seal's
 	 * `verifyRunArtifact` receives. Production passes nothing.
@@ -643,6 +784,12 @@ export function verifyCampaignIndex(args: {
 			rigPublicKeySha256: publicKeySha256(rigPublicRaw32),
 		};
 	}
+	if (args.stageReceiptPath !== undefined && attestationTrust === null) {
+		return reject(
+			"TRUST_PROTOCOL",
+			"--stage-receipt needs --mac-public-key and --rig-public-key: the bound is recomputed over the staged leaves",
+		);
+	}
 	if (
 		integrityOnly &&
 		args.expectedPromotableCount !== undefined &&
@@ -695,6 +842,34 @@ export function verifyCampaignIndex(args: {
 	if (args.expectedTopology) {
 		const topology = proveRegisteredTopology(index, args.expectedTopology);
 		if (!topology.ok) return topology;
+	}
+
+	// A canonical entry that claims promotion is a claim against the external
+	// trust bound, so the bound is recomputed before any seal is opened: an
+	// index that claims promotion without the material to check the claim is
+	// refused here, not sixty seals later by the quarantine's fallback. (A
+	// focused or pilot entry claiming promotion is refused by the purpose rule
+	// in the loop below, which names the entry.)
+	let externalTrustBoundValidation: ExternalTrustBoundValidation | undefined;
+	if (args.stageReceiptPath !== undefined && attestationTrust !== null) {
+		const validated = validateExternalTrustBound({
+			stageReceiptPath: args.stageReceiptPath,
+			externalTrustBoundSha256: args.externalTrustBoundSha256,
+			index,
+			macPublicKeySha256: attestationTrust.macPublicKeySha256,
+			rigPublicKeySha256: attestationTrust.rigPublicKeySha256,
+		});
+		if (!validated.ok) return validated;
+		externalTrustBoundValidation = validated.validation;
+	} else if (
+		!integrityOnly &&
+		index.executionPurpose === "canonical" &&
+		index.entries.some((entry) => entry.promotable)
+	) {
+		return reject(
+			"EXTERNAL_TRUST_BOUND_UNVALIDATED",
+			"the index carries promotable entries and the external trust bound was not recomputed: pass --stage-receipt with both staged public leaves",
+		);
 	}
 
 	const indexedSealed = new Set<string>();
@@ -870,6 +1045,7 @@ export function verifyCampaignIndex(args: {
 				const quarantine = checkPromotionQuarantine({
 					artifact: parsed,
 					externalTrustBound: args.externalTrustBoundSha256,
+					externalTrustBoundValidation,
 					expectedComparisonId: index.campaignId,
 				});
 				if (!quarantine.promotable) {
@@ -1219,6 +1395,8 @@ export const VERIFY_CAMPAIGN_INDEX_USAGE =
 	"usage: verify-campaign-index --campaign-root=... --index=... --external-trust-bound-sha256=...\n" +
 	"  optional: --mac-public-key=... --rig-public-key=... (both or neither: raw 32-byte\n" +
 	"            Ed25519 keys; supplying them verifies each seal's attestation graph)\n" +
+	"            --stage-receipt=... (with both keys: recomputes the external trust bound;\n" +
+	"            required before any entry can be promotable)\n" +
 	"            --integrity-only\n" +
 	"            --expect-canonical-fanout-complete\n" +
 	"            --expected-{pass,fail,refused,promotable,sealed,flat,pair}-count=<n>\n" +
@@ -1258,6 +1436,7 @@ const KNOWN_FLAGS = new Set<string>([
 	"external-trust-bound-sha256",
 	"mac-public-key",
 	"rig-public-key",
+	"stage-receipt",
 	"integrity-only",
 	"expect-canonical-fanout-complete",
 	...COUNT_FLAGS.map(([flag]) => flag),
@@ -1383,6 +1562,7 @@ export function parseVerifyCampaignIndexArgs(
 	if (!topology.ok) return { ok: false, message: topology.message };
 	const macPublicKeyPath = parseFlag(argv, "mac-public-key");
 	const rigPublicKeyPath = parseFlag(argv, "rig-public-key");
+	const stageReceiptPath = parseFlag(argv, "stage-receipt");
 	return {
 		ok: true,
 		args: {
@@ -1391,6 +1571,7 @@ export function parseVerifyCampaignIndexArgs(
 			externalTrustBoundSha256,
 			...(macPublicKeyPath !== undefined ? { macPublicKeyPath } : {}),
 			...(rigPublicKeyPath !== undefined ? { rigPublicKeyPath } : {}),
+			...(stageReceiptPath !== undefined ? { stageReceiptPath } : {}),
 			...(argv.includes("--integrity-only") ? { integrityOnly: true } : {}),
 			...(argv.includes("--expect-canonical-fanout-complete")
 				? { expectCanonicalFanoutComplete: true }
