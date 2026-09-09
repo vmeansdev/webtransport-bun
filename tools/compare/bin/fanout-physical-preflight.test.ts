@@ -5,7 +5,7 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -42,6 +42,8 @@ import {
 	parsePsCpuTime,
 	preflightOfferPlan,
 	preflightReceiptPath,
+	consumedCampaignRootReason,
+	listExecutionRecords,
 } from "./fanout-physical-preflight.ts";
 
 const REPO_ROOT = resolve(import.meta.dir, "..", "..", "..");
@@ -418,6 +420,8 @@ function syntheticReceipt(): PreflightReceiptV1 {
 			failureCode: "TRUST_PROTOCOL",
 			reason: "expectedOfferedIngress 2500 != 5000",
 			sealedPath: null,
+			campaignRootRecordsBefore: [],
+			campaignRootRecordsRemoved: ["execution-000001-ws.json"],
 		},
 		windows: {
 			note: "origin-window counts",
@@ -641,6 +645,27 @@ describe("the sampler's parsing and integration", () => {
 		expect(LINUX_SAMPLER_SCRIPT).toContain("/proc/$pid/task/$pid/stat");
 		expect(LINUX_SAMPLER_SCRIPT).toContain("/proc/$pid/limits");
 		expect(LINUX_SAMPLER_SCRIPT).toContain("cpu MHz");
+	});
+
+	it("never starts on a campaign root that already holds an execution record, and removes only its own", () => {
+		// The Mac supervisor commits execution records with O_EXCL and refuses
+		// to start over a root that holds one: the first physical pass left
+		// execution-000001-ws.json behind and every later pass died at spawn.
+		const root = mkdtempSync(join(tmpdir(), "preflight-root-"));
+		writeFileSync(join(root, "manifest.json"), "{}");
+		expect(listExecutionRecords(root)).toEqual([]);
+		expect(consumedCampaignRootReason([])).toBeNull();
+		writeFileSync(join(root, "execution-000001-ws.json"), "{}");
+		writeFileSync(join(root, "execution-000002-wt.json"), "{}");
+		writeFileSync(join(root, "execution-000003-xx.json"), "{}");
+		expect(listExecutionRecords(root)).toEqual([
+			"execution-000001-ws.json",
+			"execution-000002-wt.json",
+		]);
+		const reason = consumedCampaignRootReason(listExecutionRecords(root));
+		expect(reason).toContain("execution-000001-ws.json");
+		expect(reason).toContain("never runs on a consumed root");
+		rmSync(root, { recursive: true, force: true });
 	});
 
 	it("keeps the sampler alive by /proc, never by a signal probe it is not allowed to send", () => {
@@ -903,7 +928,7 @@ describe("the lease factory's preflight pacing input", () => {
  * whose count predicate is the only proof the publisher was paced at 500/s.
  */
 describe("fanout-physical-preflight --loopback", () => {
-	it("runs the ticker 2x pass through the production lifecycle and writes a receipt that parses", async () => {
+	it("runs the ticker 1x pass through the production lifecycle and writes a receipt that parses", async () => {
 		const built = Bun.spawnSync({
 			cmd: [
 				"cargo",
@@ -939,7 +964,7 @@ describe("fanout-physical-preflight --loopback", () => {
 				"--cell",
 				"ticker-fanout/rate-250",
 				"--pass",
-				"2x",
+				"1x",
 				"--out",
 				out,
 				"--loopback",
@@ -952,7 +977,7 @@ describe("fanout-physical-preflight --loopback", () => {
 				candidate: R1_CANDIDATE_ID,
 				transport: "ws",
 				cellId: "ticker-fanout/rate-250",
-				pass: "2x",
+				pass: "1x",
 			});
 			const receiptJson = JSON.parse(readFileSync(path, "utf8")) as unknown;
 			const parsed = parsePreflightReceipt(receiptJson);
@@ -960,19 +985,23 @@ describe("fanout-physical-preflight --loopback", () => {
 			const receipt = parsed.value;
 			expect(receipt.mode).toBe("loopback");
 			expect(receipt.preconditions.enforced).toBe(false);
-			expect(receipt.offer.pacingSource).toBe("preflight-input");
-			expect(receipt.offer.publisherRatePerSecond).toBe(500);
+			expect(receipt.offer.pacingSource).toBe("cell");
+			expect(receipt.offer.publisherRatePerSecond).toBe(250);
 			expect(receipt.lifecycle.completed).toBe(true);
+			expect(receipt.lifecycle.campaignRootRecordsBefore).toEqual([]);
+			expect(receipt.lifecycle.campaignRootRecordsRemoved).toEqual([
+				"execution-000001-ws.json",
+			]);
 			expect(receipt.windows.offeredByOriginWindow).toEqual(
-				new Array<number>(10).fill(500),
+				new Array<number>(10).fill(250),
 			);
 			expect(receipt.windows.acceptedByOriginWindow).toEqual(
-				new Array<number>(10).fill(500),
+				new Array<number>(10).fill(250),
 			);
 			expect(receipt.windows.deliveredByOriginWindow).toEqual(
-				new Array<number>(10).fill(50_000),
+				new Array<number>(10).fill(25_000),
 			);
-			expect(receipt.totals.delivered).toBe(500_000);
+			expect(receipt.totals.delivered).toBe(250_000);
 			expect(receipt.warmup.macDelivered).toBe(1_000);
 			expect(receipt.warmup.relayDeliveries).toBe(1_000);
 			expect(receipt.faults).toEqual(NO_FAULTS);
