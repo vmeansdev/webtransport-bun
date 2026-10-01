@@ -98,11 +98,11 @@ import {
 import {
 	expectedR5DecisionFields,
 	expectedR5LadderPlanId,
-	extractR5CellSummary,
 	R5_CANDIDATE_DECISION_SCHEMA,
 	R5_DECISION_ALTERNATIVES,
 	R5_VENDORED_WTRANSPORT_GATE_ID,
 	R5_VENDORED_WTRANSPORT_TESTS,
+	r5CellSummaries,
 } from "./g6-capacity-r5-decision.ts";
 import { deriveWorkAuthority } from "./g6-capacity-work-authority.ts";
 import { linuxProbeFixtureText } from "./g6-linux-probe-fixture.ts";
@@ -247,6 +247,8 @@ export async function completeGoalAdaptersFixture(
 	>["proof"] = syntheticLinuxProcessFixture().proof,
 	options: {
 		bOutcomes?: Readonly<Record<string, WorkOutcome>>;
+		/** Sealed outcome override for A' cells (e.g. a trailing XB INVALID). */
+		aOutcomes?: Readonly<Record<string, WorkOutcome>>;
 		realProducerSources?: boolean;
 		preparedProcessCwd?: string;
 		/** r5 A' (C-PUMP attribution) + recompute-bound decision + selected B. */
@@ -485,26 +487,29 @@ export async function completeGoalAdaptersFixture(
 	let decision: Row,
 		r5Decision: ReturnType<typeof evaluateR5Attribution> | null = null;
 	if (r5) {
-		const cells = a.final.completed.map(({ nodeId }) => {
-			const node = requireDefined(
-				a.policy.workPlan.nodes.find((row) => row.id === nodeId),
-			);
-			const completion = record(
-				json(join(a.workRoot, "work", nodeId, "completion.json")),
-			);
-			return extractR5CellSummary(
-				readWorkCellEvidence(
+		const cells = r5CellSummaries(
+			a.final.completed.map(({ nodeId }) => {
+				const completion = record(
+					json(join(a.workRoot, "work", nodeId, "completion.json")),
+				);
+				return {
+					nodeId,
+					outcome: record(completion.grade).outcome as WorkOutcome,
+					startedAt: fixtureText(completion.startedAt),
+				};
+			}),
+			(nodeId) => {
+				const node = requireDefined(
+					a.policy.workPlan.nodes.find((row) => row.id === nodeId),
+				);
+				return readWorkCellEvidence(
 					a.workRoot,
 					node,
 					requireDefined(a.policy.workProfiles[node.profile]),
 					a.workAuthority,
-				),
-				{
-					outcome: record(completion.grade).outcome as WorkOutcome,
-					startedAt: fixtureText(completion.startedAt),
-				},
-			);
-		});
+				);
+			},
+		);
 		r5Decision = evaluateR5Attribution({
 			cells,
 			expectedSourceSha: a.sourceSha,
@@ -1453,7 +1458,9 @@ export async function completeGoalAdaptersFixture(
 				),
 				p = requireDefined(policy.workProfiles[node.profile]);
 			const expectedOutcome =
-				lane === "B" ? (options.bOutcomes?.[node.id] ?? "PASS") : "PASS";
+				lane === "B"
+					? (options.bOutcomes?.[node.id] ?? "PASS")
+					: (options.aOutcomes?.[node.id] ?? "PASS");
 			// r5 arms reuse the historical probe-on/off raw cells and rebind knobs.
 			const templateId = r5
 					? p.udpSendBatch === 64
@@ -1664,6 +1671,9 @@ export async function completeGoalAdaptersFixture(
 				);
 				steadyDrain.rtt = histogramJson(metrics.ackMs);
 				steadyDrain.serverHold = histogramJson(0.01);
+				// A sealed A' INVALID mirrors A07 A0-1: one session error of 40k.
+				if (lane === "A" && expectedOutcome === "INVALID")
+					client.sessionsErr = 1;
 				scan.clientStdout = `mmo-client: json ${JSON.stringify(client)}\n`;
 				const aggregate = record(scan.aggregate),
 					aggSteady = record(aggregate.steady),
@@ -2021,8 +2031,10 @@ export async function completeGoalAdaptersFixture(
 				operationId: "offrunner-evidence-seal",
 			},
 			status: final.terminal,
-			finalGatesComplete: final.terminal !== "INCOMPLETE",
-			evidenceCollectionComplete: final.terminal !== "INCOMPLETE",
+			// Production (A01-A08): an INVALID-stopped run still completes its
+			// final gates and evidence collection and seals INCOMPLETE.
+			finalGatesComplete: true,
+			evidenceCollectionComplete: true,
 			finalGateError: null,
 			manifestArtifactSha256: canonicalArtifactSha256(manifest),
 		});

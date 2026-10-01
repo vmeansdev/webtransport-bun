@@ -535,3 +535,47 @@ test("r5 waiter safety requires the exact passing vendored wtransport datagram-p
 	const missing = refused(f, "missing vendored gate output");
 	expect(missing.exitCode).toBe(2);
 }, 600_000);
+
+test("r5 a trailing XB INVALID (raw S5 session error) only removes batch64; a non-trailing-arm INVALID stays INCOMPLETE", async () => {
+	const f = await completeGoalAdaptersFixture(processFixture().proof, {
+		r5: {},
+		aOutcomes: { "XB-1": "INVALID" },
+	});
+	roots.push(f.repoRoot);
+	expect(f.campaignA.final.completed.map((row) => row.nodeId)).toEqual([
+		"Xon-1",
+		"Xoff-1",
+		"A0-1",
+		"A0-2",
+		"Xoff-2",
+		"Xon-2",
+		"XB-1",
+	]);
+	expect(f.r5Decision).toMatchObject({
+		status: "SELECTED",
+		sendPath: "stock",
+		bGo: true,
+	});
+	expect(evaluateCapacityGoal(f)).toMatchObject({
+		status: "PASS",
+		exitCode: 0,
+		r5: { sendPath: "stock" },
+	});
+	// Sealed bytes of the INVALID cell stay manifest-covered; they are never
+	// extracted (r5CellSummaries unit tests cover an absent raw cell).
+	const restore = tamper(f, aCell(f, "XB-1"), () => "{not json");
+	refused(f, "tampered sealed INVALID cell", /pre-sealed bytes changed/);
+	restore();
+
+	const g = await completeGoalAdaptersFixture(processFixture().proof, {
+		r5: {},
+		aOutcomes: { "A0-1": "INVALID" },
+	});
+	roots.push(g.repoRoot);
+	expect(g.r5Decision).toMatchObject({ status: "INCOMPLETE", bGo: false });
+	refused(
+		g,
+		"A0 INVALID with B present",
+		/B exists although the A' decision is INCOMPLETE/,
+	);
+}, 600_000);

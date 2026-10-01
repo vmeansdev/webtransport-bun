@@ -271,7 +271,7 @@ const RAW_GATE_CATALOG: GateCatalog = {
 					"tools/load/g6-capacity-goal-evaluate.test.ts",
 				]),
 			],
-			1_800_000,
+			5_400_000,
 			"offrunner",
 		),
 		gate(

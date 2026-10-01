@@ -145,6 +145,34 @@ function histogramMs(value: unknown, label: string) {
 }
 
 /**
+ * Summaries for the sealed A' completions in order. Plan r5 T2.2: the final
+ * INVALID cell stops the campaign and contributes nothing (its raw evidence
+ * may be absent or ungradable), so it is dropped without extraction; an
+ * INVALID anywhere else, or any extraction failure of a non-INVALID cell,
+ * fails closed.
+ */
+export function r5CellSummaries(
+	completions: readonly {
+		nodeId: string;
+		outcome: WorkOutcome;
+		startedAt: string;
+	}[],
+	readCell: (nodeId: string) => CapacityRawCellInput,
+): R5CellSummary[] {
+	const invalidAt = completions.findIndex((row) => row.outcome === "INVALID");
+	if (invalidAt >= 0 && invalidAt !== completions.length - 1)
+		fail("A' completions continue after an INVALID cell");
+	return completions
+		.filter((row) => row.outcome !== "INVALID")
+		.map((row) =>
+			extractR5CellSummary(readCell(row.nodeId), {
+				outcome: row.outcome,
+				startedAt: row.startedAt,
+			}),
+		);
+}
+
+/**
  * One A' cell summary from exact retained raw evidence. CPU and offered
  * datagrams use the steady window on both roles; clauses come from the same
  * S1-S5 grader the rated cells use; the outcome is the sealed (re-graded) one.

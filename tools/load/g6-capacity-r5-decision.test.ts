@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import type { R5Decision } from "./g6-capacity-attribution-r5.ts";
 import { CAPACITY_NATIVE_PROOF_TESTS } from "./g6-capacity-proof-catalog.ts";
@@ -9,6 +9,7 @@ import {
 	R5_BATCH_OWNERSHIP_TESTS,
 	R5_CANDIDATE_DECISION_SCHEMA,
 	R5_DECISION_ALTERNATIVES,
+	r5CellSummaries,
 	validateR5CandidateDecision,
 } from "./g6-capacity-r5-decision.ts";
 
@@ -192,4 +193,55 @@ test("r5 decision record must equal the recompute, the window and the pre-regist
 		[{ extra: true }, "missing or unknown fields"],
 	] as const)
 		expect(() => validate(decision(), edit)).toThrow(message);
+});
+
+describe("r5CellSummaries", () => {
+	const never = (nodeId: string): never => {
+		throw new Error(`read ${nodeId}`);
+	};
+	test("drops only a trailing INVALID completion without reading its raw cell", () => {
+		expect(
+			r5CellSummaries(
+				[
+					{
+						nodeId: "Xon-1",
+						outcome: "INVALID",
+						startedAt: "2026-10-02T00:00:00.000Z",
+					},
+				],
+				never,
+			),
+		).toEqual([]);
+	});
+	test("fails closed on an INVALID that is not last and on raw failures of rated cells", () => {
+		expect(() =>
+			r5CellSummaries(
+				[
+					{
+						nodeId: "Xon-1",
+						outcome: "INVALID",
+						startedAt: "2026-10-02T00:00:00.000Z",
+					},
+					{
+						nodeId: "Xoff-1",
+						outcome: "PASS",
+						startedAt: "2026-10-02T00:07:00.000Z",
+					},
+				],
+				never,
+			),
+		).toThrow("continue after an INVALID");
+		expect(() =>
+			r5CellSummaries(
+				[
+					{
+						nodeId: "Xon-1",
+						outcome: "MISS",
+						startedAt: "2026-10-02T00:00:00.000Z",
+					},
+				],
+				never,
+			),
+		).toThrow("read Xon-1");
+	});
 });

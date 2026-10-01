@@ -86,10 +86,10 @@ import {
 import {
 	batchOwnershipTestsPassed,
 	expectedR5LadderPlanId,
-	extractR5CellSummary,
 	isR5AttributionPlanId,
 	isR5LadderPlanId,
 	R5_VENDORED_WTRANSPORT_GATE_ID,
+	r5CellSummaries,
 	validateR5CandidateDecision,
 	vendoredWtransportTestsPassed,
 } from "./g6-capacity-r5-decision.ts";
@@ -566,8 +566,7 @@ function loadCampaign(
 		preSealEnvelope.phase !== "FINAL" ||
 		preSealEnvelope.operationId !== "offrunner-evidence-seal" ||
 		preSealEnvelope.clockSource !== "offrunner" ||
-		preSeal.status !==
-			(lane === "A" ? "ATTRIBUTION_COMPLETE" : "LADDER_COMPLETE") ||
+		!terminalStatuses(lane, policy).includes(String(preSeal.status)) ||
 		preSeal.finalGatesComplete !== true ||
 		preSeal.evidenceCollectionComplete !== true ||
 		preSeal.finalGateError !== null ||
@@ -605,9 +604,16 @@ function loadCampaign(
 	);
 	const final = verifyWorkFinal({ root: workRoot, policy, ledger });
 	if (
-		final.terminal !==
-			(lane === "A" ? "ATTRIBUTION_COMPLETE" : "LADDER_COMPLETE") ||
+		!terminalStatuses(lane, policy).includes(final.terminal) ||
+		String(preSeal.status) !== final.terminal ||
 		ms(final.recordedAt) > ms(preSealEnvelope.recordedAt)
+	)
+		fail(`${lane} raw work final is incomplete`);
+	// Plan r5 T2.2: an r5 A' run may end early only because its final cell
+	// graded INVALID; any other incomplete terminal stays refused.
+	if (
+		final.terminal === "INCOMPLETE" &&
+		final.completed.at(-1)?.outcome !== "INVALID"
 	)
 		fail(`${lane} raw work final is incomplete`);
 	const progress = readWorkExecution({
@@ -677,6 +683,16 @@ function loadCampaign(
 		probeProducerSha256,
 	};
 }
+/** Accepted sealed terminals: B and historical A must complete; an r5 A' may stop at a final INVALID. */
+function terminalStatuses(
+	lane: "A" | "B",
+	policy: { workPlan: { id: string } },
+): string[] {
+	if (lane === "B") return ["LADDER_COMPLETE"];
+	return isR5AttributionPlanId(policy.workPlan.id)
+		? ["ATTRIBUTION_COMPLETE", "INCOMPLETE"]
+		: ["ATTRIBUTION_COMPLETE"];
+}
 type Campaign = ReturnType<typeof loadCampaign>;
 function attribution(context: EvidenceContext, campaign: Campaign) {
 	const result = evaluateSendPathAttribution({
@@ -734,22 +750,24 @@ function attributionR5(context: EvidenceContext, campaign: Campaign) {
 		makeCandidateAttributionWorkPlan(),
 		"A' r5 attribution DAG",
 	);
-	const cells = campaign.progress.completions.map((completion) => {
-		const node = requireDefined(
-			campaign.policy.workPlan.nodes.find(
-				(row) => row.id === completion.nodeId,
-			),
-		);
-		return extractR5CellSummary(
-			readWorkCellEvidence(
+	const cells = r5CellSummaries(
+		campaign.progress.completions.map((completion) => ({
+			nodeId: completion.nodeId,
+			outcome: completion.grade.outcome,
+			startedAt: completion.startedAt,
+		})),
+		(nodeId) => {
+			const node = requireDefined(
+				campaign.policy.workPlan.nodes.find((row) => row.id === nodeId),
+			);
+			return readWorkCellEvidence(
 				campaign.workRoot,
 				node,
 				requireDefined(campaign.policy.workProfiles[node.profile]),
 				campaign.workAuthority,
-			),
-			{ outcome: completion.grade.outcome, startedAt: completion.startedAt },
-		);
-	});
+			);
+		},
+	);
 	return evaluateR5Attribution({
 		cells,
 		expectedSourceSha: campaign.sourceSha,
