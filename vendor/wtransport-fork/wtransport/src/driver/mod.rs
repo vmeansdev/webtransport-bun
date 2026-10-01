@@ -17,7 +17,10 @@ use crate::stream::OpeningUniStream;
 use crate::zerortt::ZeroRtt;
 use crate::SessionId;
 use crate::VarInt;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio::sync::Mutex;
@@ -28,6 +31,46 @@ use tracing::instrument;
 use tracing::trace;
 use tracing::Instrument;
 use utils::BiChannelEndpoint;
+
+static PUMPS_SPAWNED: AtomicU64 = AtomicU64::new(0);
+static PUMPS_LIVE: AtomicU64 = AtomicU64::new(0);
+
+/// Decrements the live-pump gauge when a pump task ends or is aborted.
+struct PumpLiveGuard;
+
+impl Drop for PumpLiveGuard {
+    fn drop(&mut self) {
+        PUMPS_LIVE.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Whether drivers read datagrams in a dedicated task (the default) or inline in
+/// the driver's select loop (`WTRANSPORT_DATAGRAM_PUMP=0`). Read once per process.
+fn datagram_pump_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("WTRANSPORT_DATAGRAM_PUMP").as_deref() != Ok("0"))
+}
+
+/// Which datagram read path this process's drivers use, and how many pump tasks
+/// were spawned and are still running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DatagramDriverStats {
+    /// `true` when datagrams are read by a dedicated per-connection task.
+    pub pump: bool,
+    /// Pump tasks spawned since process start (restarts included).
+    pub pumps_spawned: u64,
+    /// Pump tasks currently alive.
+    pub pumps_live: u64,
+}
+
+/// Effective datagram read path and pump task counters for this process.
+pub fn datagram_driver_stats() -> DatagramDriverStats {
+    DatagramDriverStats {
+        pump: datagram_pump_enabled(),
+        pumps_spawned: PUMPS_SPAWNED.load(Ordering::Relaxed),
+        pumps_live: PUMPS_LIVE.load(Ordering::Relaxed),
+    }
+}
 use wtransport_proto::error::ErrorCode;
 use wtransport_proto::frame::Frame;
 use wtransport_proto::session::SessionRequest;
@@ -407,6 +450,64 @@ mod worker {
     use wtransport_proto::stream_header::StreamKind;
     use wtransport_proto::varint::VarInt;
 
+    /// Owns one connection's datagram reader task. Dropping it (with the worker)
+    /// aborts the task, so no reader outlives its driver.
+    pub(super) struct DatagramPump {
+        handle: JoinHandle<DriverError>,
+    }
+
+    impl DatagramPump {
+        fn spawn(
+            quic_connection: &quinn::Connection,
+            ready_datagrams: &mpsc::Sender<Datagram>,
+        ) -> Self {
+            let quic_connection = quic_connection.clone();
+            let ready_datagrams = ready_datagrams.clone();
+            PUMPS_SPAWNED.fetch_add(1, Ordering::Relaxed);
+            PUMPS_LIVE.fetch_add(1, Ordering::Relaxed);
+            // Owned by the future, so it is dropped (and the gauge decremented) even
+            // when the task is aborted before its first poll.
+            let live = PumpLiveGuard;
+            let handle = tokio::spawn(async move {
+                let _live = live;
+                loop {
+                    if let Err(error) =
+                        Worker::accept_datagram(&quic_connection, &ready_datagrams).await
+                    {
+                        return error;
+                    }
+                }
+            });
+            Self { handle }
+        }
+
+        /// Resolves with the pump's error; never resolves when there is no pump.
+        /// A panic inside the pump is re-raised here rather than turned into an
+        /// ordinary disconnect.
+        pub(super) async fn join(pump: &mut Option<Self>) -> DriverError {
+            let Some(pump) = pump.as_mut() else {
+                return std::future::pending().await;
+            };
+            Self::outcome((&mut pump.handle).await)
+        }
+
+        pub(super) fn outcome(result: Result<DriverError, tokio::task::JoinError>) -> DriverError {
+            match result {
+                Ok(error) => error,
+                Err(join_error) if join_error.is_panic() => {
+                    std::panic::resume_unwind(join_error.into_panic())
+                }
+                Err(_cancelled) => DriverError::NotConnected,
+            }
+        }
+    }
+
+    impl Drop for DatagramPump {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+
     pub struct Worker {
         quic_connection: quinn::Connection,
         ready_settings: mpsc::Sender<Settings>,
@@ -570,6 +671,14 @@ mod worker {
                 self.rebuild_or(error, &mut rebuilt).await?;
             }
 
+            // Datagrams are read by their own task unless WTRANSPORT_DATAGRAM_PUMP=0:
+            // a datagram then wakes only that task instead of this select, whose
+            // every pass re-polls the accept and control-stream futures under the
+            // connection lock.
+            let pump_enabled = datagram_pump_enabled();
+            let mut datagram_pump = pump_enabled
+                .then(|| DatagramPump::spawn(&self.quic_connection, &self.ready_datagrams));
+
             loop {
                 let step: Result<(), DriverError> = tokio::select! {
                     result = Self::accept_uni(&self.quic_connection,
@@ -586,8 +695,16 @@ mod worker {
                     }
 
                     result = Self::accept_datagram(&self.quic_connection,
-                                                   &self.ready_datagrams) => {
+                                                   &self.ready_datagrams), if !pump_enabled => {
                         result
+                    }
+
+                    error = DatagramPump::join(&mut datagram_pump), if pump_enabled => {
+                        // The pump ended: hand its error to the same rebuild path the
+                        // inline accept uses, and restart it so a recovered connection
+                        // keeps reading exactly where the inline accept would retry.
+                        datagram_pump = Some(DatagramPump::spawn(&self.quic_connection, &self.ready_datagrams));
+                        Err(error)
                     }
 
                     uni_h3_stream = ready_uni_h3_streams.1.recv() => {
@@ -1150,3 +1267,45 @@ mod worker {
 pub(crate) mod qpack;
 pub(crate) mod streams;
 pub(crate) mod utils;
+
+#[cfg(test)]
+mod datagram_pump_tests {
+    use super::worker::DatagramPump;
+    use super::DriverError;
+
+    #[tokio::test]
+    async fn pump_outcome_reraises_a_panic_instead_of_reporting_a_disconnect() {
+        let join = tokio::spawn(async { panic!("pump exploded") }).await;
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: DriverError = DatagramPump::outcome(join.map(|()| DriverError::NotConnected));
+        }));
+        let payload = caught.expect_err("a pump panic must propagate");
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"pump exploded"));
+    }
+
+    #[tokio::test]
+    async fn pump_outcome_passes_errors_through_and_maps_cancellation_to_not_connected() {
+        let ok = tokio::spawn(async { DriverError::NotConnected }).await;
+        assert!(matches!(
+            DatagramPump::outcome(ok),
+            DriverError::NotConnected
+        ));
+        let handle = tokio::spawn(std::future::pending::<DriverError>());
+        handle.abort();
+        assert!(matches!(
+            DatagramPump::outcome(handle.await),
+            DriverError::NotConnected
+        ));
+    }
+
+    #[tokio::test]
+    async fn join_without_a_pump_never_resolves() {
+        let mut none: Option<DatagramPump> = None;
+        let joined = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            DatagramPump::join(&mut none),
+        )
+        .await;
+        assert!(joined.is_err());
+    }
+}

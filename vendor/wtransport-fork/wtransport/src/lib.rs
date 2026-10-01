@@ -159,4 +159,9 @@ pub use wtransport_proto as proto;
 pub use quinn;
 
 mod driver;
+
+/// Effective datagram read path of this process's drivers; see [`datagram_driver_stats`].
+pub use driver::datagram_driver_stats;
+/// Snapshot returned by [`datagram_driver_stats`].
+pub use driver::DatagramDriverStats;
 mod zerortt;
