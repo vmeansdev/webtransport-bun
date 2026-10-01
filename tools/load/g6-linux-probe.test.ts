@@ -5,7 +5,12 @@ import {
 	cpuJiffiesToSec,
 	DEFAULT_MAX_BYTES,
 	effectiveSocketBufferSummary,
+	FINAL_RESERVE_BYTES,
 	JsonlBudget,
+	LINUX_PROBE_CADENCE,
+	LINUX_PROBE_HEADER_SCHEMA,
+	PhaseCadenceGate,
+	type ProbePhase,
 	parseLinuxProbeDetailMode,
 	parseLoadavg,
 	parseNetRxSoftirq,
@@ -15,6 +20,8 @@ import {
 	parseShards,
 	parseSoftnetStat,
 	parseSsSocketMemory,
+	queueStrideTicks,
+	schedPairsWithQueueSample,
 	shardSocketInodeProblem,
 } from "./g6-linux-probe.ts";
 import {
@@ -343,4 +350,150 @@ describe("g6-linux-probe artifact budget", () => {
 			2 * measuredBytesPerSecond * fiftyKRungCellSeconds,
 		);
 	}, 15_000);
+
+	test("connect at 50/250 ms keeps a 24-shard 40k-scale probe under the cap; uniform 10/50 ms would not", () => {
+		const shards = 24;
+		// Realistic producer rows: six-digit PIDs, eight-digit inodes, wide
+		// counters and a 19-digit monotonic clock (measured ~170 B/shard).
+		const queueRow = (phase: ProbePhase) => ({
+			schema: "g6-c32-linux-probe-queue/2",
+			phase,
+			monotonicNs: "1234567890123456789",
+			shards: Array.from({ length: shards }, (_, index) => ({
+				serverId: index + 1,
+				pid: 912_345 + index,
+				inodes: [String(81_234_567 + index)],
+				socketCount: 1,
+				udp4SocketCount: 1,
+				udp6SocketCount: 0,
+				txQueueBytes: 1_234_567,
+				rxQueueBytes: 12_345_678,
+				drops: 1_234_567,
+			})),
+		});
+		const schedRow = (phase: ProbePhase) => ({
+			schema: "g6-c32-linux-probe-sched/2",
+			phase,
+			monotonicNs: "1234567890123456789",
+			netRx: 123_456_789_012,
+			softnet: {
+				processed: 123_456_789_012,
+				dropped: 12_345,
+				timeSqueeze: 1_234_567,
+			},
+			sched: Array.from({ length: shards }, (_, index) => ({
+				serverId: index + 1,
+				pid: 912_345 + index,
+				runtimeNs: 123_456_789_012_345,
+				waitNs: 12_345_678_901_234,
+				timeslices: 123_456_789,
+			})),
+			load1: 12.34,
+			procsRunning: 48,
+		});
+		const bytes = (row: unknown) =>
+			Buffer.byteLength(`${JSON.stringify(row)}\n`);
+		const perShard = bytes(queueRow("steady")) / shards;
+		expect(perShard).toBeGreaterThanOrEqual(150);
+		expect(perShard).toBeLessThanOrEqual(200);
+		const plan: [ProbePhase, number][] = [
+			["connect", 160],
+			["steady", 120],
+			["drain", 1],
+			["idle", 30],
+		];
+		const project = (uniform: boolean): number => {
+			const gate = new PhaseCadenceGate();
+			let executed = 0;
+			let total = 0;
+			for (const [phase, seconds] of plan) {
+				const ticks = (seconds * 1000) / LINUX_PROBE_CADENCE.queueCadenceMs;
+				const q = bytes(queueRow(phase));
+				const sc = bytes(schedRow(phase));
+				for (let tick = 0; tick < ticks; tick++) {
+					if (!uniform && !gate.shouldSample(phase)) continue;
+					total += q;
+					if (schedPairsWithQueueSample(executed)) total += sc;
+					executed += 1;
+				}
+			}
+			return total;
+		};
+		const limit = DEFAULT_MAX_BYTES - FINAL_RESERVE_BYTES;
+		const phaseAware = project(false);
+		const uniform = project(true);
+		expect(phaseAware).toBeLessThan(limit);
+		expect(uniform).toBeGreaterThan(limit);
+		// Headroom stays meaningful (~92 MB projected at 40k).
+		expect(phaseAware).toBeLessThan(0.75 * limit);
+	}, 15_000);
+});
+
+describe("g6-linux-probe phase-aware cadence", () => {
+	test("declares a /3 header with a 50 ms connect queue cadence and unchanged 10/50 ms elsewhere", () => {
+		expect(LINUX_PROBE_HEADER_SCHEMA).toBe("g6-c32-linux-probe-header/3");
+		expect(LINUX_PROBE_CADENCE).toEqual({
+			queueCadenceMs: 10,
+			schedCadenceMs: 50,
+			connectQueueCadenceMs: 50,
+		});
+		expect(queueStrideTicks("connect")).toBe(5);
+		for (const phase of ["steady", "drain", "idle", "closed"] as const)
+			expect(queueStrideTicks(phase)).toBe(1);
+	});
+
+	test("a synthetic run samples connect every 50 ms, steady every 10 ms, and pairs sched every 5th executed sample", () => {
+		const gate = new PhaseCadenceGate();
+		// Boundaries deliberately land off the 50 ms connect grid.
+		const boundaries: [ProbePhase, number][] = [
+			["connect", 0],
+			["steady", 1_030],
+			["drain", 2_030],
+			["idle", 2_300],
+			["closed", 2_600],
+		];
+		const phaseAt = (ms: number): ProbePhase | null => {
+			let phase: ProbePhase | null = null;
+			for (const [name, start] of boundaries) if (ms >= start) phase = name;
+			return phase;
+		};
+		const queue: { ms: number; phase: ProbePhase }[] = [];
+		const sched: { ms: number; phase: ProbePhase }[] = [];
+		expect(gate.shouldSample(null)).toBe(false);
+		for (let ms = 0; ms < 2_900; ms += LINUX_PROBE_CADENCE.queueCadenceMs) {
+			const phase = phaseAt(ms);
+			if (!gate.shouldSample(phase) || phase === null) continue;
+			if (schedPairsWithQueueSample(queue.length)) sched.push({ ms, phase });
+			queue.push({ ms, phase });
+		}
+		const gaps = (
+			rows: { ms: number; phase: ProbePhase }[],
+			phase: ProbePhase,
+		) => {
+			const times = rows
+				.filter((row) => row.phase === phase)
+				.map((row) => row.ms);
+			return times
+				.slice(1)
+				.map((time, index) => time - (times[index] as number));
+		};
+		expect(new Set(gaps(queue, "connect"))).toEqual(new Set([50]));
+		expect(new Set(gaps(sched, "connect"))).toEqual(new Set([250]));
+		for (const phase of ["steady", "drain", "idle", "closed"] as const) {
+			expect(new Set(gaps(queue, phase))).toEqual(new Set([10]));
+			expect(new Set(gaps(sched, phase))).toEqual(new Set([50]));
+		}
+		expect(queue.filter((row) => row.phase === "connect")).toHaveLength(21);
+		// The first steady sample is the first base tick at/after the boundary.
+		const firstSteady = queue.find((row) => row.phase === "steady");
+		expect(firstSteady?.ms).toBe(1_030);
+		expect((firstSteady?.ms ?? Infinity) - 1_030).toBeLessThanOrEqual(10);
+		// Every sched sample coincides with an executed queue sample whose
+		// zero-based index is a multiple of 5.
+		for (const row of sched) {
+			const index = queue.findIndex((q) => q.ms === row.ms);
+			expect(index % 5).toBe(0);
+		}
+		expect(sched).toHaveLength(Math.ceil(queue.length / 5));
+	});
 });

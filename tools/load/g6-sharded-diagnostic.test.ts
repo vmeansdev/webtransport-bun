@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { requireDefined } from "./g6-c32-freeze-model.ts";
 import {
 	linuxProbeFixture,
 	linuxProbeFixtureText,
@@ -7,12 +8,12 @@ import {
 	deltaHostUdpCounters,
 	GENERATOR_SAMPLE_SEPARATOR,
 	INTERFACE_SAMPLE_SEPARATOR,
-	parseLinuxProbeJsonl,
 	parseConnectErrorsSample,
 	parseEthtoolStats,
 	parseGeneratorHostSample,
 	parseHostUdpCounters,
 	parseInterfaceSample,
+	parseLinuxProbeJsonl,
 	parseMeminfoKb,
 	parseOwnedUdpSocketTable,
 	parseProcNetDev,
@@ -321,9 +322,12 @@ describe("G6 Linux probe phase parser", () => {
 		else
 			expect(() => parseLinuxProbeJsonl(linuxProbeFixtureText(rows))).toThrow();
 	};
-	const footer = (rows: ReturnType<typeof linuxProbeFixture>) => rows.at(-1)!;
+	const footer = (rows: ReturnType<typeof linuxProbeFixture>) =>
+		requireDefined(rows.at(-1));
 	const first = (rows: ReturnType<typeof linuxProbeFixture>, kind: string) =>
-		rows.find((row) => row.schema === `g6-c32-linux-probe-${kind}/2`)!;
+		requireDefined(
+			rows.find((row) => row.schema === `g6-c32-linux-probe-${kind}/2`),
+		);
 
 	test("rejects missing, out-of-order, duplicate, and backwards phase boundaries", () => {
 		reject((rows) => {
@@ -333,13 +337,15 @@ describe("G6 Linux probe phase parser", () => {
 			);
 		});
 		reject((rows) => {
-			rows.find((row) => row.phase === "steady")!.phase = "drain";
+			requireDefined(rows.find((row) => row.phase === "steady")).phase =
+				"drain";
 		});
 		reject((rows) => {
 			rows.splice(2, 0, { ...rows[1] });
 		});
 		reject((rows) => {
-			rows.find((row) => row.phase === "steady")!.monotonicNs = "1";
+			requireDefined(rows.find((row) => row.phase === "steady")).monotonicNs =
+				"1";
 		});
 		reject((rows) => {
 			rows.splice(
@@ -378,13 +384,13 @@ describe("G6 Linux probe phase parser", () => {
 			});
 		}
 		reject((rows) => {
-			rows[0]!.shards = [];
+			requireDefined(rows[0]).shards = [];
 		});
 		reject((rows) => {
-			rows[0]!.shards[0].serverId = 2;
+			requireDefined(rows[0]).shards[0].serverId = 2;
 		});
 		reject((rows) => {
-			rows[0]!.shards[0].inodes = [];
+			requireDefined(rows[0]).shards[0].inodes = [];
 		});
 		reject((rows) => {
 			first(rows, "queue").shards[0].inodes = ["112"];
@@ -443,14 +449,185 @@ describe("G6 Linux probe phase parser", () => {
 			footer(rows).queueCadenceMs = 20;
 		}, /cadence/i);
 		reject((rows) => {
-			rows[0]!.queueCadenceMs = 0;
+			requireDefined(rows[0]).queueCadenceMs = 0;
 		}, /cadence/i);
 		reject((rows) => {
 			footer(rows).measurementMode.detail = "off";
 		});
 		reject((rows) => {
-			delete rows[0]!.phaseOrder;
+			delete requireDefined(rows[0]).phaseOrder;
 		});
+	});
+
+	test("parses the /3 header's declared connect cadence and keeps historical /2 unchanged", () => {
+		const current = linuxProbeFixture();
+		expect(current[0]).toMatchObject({
+			schema: "g6-c32-linux-probe-header/3",
+			queueCadenceMs: 10,
+			schedCadenceMs: 50,
+			connectQueueCadenceMs: 50,
+		});
+		const parsedCurrent = parseLinuxProbeJsonl(linuxProbeFixtureText(current));
+		expect(parsedCurrent.summary.connectQueueCadenceMs).toBe(50);
+		const historical = linuxProbeFixture(1, { headerVersion: 2 });
+		expect(requireDefined(historical[0]).schema).toBe(
+			"g6-c32-linux-probe-header/2",
+		);
+		expect("connectQueueCadenceMs" in requireDefined(historical[0])).toBe(
+			false,
+		);
+		const parsedHistorical = parseLinuxProbeJsonl(
+			linuxProbeFixtureText(historical),
+		);
+		const { summary: currentSummary, ...currentRest } = parsedCurrent;
+		const { summary: historicalSummary, ...historicalRest } = parsedHistorical;
+		expect(historicalRest).toEqual(currentRest);
+		expect("connectQueueCadenceMs" in historicalSummary).toBe(false);
+		expect(currentSummary.queueCadenceMs).toBe(10);
+	});
+
+	test("fails closed on undeclared, altered or mismatched connect cadence", () => {
+		reject((rows) => {
+			delete requireDefined(rows[0]).connectQueueCadenceMs;
+		}, /cadence/i);
+		reject((rows) => {
+			requireDefined(rows[0]).connectQueueCadenceMs = 10;
+		}, /cadence/i);
+		reject((rows) => {
+			footer(rows).connectQueueCadenceMs = 10;
+		}, /connect queue cadence/i);
+		reject((rows) => {
+			delete footer(rows).connectQueueCadenceMs;
+		}, /connect queue cadence/i);
+		reject((rows) => {
+			requireDefined(rows[0]).schema = "g6-c32-linux-probe-header/4";
+		}, /header/i);
+		const historical = (
+			mutate: (rows: ReturnType<typeof linuxProbeFixture>) => void,
+		) => {
+			const rows = linuxProbeFixture(1, { headerVersion: 2 });
+			mutate(rows);
+			expect(() => parseLinuxProbeJsonl(linuxProbeFixtureText(rows))).toThrow(
+				/cadence/i,
+			);
+		};
+		// A /2 header claimed one uniform cadence; it cannot carry a connect one.
+		historical((rows) => {
+			requireDefined(rows[0]).connectQueueCadenceMs = 50;
+		});
+		historical((rows) => {
+			footer(rows).connectQueueCadenceMs = 50;
+		});
+	});
+
+	test("accepts 50 ms connect / 10 ms steady samples with sched on every 5th queue sample", () => {
+		const rows = linuxProbeFixture();
+		const header = requireDefined(rows[0]);
+		const footerRow = requireDefined(rows.at(-1));
+		const queueTemplate = requireDefined(
+			rows.find((row) => row.schema === "g6-c32-linux-probe-queue/2"),
+		);
+		const schedTemplate = requireDefined(
+			rows.find((row) => row.schema === "g6-c32-linux-probe-sched/2"),
+		);
+		const out: ReturnType<typeof linuxProbeFixture> = [header];
+		const plan = [
+			{ phase: "connect", start: 0, samples: 12, stepMs: 50 },
+			{ phase: "steady", start: 1_000, samples: 30, stepMs: 10 },
+			{ phase: "drain", start: 2_000, samples: 7, stepMs: 10 },
+			{ phase: "idle", start: 3_000, samples: 6, stepMs: 10 },
+		];
+		let executed = 0;
+		const coverage: Record<string, unknown> = {};
+		const boundaries: Record<string, unknown> = {};
+		const connect = { queueSamples: 0, schedSamples: 0 };
+		for (const [index, step] of plan.entries()) {
+			const boundaryNs = 1_000_000_000 + step.start * 1_000_000;
+			boundaries[step.phase] = {
+				monotonicNs: String(boundaryNs),
+				requestId: index + 1,
+			};
+			out.push({
+				schema: "g6-c32-linux-probe-phase/1",
+				phase: step.phase,
+				...(boundaries[step.phase] as object),
+			});
+			let sched = 0;
+			for (let i = 0; i < step.samples; i++) {
+				const monotonicNs = String(boundaryNs + i * step.stepMs * 1_000_000);
+				out.push({
+					...structuredClone(queueTemplate),
+					phase: step.phase,
+					monotonicNs,
+				});
+				if (executed % 5 === 0) {
+					out.push({
+						...structuredClone(schedTemplate),
+						phase: step.phase,
+						monotonicNs,
+					});
+					sched++;
+				}
+				executed++;
+			}
+			coverage[step.phase] = {
+				queueSamples: step.samples,
+				schedSamples: sched,
+			};
+			if (step.phase === "connect") {
+				connect.queueSamples = step.samples;
+				connect.schedSamples = sched;
+			}
+		}
+		const totalSched = Object.values(coverage).reduce(
+			(sum: number, row) =>
+				sum + (row as { schedSamples: number }).schedSamples,
+			0,
+		);
+		out.push({
+			...footerRow,
+			monotonicNs: "5000000000",
+			queueSamples: executed,
+			schedSamples: totalSched,
+			phaseBoundaries: boundaries,
+			phaseCoverage: coverage,
+			summary: {
+				...footerRow.summary,
+				peakReceiveQueueBytes: 5,
+				peakDrops: 0,
+				drainStallAligned: false,
+				pressureAlignments: 0,
+				peakProcsRunning: 1,
+				peakLoad1: 0.1,
+			},
+			historicalConnectSummary: {
+				peakReceiveQueueBytes: 5,
+				peakDrops: 0,
+				...connect,
+				pressureAlignments: 0,
+				drainStallAligned: false,
+			},
+		});
+		const parsed = parseLinuxProbeJsonl(linuxProbeFixtureText(out));
+		expect(parsed.phaseCoverage.connect).toEqual({
+			queueSamples: 12,
+			schedSamples: 3,
+		});
+		expect(parsed.phaseSampleExtents.connect.queue.maxGapNs).toBe("50000000");
+		expect(parsed.phaseSampleExtents.connect.sched.maxGapNs).toBe("250000000");
+		expect(parsed.phaseSampleExtents.steady.queue.maxGapNs).toBe("10000000");
+		expect(parsed.phaseSampleExtents.steady.sched.maxGapNs).toBe("50000000");
+		// Pairing remains global across the boundary: dropping a scheduled
+		// record anywhere still fails closed.
+		const unpaired = structuredClone(out);
+		const steadySched = unpaired.findIndex(
+			(row) =>
+				row.schema === "g6-c32-linux-probe-sched/2" && row.phase === "steady",
+		);
+		unpaired.splice(steadySched, 1);
+		expect(() => parseLinuxProbeJsonl(linuxProbeFixtureText(unpaired))).toThrow(
+			/scheduler/i,
+		);
 	});
 
 	test("requires complete terminal evidence and recomputes rather than trusts its summaries", () => {

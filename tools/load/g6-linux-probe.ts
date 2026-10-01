@@ -17,16 +17,60 @@ import {
 
 const QUEUE_CADENCE_MS = 10;
 const SCHED_CADENCE_MS = 50;
+// Connect-phase queue cadence. A 30-50k connect phase runs ~160 s; at 24
+// shards a 10 ms queue stream there alone would spend ~75 MB of the fixed cap,
+// so connect samples every 50 ms. steady/drain/idle/closed stay at 10 ms.
+const CONNECT_QUEUE_CADENCE_MS = 50;
+/** Header schema of the current producer; /2 declared one uniform cadence. */
+export const LINUX_PROBE_HEADER_SCHEMA = "g6-c32-linux-probe-header/3";
+export const LINUX_PROBE_CADENCE = {
+	queueCadenceMs: QUEUE_CADENCE_MS,
+	schedCadenceMs: SCHED_CADENCE_MS,
+	connectQueueCadenceMs: CONNECT_QUEUE_CADENCE_MS,
+} as const;
+/** A scheduler record accompanies every Nth executed queue sample. */
+export const SCHED_EVERY_QUEUE_SAMPLES = SCHED_CADENCE_MS / QUEUE_CADENCE_MS;
 // Sized for the 50k ladder rung: r72's L20000-1 measured ~197 KB/s of probe
 // output and truncated a ~150s cell at the old 16 MiB cap; a 50k cell runs
 // ~300s (~60 MB), so 128 MiB keeps >2x margin. Truncation stays fail-closed.
 export const DEFAULT_MAX_BYTES = 128 * 1024 * 1024;
-const FINAL_RESERVE_BYTES = 64 * 1024;
+export const FINAL_RESERVE_BYTES = 64 * 1024;
 const REQUIRED_PHASES = ["connect", "steady", "drain", "idle"] as const;
 const OPTIONAL_PHASES = ["closed"] as const;
-type ProbePhase =
+export type ProbePhase =
 	| (typeof REQUIRED_PHASES)[number]
 	| (typeof OPTIONAL_PHASES)[number];
+
+/** Base-timer ticks (QUEUE_CADENCE_MS each) between queue samples in a phase. */
+export function queueStrideTicks(phase: ProbePhase): number {
+	return phase === "connect" ? CONNECT_QUEUE_CADENCE_MS / QUEUE_CADENCE_MS : 1;
+}
+
+/**
+ * Decides, per base-timer tick, whether the probe samples. The stride restarts
+ * at every phase boundary and the first tick of a phase always samples, so
+ * entering steady costs at most one 10 ms tick before the first sample.
+ */
+export class PhaseCadenceGate {
+	private phase: ProbePhase | null = null;
+	private ticks = 0;
+
+	shouldSample(phase: ProbePhase | null): boolean {
+		if (phase === null) return false;
+		if (phase !== this.phase) {
+			this.phase = phase;
+			this.ticks = 0;
+		}
+		const take = this.ticks % queueStrideTicks(phase) === 0;
+		this.ticks += 1;
+		return take;
+	}
+}
+
+/** Sched pairing: the executed queue sample with this zero-based index pairs. */
+export function schedPairsWithQueueSample(executedIndex: number): boolean {
+	return executedIndex % SCHED_EVERY_QUEUE_SAMPLES === 0;
+}
 const MAX_DISTINCT_PROBLEMS = 32;
 
 function arg(name: string): string | null {
@@ -472,9 +516,8 @@ function connectProbe(out: string, shardsRaw: string, maxBytes: number): void {
 	>;
 	let currentPhase: ProbePhase | null = null;
 	writer.append({
-		schema: "g6-c32-linux-probe-header/2",
-		queueCadenceMs: QUEUE_CADENCE_MS,
-		schedCadenceMs: SCHED_CADENCE_MS,
+		schema: LINUX_PROBE_HEADER_SCHEMA,
+		...LINUX_PROBE_CADENCE,
 		startedAt: new Date().toISOString(),
 		measurementMode,
 		producerSha256,
@@ -494,8 +537,7 @@ function connectProbe(out: string, shardsRaw: string, maxBytes: number): void {
 				schema: "g6-c32-linux-probe/2",
 				complete: false,
 				endedAt: new Date().toISOString(),
-				queueCadenceMs: QUEUE_CADENCE_MS,
-				schedCadenceMs: SCHED_CADENCE_MS,
+				...LINUX_PROBE_CADENCE,
 				queueSamples: 0,
 				schedSamples: 0,
 				artifactBytes: writer.bytes,
@@ -614,7 +656,7 @@ function connectProbe(out: string, shardsRaw: string, maxBytes: number): void {
 			if (currentPhase !== "closed")
 				phaseCoverage[currentPhase].queueSamples += 1;
 		}
-		if (tick % (SCHED_CADENCE_MS / QUEUE_CADENCE_MS) === 0) {
+		if (schedPairsWithQueueSample(tick)) {
 			const netRx = parseNetRxSoftirq(read("/proc/softirqs") ?? "");
 			const softnet = parseSoftnetStat(read("/proc/net/softnet_stat") ?? "");
 			const sched = shards.map((shard) => ({
@@ -668,7 +710,10 @@ function connectProbe(out: string, shardsRaw: string, maxBytes: number): void {
 		tick += 1;
 	};
 
-	const timer = setInterval(sample, QUEUE_CADENCE_MS);
+	const gate = new PhaseCadenceGate();
+	const timer = setInterval(() => {
+		if (gate.shouldSample(currentPhase)) sample();
+	}, QUEUE_CADENCE_MS);
 	const finish = (forcedCode = 0): void => {
 		if (finishStarted) return;
 		finishStarted = true;
@@ -712,8 +757,7 @@ function connectProbe(out: string, shardsRaw: string, maxBytes: number): void {
 				endedAt: new Date().toISOString(),
 				monotonicNs: process.hrtime.bigint().toString(),
 				probeCpuEnd: cpuEnd,
-				queueCadenceMs: QUEUE_CADENCE_MS,
-				schedCadenceMs: SCHED_CADENCE_MS,
+				...LINUX_PROBE_CADENCE,
 				queueSamples,
 				schedSamples,
 				artifactBytes: writer.bytes,

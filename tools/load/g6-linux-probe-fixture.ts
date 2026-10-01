@@ -1,12 +1,25 @@
-/** Synthetic raw probe records for parser/evaluator tests, never live proof. */
-export function linuxProbeFixture(shardCount = 1) {
+/**
+ * Synthetic raw probe records for parser/evaluator tests, never live proof.
+ * headerVersion 3 (default) declares the current producer's connect-only 50 ms
+ * queue cadence; 2 is the historical uniform-cadence header. Sample timestamps
+ * are schematic (the parser does not police intra-phase spacing).
+ */
+export function linuxProbeFixture(
+	shardCount = 1,
+	options: { headerVersion?: 2 | 3 } = {},
+) {
+	const headerVersion = options.headerVersion ?? 3;
+	const cadence =
+		headerVersion === 3
+			? { queueCadenceMs: 10, schedCadenceMs: 50, connectQueueCadenceMs: 50 }
+			: { queueCadenceMs: 10, schedCadenceMs: 50 };
 	const phases = ["connect", "steady", "drain", "idle"] as const;
+	// biome-ignore lint/suspicious/noExplicitAny: synthetic rows are mutated freely by tests
 	const rows: Record<string, any>[] = [
 		{
-			schema: "g6-c32-linux-probe-header/2",
+			schema: `g6-c32-linux-probe-header/${headerVersion}`,
 			startedAt: "2026-09-04T00:00:00.000Z",
-			queueCadenceMs: 10,
-			schedCadenceMs: 50,
+			...cadence,
 			measurementMode: { detail: "on", phaseAware: true },
 			producerSha256: "a".repeat(64),
 			phaseOrder: phases,
@@ -82,8 +95,7 @@ export function linuxProbeFixture(shardCount = 1) {
 		complete: true,
 		endedAt: "2026-09-04T00:00:00.200Z",
 		monotonicNs: "300000000",
-		queueCadenceMs: 10,
-		schedCadenceMs: 50,
+		...cadence,
 		queueSamples: 20,
 		schedSamples: 4,
 		artifactBytes: 0,
@@ -131,9 +143,11 @@ export function linuxProbeFixture(shardCount = 1) {
 			}));
 		}
 	}
+	const terminal = rows.at(-1);
+	if (!terminal) throw new Error("fixture has no terminal row");
 	for (const field of ["summary", "historicalConnectSummary"]) {
-		rows.at(-1)![field].peakReceiveQueueBytes *= shardCount;
-		rows.at(-1)![field].peakDrops *= shardCount;
+		terminal[field].peakReceiveQueueBytes *= shardCount;
+		terminal[field].peakDrops *= shardCount;
 	}
 	return rows;
 }
@@ -143,12 +157,11 @@ export function linuxProbeFixtureText(rows = linuxProbeFixture()): string {
 	let bytes = 0;
 	return rows
 		.map((row) => {
-			const encoded =
-				JSON.stringify(
-					row.schema === "g6-c32-linux-probe/2"
-						? { ...row, artifactBytes: bytes }
-						: row,
-				) + "\n";
+			const encoded = `${JSON.stringify(
+				row.schema === "g6-c32-linux-probe/2"
+					? { ...row, artifactBytes: bytes }
+					: row,
+			)}\n`;
 			bytes += Buffer.byteLength(encoded);
 			return encoded;
 		})

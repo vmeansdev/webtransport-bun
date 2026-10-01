@@ -13,7 +13,7 @@ import {
 const hash = (value: string | Buffer) =>
 	createHash("sha256").update(value).digest("hex");
 const PHASES = ["connect", "steady", "drain", "idle"] as const;
-const source = String.raw`
+const source = `
 import { createSocket } from 'node:dgram';
 import { createServer } from 'node:net';
 import { createInterface } from 'node:readline';
@@ -192,10 +192,16 @@ export function validateLinuxProbeProof(
 			.map((line) => record(JSON.parse(line)));
 		const header = record(rows[0]),
 			footer = record(rows.at(-1));
+		// /2 receipts declared one uniform 10/50 ms cadence; /3 adds the 50 ms
+		// connect-only queue cadence, declared identically on header and footer.
+		const historicalHeader = header.schema === "g6-c32-linux-probe-header/2";
 		for (const row of [header, footer])
 			if (
 				row.queueCadenceMs !== 10 ||
 				row.schedCadenceMs !== 50 ||
+				(historicalHeader
+					? "connectQueueCadenceMs" in row
+					: row.connectQueueCadenceMs !== 50) ||
 				record(row.measurementMode).detail !== "on" ||
 				record(row.measurementMode).phaseAware !== true
 			)
@@ -223,7 +229,8 @@ export function validateLinuxProbeProof(
 				fail("raw CPU accounting");
 		}
 		if (
-			header.schema !== "g6-c32-linux-probe-header/2" ||
+			(header.schema !== "g6-c32-linux-probe-header/2" &&
+				header.schema !== "g6-c32-linux-probe-header/3") ||
 			footer.schema !== "g6-c32-linux-probe/2" ||
 			header.producerSha256 !== expected.producerSha256 ||
 			footer.producerSha256 !== expected.producerSha256
@@ -303,7 +310,7 @@ export function validateLinuxProbeProof(
 			const now = BigInt(row.monotonicNs);
 			if (now < sampleClock) fail("raw clock reversed");
 			sampleClock = now;
-			const phaseIndex = PHASES.findIndex((phase) => phase === row.phase);
+			const phaseIndex = PHASES.indexOf(row.phase as (typeof PHASES)[number]);
 			if (phaseIndex < 0) fail("raw phase");
 			if (
 				now < BigInt(String(record(phaseRows[phaseIndex]).monotonicNs)) ||

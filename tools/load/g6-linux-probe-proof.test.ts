@@ -99,7 +99,7 @@ test("raw connect proof refuses altered cadence, child exit, unavailable counter
 			.split("\n")
 			.map((line) => JSON.parse(line));
 		mutation(rows);
-		first.raw = rows.map((row) => JSON.stringify(row)).join("\n") + "\n";
+		first.raw = `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`;
 		expect(() => validateLinuxProbeProof(proof, expected)).toThrow();
 	}
 });
@@ -373,3 +373,66 @@ if (process.platform === "linux")
 				while (!closed && performance.now() < cutoff) await Bun.sleep(10);
 			}
 		}, 15000);
+
+test("raw connect proof accepts the /3 phase-aware header and refuses a misdeclared connect cadence", () => {
+	const proofFor = (
+		mutate: (rows: Record<string, unknown>[]) => void,
+	): ReturnType<typeof linuxProbeProofFixture> => {
+		const proof = linuxProbeProofFixture({
+			...expected,
+			startedAt: "2026-09-06T00:00:00.000Z",
+			finishedAt: "2026-09-06T00:00:03.000Z",
+		});
+		for (const item of proof.cases) {
+			const rows: Record<string, unknown>[] = item.raw
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line));
+			mutate(rows);
+			const footer = requireDefined(rows.at(-1));
+			footer.artifactBytes = Buffer.byteLength(
+				`${rows
+					.slice(0, -1)
+					.map((row) => JSON.stringify(row))
+					.join("\n")}\n`,
+			);
+			item.raw = `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`;
+		}
+		return proof;
+	};
+	const upgrade = (rows: Record<string, unknown>[]) => {
+		requireDefined(rows[0]).schema = "g6-c32-linux-probe-header/3";
+		requireDefined(rows[0]).connectQueueCadenceMs = 50;
+		requireDefined(rows.at(-1)).connectQueueCadenceMs = 50;
+	};
+	expect(
+		validateLinuxProbeProof(proofFor(upgrade), expected).cases,
+	).toHaveLength(2);
+	// Historical /2 receipts still verify unchanged.
+	expect(
+		validateLinuxProbeProof(
+			proofFor(() => {}),
+			expected,
+		).cases,
+	).toHaveLength(2);
+	for (const mutate of [
+		(rows: Record<string, unknown>[]) => {
+			upgrade(rows);
+			requireDefined(rows[0]).connectQueueCadenceMs = 10;
+		},
+		(rows: Record<string, unknown>[]) => {
+			upgrade(rows);
+			delete requireDefined(rows.at(-1)).connectQueueCadenceMs;
+		},
+		(rows: Record<string, unknown>[]) => {
+			requireDefined(rows[0]).connectQueueCadenceMs = 50;
+		},
+		(rows: Record<string, unknown>[]) => {
+			upgrade(rows);
+			requireDefined(rows[0]).schema = "g6-c32-linux-probe-header/4";
+		},
+	])
+		expect(() => validateLinuxProbeProof(proofFor(mutate), expected)).toThrow(
+			/cadence|producer/,
+		);
+});

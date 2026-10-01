@@ -651,6 +651,12 @@ export const LINUX_PROBE_PHASES = [
 	"idle",
 ] as const;
 export const LINUX_PROBE_OPTIONAL_PHASES = ["closed"] as const;
+/** Accepted probe header schemas: /2 is historical uniform 10/50 ms cadence;
+ * /3 also declares a 50 ms connect-phase queue cadence. */
+export const LINUX_PROBE_HEADER_SCHEMAS: readonly string[] = [
+	"g6-c32-linux-probe-header/2",
+	"g6-c32-linux-probe-header/3",
+];
 
 export type LinuxProbePhase =
 	| (typeof LINUX_PROBE_PHASES)[number]
@@ -971,7 +977,7 @@ export function parseLinuxProbeJsonl(text: string): ParsedLinuxProbeJsonl {
 		);
 		if (lineIndex === 0)
 			probeAssert(
-				entry.schema === "g6-c32-linux-probe-header/2",
+				LINUX_PROBE_HEADER_SCHEMAS.includes(entry.schema as string),
 				"header must be first",
 			);
 		if (pendingSched)
@@ -979,7 +985,7 @@ export function parseLinuxProbeJsonl(text: string): ParsedLinuxProbeJsonl {
 				entry.schema === "g6-c32-linux-probe-sched/2",
 				"scheduled scheduler sample is missing",
 			);
-		if (entry.schema === "g6-c32-linux-probe-header/2") {
+		if (LINUX_PROBE_HEADER_SCHEMAS.includes(entry.schema as string)) {
 			probeAssert(
 				header === null && lineIndex === 0,
 				"has duplicate or late header",
@@ -993,8 +999,15 @@ export function parseLinuxProbeJsonl(text: string): ParsedLinuxProbeJsonl {
 				entry.producerSha256,
 				"Linux probe header producerSha256",
 			);
+			// /2 declared one uniform 10/50 ms cadence; /3 additionally declares
+			// the connect-only 50 ms queue cadence (sched still pairs every 5th
+			// executed queue sample, so connect sched is every 250 ms).
 			probeAssert(
-				entry.queueCadenceMs === 10 && entry.schedCadenceMs === 50,
+				entry.queueCadenceMs === 10 &&
+					entry.schedCadenceMs === 50 &&
+					(entry.schema === "g6-c32-linux-probe-header/2"
+						? !("connectQueueCadenceMs" in entry)
+						: entry.connectQueueCadenceMs === 50),
 				"cadence differs from the fixed producer",
 			);
 			probeClaim(entry.phaseOrder, [...LINUX_PROBE_PHASES], "phase order");
@@ -1277,6 +1290,11 @@ export function parseLinuxProbeJsonl(text: string): ParsedLinuxProbeJsonl {
 		summary.schedCadenceMs,
 		header.schedCadenceMs,
 		"scheduler cadence",
+	);
+	probeClaim(
+		summary.connectQueueCadenceMs,
+		header.connectQueueCadenceMs,
+		"connect queue cadence",
 	);
 	probeAssert(
 		summary.truncated === false,
