@@ -107,6 +107,13 @@ export const CAPACITY_HARNESS_PROOF_FILES = [
 	"tools/load/g6-capacity-raw-cell.test.ts",
 	"tools/load/g6-capacity-work-authority.test.ts",
 	"tools/load/g6-capacity-host-review.test.ts",
+	// r5 successor: paired attribution decision, datagram-driver echo and the
+	// local receipt producer are harness lifecycle proof too.
+	"tools/load/g6-capacity-attribution-r5.test.ts",
+	"tools/load/g6-capacity-r5-decision.test.ts",
+	"tools/load/g6-capacity-r5-goal.test.ts",
+	"tools/load/g6-datagram-driver.test.ts",
+	"tools/load/g6-capacity-local-receipt.test.ts",
 ] as const;
 export function capacityLocalProofArgv(
 	kind: LocalReceiptKind,

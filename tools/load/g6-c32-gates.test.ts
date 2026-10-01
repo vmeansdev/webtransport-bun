@@ -311,7 +311,7 @@ describe("G6 c32 immutable gate catalog", () => {
 		);
 		expect(
 			catalog.gates.filter(({ phase }) => phase === "PREPARED_HOST"),
-		).toHaveLength(10);
+		).toHaveLength(11);
 		expect(
 			catalog.gates.find((g) => g.id === "prepared-server-native-unit-tests"),
 		).toMatchObject({
