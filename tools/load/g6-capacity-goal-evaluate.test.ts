@@ -36,6 +36,7 @@ import {
 	type CapacityGoalEvaluation,
 	capacityLocalProofArgv,
 	type LocalReceiptKind,
+	validateCapacityGoalContract,
 } from "./g6-capacity-goal-evaluate.ts";
 import {
 	linuxProbeFixture,
@@ -2472,6 +2473,93 @@ describe("g6-capacity-goal-evaluate", () => {
 			const decision = parseStdout(result.stdout);
 			expect(decision.reasons).toContain(
 				"approval semantic freeze authority digest is unbound",
+			);
+		} finally {
+			rmSync(fixture.root, { force: true, recursive: true });
+		}
+	}, 15000);
+});
+
+describe("r5 contract v2 (budget top-up and pump ladder profile)", () => {
+	function contractOf(fixture: ReturnType<typeof scenario>) {
+		return JSON.parse(readFileSync(fixture.contractPath, "utf8"));
+	}
+	test("accepts the 2026-10-01 aggregate, A08 sealed prior spend and exact headroom", () => {
+		const fixture = scenario();
+		try {
+			const contract = contractOf(fixture);
+			contract.objective = {
+				...contract.objective,
+				aggregateBudgetMicrousd: 133_544_166,
+				sealedPriorSpendMicrousd: 104_996_710,
+				headroomMicrousd: 28_547_456,
+			};
+			expect(validateCapacityGoalContract(contract).objective).toMatchObject({
+				aggregateBudgetMicrousd: 133_544_166,
+				sealedPriorSpendMicrousd: 104_996_710,
+				headroomMicrousd: 28_547_456,
+			});
+			contract.objective.headroomMicrousd = 28_547_457;
+			expect(() => validateCapacityGoalContract(contract)).toThrow(
+				"headroom exceeds aggregate budget",
+			);
+		} finally {
+			rmSync(fixture.root, { force: true, recursive: true });
+		}
+	});
+	test("ladder profile accepts only the pump datagram path, never a default", () => {
+		const fixture = scenario();
+		try {
+			const contract = contractOf(fixture);
+			expect(
+				validateCapacityGoalContract(contract).ladder.profile,
+			).not.toHaveProperty("datagramPump");
+			for (const udpSendBatch of [0, 64]) {
+				contract.ladder.profile = {
+					...RAW_PROFILE,
+					udpSendBatch,
+					datagramPump: "pump",
+				};
+				expect(
+					validateCapacityGoalContract(contract).ladder.profile,
+				).toMatchObject({ datagramPump: "pump", udpSendBatch });
+			}
+			for (const datagramPump of ["legacy", null, 1]) {
+				contract.ladder.profile = { ...RAW_PROFILE, datagramPump };
+				expect(() => validateCapacityGoalContract(contract)).toThrow(
+					"datagramPump must be the pump candidate",
+				);
+			}
+			contract.ladder.profile = {
+				...RAW_PROFILE,
+				datagramPump: "pump",
+				reflectRingBypass: "on",
+			};
+			expect(() => validateCapacityGoalContract(contract)).toThrow(
+				"reflectRingBypass differs from approved fixed profile",
+			);
+		} finally {
+			rmSync(fixture.root, { force: true, recursive: true });
+		}
+	});
+	test("a pump contract refuses raw rated cells lacking the datagram echo", () => {
+		const fixture = scenario({
+			breakContract(contract) {
+				(contract.ladder as Record<string, unknown>).profile = {
+					...RAW_PROFILE,
+					datagramPump: "pump",
+				};
+			},
+		});
+		try {
+			const result = runEvaluator(
+				fixture.repoRoot,
+				fixture.evidenceRoot,
+				fixture.contractPath,
+			);
+			expect(result.exitCode).toBe(2);
+			expect(parseStdout(result.stdout).reasons.join("\n")).toContain(
+				"L5000-1: scan command SCAN_DATAGRAM_PUMP differs",
 			);
 		} finally {
 			rmSync(fixture.root, { force: true, recursive: true });

@@ -11,7 +11,12 @@ import {
 	validatePriorSpendLedger,
 	validateSpendLedger,
 } from "./g6-c32-budget.ts";
-import { makeCapacityLadderWorkPlan } from "./g6-c32-capacity-work.ts";
+import {
+	makeCandidateAttributionWorkPlan,
+	makeCapacityLadderWorkPlan,
+	R5_LADDER_PLAN_IDS,
+	type R5LadderPlanId,
+} from "./g6-c32-capacity-work.ts";
 import {
 	loadRigStateFromJournal,
 	validateG6DestructionReceipt,
@@ -63,6 +68,11 @@ import {
 	verifyWorkFinal,
 } from "./g6-c32-work-execution.ts";
 import type { WorkPlan, WorkStep, WorkTarget } from "./g6-c32-work-plan.ts";
+import { makeCandidateLadderWorkProfiles } from "./g6-c32-work-profile.ts";
+import {
+	evaluateR5Attribution,
+	type R5Decision,
+} from "./g6-capacity-attribution-r5.ts";
 import type { CapacityGoalContract } from "./g6-capacity-goal-evaluate.ts";
 import {
 	contextFromBound,
@@ -73,6 +83,16 @@ import {
 	CAPACITY_NATIVE_PROOF_TESTS,
 	capacityLocalProofArgv,
 } from "./g6-capacity-proof-catalog.ts";
+import {
+	batchOwnershipTestsPassed,
+	expectedR5LadderPlanId,
+	extractR5CellSummary,
+	isR5AttributionPlanId,
+	isR5LadderPlanId,
+	R5_VENDORED_WTRANSPORT_GATE_ID,
+	validateR5CandidateDecision,
+	vendoredWtransportTestsPassed,
+} from "./g6-capacity-r5-decision.ts";
 import { validateCapacityRawCell } from "./g6-capacity-raw-cell.ts";
 import type { RawPairIdentity } from "./g6-capacity-raw-work.ts";
 import {
@@ -118,9 +138,18 @@ export type CapacityGoalAdaptersInput = Readonly<{
 	contract: CapacityGoalContract;
 	verified: ReadonlyMap<string, string>;
 }>;
+/** r5 B ladder binding derived from the reviewed, recompute-equal A' decision. */
+export type CapacityR5LadderBinding = Readonly<{
+	sendPath: "stock" | "batch64";
+	probeInB: boolean;
+	calibrationDisposition: "non-interference" | "interference";
+	/** E2: a probe-off ladder makes no detailed-probe mechanism claim. */
+	mechanismClaim: "detailed-probe" | "none";
+}>;
 export type CapacityGoalAdaptersResult = {
 	fatalReasons: string[];
 	pendingReasons: string[];
+	r5?: CapacityR5LadderBinding;
 };
 type Row = Record<string, unknown>;
 const SCHEMAS = {
@@ -444,6 +473,12 @@ function loadCampaign(
 				context.contract.objective.sealedPriorSpendMicrousd)
 	)
 		fail(`${lane} budget differs from the immutable goal ceiling/prior spend`);
+	if (lane === "A" && isR5AttributionPlanId(policy.workPlan.id)) {
+		// r5 chains A' to the exact sealed prior final ledger (A08 for r5).
+		if (!policy.priorLedger)
+			fail("A' policy lacks its sealed prior spend ledger chain");
+		validatePriorSpendLedger(policy, context.json(policy.priorLedger.path));
+	}
 	for (const profile of Object.values(policy.workProfiles))
 		for (const [key, expected] of Object.entries(
 			context.contract.ladder.profile,
@@ -451,7 +486,12 @@ function loadCampaign(
 			if (
 				!(
 					lane === "A" &&
-					["udpSendBatch", "reflectRingBypass", "detailedProbe"].includes(key)
+					[
+						"udpSendBatch",
+						"reflectRingBypass",
+						"detailedProbe",
+						"datagramPump",
+					].includes(key)
 				) &&
 				(profile as unknown as Row)[key] !== expected
 			)
@@ -657,6 +697,115 @@ function attribution(context: EvidenceContext, campaign: Campaign) {
 		diagnosticCell(context, campaign, completion.nodeId);
 	return result;
 }
+const isR5 = (campaign: Campaign) =>
+	isR5AttributionPlanId(campaign.policy.workPlan.id);
+/** The named batch ownership tests passed in the source-bound local native receipt. */
+function localBatchOwnership(
+	context: EvidenceContext,
+	sourceSha: string,
+): boolean {
+	try {
+		const local = context.contract.localVerification.receipts.find(
+			(row) => row.receiptKind === "candidate-local-native",
+		);
+		const native = object(context.json(local?.path), "local native receipt");
+		const commands = Array.isArray(native.commands) ? native.commands : [];
+		const command = object(commands[0], "native command"),
+			out = context.read(command.stdoutPath),
+			err = context.read(command.stderrPath);
+		if (
+			native.sourceSha !== sourceSha ||
+			command.exitCode !== 0 ||
+			command.signal ||
+			digest(out) !== command.stdoutSha256 ||
+			digest(err) !== command.stderrSha256
+		)
+			return false;
+		assertNativeProofOutput(`${out}\n${err}`, false);
+		return batchOwnershipTestsPassed(`${out}\n${err}`);
+	} catch {
+		return false;
+	}
+}
+/** r5 A': recompute the pre-registered decision from validated raw cells only. */
+function attributionR5(context: EvidenceContext, campaign: Campaign) {
+	same(
+		campaign.policy.workPlan,
+		makeCandidateAttributionWorkPlan(),
+		"A' r5 attribution DAG",
+	);
+	const cells = campaign.progress.completions.map((completion) => {
+		const node = requireDefined(
+			campaign.policy.workPlan.nodes.find(
+				(row) => row.id === completion.nodeId,
+			),
+		);
+		return extractR5CellSummary(
+			readWorkCellEvidence(
+				campaign.workRoot,
+				node,
+				requireDefined(campaign.policy.workProfiles[node.profile]),
+				campaign.workAuthority,
+			),
+			{ outcome: completion.grade.outcome, startedAt: completion.startedAt },
+		);
+	});
+	return evaluateR5Attribution({
+		cells,
+		expectedSourceSha: campaign.sourceSha,
+		batchOwnershipTestsPassed: localBatchOwnership(context, campaign.sourceSha),
+	});
+}
+/** B exists only for a SELECTED, go decision, and runs exactly its encoded variant. */
+function assertR5Ladder(
+	context: EvidenceContext,
+	a: Campaign,
+	b: Campaign,
+	decision: R5Decision,
+): CapacityR5LadderBinding {
+	if (
+		decision.status !== "SELECTED" ||
+		!decision.bGo ||
+		decision.sendPath === null ||
+		decision.probeInB === null
+	)
+		fail(
+			`B exists although the A' decision is ${decision.status} with bGo=${decision.bGo}`,
+		);
+	const disposition = decision.calibration.disposition;
+	if (
+		disposition === "unmeasured" ||
+		decision.probeInB !== (disposition === "non-interference")
+	)
+		fail("r5 probe choice differs from the recorded calibration disposition");
+	const id = expectedR5LadderPlanId(decision.probeInB);
+	if (b.policy.workPlan.id !== id)
+		fail(`r5 B work plan must be ${id} for the recorded calibration`);
+	same(b.policy.workPlan, makeCapacityLadderWorkPlan(id), "r5 B work DAG");
+	if (b.sourceSha !== a.sourceSha)
+		fail("r5 B source differs from the A' source (E1 continuity)");
+	same(
+		b.policy.workProfiles,
+		makeCandidateLadderWorkProfiles(
+			requireDefined(a.policy.workProfiles.Xoff),
+			{ sendPath: decision.sendPath, probe: decision.probeInB },
+		),
+		"r5 B candidate profile",
+	);
+	const profile = context.contract.ladder.profile;
+	if (
+		profile.datagramPump !== "pump" ||
+		profile.udpSendBatch !== (decision.sendPath === "batch64" ? 64 : 0) ||
+		profile.reflectRingBypass !== "off"
+	)
+		fail("contract ladder profile differs from the r5 decision");
+	return {
+		sendPath: decision.sendPath,
+		probeInB: decision.probeInB,
+		calibrationDisposition: disposition,
+		mechanismClaim: decision.probeInB ? "detailed-probe" : "none",
+	};
+}
 function diagnosticCell(
 	_context: EvidenceContext,
 	campaign: Campaign,
@@ -705,9 +854,17 @@ function bindContractCells(context: EvidenceContext, campaign: Campaign): void {
 				operationReceiptPath: "scan.receipt.json",
 				probePath: "linux-probe.jsonl",
 			})) {
+				// An r5 probe-off cell retains no probe file: bind the exact path only.
+				const absent =
+					field === "probePath" &&
+					isR5LadderPlanId(campaign.policy.workPlan.id) &&
+					requireDefined(campaign.policy.workProfiles[node.profile])
+						.detailedProbe === false;
 				const actual = relative(
 					context.evidenceRoot,
-					context.repoPath(`${prefix}/${filename}`),
+					absent
+						? join(context.repoRoot, portable(`${prefix}/${filename}`))
+						: context.repoPath(`${prefix}/${filename}`),
 				)
 					.split(sep)
 					.join("/");
@@ -753,7 +910,7 @@ function bindContractCells(context: EvidenceContext, campaign: Campaign): void {
 function candidateDigests(
 	context: EvidenceContext,
 	campaign: Campaign,
-	result: ReturnType<typeof evaluateSendPathAttribution>,
+	result: unknown,
 ): CapacityAttributionDigests {
 	return {
 		semanticFreezeArtifactSha256: canonicalArtifactSha256(
@@ -945,6 +1102,27 @@ function waiterSafety(
 		)
 			fail("local native source command differs from final candidate");
 	}
+	const r5Batch =
+		isR5LadderPlanId(b.policy.workPlan.id) &&
+		Object.values(b.policy.workProfiles).some(
+			(profile) => profile.udpSendBatch === 64,
+		);
+	if (r5Batch) {
+		// r5 batch64 is admissible only with the named output-ownership tests
+		// passing in both direct receipts (local native and prepared Linux).
+		const outputs = [
+			native,
+			object(context.json(linux.path), "Linux proof"),
+		].map((receipt) => {
+			const command = object(
+				Array.isArray(receipt.commands) ? receipt.commands[0] : null,
+				"native proof command",
+			);
+			return `${context.read(command.stdoutPath)}\n${context.read(command.stderrPath)}`;
+		});
+		if (!outputs.every(batchOwnershipTestsPassed))
+			fail("batch64 lacks passing named output-ownership test receipts");
+	}
 	const origin = object(
 		context.json(record.preparedOriginPath),
 		"prepared origin",
@@ -1014,6 +1192,8 @@ function waiterSafety(
 		BigInt(operation.durationMonotonicNs) > 35_000_000_000n
 	)
 		fail("Linux process gate is not a successful bounded pre-load operation");
+	if (isR5LadderPlanId(b.policy.workPlan.id))
+		verifyR5VendoredWtransportGate(context, b, setup.finishedAt);
 	const sshArgs = preparedGateSshArgs({
 		command: "bun",
 		args: ["tools/load/g6-c32-linux-work-process-proof.ts"],
@@ -1123,6 +1303,70 @@ function waiterSafety(
 	verifyLocalReceipts(context);
 }
 
+/** E3: r5 B's prepared host passed the exact-catalog vendored wtransport gate. */
+function verifyR5VendoredWtransportGate(
+	context: EvidenceContext,
+	b: Campaign,
+	setupFinishedAt: string,
+): void {
+	const id = R5_VENDORED_WTRANSPORT_GATE_ID,
+		references = b.bound.hostBinding.authority.gates.receipts.filter(
+			(row) => row.id === id,
+		);
+	if (references.length !== 1 || !references[0])
+		fail("missing exact prepared vendored wtransport gate");
+	const reference = references[0],
+		gate = validateGateReceipt(
+			context.json(`${b.reference.boundRoot}/${reference.receipt.path}`),
+		),
+		operation = validateOperationReceipt(
+			context.json(
+				`${b.reference.boundRoot}/${reference.operationReceipt.path}`,
+			),
+		);
+	const definition = requireDefined(
+		G6_C32_GATE_CATALOG.gates.find((row) => row.id === id),
+	);
+	if (
+		gate.gate.id !== id ||
+		gate.gate.definitionSha256 !== gateDefinitionSha256(definition) ||
+		gate.gateCatalogAuthoritySha256 !==
+			canonicalAuthoritySha256(G6_C32_GATE_CATALOG) ||
+		gate.result.operationReceiptArtifactSha256 !==
+			canonicalArtifactSha256(operation) ||
+		gate.result.verdict !== "PASS"
+	)
+		fail("vendored wtransport gate differs from exact catalog/operation");
+	for (const envelope of [gate.envelope, operation.envelope])
+		if (
+			envelope.runId !== b.bound.runId ||
+			envelope.phase !== "PREPARED_HOST" ||
+			envelope.operationId !== `gate-${id}` ||
+			envelope.clockSource !== "offrunner"
+		)
+			fail("vendored wtransport gate belongs to another prepared run");
+	if (
+		operation.status.outcome !== "SUCCEEDED" ||
+		operation.status.exitCode !== 0 ||
+		operation.status.signal !== null ||
+		ms(operation.finishedAt) > ms(setupFinishedAt) ||
+		ms(operation.startedAt) < ms(b.firstCreate.recordedAt)
+	)
+		fail("vendored wtransport gate is not a successful pre-load operation");
+	for (const path of [operation.stdoutPath, operation.stderrPath])
+		if (!path.startsWith(`${b.bound.runId}/operations/`))
+			fail("vendored wtransport output escaped its provisioning run");
+	const provisioningRoot = dirname(b.root),
+		[stdout, stderr] = [operation.stdoutPath, operation.stderrPath].map(
+			(path) =>
+				context.readAbsolute(resolve(provisioningRoot, path)).toString("utf8"),
+		);
+	if (!vendoredWtransportTestsPassed(`${stdout}\n${stderr}`))
+		fail(
+			"vendored wtransport gate lacks the named passing datagram-pump tests",
+		);
+}
+
 export { validateCapacityDiagnosticCoverage } from "./g6-capacity-diagnostic-coverage.ts";
 
 export type CapacityAttributionDigests = Readonly<{
@@ -1158,6 +1402,59 @@ export type CapacityCandidateReview = Readonly<{
 	decisionSha256: string;
 	afterArchitectReceiptArtifactSha256: string | null;
 }>;
+/** Sequential unconditional Architect then Critic approval of exact decision bytes. */
+function validateCandidateReviews(
+	input: { architect: unknown; critic: unknown },
+	expected: {
+		sourceSha: string;
+		decisionSha256: string;
+		decisionRecordedAt: string;
+		bCreateAt: string | null;
+	},
+): void {
+	const reviews = [input.architect, input.critic].map((value, index) => {
+		const row = exact(
+			value,
+			[
+				"schema",
+				"role",
+				"verdict",
+				"unconditional",
+				"recordedAt",
+				"sourceSha",
+				"decisionSha256",
+				"afterArchitectReceiptArtifactSha256",
+			],
+			"candidate review",
+		);
+		if (
+			row.schema !== "g6-capacity-candidate-review/1" ||
+			row.role !== (index ? "critic" : "architect") ||
+			row.verdict !== "APPROVE" ||
+			row.unconditional !== true ||
+			row.sourceSha !== expected.sourceSha ||
+			row.decisionSha256 !== expected.decisionSha256
+		)
+			fail(
+				"candidate review lacks unconditional exact source/decision approval",
+			);
+		if (
+			ms(row.recordedAt) <= ms(expected.decisionRecordedAt) ||
+			(expected.bCreateAt !== null &&
+				ms(row.recordedAt) >= ms(expected.bCreateAt))
+		)
+			fail("candidate review is outside the post-decision/pre-create interval");
+		return row;
+	});
+	if (
+		requireDefined(reviews[0]).afterArchitectReceiptArtifactSha256 !== null ||
+		requireDefined(reviews[1]).afterArchitectReceiptArtifactSha256 !==
+			canonicalArtifactSha256(input.architect) ||
+		ms(requireDefined(reviews[1]).recordedAt) <=
+			ms(requireDefined(reviews[0]).recordedAt)
+	)
+		fail("candidate reviews are not sequential Architect then Critic");
+}
 /** Semantic choice remains a human review; the machine verifies the exact reviewed evidence graph. */
 export function validateCapacityCandidateDecision(input: {
 	decisionBytes: string | Buffer;
@@ -1236,47 +1533,15 @@ export function validateCapacityCandidateDecision(input: {
 	if (!ids.has(text(decision.selectedAlternativeId, "selected alternative")))
 		fail("candidate selection is orphaned from reviewed alternatives");
 	text(decision.selectionExplanation, "candidate selection explanation");
-	const reviews = [input.architect, input.critic].map((value, index) => {
-		const row = exact(
-			value,
-			[
-				"schema",
-				"role",
-				"verdict",
-				"unconditional",
-				"recordedAt",
-				"sourceSha",
-				"decisionSha256",
-				"afterArchitectReceiptArtifactSha256",
-			],
-			"candidate review",
-		);
-		if (
-			row.schema !== "g6-capacity-candidate-review/1" ||
-			row.role !== (index ? "critic" : "architect") ||
-			row.verdict !== "APPROVE" ||
-			row.unconditional !== true ||
-			row.sourceSha !== expected.sourceSha ||
-			row.decisionSha256 !== digest(input.decisionBytes)
-		)
-			fail(
-				"candidate review lacks unconditional exact source/decision approval",
-			);
-		if (
-			ms(row.recordedAt) <= ms(decision.recordedAt) ||
-			ms(row.recordedAt) >= ms(expected.bCreateAt)
-		)
-			fail("candidate review is outside the post-decision/pre-create interval");
-		return row;
-	});
-	if (
-		requireDefined(reviews[0]).afterArchitectReceiptArtifactSha256 !== null ||
-		requireDefined(reviews[1]).afterArchitectReceiptArtifactSha256 !==
-			canonicalArtifactSha256(input.architect) ||
-		ms(requireDefined(reviews[1]).recordedAt) <=
-			ms(requireDefined(reviews[0]).recordedAt)
-	)
-		fail("candidate reviews are not sequential Architect then Critic");
+	validateCandidateReviews(
+		{ architect: input.architect, critic: input.critic },
+		{
+			sourceSha: expected.sourceSha,
+			decisionSha256: digest(input.decisionBytes),
+			decisionRecordedAt: decision.recordedAt as string,
+			bCreateAt: expected.bCreateAt,
+		},
+	);
 	return decision as CapacityCandidateDecision;
 }
 
@@ -1285,7 +1550,15 @@ export function assertCapacityCompletionPrefix(
 	plan: WorkPlan,
 	completed: readonly WorkStep[],
 ): void {
-	same(plan, makeCapacityLadderWorkPlan(), "capacity work DAG");
+	same(
+		plan,
+		makeCapacityLadderWorkPlan(
+			(R5_LADDER_PLAN_IDS as readonly string[]).includes(plan.id)
+				? (plan.id as R5LadderPlanId)
+				: undefined,
+		),
+		"capacity work DAG",
+	);
 	let next: WorkTarget = plan.entry;
 	for (const step of completed) {
 		if (
@@ -1535,7 +1808,8 @@ export function evaluateCapacityGoalAdapters(
 		campaigns.set(lane, campaign);
 		return campaign;
 	};
-	let auditedDecisionPath: string | null = null;
+	let auditedDecisionPath: string | null = null,
+		r5: CapacityR5LadderBinding | undefined;
 	const recordKeys = {
 		diagnostics: ["schema", "campaignA", "campaignB"],
 		waiterSafety: [
@@ -1581,7 +1855,8 @@ export function evaluateCapacityGoalAdapters(
 			if (name === "diagnostics") {
 				const a = get("A", value.campaignA),
 					b = get("B", value.campaignB);
-				attribution(context, a);
+				if (isR5(a)) attributionR5(context, a);
+				else attribution(context, a);
 				bindContractCells(context, b);
 			} else if (name === "waiterSafety") {
 				waiterSafety(
@@ -1591,28 +1866,49 @@ export function evaluateCapacityGoalAdapters(
 				);
 			} else if (name === "sameHostA") {
 				const a = get("A", value.campaignA),
-					b = get("B", value.campaignB),
-					result = attribution(context, a);
-				assertCampaignSequence(context, a, b);
-				validateCapacityCandidateDecision({
-					decisionBytes: context.read(value.decisionPath),
-					architect: context.json(value.architectPath),
-					critic: context.json(value.criticPath),
-					expected: {
-						sourceASha: a.sourceSha,
-						sourceSha: b.sourceSha,
-						aDigests: candidateDigests(context, a, result),
-						aSealedAt: a.terminal.recordedAt,
-						bCreateAt: b.firstCreate.recordedAt,
-					},
-					readEvidence: (path) => {
-						if (!portable(path).startsWith(`${a.workPath}/work/`))
-							fail(
-								"candidate alternative is not linked to raw A work evidence",
-							);
-						return context.read(path);
-					},
-				});
+					b = get("B", value.campaignB);
+				const readEvidence = (path: string) => {
+					if (!portable(path).startsWith(`${a.workPath}/work/`))
+						fail("candidate alternative is not linked to raw A work evidence");
+					return context.read(path);
+				};
+				if (isR5(a)) {
+					const decision = attributionR5(context, a);
+					assertCampaignSequence(context, a, b);
+					validateR5CandidateDecision({
+						decisionBytes: context.read(value.decisionPath),
+						architect: context.json(value.architectPath),
+						critic: context.json(value.criticPath),
+						recomputed: decision,
+						expected: {
+							sourceSha: a.sourceSha,
+							aDigests: candidateDigests(context, a, decision),
+							aSealedAt: a.terminal.recordedAt,
+							bCreateAt: b.firstCreate.recordedAt,
+						},
+						readEvidence,
+						validateReviews: validateCandidateReviews,
+					});
+					r5 = assertR5Ladder(context, a, b, decision);
+				} else {
+					if (b.policy.workPlan.id !== "g6-capacity-ladder-b")
+						fail("historical A requires the historical B ladder plan");
+					const result = attribution(context, a);
+					assertCampaignSequence(context, a, b);
+					validateCapacityCandidateDecision({
+						decisionBytes: context.read(value.decisionPath),
+						architect: context.json(value.architectPath),
+						critic: context.json(value.criticPath),
+						expected: {
+							sourceASha: a.sourceSha,
+							sourceSha: b.sourceSha,
+							aDigests: candidateDigests(context, a, result),
+							aSealedAt: a.terminal.recordedAt,
+							bCreateAt: b.firstCreate.recordedAt,
+						},
+						readEvidence,
+					});
+				}
 				auditedDecisionPath = portable(value.decisionPath);
 			} else {
 				const a = get("A", value.campaignA),
@@ -1663,5 +1959,7 @@ export function evaluateCapacityGoalAdapters(
 			);
 		}
 	}
-	return { fatalReasons, pendingReasons };
+	return r5 && fatalReasons.length === 0
+		? { fatalReasons, pendingReasons, r5 }
+		: { fatalReasons, pendingReasons };
 }

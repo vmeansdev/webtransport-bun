@@ -658,9 +658,12 @@ test("synthetic raw INVALID 40k measurement remains incomplete with all adapters
 	);
 }, 240000);
 test("synthetic first-5k MISS requires complete raw evidence but no lower repeat or companions", async () => {
+	// The work CLI launches only profiles that name their datagram read path,
+	// so this real-CLI replay runs on the r5 (C-PUMP) A'/B lifecycle.
 	const f = await completeGoalAdaptersFixture(processFixture().proof, {
 		bOutcomes: { "L5000-1": "MISS" },
 		realProducerSources: true,
+		r5: {},
 	});
 	roots.push(f.repoRoot);
 	expect(Object.keys(requireDefined(f.contract.pendingAdapters))).toHaveLength(

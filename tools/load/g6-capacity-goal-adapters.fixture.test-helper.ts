@@ -22,7 +22,11 @@ import {
 	sealWorkSpendLedger,
 	validateBudgetPolicy,
 } from "./g6-c32-budget.ts";
-import { makeCapacityLadderWorkPlan } from "./g6-c32-capacity-work.ts";
+import {
+	makeCandidateAttributionWorkPlan,
+	makeCapacityLadderWorkPlan,
+	type R5LadderPlanId,
+} from "./g6-c32-capacity-work.ts";
 import { createCellAdmission } from "./g6-c32-cell-admission.ts";
 import {
 	cleanScan,
@@ -61,13 +65,22 @@ import { validateDesiredRig, validateRigState } from "./g6-c32-rig-model.ts";
 import { evaluateSendPathAttribution } from "./g6-c32-send-path-evaluate.ts";
 import { sendPathFixture } from "./g6-c32-send-path-fixture.test-helper.ts";
 import { publishTerminalEvidence } from "./g6-c32-terminal-evidence.ts";
-import { createWorkFinal } from "./g6-c32-work-execution.ts";
+import {
+	createWorkFinal,
+	readWorkCellEvidence,
+} from "./g6-c32-work-execution.ts";
 import {
 	operationFixture,
 	workClockDomainFixture,
 } from "./g6-c32-work-fixture.test-helper.ts";
 import { gradeWorkCell } from "./g6-c32-work-grade.ts";
 import type { WorkOutcome, WorkTarget } from "./g6-c32-work-plan.ts";
+import {
+	makeCandidateAttributionWorkProfiles,
+	makeCandidateLadderWorkProfiles,
+	type WorkProfile,
+} from "./g6-c32-work-profile.ts";
+import { evaluateR5Attribution } from "./g6-capacity-attribution-r5.ts";
 import {
 	type CapacityGoalContract,
 	G6_CAPACITY_GOAL_CONTRACT_SCHEMA,
@@ -82,9 +95,19 @@ import {
 	CAPACITY_NATIVE_PROOF_TESTS,
 	capacityLocalProofArgv,
 } from "./g6-capacity-proof-catalog.ts";
+import {
+	expectedR5DecisionFields,
+	expectedR5LadderPlanId,
+	extractR5CellSummary,
+	R5_CANDIDATE_DECISION_SCHEMA,
+	R5_DECISION_ALTERNATIVES,
+	R5_VENDORED_WTRANSPORT_GATE_ID,
+	R5_VENDORED_WTRANSPORT_TESTS,
+} from "./g6-capacity-r5-decision.ts";
 import { deriveWorkAuthority } from "./g6-capacity-work-authority.ts";
 import { linuxProbeFixtureText } from "./g6-linux-probe-fixture.ts";
 import { linuxProbeProofFixture } from "./g6-linux-probe-proof.fixture.test-helper.ts";
+import { LatencyHistogram } from "./latency-histogram.ts";
 
 type Row = Record<string, unknown>;
 function record(value: unknown): Row {
@@ -178,6 +201,45 @@ function producer(root: string) {
 	return hash.digest("hex");
 }
 
+/** r5 synthetic A' arm metrics: a pre-registered selection, not a measurement. */
+export type R5FixtureOptions = {
+	/** Xon server CPU shift vs Xoff; >5% records probe interference. */
+	calibration?: "non-interference" | "interference";
+	/** XB ACK edge large enough (<=0.85x Xoff) to select batch64. */
+	sendPath?: "stock" | "batch64";
+	/** Run B under a different plan/variant than the decision selects. */
+	bPlanId?: R5LadderPlanId;
+	bProbe?: boolean;
+	bSendPath?: "stock" | "batch64";
+	/** Make A0 cheaper than C-PUMP so no candidate is selected. */
+	noCandidate?: boolean;
+	/** Replace the prepared vendored wtransport gate stdout (E3 tamper). */
+	vendoredGateStdout?: string;
+	/** Scale one A' cell's offered moves (offered-work parity edge). */
+	offeredMovesSkew?: Readonly<Record<string, number>>;
+};
+function r5ArmMetrics(nodeId: string, r5: R5FixtureOptions) {
+	const arm = requireDefined(nodeId.split("-")[0]);
+	const pump = arm !== "A0";
+	const generatorCpuMs = r5.noCandidate ? 200000 : pump ? 150000 : 200000;
+	const serverCpuMs =
+		arm === "Xon" && r5.calibration === "interference" ? 264000 : 240000;
+	const ackMs =
+		arm === "A0"
+			? r5.noCandidate
+				? 4
+				: 20
+			: arm === "XB" && r5.sendPath === "batch64"
+				? 4
+				: 10;
+	return { generatorCpuMs, serverCpuMs, ackMs };
+}
+function histogramJson(ms: number): unknown {
+	const histogram = new LatencyHistogram();
+	for (let i = 0; i < 1000; i++) histogram.record(Math.round(ms * 1e6));
+	return histogram.toJson();
+}
+
 /** Full approved 24-shard shape, with synthetic raw events rather than live measurements. */
 export async function completeGoalAdaptersFixture(
 	processProof: ReturnType<
@@ -187,8 +249,11 @@ export async function completeGoalAdaptersFixture(
 		bOutcomes?: Readonly<Record<string, WorkOutcome>>;
 		realProducerSources?: boolean;
 		preparedProcessCwd?: string;
+		/** r5 A' (C-PUMP attribution) + recompute-bound decision + selected B. */
+		r5?: R5FixtureOptions;
 	} = {},
 ) {
+	const r5 = options.r5;
 	const repoRoot = realpathSync(
 		mkdtempSync(join(tmpdir(), "g6-all-goal-adapters-")),
 	);
@@ -219,7 +284,7 @@ export async function completeGoalAdaptersFixture(
 	const raw = sendPathFixture();
 	if (raw.policy.schema !== "g6-c32-budget-policy/2")
 		throw Error("synthetic policy /2 required");
-	const aPolicy = validateBudgetPolicy({
+	let aPolicy = validateBudgetPolicy({
 		...raw.policy,
 		workProfiles: Object.fromEntries(
 			Object.entries(raw.policy.workProfiles).map(([name, value]) => [
@@ -228,30 +293,86 @@ export async function completeGoalAdaptersFixture(
 			]),
 		),
 	});
+	// r5 chains A' to a sealed prior ledger (A08 in the live campaign).
+	const priorLedgerPath = "evidence/prior/final-spend-ledger.json";
+	let r5Common: WorkProfile | null = null;
+	if (r5) {
+		const priorLedger = [
+			appendSpendLedgerEntry(null, {
+				recordedAt: at(-3600),
+				campaignId: aPolicy.campaignId,
+				runId: "synthetic-a08",
+				budgetPolicySha256: "d".repeat(64),
+				event: "SEAL",
+				accruedLifecycleMicrousd: 0,
+				prospectiveCellMicrousd: 0,
+				teardownReserveMicrousd: 0,
+				totalAuthorizedMicrousd: 104996710,
+				remainingBudgetMicrousd: 28547456,
+				decision: null,
+			}),
+		];
+		write(repoRoot, priorLedgerPath, priorLedger);
+		const common: WorkProfile = {
+			...requireDefined(
+				(aPolicy as { workProfiles: Record<string, WorkProfile> }).workProfiles[
+					"stock-probe-off"
+				],
+			),
+			datagramPump: "pump",
+		};
+		r5Common = common;
+		const workPlan = makeCandidateAttributionWorkPlan();
+		aPolicy = validateBudgetPolicy({
+			...aPolicy,
+			totalBudgetMicrousd: 133544166,
+			spentBeforeMicrousd: 104996710,
+			priorLedger: {
+				path: priorLedgerPath,
+				sha256: canonicalArtifactSha256(priorLedger),
+				sealedSpentMicrousd: 104996710,
+			},
+			cellMaximumSeconds: { "attribution-r4": 420 },
+			allowedStages: ["attribution-r4"],
+			workPlan,
+			workProfiles: makeCandidateAttributionWorkProfiles(common),
+		});
+	}
 	const a = await campaign("A", 0, aPolicy);
 	const candidateChangePath = options.realProducerSources
 		? "crates/native/src/capacity_fixture_identity.rs"
 		: "crates/native/src/datagram_reflector.rs";
-	write(
-		repoRoot,
-		candidateChangePath,
-		"// Synthetic native-only candidate B\n",
-	);
-	git(repoRoot, "add", candidateChangePath);
-	git(
-		repoRoot,
-		"commit",
-		"--quiet",
-		"-m",
-		"Change synthetic native candidate B",
-	);
-	const profile = {
-		...(raw.policy.schema === "g6-c32-budget-policy/2"
-			? requireDefined(raw.policy.workProfiles["stock-probe-on"])
-			: {}),
-		reflectRingBypass: "off",
-		shards: 24,
-	};
+	if (!r5) {
+		write(
+			repoRoot,
+			candidateChangePath,
+			"// Synthetic native-only candidate B\n",
+		);
+		git(repoRoot, "add", candidateChangePath);
+		git(
+			repoRoot,
+			"commit",
+			"--quiet",
+			"-m",
+			"Change synthetic native candidate B",
+		);
+	}
+	const r5BSendPath = r5?.bSendPath ?? r5?.sendPath ?? "stock",
+		r5BProbe = r5?.bProbe ?? r5?.calibration !== "interference";
+	const profile = r5Common
+		? requireDefined(
+				makeCandidateLadderWorkProfiles(r5Common, {
+					sendPath: r5BSendPath,
+					probe: r5BProbe,
+				}).candidate,
+			)
+		: {
+				...(raw.policy.schema === "g6-c32-budget-policy/2"
+					? requireDefined(raw.policy.workProfiles["stock-probe-on"])
+					: {}),
+				reflectRingBypass: "off",
+				shards: 24,
+			};
 	const bPolicy = validateBudgetPolicy({
 		...raw.policy,
 		schema: "g6-c32-budget-policy/2",
@@ -261,7 +382,12 @@ export async function completeGoalAdaptersFixture(
 		maximumLifecycleCostMicrousd: 8252460,
 		cellMaximumSeconds: { ladder: 480, companion: 480 },
 		allowedStages: ["ladder", "companion"],
-		workPlan: makeCapacityLadderWorkPlan(),
+		...(r5 ? { totalBudgetMicrousd: a.policy.totalBudgetMicrousd } : {}),
+		workPlan: r5
+			? makeCapacityLadderWorkPlan(
+					r5.bPlanId ?? expectedR5LadderPlanId(r5BProbe),
+				)
+			: makeCapacityLadderWorkPlan(),
 		workProfiles: { candidate: profile },
 		priorLedger: {
 			path: `${a.reference.runRoot}/terminal/final-spend-ledger.json`,
@@ -341,51 +467,100 @@ export async function completeGoalAdaptersFixture(
 			requireDefined(metadata).startsWith("100755") ? 0o755 : 0o644,
 		);
 	}
-	const aResult = evaluateSendPathAttribution({
-		root: a.workRoot,
-		policy: a.policy,
-		ledger: a.ledger,
-		boundHostPair: a.pair,
-		nativeProducerSha256: a.nativeProducer,
-		probeProducerSha256: a.probeProducer,
-		workAuthority: a.workAuthority,
+	const aDigests = (attribution: unknown) => ({
+		semanticFreezeArtifactSha256: canonicalArtifactSha256(
+			a.bound.semanticFreeze,
+		),
+		hostBindingArtifactSha256: canonicalArtifactSha256(a.bound.hostBinding),
+		terminalReceiptSha256: sha(
+			readFileSync(
+				join(repoRoot, a.reference.runRoot, "terminal/terminal-receipt.json"),
+			),
+		),
+		workFinalArtifactSha256: canonicalArtifactSha256(a.final),
+		attributionArtifactSha256: canonicalArtifactSha256(attribution),
 	});
-	if (
-		!aResult.evidenceValid ||
-		aResult.attributionVerdict !== "VALID_PAIRED_ATTRIBUTION"
-	)
-		throw Error(`synthetic A attribution: ${JSON.stringify(aResult)}`);
-	const decision = {
-		schema: "g6-capacity-candidate-decision/1",
-		recordedAt: at(1500),
-		sourceASha: a.sourceSha,
-		sourceSha: b.sourceSha,
-		aDigests: {
-			semanticFreezeArtifactSha256: canonicalArtifactSha256(
-				a.bound.semanticFreeze,
-			),
-			hostBindingArtifactSha256: canonicalArtifactSha256(a.bound.hostBinding),
-			terminalReceiptSha256: sha(
-				readFileSync(
-					join(repoRoot, a.reference.runRoot, "terminal/terminal-receipt.json"),
+	const aCellPath = (nodeId: string) =>
+		`${a.reference.runRoot}/campaign-${a.policy.runId}/work/${nodeId}/g6-sharded-scan.json`;
+	let decision: Row,
+		r5Decision: ReturnType<typeof evaluateR5Attribution> | null = null;
+	if (r5) {
+		const cells = a.final.completed.map(({ nodeId }) => {
+			const node = requireDefined(
+				a.policy.workPlan.nodes.find((row) => row.id === nodeId),
+			);
+			const completion = record(
+				json(join(a.workRoot, "work", nodeId, "completion.json")),
+			);
+			return extractR5CellSummary(
+				readWorkCellEvidence(
+					a.workRoot,
+					node,
+					requireDefined(a.policy.workProfiles[node.profile]),
+					a.workAuthority,
 				),
-			),
-			workFinalArtifactSha256: canonicalArtifactSha256(a.final),
-			attributionArtifactSha256: canonicalArtifactSha256(aResult),
-		},
-		alternatives: ["selected", "not-selected"].map((id) => ({
-			id,
-			explanation: `Synthetic alternative ${id}, no product inference.`,
-			evidencePaths: [
-				`${a.reference.runRoot}/campaign-${a.policy.runId}/work/A1-1/g6-sharded-scan.json`,
-			],
-			files: ["crates/native/src/datagram_reflector.rs"],
-			tests: ["tools/load/g6-capacity-goal-adapters.ts"],
-		})),
-		selectedAlternativeId: "selected",
-		selectionExplanation:
-			"Synthetic source-linked decision for adapter replay only.",
-	};
+				{
+					outcome: record(completion.grade).outcome as WorkOutcome,
+					startedAt: fixtureText(completion.startedAt),
+				},
+			);
+		});
+		r5Decision = evaluateR5Attribution({
+			cells,
+			expectedSourceSha: a.sourceSha,
+			batchOwnershipTestsPassed: true,
+		});
+		decision = {
+			schema: R5_CANDIDATE_DECISION_SCHEMA,
+			recordedAt: at(1500),
+			sourceSha: a.sourceSha,
+			aDigests: aDigests(r5Decision),
+			...expectedR5DecisionFields(r5Decision),
+			scopeStatement:
+				"Synthetic: A' attributes ACK hold, send path (stock vs batch64, no peer hint), datagram receive path and per-role CPU per offered datagram; the peer-hint arm is excluded and B runs reflectRingBypass off.",
+			alternatives: R5_DECISION_ALTERNATIVES.map((id) => ({
+				id,
+				explanation: `Synthetic alternative ${id}, no product inference.`,
+				evidencePaths: [aCellPath("Xoff-1"), aCellPath("A0-1")],
+				files: ["crates/native/src/datagram_reflector.rs"],
+				tests: ["tools/load/g6-capacity-goal-adapters.ts"],
+			})),
+			selectionExplanation:
+				"Synthetic mechanical application of the pre-registered r5 rule.",
+		};
+	} else {
+		const aResult = evaluateSendPathAttribution({
+			root: a.workRoot,
+			policy: a.policy,
+			ledger: a.ledger,
+			boundHostPair: a.pair,
+			nativeProducerSha256: a.nativeProducer,
+			probeProducerSha256: a.probeProducer,
+			workAuthority: a.workAuthority,
+		});
+		if (
+			!aResult.evidenceValid ||
+			aResult.attributionVerdict !== "VALID_PAIRED_ATTRIBUTION"
+		)
+			throw Error(`synthetic A attribution: ${JSON.stringify(aResult)}`);
+		decision = {
+			schema: "g6-capacity-candidate-decision/1",
+			recordedAt: at(1500),
+			sourceASha: a.sourceSha,
+			sourceSha: b.sourceSha,
+			aDigests: aDigests(aResult),
+			alternatives: ["selected", "not-selected"].map((id) => ({
+				id,
+				explanation: `Synthetic alternative ${id}, no product inference.`,
+				evidencePaths: [aCellPath("A1-1")],
+				files: ["crates/native/src/datagram_reflector.rs"],
+				tests: ["tools/load/g6-capacity-goal-adapters.ts"],
+			})),
+			selectedAlternativeId: "selected",
+			selectionExplanation:
+				"Synthetic source-linked decision for adapter replay only.",
+		};
+	}
 	const decisionPath = "evidence/decision.json";
 	write(repoRoot, decisionPath, decision);
 	const review = (role: string, seconds: number, after: string | null) => ({
@@ -717,6 +892,8 @@ export async function completeGoalAdaptersFixture(
 		evidenceRoot,
 		contract,
 		contractPath,
+		decisionPath,
+		r5Decision,
 		verified,
 		campaignA: a,
 		campaignB: b,
@@ -1072,6 +1249,10 @@ export async function completeGoalAdaptersFixture(
 													),
 												});
 						}
+						if (request.gate.id === R5_VENDORED_WTRANSPORT_GATE_ID)
+							stdout =
+								options.r5?.vendoredGateStdout ??
+								`${R5_VENDORED_WTRANSPORT_TESTS.map((name) => `test ${name} ... ok`).join("\n")}\n\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n`;
 						write(dirname(runRoot), receipt.stdoutPath, stdout);
 						write(dirname(runRoot), receipt.stderrPath, stderr);
 						const receiptPath = `operations/gates/${request.gate.id}/operation.receipt.json`;
@@ -1273,7 +1454,16 @@ export async function completeGoalAdaptersFixture(
 				p = requireDefined(policy.workProfiles[node.profile]);
 			const expectedOutcome =
 				lane === "B" ? (options.bOutcomes?.[node.id] ?? "PASS") : "PASS";
-			const templateId = lane === "A" ? node.id : "A1-1",
+			// r5 arms reuse the historical probe-on/off raw cells and rebind knobs.
+			const templateId = r5
+					? p.udpSendBatch === 64
+						? "B-1"
+						: p.detailedProbe
+							? "A1-1"
+							: "A0-1"
+					: lane === "A"
+						? node.id
+						: "A1-1",
 				template = join(raw.root, "work", templateId),
 				prefix = `work/${node.id}`;
 			const start = offset + 120 + index * 125,
@@ -1309,7 +1499,8 @@ export async function completeGoalAdaptersFixture(
 						"admission.json",
 						"start.json",
 						"work-grade.json",
-					].includes(name)
+					].includes(name) ||
+					(r5 && !p.detailedProbe && name === "linux-probe.jsonl")
 				)
 					continue;
 				const bytes = readFileSync(join(template, name), "utf8");
@@ -1333,6 +1524,11 @@ export async function completeGoalAdaptersFixture(
 			}
 			const steering = record(diagnostic.postRunSteering);
 			steering.capturedAtMs = fixtureNumber(steering.capturedAtMs) + shift;
+			if (r5 && !p.detailedProbe && templateId !== "A0-1")
+				// Probe-off arms on a probe-on template retain the explicit off record.
+				diagnostic.linuxProbe = record(
+					json(join(raw.root, "work", "A0-1", "g6-sharded-diagnostic.json")),
+				).linuxProbe;
 			if (lane === "B") {
 				const fresh = record(
 						transform(cleanScan(node.requestedSessions, p, 1)),
@@ -1441,6 +1637,53 @@ export async function completeGoalAdaptersFixture(
 				record(rung.T2).hostLoad = { gro: "off" };
 				// Preserve native/probe phase cuts while taking the requested-session raw quality counters from the reusable fixture.
 			}
+			if (r5) {
+				// r5 echoes: datagram read path on both roles, per-role steady CPU,
+				// offered work and per-arm ACK/hold histograms (A' only).
+				const client = record(
+					JSON.parse(
+						fixtureText(scan.clientStdout).slice("mmo-client: json ".length),
+					),
+				);
+				const pump = p.datagramPump === "pump";
+				client.datagramDriver = {
+					mode: p.datagramPump,
+					pumpsSpawned: pump ? 128 : 0,
+					pumpsLive: 0,
+				};
+				const steady = record(record(client.windows).steady);
+				const steadyDrain = record(record(client.windows).steadyDrain);
+				const metrics =
+					lane === "A"
+						? r5ArmMetrics(node.id, r5)
+						: { generatorCpuMs: 150000, serverCpuMs: 240000, ackMs: 10 };
+				record(client.client).cpuMsSteady = metrics.generatorCpuMs;
+				steady.scheduleTicksDue = Math.round(
+					fixtureNumber(steady.sent) *
+						(lane === "A" ? (r5.offeredMovesSkew?.[node.id] ?? 1) : 1),
+				);
+				steadyDrain.rtt = histogramJson(metrics.ackMs);
+				steadyDrain.serverHold = histogramJson(0.01);
+				scan.clientStdout = `mmo-client: json ${JSON.stringify(client)}\n`;
+				const aggregate = record(scan.aggregate),
+					aggSteady = record(aggregate.steady),
+					emitter = record(aggSteady.emitter);
+				emitter.ackIssued = fixtureNumber(aggSteady.rxTotal);
+				emitter.snapshotDue = fixtureNumber(emitter.snapshotIssued);
+				aggSteady.cpuMs = metrics.serverCpuMs;
+				record(record(aggregate.lifetime).metrics).datagramPumpsSpawned = pump
+					? p.shards
+					: 0;
+				const shard = requireDefined(fixtureRecords(scan.shards)[0]),
+					windows = record(shard.windows);
+				record(windows.steady).cpuMs = metrics.serverCpuMs;
+				const shardEmitter = record(record(windows.steady).emitter);
+				shardEmitter.ackIssued = emitter.ackIssued;
+				shardEmitter.snapshotDue = emitter.snapshotDue;
+				record(record(windows.lifetime).metrics).datagramPumpsSpawned = pump
+					? p.shards
+					: 0;
+			}
 			const share = (total: number, index: number) =>
 				Math.floor(total / p.shards) + (index < total % p.shards ? 1 : 0);
 			const templateShard = requireDefined(fixtureRecords(scan.shards)[0]);
@@ -1548,6 +1791,20 @@ export async function completeGoalAdaptersFixture(
 				if (name === "scan.receipt.json")
 					receipt.action.args = receipt.action.args.map((arg: string) =>
 						arg.replaceAll("SCAN_SHARDS=1 ", `SCAN_SHARDS=${p.shards} `),
+					);
+				if (r5 && name === "scan.receipt.json")
+					receipt.action.args = receipt.action.args.map((arg: string) =>
+						arg.includes("SCAN_UDP_SEND_BATCH=")
+							? `SCAN_DATAGRAM_PUMP=${p.datagramPump} ${arg
+									.replace(
+										/SCAN_UDP_SEND_BATCH=\d+ /,
+										`SCAN_UDP_SEND_BATCH=${p.udpSendBatch} `,
+									)
+									.replace(
+										/SCAN_LINUX_PROBE_ENABLED=\d /,
+										`SCAN_LINUX_PROBE_ENABLED=${p.detailedProbe ? 1 : 0} `,
+									)}`
+							: arg,
 					);
 				receipt.envelope.runId = runId;
 				receipt.envelope.sequence =

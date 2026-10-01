@@ -1,5 +1,8 @@
 import { createHash } from "node:crypto";
-import { evaluateCapacityGoalAdapters } from "./g6-capacity-goal-adapters.ts";
+import {
+	type CapacityR5LadderBinding,
+	evaluateCapacityGoalAdapters,
+} from "./g6-capacity-goal-adapters.ts";
 import { assertNativeProofOutput } from "./g6-capacity-proof-catalog.ts";
 import {
 	validateClientPorts,
@@ -59,6 +62,7 @@ import {
 	gradeSuccessorRung,
 	type SuccessorGradeRequest,
 } from "./g6-c32-successor-grade.ts";
+import { assertGeneratorDatagramDriver } from "./g6-datagram-driver.ts";
 import type { ParsedLinuxProbeJsonl } from "./g6-sharded-diagnostic.ts";
 import { G6_SHARDED_VALIDITY, steeredTotal } from "./g6-sharded-grade.ts";
 
@@ -114,7 +118,10 @@ type CompanionRunBinding = RawRunPaths &
 		activeWorkloadSessions: number;
 	}>;
 
-type LadderProfile = Readonly<Required<SuccessorGradeRequest["profile"]>>;
+/** r5 ladders add the wtransport datagram read path; it is never defaulted. */
+type LadderProfile = Readonly<
+	Required<SuccessorGradeRequest["profile"]> & { datagramPump?: "pump" }
+>;
 
 const FIXED_PROFILE = {
 	shards: 24,
@@ -182,6 +189,11 @@ export type CapacityGoalEvaluation = Readonly<{
 	exitCode: 0 | 1 | 2;
 	sourceSha: string | null;
 	reasons: string[];
+	/** r5 only: the reviewed, recompute-equal A' decision binding B. */
+	r5?: CapacityR5LadderBinding & {
+		/** Evaluator-recorded E2 disposition: probe-off B makes no mechanism claim. */
+		claims: readonly string[];
+	};
 }>;
 
 function isRecord(value: unknown): value is JsonRecord {
@@ -652,9 +664,15 @@ function validateLadderProfile(value: unknown): LadderProfile {
 	if (!isRecord(value)) fail("contract.ladder.profile must be an object");
 	requireExactKeys(
 		value,
-		[...Object.keys(FIXED_PROFILE), "udpSendBatch"],
+		[
+			...Object.keys(FIXED_PROFILE),
+			"udpSendBatch",
+			...(Object.hasOwn(value, "datagramPump") ? ["datagramPump"] : []),
+		],
 		"contract.ladder.profile",
 	);
+	if (Object.hasOwn(value, "datagramPump") && value.datagramPump !== "pump")
+		fail("contract.ladder.profile.datagramPump must be the pump candidate");
 	for (const [field, expected] of Object.entries(FIXED_PROFILE)) {
 		if (value[field] !== expected)
 			fail(
@@ -665,7 +683,11 @@ function validateLadderProfile(value: unknown): LadderProfile {
 		fail(
 			"contract.ladder.profile.udpSendBatch is not an approved candidate mode",
 		);
-	return { ...FIXED_PROFILE, udpSendBatch: value.udpSendBatch };
+	return {
+		...FIXED_PROFILE,
+		udpSendBatch: value.udpSendBatch,
+		...(value.datagramPump === "pump" ? { datagramPump: "pump" as const } : {}),
+	};
 }
 
 export function validateCapacityGoalContract(
@@ -1313,6 +1335,7 @@ function loadRawRun(
 	sessions: number,
 	active: number,
 	workNodeId = run.label,
+	probeRequired = true,
 ) {
 	const scan = requireRecord(
 		JSON.parse(read(run.scanPath)),
@@ -1393,6 +1416,7 @@ function loadRawRun(
 		sessions,
 		active,
 		startedAt,
+		probeRequired,
 	);
 	read(`${operationRoot}${operation.stderrPath}`);
 	order.sequence = operation.envelope.sequence;
@@ -1460,6 +1484,24 @@ function loadRawRun(
 	)
 		fail("client fixedSourcePortBase differs from registered profile");
 	validateClientPorts(report, contract.ladder.profile);
+	const datagramPump = contract.ladder.profile.datagramPump;
+	if (datagramPump !== undefined) {
+		// Both roles must prove the registered datagram read path carried traffic.
+		assertGeneratorDatagramDriver(report, datagramPump);
+		const spawned = requireRecord(
+			requireRecord(
+				requireRecord(scan.aggregate, "scan aggregate").lifetime,
+				"scan lifetime aggregate",
+			).metrics,
+			"scan lifetime metrics",
+		).datagramPumpsSpawned;
+		if (
+			typeof spawned !== "number" ||
+			!Number.isSafeInteger(spawned) ||
+			spawned < 1
+		)
+			fail("server datagram pump counters contradict the registered profile");
+	}
 	validateRawNumbers(scan, report);
 	validateRawLifecycle(
 		diagnostic,
@@ -1483,7 +1525,8 @@ function loadRawRun(
 			.steered !== rawSteered
 	)
 		fail("diagnostic post-run steering differs from raw witness");
-	const probe = read(run.probePath);
+	// E2 probe-off B retains no detailed probe; never read a stale artifact.
+	const probe = probeRequired ? read(run.probePath) : "";
 	return {
 		scan: scan as unknown as SuccessorGradeRequest["scan"],
 		diagnostic,
@@ -1554,6 +1597,7 @@ function rungDecision(
 	pair: RawPairIdentity,
 	order: OperationOrder,
 	reasons: string[],
+	probeRequired = true,
 ): "CLEAN" | "UNCLEAN" | "INCOMPLETE" {
 	try {
 		const raw = loadRawRun(
@@ -1564,6 +1608,8 @@ function rungDecision(
 			order,
 			run.rung,
 			run.rung,
+			run.label,
+			probeRequired,
 		);
 		const profile = contract.ladder.profile;
 		const grade = gradeSuccessorRung({
@@ -1600,10 +1646,11 @@ function rungDecision(
 				expectedUdpSendBatch: profile.udpSendBatch,
 			},
 			diagnostic: raw.diagnostic,
-			probe: raw.probe,
-			probeRequired: true,
+			probe: probeRequired ? raw.probe : null,
+			probeRequired,
 		});
-		validateProbeEvidence(rca.probePhaseEvidence, contract, raw);
+		if (probeRequired)
+			validateProbeEvidence(rca.probePhaseEvidence, contract, raw);
 		const invalid = [...grade.invalidReasons, ...rca.reasons];
 		if (!Number.isFinite(rca.connectWallSec) || rca.connectWallSec <= 0)
 			invalid.push("connect wall time must be positive");
@@ -1636,6 +1683,7 @@ function evaluateCompanions(
 	requested: number,
 	active: number,
 	reasons: string[],
+	probeRequired = true,
 ): boolean {
 	const companions = contract.ladder.companions ?? [];
 	if (contract.ladder.companionRoot && companions.length === 0) {
@@ -1671,19 +1719,21 @@ function evaluateCompanions(
 				requested,
 				active,
 				`C${requested}-${run.label.slice(1)}`,
+				probeRequired,
 			);
 			const result = evaluateSessionScaleCell({
 				label: run.label,
 				scan: raw.scan,
 				diagnostic: raw.diagnostic,
-				probe: raw.probe,
-				probeRequired: true,
+				probe: probeRequired ? raw.probe : null,
+				probeRequired,
 				expectCandidate: contract.objective.sourceSha,
 				expectedShards: contract.ladder.profile.shards,
 				expectedRequestedSessions: requested,
 				expectedActiveWorkloadSessions: active,
 			});
-			validateProbeEvidence(result.probePhaseEvidence, contract, raw);
+			if (probeRequired)
+				validateProbeEvidence(result.probePhaseEvidence, contract, raw);
 			if (
 				!result.complete ||
 				![result.ingestRatio, result.deliveryRatio, result.dutyRatio].every(
@@ -1707,6 +1757,7 @@ function evaluateLadder(
 	contract: CapacityGoalContract,
 	reasons: string[],
 	verified: ReadonlyMap<string, string>,
+	probeRequired = true,
 ): {
 	goalStatus: EvaluationStatus;
 	liveTargetStatus: LiveTargetStatus;
@@ -1751,7 +1802,15 @@ function evaluateLadder(
 			reasons.push("contract ladder run order is invalid");
 			return incomplete();
 		}
-		const status = rungDecision(read, run, contract, pair, order, reasons);
+		const status = rungDecision(
+			read,
+			run,
+			contract,
+			pair,
+			order,
+			reasons,
+			probeRequired,
+		);
 		if (status === "INCOMPLETE") return incomplete();
 		if (status === "UNCLEAN") {
 			if (rung <= 40_000) liveTargetStatus = "MISS";
@@ -1784,7 +1843,15 @@ function evaluateLadder(
 					return incomplete();
 				}
 				if (
-					rungDecision(read, repeat, contract, pair, order, reasons) !== "CLEAN"
+					rungDecision(
+						read,
+						repeat,
+						contract,
+						pair,
+						order,
+						reasons,
+						probeRequired,
+					) !== "CLEAN"
 				) {
 					reasons.push(
 						`required lower-rung repeat ${repeatLabel} is not clean`,
@@ -1805,6 +1872,7 @@ function evaluateLadder(
 				rung,
 				lower,
 				reasons,
+				probeRequired,
 			);
 			return {
 				goalStatus: complete
@@ -1997,11 +2065,19 @@ export function evaluateCapacityGoal(input: {
 		});
 		fatalReasons.push(...adapters.fatalReasons);
 		pendingReasons.push(...adapters.pendingReasons);
+		// E2: only a reviewed recompute recording "interference" with the exact
+		// probe-off r5 plan relaxes the rated-cell detailed-probe requirement.
+		const r5 = adapters.r5;
+		const probeOff =
+			r5 !== undefined &&
+			!r5.probeInB &&
+			r5.calibrationDisposition === "interference";
 		const ladder = evaluateLadder(
 			evidenceRoot,
 			contract,
 			fatalReasons,
 			verified,
+			!probeOff,
 		);
 		const status =
 			fatalReasons.length === 0 && pendingReasons.length === 0
@@ -2022,6 +2098,18 @@ export function evaluateCapacityGoal(input: {
 			exitCode,
 			sourceSha: contract.objective.sourceSha,
 			reasons: uniq([...fatalReasons, ...pendingReasons]),
+			...(r5
+				? {
+						r5: {
+							...r5,
+							claims: probeOff
+								? [
+										"no mechanism claim: B ran probe-off after A' recorded detailed-probe interference",
+									]
+								: [],
+						},
+					}
+				: {}),
 		};
 	} catch {
 		return {
