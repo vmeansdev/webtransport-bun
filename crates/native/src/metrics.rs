@@ -90,6 +90,11 @@ pub struct ServerMetricsSnapshot {
     pub udp_send_batch_congestion_dropped: Option<f64>,
     pub udp_send_batch_errors: Option<f64>,
     pub udp_send_batch_max_batch: Option<f64>,
+    /// Datagram read tasks the wtransport driver spawned in this process
+    /// (0 when `WTRANSPORT_DATAGRAM_PUMP=0` selects the inline path), and how
+    /// many are alive now. Process-wide, like the batch counters above.
+    pub datagram_pumps_spawned: Option<f64>,
+    pub datagram_pumps_live: Option<f64>,
     pub datagram_reflect_send_errors_by_reason: Option<ReflectSendErrorsSnapshot>,
     /// Native only. Receive-to-reflection duration. Present when any observation.
     pub datagram_reflect_hold: Option<HistogramSnapshot>,

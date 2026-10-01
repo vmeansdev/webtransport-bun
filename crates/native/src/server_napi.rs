@@ -610,6 +610,14 @@ impl ServerHandle {
         .unwrap_or_default()
     }
 
+    /// Datagram read path the wtransport driver uses in this process:
+    /// `"pump"` (dedicated per-connection task, the default) or `"legacy"`
+    /// (inline in the driver select loop, `WTRANSPORT_DATAGRAM_PUMP=0`).
+    #[napi]
+    pub fn server_datagram_driver(&self) -> String {
+        crate::datagram_driver::effective_mode().to_string()
+    }
+
     /// Cross-connection UDP send batch size the addon actually resolved
     /// (`WEBTRANSPORT_NATIVE_UDP_SEND_BATCH`); 0 = off, one sendmsg per
     /// transmit as before.

@@ -799,6 +799,9 @@ export interface WebTransportServer {
 	/** Cross-connection UDP send batch size the addon resolved
 	 * (`WEBTRANSPORT_NATIVE_UDP_SEND_BATCH`); 0 = off, one sendmsg per transmit. */
 	serverUdpSendBatch(): number;
+	/** wtransport driver datagram read path in this process: "pump" (default,
+	 * dedicated per-connection task) | "legacy" (`WTRANSPORT_DATAGRAM_PUMP=0`). */
+	serverDatagramDriver(): string;
 	/** Linux sendmmsg EAGAIN policy: "wait" | "drop". */
 	serverUdpSendEagainMode(): string;
 	/** Native reflector direct-lane mode: "off" | "on". */
@@ -1169,6 +1172,8 @@ export type MetricsSnapshot = {
 	udpSendBatchDropped?: number;
 	udpSendBatchCongestionDropped?: number;
 	udpSendBatchErrors?: number;
+	datagramPumpsSpawned?: number;
+	datagramPumpsLive?: number;
 	udpSendBatchMaxBatch?: number;
 	datagramReflectSendErrorsByReason?: {
 		notConnected: number;
@@ -1645,6 +1650,8 @@ interface NativeServerHandle {
 	serverUdpSendBufferBytes(): number;
 	/** UDP send batch size (0 = off); version-bound with the prebuild. */
 	serverUdpSendBatch(): number;
+	/** Datagram driver read path; version-bound with the prebuild. */
+	serverDatagramDriver(): string;
 	/** Linux sendmmsg EAGAIN policy; version-bound with the prebuild. */
 	serverUdpSendEagainMode(): string;
 	serverReflectRingBypass(): string;
@@ -2777,6 +2784,7 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		serverAckCadence: () => handle.serverAckCadence(),
 		serverUdpSendBufferBytes: () => handle.serverUdpSendBufferBytes(),
 		serverUdpSendBatch: () => handle.serverUdpSendBatch(),
+		serverDatagramDriver: () => handle.serverDatagramDriver(),
 		serverUdpSendEagainMode: () => handle.serverUdpSendEagainMode(),
 		serverReflectRingBypass: () => handle.serverReflectRingBypass(),
 		...(typeof handle.__sendPathDiagnostics === "function"

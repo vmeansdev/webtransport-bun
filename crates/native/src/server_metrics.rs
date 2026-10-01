@@ -369,6 +369,8 @@ impl ServerMetrics {
             ),
             udp_send_batch_errors: Some(crate::udp_send_batch::stats().errors as f64),
             udp_send_batch_max_batch: Some(crate::udp_send_batch::stats().max_batch as f64),
+            datagram_pumps_spawned: Some(wtransport::datagram_driver_stats().pumps_spawned as f64),
+            datagram_pumps_live: Some(wtransport::datagram_driver_stats().pumps_live as f64),
             datagram_reflect_send_errors_by_reason: Some(
                 super::metrics::ReflectSendErrorsSnapshot {
                     not_connected: self

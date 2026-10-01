@@ -1925,9 +1925,15 @@ async fn run(
     } else {
         Some(reconnect_total_ms as f64 / reconnects.len() as f64)
     };
-    let host_udp_field = host_udp_json(options.diagnostic_host_udp, &host_udp_samples)
-        .map(|json| format!("\"hostUdp\":{json},"))
-        .unwrap_or_default();
+    // Which datagram read path this generator's wtransport drivers actually
+    // used, so a paired campaign arm cannot be mislabeled by its environment.
+    let host_udp_field = format!(
+        "\"datagramDriver\":{},{}",
+        datagram_driver_json(wtransport::datagram_driver_stats()),
+        host_udp_json(options.diagnostic_host_udp, &host_udp_samples)
+            .map(|json| format!("\"hostUdp\":{json},"))
+            .unwrap_or_default()
+    );
 
     let json = format!(
         concat!(
@@ -2586,8 +2592,41 @@ async fn hold_session(
     conn.close(0u32.into(), b"g6 run complete");
 }
 
+/// `{"mode":"pump"|"legacy","pumpsSpawned":N,"pumpsLive":N}` for the report.
+fn datagram_driver_json(stats: wtransport::DatagramDriverStats) -> String {
+    format!(
+        "{{\"mode\":\"{}\",\"pumpsSpawned\":{},\"pumpsLive\":{}}}",
+        if stats.pump { "pump" } else { "legacy" },
+        stats.pumps_spawned,
+        stats.pumps_live
+    )
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn datagram_driver_json_reports_mode_and_pump_counts() {
+        let pump = wtransport::DatagramDriverStats {
+            pump: true,
+            pumps_spawned: 7,
+            pumps_live: 3,
+        };
+        assert_eq!(
+            super::datagram_driver_json(pump),
+            r#"{"mode":"pump","pumpsSpawned":7,"pumpsLive":3}"#
+        );
+        let legacy = wtransport::DatagramDriverStats {
+            pump: false,
+            pumps_spawned: 0,
+            pumps_live: 0,
+        };
+        assert_eq!(
+            super::datagram_driver_json(legacy),
+            r#"{"mode":"legacy","pumpsSpawned":0,"pumpsLive":0}"#
+        );
+    }
+
     use super::*;
     use crate::latency_probe::{CLASS_ACTION, CLASS_MOVE};
 

@@ -161,6 +161,8 @@ export type MetricsSnapshot = {
 	/** Unsent suffixes deliberately discarded by EAGAIN drop mode. */
 	udpSendBatchCongestionDropped?: number;
 	udpSendBatchErrors?: number;
+	datagramPumpsSpawned?: number;
+	datagramPumpsLive?: number;
 	udpSendBatchMaxBatch?: number;
 	datagramReflectRingBypassMarked?: number;
 	datagramReflectRingBypassRefreshed?: number;
