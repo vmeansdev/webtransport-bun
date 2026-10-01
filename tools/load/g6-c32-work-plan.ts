@@ -7,7 +7,7 @@ export type WorkTarget = string | { terminal: WorkTerminal };
 export type WorkNode = {
 	id: string;
 	label: string;
-	kind: "attribution" | "ladder" | "companion";
+	kind: "attribution" | "attribution-r4" | "ladder" | "companion";
 	profile: string;
 	requestedSessions: number;
 	activeWorkloadSessions: number;
@@ -122,6 +122,7 @@ function node(value: unknown, profiles: readonly string[]): WorkNode {
 	if (!profiles.includes(profile)) fail(`unknown profile ${profile}`);
 	if (
 		object.kind !== "attribution" &&
+		object.kind !== "attribution-r4" &&
 		object.kind !== "ladder" &&
 		object.kind !== "companion"
 	)

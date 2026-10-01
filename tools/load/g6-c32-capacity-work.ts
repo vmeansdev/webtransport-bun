@@ -47,7 +47,62 @@ export function makeAttributionWorkPlan(): WorkPlan {
 	});
 }
 
-export function makeCapacityLadderWorkPlan(): WorkPlan {
+/** Ladder B plan ids. The probe-off id exists only for the pre-registered r5
+ * fallback when A' measured detailed-probe interference; the evaluator accepts
+ * it only with that recorded disposition. */
+export const R5_LADDER_PLAN_IDS = [
+	"g6-capacity-ladder-b-r5",
+	"g6-capacity-ladder-b-r5-probe-off",
+] as const;
+export type R5LadderPlanId = (typeof R5_LADDER_PLAN_IDS)[number];
+
+/** r5 successor A': same envelope as the original A (8 x 420 s, 2100 s setup,
+ * 60 s control, 600 s teardown). Selection-critical arms run first and are
+ * mirrored; the send-path arm XB runs last so an XB INVALID only removes the
+ * batch64 option. PASS and MISS (including S2/S4) continue; INVALID stops. */
+export function makeCandidateAttributionWorkPlan(): WorkPlan {
+	const profiles = ["Xon", "Xoff", "A0", "XB"];
+	const cells = [
+		"Xon-1",
+		"Xoff-1",
+		"A0-1",
+		"A0-2",
+		"Xoff-2",
+		"Xon-2",
+		"XB-1",
+		"XB-2",
+	];
+	return validateWorkPlan({
+		schema: "g6-c32-work-plan/1",
+		id: "g6-capacity-attribution-a-r5",
+		setupMaximumSeconds: 2100,
+		controlMaximumSeconds: 60,
+		teardownReserveSeconds: 600,
+		activeMaximumSeconds: 5520,
+		profiles,
+		entry: cells[0],
+		nodes: cells.map(
+			(id, index): WorkNode => ({
+				id,
+				label: id,
+				kind: "attribution-r4",
+				profile: requireDefined(id.split("-")[0]),
+				requestedSessions: 40000,
+				activeWorkloadSessions: 40000,
+				maximumSeconds: 420,
+				next: {
+					PASS: cells[index + 1] ?? COMPLETE,
+					MISS: cells[index + 1] ?? COMPLETE,
+					INVALID: INCOMPLETE,
+				},
+			}),
+		),
+	});
+}
+
+export function makeCapacityLadderWorkPlan(
+	id: "g6-capacity-ladder-b" | R5LadderPlanId = "g6-capacity-ladder-b",
+): WorkPlan {
 	const rungs = [5000, 10000, 20000, 30000, 40000, 40000, 50000, 50000];
 	const ids = rungs.map(
 		(rung, index) => `L${rung}-${rungs[index - 1] === rung ? 2 : 1}`,
@@ -116,7 +171,7 @@ export function makeCapacityLadderWorkPlan(): WorkPlan {
 	}
 	return validateWorkPlan({
 		schema: "g6-c32-work-plan/1",
-		id: "g6-capacity-ladder-b",
+		id,
 		setupMaximumSeconds: 2100,
 		controlMaximumSeconds: 120,
 		teardownReserveSeconds: 600,

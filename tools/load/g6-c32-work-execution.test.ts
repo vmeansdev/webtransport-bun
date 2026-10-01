@@ -1102,7 +1102,7 @@ test("CLI init requires a complete verified BIND and has no caller-supplied prod
 
 test("online CLI ladder MISS from a lost session or receive error takes the lower repeat, never a higher rung", async () => {
 	for (const defect of ["session", "receive"] as const) {
-		const input = executionFixture(true),
+		const input = executionFixture(true, true),
 			first = prepareCell(input);
 		finishPreparedCell(first);
 		const cell = prepareCell(
@@ -1140,7 +1140,7 @@ test("online CLI ladder MISS from a lost session or receive error takes the lowe
 
 test("online invalid native coverage stops attribution, while an ACK-only MISS still continues", async () => {
 	for (const invalid of [true, false]) {
-		const cell = prepareCell(executionFixture(), (raw) => {
+		const cell = prepareCell(executionFixture(false, true), (raw) => {
 			if (invalid)
 				requireDefined(
 					raw.diagnostic.sendPathDiagnostics.shards[0],
@@ -1162,7 +1162,7 @@ test("online invalid native coverage stops attribution, while an ACK-only MISS s
 		expect(await runWorkCli(cliArguments(cell.input, "next"))).toMatchObject(
 			invalid
 				? { node: null, argv: [], terminal: "INCOMPLETE" }
-				: { node: { id: "A1-1" }, terminal: null },
+				: { node: { id: "Xoff-1" }, terminal: null },
 		);
 	}
 });

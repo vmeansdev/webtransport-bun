@@ -320,6 +320,11 @@ export function validateScanCommand(
 			G6_OFFBOX_WORK_ROOT: `/root/webtransport-bun/.scratch/bare-metal-campaign/runs/${operation.envelope.runId}`,
 			G6_OFFBOX_WORK_BOOT_ID: pair.generator.bootId,
 		});
+	// r5 profiles name the datagram read path; historical ones never carried it.
+	const datagramPump = (p as { datagramPump?: string }).datagramPump;
+	if (datagramPump !== undefined) fixed.SCAN_DATAGRAM_PUMP = datagramPump;
+	else if (Object.hasOwn(env, "SCAN_DATAGRAM_PUMP"))
+		fail("scan command sets a datagram path the registered profile lacks");
 	for (const [key, value] of Object.entries(fixed))
 		if (env[key] !== String(value))
 			fail(`scan command ${key} differs from registered host/profile`);

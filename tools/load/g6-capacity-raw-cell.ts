@@ -450,6 +450,7 @@ export function validateCapacityRawCell(
 		udpSendBatch: p.udpSendBatch,
 		serverUdpSendEagainMode: p.serverUdpSendEagainMode,
 		reflectRingBypass: p.reflectRingBypass,
+		...(p.datagramPump === undefined ? {} : { datagramPump: p.datagramPump }),
 	};
 	for (const [key, value] of Object.entries(expected))
 		if (config[key] !== value || dispatch[key] !== value)
@@ -552,7 +553,7 @@ export function validateCapacityRawCell(
 		mode.phaseAware !== true
 	)
 		fail("cell lacks explicit probe-off evidence");
-	if (node.kind === "attribution")
+	if (node.kind === "attribution" || node.kind === "attribution-r4")
 		validateAttributionInputs(scan, report, native, input.probe, probe);
 	return { scan: input.scan, diagnostic, report, native, probe };
 }

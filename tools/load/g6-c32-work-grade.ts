@@ -10,6 +10,7 @@ import {
 	type CapacityRawCellInput,
 	validateCapacityRawCell,
 } from "./g6-capacity-raw-cell.ts";
+import { assertGeneratorDatagramDriver } from "./g6-datagram-driver.ts";
 import { G6_SHARDED_CLAUSES } from "./g6-sharded-grade.ts";
 
 export type WorkGradeInput = CapacityRawCellInput;
@@ -31,6 +32,23 @@ export function gradeWorkCell(input: WorkGradeInput): WorkGrade {
 	const { node, profile: p, scan } = input;
 	try {
 		const { diagnostic, report } = validateCapacityRawCell(input);
+		if (p.datagramPump !== undefined) {
+			// The arm's datagram read path must be the one both roles actually ran.
+			if ((scan.config as RecordValue).datagramPump !== p.datagramPump)
+				throw Error("scan datagramPump differs from the work profile");
+			assertGeneratorDatagramDriver(report, p.datagramPump);
+			const spawned = (
+				scan.aggregate.lifetime?.metrics as RecordValue | undefined
+			)?.datagramPumpsSpawned;
+			if (
+				typeof spawned !== "number" ||
+				!Number.isSafeInteger(spawned) ||
+				(p.datagramPump === "pump" ? spawned < 1 : spawned !== 0)
+			)
+				throw Error(
+					"server datagram pump counters contradict the work profile",
+				);
+		}
 		for (const field of [
 			"udpSendBatchErrors",
 			"udpSendBatchCongestionDropped",
@@ -96,7 +114,33 @@ export function gradeWorkCell(input: WorkGradeInput): WorkGrade {
 			grade.gate === "PASS" &&
 			(node.kind !== "ladder" ||
 				(cell.functionalPass && cell.ingressCleanPass));
-		if (node.kind === "attribution") {
+		if (node.kind === "attribution-r4") {
+			// r5 paired attribution: S1-S4 MISS (including delivery) is the
+			// measured quantity and continues; only session loss stops the run.
+			if (grade.clauses.S5_sessionsLost?.pass !== true)
+				throw Error("attribution-r4 S5 session loss");
+			if (
+				report.sessionsErr !== 0 ||
+				object(object(report.windows).steady).sessionsLost !== 0
+			)
+				throw Error("attribution-r4 lost sessions");
+			// Host UDP counters are recorded pressure here, not INVALID, but they
+			// must still be well-formed and monotonic evidence.
+			for (const host of [diagnostic.serverHostUdp, report.hostUdp])
+				for (const field of ["InErrors", "RcvbufErrors", "SndbufErrors"]) {
+					const before = object(object(host).connect)[field],
+						after = object(object(host).idle)[field];
+					if (
+						typeof before !== "number" ||
+						typeof after !== "number" ||
+						!Number.isSafeInteger(before) ||
+						!Number.isSafeInteger(after) ||
+						before < 0 ||
+						after < before
+					)
+						throw Error("attribution-r4 malformed host UDP counters");
+				}
+		} else if (node.kind === "attribution") {
 			if (
 				Object.entries(grade.clauses).some(
 					([key, clause]) => key !== "S4_ackRttP99Ms" && !clause.pass,

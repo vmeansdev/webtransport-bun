@@ -52,6 +52,11 @@ export function workCellArguments(node: WorkNode, p: WorkProfile): string[] {
 		1,
 		p.fixedSourcePortBase,
 		p.shards,
+		// Never launch a cell whose arm does not name its datagram read path.
+		p.datagramPump ??
+			(() => {
+				throw Error("work profile lacks datagramPump; refusing to launch");
+			})(),
 	].map(String);
 }
 

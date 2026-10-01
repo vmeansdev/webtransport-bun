@@ -24,6 +24,10 @@ import type { BoundarySnapshot, EmitterPhase } from "./g6-artifact.ts";
 import { resolveEmitterMode } from "./g6-emitter-mode.ts";
 import { createFatalEmitterScheduler } from "./g6-fatal-emitter.ts";
 import {
+	nativeSendPathProducerSha256,
+	readNativeSendPath,
+} from "./g6-native-send-path.ts";
+import {
 	createG6ServerCore,
 	freshG6ServerState,
 	type G6ServerCoreMirror,
@@ -33,10 +37,6 @@ import {
 	reconcileReflectorCounters,
 } from "./g6-server-core.ts";
 import { createMonotonicClock } from "./latency-clock.ts";
-import {
-	nativeSendPathProducerSha256,
-	readNativeSendPath,
-} from "./g6-native-send-path.ts";
 import {
 	CLASS_ACK,
 	CLASS_RAID,
@@ -162,6 +162,7 @@ async function main(): Promise<void> {
 	const serverUdpSendBatch = server.serverUdpSendBatch();
 	const serverUdpSendEagainMode = server.serverUdpSendEagainMode();
 	const reflectRingBypass = server.serverReflectRingBypass();
+	const datagramDriver = server.serverDatagramDriver();
 	let reflectorCounters: ReflectorCounters = {
 		hits: 0,
 		sent: 0,
@@ -294,6 +295,7 @@ async function main(): Promise<void> {
 		serverUdpSendBatch,
 		serverUdpSendEagainMode,
 		reflectRingBypass,
+		datagramDriver,
 		pacerPps: process.env.WEBTRANSPORT_PACER_PPS ?? null,
 		pacerNice: process.env.WEBTRANSPORT_PACER_NICE ?? null,
 		pacerSched: process.env.WEBTRANSPORT_PACER_SCHED ?? null,

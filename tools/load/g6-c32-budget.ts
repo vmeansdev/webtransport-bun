@@ -605,8 +605,10 @@ export function validateBudgetPolicy(value: unknown): BudgetPolicy {
 		fail("work-plan cell durations disagree with policy");
 	if (
 		value.lifecycle === "attribution-only"
-			? kinds.some((kind) => kind !== "attribution")
-			: kinds.includes("attribution")
+			? kinds.some(
+					(kind) => kind !== "attribution" && kind !== "attribution-r4",
+				)
+			: kinds.includes("attribution") || kinds.includes("attribution-r4")
 	)
 		fail("work-plan kinds disagree with lifecycle");
 	return {

@@ -64,6 +64,10 @@ import {
 	allocateClientProcesses,
 	mergeClientReports,
 } from "./g6-client-merge.ts";
+import {
+	assertGeneratorDatagramDriver,
+	clientReportsForDriverCheck,
+} from "./g6-datagram-driver.ts";
 import { type G6EmitterMode, resolveEmitterMode } from "./g6-emitter-mode.ts";
 import { DEFAULT_MAX_BYTES } from "./g6-linux-probe.ts";
 import {
@@ -175,6 +179,15 @@ const UDP_SEND_BATCH = parseNonnegativeIntegerEnv("SCAN_UDP_SEND_BATCH", 0);
 const SERVER_UDP_SEND_EAGAIN_MODE =
 	process.env.SCAN_SERVER_UDP_SEND_EAGAIN_MODE ?? "wait";
 const REFLECT_RING_BYPASS = process.env.SCAN_REFLECT_RING_BYPASS ?? "off";
+// wtransport driver datagram read path for BOTH roles: "pump" (library
+// default) or "legacy" (WTRANSPORT_DATAGRAM_PUMP=0), the paired A' control.
+const DATAGRAM_PUMP_RAW = process.env.SCAN_DATAGRAM_PUMP ?? "pump";
+if (DATAGRAM_PUMP_RAW !== "pump" && DATAGRAM_PUMP_RAW !== "legacy")
+	throw new Error(
+		`g6-sharded-scan: SCAN_DATAGRAM_PUMP must be pump|legacy, got ${DATAGRAM_PUMP_RAW}`,
+	);
+const DATAGRAM_PUMP: "pump" | "legacy" = DATAGRAM_PUMP_RAW;
+const WTRANSPORT_DATAGRAM_PUMP_ENV = DATAGRAM_PUMP === "legacy" ? "0" : "1";
 
 // Post-hoc refusal for a paced cell whose pacer thread did not get the
 // priority it was asked for (WEBTRANSPORT_PACER_NICE / _SCHED). The cell has
@@ -1140,6 +1153,7 @@ async function main(): Promise<void> {
 				WEBTRANSPORT_NATIVE_UDP_SEND_EAGAIN_MODE: SERVER_UDP_SEND_EAGAIN_MODE,
 				WEBTRANSPORT_NATIVE_REFLECT_RING_BYPASS:
 					REFLECT_RING_BYPASS === "on" ? "1" : "0",
+				WTRANSPORT_DATAGRAM_PUMP: WTRANSPORT_DATAGRAM_PUMP_ENV,
 				// The addon writes warn/error events verbatim to the shard's
 				// stderr (peer ip:port included), bypassing its bounded log
 				// channel and the JS loop; the scan keeps that stderr per shard.
@@ -1223,6 +1237,7 @@ async function main(): Promise<void> {
 					serverUdpSendBatch?: number;
 					serverUdpSendEagainMode?: string;
 					reflectRingBypass?: string;
+					datagramDriver?: string;
 					pacerStats?: Record<string, unknown>;
 					sendPathDiagnostics?: unknown;
 					sendPathProducerSha256?: string;
@@ -1307,6 +1322,17 @@ async function main(): Promise<void> {
 						failShard(
 							new Error(
 								`shard ${i} serverUdpSendEagainMode ${msg.serverUdpSendEagainMode ?? "missing"} != ${SERVER_UDP_SEND_EAGAIN_MODE}`,
+							),
+						);
+						child.kill("SIGTERM");
+						return;
+					}
+					// The driver mode is read once per process: a shard that echoes a
+					// different mode never got (or refused) the environment.
+					if (msg.datagramDriver !== DATAGRAM_PUMP) {
+						failShard(
+							new Error(
+								`shard ${i} datagramDriver ${msg.datagramDriver ?? "missing"} != ${DATAGRAM_PUMP}`,
 							),
 						);
 						child.kill("SIGTERM");
@@ -1791,6 +1817,7 @@ async function main(): Promise<void> {
 				"env",
 				`WT_LINUXGEN_CLONE=${OFFBOX_CLONE}`,
 				`WT_MACGEN_CLONE=${OFFBOX_CLONE}`,
+				`WTRANSPORT_DATAGRAM_PUMP=${WTRANSPORT_DATAGRAM_PUMP_ENV}`,
 				// MMO_CLIENT_QOS (optional): macOS thread QoS class for the
 				// generator's threads; the report discloses what was achieved.
 				...(process.env.MMO_CLIENT_QOS
@@ -2029,6 +2056,10 @@ async function main(): Promise<void> {
 			throw new Error(`g6-sharded-scan: generator exited ${clientExit}`);
 		}
 		console.log(`g6-sharded-scan: client exited ${clientExit}`);
+		// The generator shares the wtransport driver: its own report must show it
+		// ran the configured datagram path, or the arm is mislabeled.
+		for (const report of clientReportsForDriverCheck(clientStdout))
+			assertGeneratorDatagramDriver(report, DATAGRAM_PUMP);
 
 		/**
 		 * Read `steady.quic` only. quinn's counters are per connection and live
@@ -2045,6 +2076,7 @@ async function main(): Promise<void> {
 			entries: ShardWindowMetrics[];
 		}): Record<string, unknown> => {
 			const metricNames = [
+				"datagramPumpsSpawned",
 				"udpSendBatchErrors",
 				"udpSendBatchCongestionDropped",
 				"datagramReflectRingBypassMarked",
@@ -2225,6 +2257,7 @@ async function main(): Promise<void> {
 				udpSendBatch: UDP_SEND_BATCH,
 				serverUdpSendEagainMode: SERVER_UDP_SEND_EAGAIN_MODE,
 				reflectRingBypass: REFLECT_RING_BYPASS,
+				datagramPump: DATAGRAM_PUMP,
 				pacerPps: process.env.WEBTRANSPORT_PACER_PPS ?? null,
 				port: PORT,
 				pinDir: PIN_DIR,
@@ -2279,6 +2312,7 @@ async function main(): Promise<void> {
 					udpSendBatch: UDP_SEND_BATCH,
 					serverUdpSendEagainMode: SERVER_UDP_SEND_EAGAIN_MODE,
 					reflectRingBypass: REFLECT_RING_BYPASS,
+					datagramPump: DATAGRAM_PUMP,
 					endpoints: ENDPOINTS,
 					connectConcurrency: CONNECT_CONCURRENCY,
 					connectRatePerSec: CONNECT_RATE_PER_SEC,

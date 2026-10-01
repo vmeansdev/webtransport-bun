@@ -12,13 +12,16 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-	makeAttributionWorkPlan,
+	makeCandidateAttributionWorkPlan,
 	makeCapacityLadderWorkPlan,
 } from "./g6-c32-capacity-work.ts";
 import { validateArtifactManifestRecord } from "./g6-c32-freeze-model.ts";
 import { workCellArguments } from "./g6-c32-work-cli.ts";
 import { workProfileFixture } from "./g6-c32-work-fixture.test-helper.ts";
-import { makeAttributionWorkProfiles } from "./g6-c32-work-profile.ts";
+import {
+	makeCandidateAttributionWorkProfiles,
+	makeCandidateLadderWorkProfiles,
+} from "./g6-c32-work-profile.ts";
 
 const controllerPath = join(import.meta.dir, "g6-c32-rca-controller.sh");
 const scanPath = join(import.meta.dir, "g6-sharded-scan.ts");
@@ -125,9 +128,9 @@ test("work cell timeout includes blocking setup and invokes owned cleanup withou
 	const root = mkdtempSync(join(tmpdir(), "g6-work-timeout-"));
 	roots.push(root);
 	const args = workCellArguments(
-		requiredFixture(makeAttributionWorkPlan().nodes[0]),
+		requiredFixture(makeCandidateAttributionWorkPlan().nodes[1]),
 		requiredFixture(
-			makeAttributionWorkProfiles(workProfileFixture)["stock-probe-off"],
+			makeCandidateAttributionWorkProfiles(workProfileFixture).Xoff,
 		),
 	);
 	const script = `${extractFunction(source(), "work_bounded")}\n${extractFunction(source(), "run_work_cell")}
@@ -233,16 +236,19 @@ release_continuous_lock_raw || exit $?
 
 test("controller consumes the DAG-supplied exact A and B order and knob bindings", () => {
 	for (const plan of [
-		makeAttributionWorkPlan(),
-		makeCapacityLadderWorkPlan(),
+		makeCandidateAttributionWorkPlan(),
+		makeCapacityLadderWorkPlan("g6-capacity-ladder-b-r5"),
 	]) {
 		const root = mkdtempSync(join(tmpdir(), "g6-work-sequence-"));
 		roots.push(root);
 		mkdirSync(join(root, "qualification"));
 		mkdirSync(join(root, "closeout"));
 		const profiles = plan.id.includes("attribution")
-			? makeAttributionWorkProfiles(workProfileFixture)
-			: { candidate: workProfileFixture };
+			? makeCandidateAttributionWorkProfiles(workProfileFixture)
+			: makeCandidateLadderWorkProfiles(workProfileFixture, {
+					sendPath: "stock",
+					probe: true,
+				});
 		const cells = [];
 		let id: string | null = plan.entry;
 		while (id) {
@@ -311,7 +317,7 @@ test("actual work scan receipt and owned shell preserve one complete bash -c com
 	const bin = join(root, "bin"),
 		clone = join(root, "clone"),
 		remote = join(root, "remote"),
-		cell = "A0-1";
+		cell = "Xoff-1";
 	for (const dir of [
 		bin,
 		clone,
@@ -379,7 +385,7 @@ g6_ssh() { case "$2" in 'setsid --wait bash -c '*) /bin/bash -c "$2";; *) return
 g6_scp() { return 0; }
 work_cli() { return 0; }
 restore_cell_instruments() { return 0; }
-run_cell_once ${workCellArguments(requiredFixture(makeAttributionWorkPlan().nodes[0]), requiredFixture(makeAttributionWorkProfiles(workProfileFixture)["stock-probe-off"])).join(" ")}`;
+run_cell_once ${workCellArguments(requiredFixture(makeCandidateAttributionWorkPlan().nodes[1]), requiredFixture(makeCandidateAttributionWorkProfiles(workProfileFixture).Xoff)).join(" ")}`;
 	const result = spawnSync("bash", ["-c", script], {
 		encoding: "utf8",
 		timeout: 5000,

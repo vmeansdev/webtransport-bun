@@ -22,6 +22,10 @@ export type WorkProfile = {
 	reflectRingBypass: "on" | "off";
 	detailedProbe: boolean;
 	nativeDiagnostics: true;
+	/** wtransport driver datagram read path for both roles (r5 and later).
+	 * Absent only in historical policies sealed before the knob existed; it is
+	 * never defaulted, so their artifact digests are unchanged. */
+	datagramPump?: "pump" | "legacy";
 };
 export type WorkProfiles = Record<string, WorkProfile>;
 const KEYS = [
@@ -62,7 +66,13 @@ function exact(value: Record<string, unknown>, keys: string[]) {
 }
 function profile(value: unknown): WorkProfile {
 	const p = object(value);
-	exact(p, KEYS);
+	exact(p, Object.hasOwn(p, "datagramPump") ? [...KEYS, "datagramPump"] : KEYS);
+	if (
+		Object.hasOwn(p, "datagramPump") &&
+		p.datagramPump !== "pump" &&
+		p.datagramPump !== "legacy"
+	)
+		fail("datagramPump must be pump or legacy");
 	for (const key of [
 		"shards",
 		"endpoints",
@@ -146,6 +156,55 @@ export function makeAttributionWorkProfiles(common: WorkProfile): WorkProfiles {
 	};
 }
 
+/** r5 A' arms on one common base: Xon/Xoff = pump with probe on/off (probe
+ * calibration), A0 = legacy inline read (receive-path control), XB = pump with
+ * batch64 and no peer hint (send-path comparison). Native counters identical. */
+export function makeCandidateAttributionWorkProfiles(
+	common: WorkProfile,
+): WorkProfiles {
+	const p = profile({ ...common, datagramPump: "pump" });
+	const stock = {
+		...p,
+		udpSendBatch: 0 as const,
+		reflectRingBypass: "off" as const,
+	};
+	return {
+		Xon: { ...stock, detailedProbe: true, datagramPump: "pump" },
+		Xoff: { ...stock, detailedProbe: false, datagramPump: "pump" },
+		A0: { ...stock, detailedProbe: false, datagramPump: "legacy" },
+		XB: {
+			...stock,
+			udpSendBatch: 64,
+			detailedProbe: false,
+			datagramPump: "pump",
+		},
+	};
+}
+
+/** Every r5 B ladder profile variant is source-encoded here; the A' decision
+ * record selects one through policy, so B's source equals A''s source. */
+export function makeCandidateLadderWorkProfiles(
+	common: WorkProfile,
+	choice: { sendPath: "stock" | "batch64"; probe: boolean },
+): WorkProfiles {
+	const p = profile({ ...common, datagramPump: "pump" });
+	return {
+		candidate: {
+			...p,
+			datagramPump: "pump",
+			reflectRingBypass: "off",
+			udpSendBatch: choice.sendPath === "batch64" ? 64 : 0,
+			detailedProbe: choice.probe,
+		},
+	};
+}
+
+const R5_KEYS = [...KEYS, "datagramPump"];
+const R5_LADDER_IDS = new Set([
+	"g6-capacity-ladder-b-r5",
+	"g6-capacity-ladder-b-r5-probe-off",
+]);
+
 export function validateWorkProfiles(
 	planValue: WorkPlan,
 	value: unknown,
@@ -156,6 +215,36 @@ export function validateWorkProfiles(
 	const result = Object.fromEntries(
 		plan.profiles.map((name) => [name, profile(entries[name])]),
 	);
+	if (plan.nodes.some((node) => node.kind === "attribution-r4")) {
+		if (plan.nodes.some((node) => node.kind !== "attribution-r4"))
+			fail("attribution-r4 plans contain only attribution-r4 cells");
+		const base = result.Xoff ?? fail("attribution-r4 lacks the Xoff profile");
+		const expected = makeCandidateAttributionWorkProfiles(base);
+		exact(result, Object.keys(expected));
+		for (const name of Object.keys(expected))
+			if (
+				R5_KEYS.some(
+					(key) =>
+						requireDefined(result[name])[key as keyof WorkProfile] !==
+						requireDefined(expected[name])[key as keyof WorkProfile],
+				)
+			)
+				fail("attribution-r4 common knobs or arm bindings differ");
+		return result;
+	}
+	if (R5_LADDER_IDS.has(plan.id)) {
+		const candidate =
+			result.candidate ?? fail("r5 ladder lacks the candidate profile");
+		exact(result, ["candidate"]);
+		const probeOff = plan.id.endsWith("-probe-off");
+		if (
+			candidate.datagramPump !== "pump" ||
+			candidate.reflectRingBypass !== "off" ||
+			candidate.detailedProbe === probeOff
+		)
+			fail("r5 ladder profile differs from a source-encoded variant");
+		return result;
+	}
 	if (plan.nodes.some((node) => node.kind === "attribution")) {
 		const base =
 			result["stock-probe-on"] ??

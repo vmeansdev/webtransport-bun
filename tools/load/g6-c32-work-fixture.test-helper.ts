@@ -10,6 +10,7 @@ import {
 } from "./g6-c32-budget.ts";
 import {
 	makeAttributionWorkPlan,
+	makeCandidateAttributionWorkPlan,
 	makeCapacityLadderWorkPlan,
 } from "./g6-c32-capacity-work.ts";
 import {
@@ -28,6 +29,8 @@ import { initializeWorkExecution } from "./g6-c32-work-execution.ts";
 import type { WorkNode } from "./g6-c32-work-plan.ts";
 import {
 	makeAttributionWorkProfiles,
+	makeCandidateAttributionWorkProfiles,
+	makeCandidateLadderWorkProfiles,
 	type WorkProfile,
 } from "./g6-c32-work-profile.ts";
 import type { RawPairIdentity } from "./g6-capacity-raw-work.ts";
@@ -262,6 +265,9 @@ export function workScanWitness(input: {
 		SCAN_UDP_SEND_BATCH: p.udpSendBatch,
 		SCAN_SERVER_UDP_SEND_EAGAIN_MODE: p.serverUdpSendEagainMode,
 		SCAN_REFLECT_RING_BYPASS: p.reflectRingBypass,
+		...(p.datagramPump === undefined
+			? {}
+			: { SCAN_DATAGRAM_PUMP: p.datagramPump }),
 		G6_BPF_READY_RECEIPT: `${remote}/g6-shard-bpf-ready.json`,
 		SCAN_LINUX_PROBE_ENABLED: p.detailedProbe ? 1 : 0,
 		SCAN_LINUX_PROBE_OUT: `${remote}/linux-probe.jsonl`,
@@ -521,6 +527,14 @@ export function workGradeFixture(
 	client.windows.steady.sent = node.activeWorkloadSessions * 4 * 120;
 	client.windows.steadyDrain.rxSnapshot =
 		node.activeWorkloadSessions * 15 * 120;
+	// r5 profiles: the generator reports the datagram path it actually ran.
+	if (profile.datagramPump !== undefined)
+		client.datagramDriver = {
+			mode: profile.datagramPump,
+			pumpsSpawned:
+				profile.datagramPump === "pump" ? node.requestedSessions : 0,
+			pumpsLive: 0,
+		};
 	scan.clientStdout = `mmo-client: json ${JSON.stringify(client)}\n`;
 	const share = (total: number, index: number) =>
 		Math.floor(total / profile.shards) +
@@ -580,6 +594,12 @@ export function workGradeFixture(
 		{
 			udpSendBatchErrors: 0,
 			datagramReflectRingBypassed: profile.reflectRingBypass === "on" ? 100 : 0,
+			...(profile.datagramPump === undefined
+				? {}
+				: {
+						datagramPumpsSpawned:
+							profile.datagramPump === "pump" ? node.requestedSessions : 0,
+					}),
 		},
 	);
 	const diagnostic = diagnosticFixture({
@@ -740,7 +760,7 @@ export function cleanupWorkFixtures() {
 	for (const root of roots.splice(0))
 		rmSync(root, { recursive: true, force: true });
 }
-export function workPolicyFixture(ladder = false) {
+export function workPolicyFixture(ladder = false, r5 = false) {
 	return validateBudgetPolicy({
 		schema: "g6-c32-budget-policy/2",
 		campaignId: "test-work",
@@ -755,17 +775,36 @@ export function workPolicyFixture(ladder = false) {
 		maximumLifecycleCostMicrousd: ladder ? 8252460 : 6627960,
 		cellMaximumSeconds: ladder
 			? { ladder: 480, companion: 480 }
-			: { attribution: 420 },
-		allowedStages: ladder ? ["ladder", "companion"] : ["attribution"],
+			: r5
+				? { "attribution-r4": 420 }
+				: { attribution: 420 },
+		allowedStages: ladder
+			? ["ladder", "companion"]
+			: r5
+				? ["attribution-r4"]
+				: ["attribution"],
 		priorLedger: {
 			path: "prior.json",
 			sha256: "b".repeat(64),
 			sealedSpentMicrousd: 91350910,
 		},
-		workPlan: ladder ? makeCapacityLadderWorkPlan() : makeAttributionWorkPlan(),
-		workProfiles: ladder
-			? { candidate: { ...workProfileFixture, shards: 1 } }
-			: makeAttributionWorkProfiles(workProfileFixture),
+		workPlan: r5
+			? ladder
+				? makeCapacityLadderWorkPlan("g6-capacity-ladder-b-r5")
+				: makeCandidateAttributionWorkPlan()
+			: ladder
+				? makeCapacityLadderWorkPlan()
+				: makeAttributionWorkPlan(),
+		workProfiles: r5
+			? ladder
+				? makeCandidateLadderWorkProfiles(
+						{ ...workProfileFixture, shards: 1 },
+						{ sendPath: "stock", probe: true },
+					)
+				: makeCandidateAttributionWorkProfiles(workProfileFixture)
+			: ladder
+				? { candidate: { ...workProfileFixture, shards: 1 } }
+				: makeAttributionWorkProfiles(workProfileFixture),
 	});
 }
 export function operationFixture(
@@ -806,7 +845,7 @@ export function workClockDomainFixture() {
 		bootId: "11111111-2222-3333-4444-555555555555",
 	};
 }
-export function executionFixture(ladder = false) {
+export function executionFixture(ladder = false, r5 = false) {
 	const root = mkdtempSync(join(tmpdir(), "g6-work-execution-"));
 	roots.push(root);
 	mkdirSync(join(root, "qualification"));
@@ -816,7 +855,7 @@ export function executionFixture(ladder = false) {
 	);
 	for (const stream of ["stdout", "stderr"])
 		writeFileSync(join(root, `qualification/setup.${stream}`), "");
-	const policy = workPolicyFixture(ladder),
+	const policy = workPolicyFixture(ladder, r5),
 		hash = budgetPolicyArtifactSha256(policy);
 	const base = {
 		recordedAt: "2026-09-05T00:00:00.000Z",
