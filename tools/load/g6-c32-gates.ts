@@ -418,7 +418,7 @@ const RAW_GATE_CATALOG: GateCatalog = {
 				"--",
 				"--test-threads=1",
 			],
-			300_000,
+			180_000,
 			"server",
 			[],
 			"vendor/wtransport-fork",
