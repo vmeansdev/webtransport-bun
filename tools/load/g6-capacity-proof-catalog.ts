@@ -11,6 +11,7 @@ export type LocalReceiptKind =
 // This executable catalog is part of the source freeze, not supplied by a receipt.
 export const CAPACITY_NATIVE_PROOF_TESTS = [
 	"datagram_reflector::tests::shared_peer_hints_coalesce_and_cancellation_is_not_connection_owned",
+	"datagram_driver::tests::pump_tasks_end_with_their_connections",
 	...[
 		"repeated_pending_polls_keep_one_owned_registration_and_drop_cancels_it",
 		"independent_waiters_cancel_and_rebind_without_retained_storage",
