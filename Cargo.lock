@@ -1726,7 +1726,6 @@ checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
 [[package]]
 name = "wtransport"
 version = "0.7.1-zerortt-qpack.1"
-source = "git+https://github.com/vmeansdev/wtransport?rev=c1888a890525ad79b58a3f1970afcfdec60d46f7#c1888a890525ad79b58a3f1970afcfdec60d46f7"
 dependencies = [
  "bytes",
  "pem",
@@ -1749,7 +1748,6 @@ dependencies = [
 [[package]]
 name = "wtransport-proto"
 version = "0.7.1-zerortt-qpack.1"
-source = "git+https://github.com/vmeansdev/wtransport?rev=c1888a890525ad79b58a3f1970afcfdec60d46f7#c1888a890525ad79b58a3f1970afcfdec60d46f7"
 dependencies = [
  "httlib-huffman",
  "octets",
