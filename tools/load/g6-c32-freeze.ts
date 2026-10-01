@@ -151,6 +151,19 @@ export const DEFAULT_CAMPAIGN_INPUT_PATHS = [
 	"tools/offbox/linux-generator-entry-g6.sh",
 	"tools/load/g6-shard-bpf-setup.sh",
 	"tools/load/g6-c32-ladder-profile.json",
+	// r5 successor: the datagram pump candidate (vendored driver and its
+	// reporting on both roles) and the A' decision/evaluation path.
+	"Cargo.toml",
+	"Cargo.lock",
+	"vendor/wtransport-fork/Cargo.lock",
+	"vendor/wtransport-fork/wtransport/src/driver/mod.rs",
+	"vendor/wtransport-fork/wtransport/src/lib.rs",
+	"crates/native/src/datagram_driver.rs",
+	"crates/reference/src/mmo_client.rs",
+	"tools/load/g6-datagram-driver.ts",
+	"tools/load/g6-capacity-attribution-r5.ts",
+	"tools/load/g6-capacity-r5-decision.ts",
+	"tools/load/g6-capacity-local-receipt.ts",
 ] as const;
 
 export type CreateSemanticFreezeInput = {
