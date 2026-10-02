@@ -214,8 +214,8 @@ function fixture(deadlineSeconds = 8000, profileShards = 24, legacy = false) {
 			generatorName: `${runId}-generator`,
 		},
 		profile: {
-			region: "ams3",
-			size: "c-48-intel",
+			region: "lon1",
+			size: "c-48",
 			image: "ubuntu-24-04-x64",
 			vpcUuid: "test-vpc",
 			projectMode: "assign",

@@ -117,8 +117,8 @@ export function validateWorkAuthority(value: unknown): WorkAuthority {
 			host.runtime.os !== "Linux" ||
 			host.binary.kind !==
 				(role === "server" ? "native-addon" : "mmo-client") ||
-			host.provider.region !== "ams3" ||
-			host.provider.size !== "c-48-intel" ||
+			host.provider.region !== "lon1" ||
+			host.provider.size !== "c-48" ||
 			host.provider.vcpus !== 48 ||
 			host.provider.memoryMiB !== 98304
 		)

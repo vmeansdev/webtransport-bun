@@ -112,10 +112,10 @@ export function makeDesiredRig(input: MakeDesiredRigInput): DesiredRig {
 			generatorName: `${input.runId}-generator`,
 		},
 		profile: {
-			region: "ams3",
-			size: "c-48-intel",
+			region: "lon1",
+			size: "c-48",
 			image: "ubuntu-24-04-x64",
-			vpcUuid: "6e8547b7-b698-4e28-b4d1-8c755217106c",
+			vpcUuid: "f38a6ca8-441c-4754-8655-c73bc63c190f",
 			projectMode: "none",
 			projectId: null,
 			sshKeyId: input.sshKeyId ?? 34466793,

@@ -509,8 +509,8 @@ function loadCampaign(
 				packet.source.commit !== sourceSha ||
 				packet.envelope.runId !== runId ||
 				packet.provider.role !== role ||
-				packet.provider.size !== "c-48-intel" ||
-				packet.provider.region !== "ams3" ||
+				packet.provider.size !== "c-48" ||
+				packet.provider.region !== "lon1" ||
 				packet.provider.vcpus !== 48 ||
 				packet.provider.memoryMiB !== 98304 ||
 				packet.runtime.os !== "Linux"

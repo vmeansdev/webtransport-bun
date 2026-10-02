@@ -784,7 +784,7 @@ async function makeBindingFixture(
 		role: "server" as const,
 		name: "g6-server",
 		tags: ["g6-managed", "g6-run"],
-		region: "ams3",
+		region: "lon1",
 		size: "c-32",
 		image: "ubuntu-24-04-x64",
 		vpcUuid: "vpc-1",

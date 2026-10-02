@@ -280,8 +280,8 @@ function validatePair(
 		)
 			fail(`${role} source/provenance differs from this frozen run`);
 		if (
-			host.provider.region !== "ams3" ||
-			host.provider.size !== "c-48-intel" ||
+			host.provider.region !== "lon1" ||
+			host.provider.size !== "c-48" ||
 			host.provider.vcpus !== 48 ||
 			host.provider.memoryMiB !== 98304
 		)

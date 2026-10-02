@@ -58,7 +58,7 @@ function droplet(role: "server" | "generator"): DropletIdentity {
 		role,
 		name: `g6-c32-host-test-${role}`,
 		tags: ["g6-c32-managed", "g6-c32-host-test"],
-		region: "ams3",
+		region: "lon1",
 		size: "c-32-intel",
 		image: "ubuntu-24-04-x64",
 		vpcUuid: "vpc-123",

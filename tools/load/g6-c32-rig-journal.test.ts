@@ -47,7 +47,7 @@ const desiredRigAuthority = {
 	runTag: "g6-c32-run-test",
 	roles: ["server", "generator"],
 	profile: {
-		region: "ams3",
+		region: "lon1",
 		size: "c-32",
 		image: "ubuntu-24-04-x64",
 	},
