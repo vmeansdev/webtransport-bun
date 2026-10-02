@@ -28,6 +28,17 @@ async function waitAbsent(pid: number, milliseconds = 2500): Promise<void> {
 	while (present(pid) && performance.now() < deadline) await Bun.sleep(10);
 	if (present(pid)) throw Error(`self-expiring fixture ${pid} did not exit`);
 }
+/**
+ * A SIGKILLed descendant is briefly a zombie until its reparented parent reaps
+ * it, and kill(pid, 0) still succeeds for a zombie on macOS. Allow only that
+ * reap window (far below the fixture's 1500 ms self-expiry) before asserting
+ * the owned child is gone.
+ */
+async function reapedPromptly(pid: number): Promise<boolean> {
+	const deadline = performance.now() + 250;
+	while (present(pid) && performance.now() < deadline) await Bun.sleep(5);
+	return !present(pid);
+}
 function leaderFixture(code: number | null) {
 	const root = mkdtempSync(join(tmpdir(), "g6-work-owned-")),
 		ready = join(root, "ready.json"),
@@ -73,7 +84,7 @@ for (const code of [0, 37])
 				new Date(Date.now() + 1000).toISOString(),
 			);
 			expect(status).toBe(code);
-			expect(present(fixture.pid())).toBe(false);
+			expect(await reapedPromptly(fixture.pid())).toBe(true);
 		} finally {
 			await fixture.cleanup();
 		}
@@ -102,7 +113,7 @@ test("nested production supervisor cannot report successful cleanup while inner-
 			signal: null,
 		});
 		expect(result.ownership.cleanupComplete).toBe(true);
-		expect(present(fixture.pid())).toBe(false);
+		expect(await reapedPromptly(fixture.pid())).toBe(true);
 	} finally {
 		await fixture.cleanup();
 	}
@@ -138,7 +149,7 @@ test("nested outer cancellation kills a wrapper during inner cleanup without lea
 		expect(existsSync(stoppedPath)).toBe(true);
 		expect(performance.now() - abortedAt).toBeLessThan(600);
 		// Outer group flags alone are not proof about the separately owned group.
-		expect(present(fixture.pid())).toBe(false);
+		expect(await reapedPromptly(fixture.pid())).toBe(true);
 	} finally {
 		await fixture.cleanup();
 	}
