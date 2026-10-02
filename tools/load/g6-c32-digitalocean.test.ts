@@ -114,10 +114,10 @@ const desired: DesiredRig = {
 		generatorName: "g6-c32-do-test-generator",
 	},
 	profile: {
-		region: "lon1",
+		region: "ric1",
 		size: "c-32-intel",
 		image: "ubuntu-24-04-x64",
-		vpcUuid: "f38a6ca8-441c-4754-8655-c73bc63c190f",
+		vpcUuid: "02276475-d3ca-451f-9ea2-30db481509e1",
 		projectMode: "assign",
 		projectId: "project-123",
 		sshKeyId: 34466793,
@@ -157,7 +157,7 @@ const accountFixture = JSON.stringify({
 
 const regionFixture = JSON.stringify([
 	{
-		slug: "lon1",
+		slug: "ric1",
 		name: "Amsterdam 3",
 		available: true,
 		features: ["private_networking", "backups"],
@@ -171,7 +171,7 @@ const sizeFixture = JSON.stringify([
 		memory: 65_536,
 		vcpus: 32,
 		disk: 400,
-		regions: ["lon1"],
+		regions: ["ric1"],
 		available: true,
 		price_hourly: "1.3006",
 	},
@@ -185,7 +185,7 @@ const imageFixture = JSON.stringify([
 		distribution: "Ubuntu",
 		slug: "ubuntu-24-04-x64",
 		public: true,
-		regions: ["lon1"],
+		regions: ["ric1"],
 		created_at: "2026-06-12T15:07:53Z",
 		status: "available",
 	},
@@ -193,11 +193,11 @@ const imageFixture = JSON.stringify([
 
 const vpcFixture = JSON.stringify([
 	{
-		id: "f38a6ca8-441c-4754-8655-c73bc63c190f",
-		urn: "do:vpc:f38a6ca8-441c-4754-8655-c73bc63c190f",
-		name: "default-lon1",
+		id: "02276475-d3ca-451f-9ea2-30db481509e1",
+		urn: "do:vpc:02276475-d3ca-451f-9ea2-30db481509e1",
+		name: "default-ric1",
 		ip_range: "10.110.0.0/20",
-		region: "lon1",
+		region: "ric1",
 		created_at: "2025-02-23T20:36:56Z",
 		default: true,
 	},
@@ -251,7 +251,7 @@ function rawDroplet(
 		memory: 65_536,
 		vcpus: 32,
 		disk: 400,
-		region: { slug: "lon1", name: "Amsterdam 3" },
+		region: { slug: "ric1", name: "Amsterdam 3" },
 		image: { id: 232566559, slug: "ubuntu-24-04-x64" },
 		size_slug: "c-32-intel",
 		status: "active",
@@ -282,7 +282,7 @@ describe("G6 c32 DigitalOcean normalization", () => {
 			dropletLimit: 25,
 		});
 		expect(normalizeRegion(regionFixture, desired.profile.region)).toEqual({
-			slug: "lon1",
+			slug: "ric1",
 			available: true,
 		});
 		expect(normalizeSize(sizeFixture, desired.profile)).toEqual({
@@ -298,7 +298,7 @@ describe("G6 c32 DigitalOcean normalization", () => {
 		});
 		expect(normalizeVpc(vpcFixture, desired.profile)).toEqual({
 			uuid: desired.profile.vpcUuid,
-			region: "lon1",
+			region: "ric1",
 			isDefault: true,
 		});
 		expect(normalizeSshKey(sshKeyFixture, desired.profile.sshKeyId)).toEqual({
@@ -505,7 +505,7 @@ describe("G6 c32 exact DigitalOcean mutations", () => {
 				desired.roles.serverName,
 				desired.roles.generatorName,
 				"--region",
-				"lon1",
+				"ric1",
 				"--size",
 				"c-32-intel",
 				"--image",

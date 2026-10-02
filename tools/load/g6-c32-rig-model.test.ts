@@ -47,7 +47,7 @@ const desiredRig: DesiredRig = {
 		generatorName: "g6-c32-rig-model-test-generator",
 	},
 	profile: {
-		region: "lon1",
+		region: "ric1",
 		size: "c-32",
 		image: "ubuntu-24-04-x64",
 		vpcUuid: "vpc-123",

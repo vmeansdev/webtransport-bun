@@ -79,7 +79,7 @@ function fixture(
 			generatorName: `${runId}-generator`,
 		},
 		profile: {
-			region: "lon1",
+			region: "ric1",
 			size: "c-32",
 			image: "ubuntu-24-04-x64",
 			vpcUuid: "test-vpc",
@@ -142,7 +142,7 @@ function fixture(
 						role,
 						name: `${runId}-${role}`,
 						tags: [desired.managementTag, runId],
-						region: "lon1",
+						region: "ric1",
 						size: "c-32",
 						image: "ubuntu-24-04-x64",
 						vpcUuid: "test-vpc",

@@ -1025,8 +1025,8 @@ export async function completeGoalAdaptersFixture(
 				generatorName: `${runId}-generator`,
 			},
 			profile: {
-				region: "lon1",
-				size: "c-48",
+				region: "ric1",
+				size: "g5-48vcpu-96gb-80gb",
 				image: "ubuntu-24-04-x64",
 				vpcUuid: pair.server.provider.vpcUuid,
 				projectMode: "none",
