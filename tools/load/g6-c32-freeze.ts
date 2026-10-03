@@ -121,6 +121,8 @@ export const DEFAULT_CAMPAIGN_INPUT_PATHS = [
 	"tools/load/g6-c32-work-grade.ts",
 	"tools/load/g6-c32-work-timeout.ts",
 	"tools/load/g6-c32-work-remote.ts",
+	"tools/load/g6-generator-fanout.ts",
+	"tools/load/g6-client-merge.ts",
 	"tools/load/g6-c32-execution-clock.ts",
 	"tools/load/g6-c32-terminal-evidence.ts",
 	"tools/load/g6-c32-prepared-command.ts",
