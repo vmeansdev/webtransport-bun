@@ -443,11 +443,23 @@ function loadCampaign(
 	const reference = campaignReference(context, value),
 		root = context.repoPath(reference.runRoot),
 		boundRoot = context.repoPath(reference.boundRoot);
+	const policyBytes = context.read(reference.policyPath),
+		policy = validateBudgetPolicy(JSON.parse(policyBytes.toString("utf8")));
+	// An r5 A' may be retained under a harness-only descendant: its frozen
+	// bytes still equal its Git commit, and E1 continuity to B is enforced by
+	// r5SourceContinuity. Historical A keeps the exact-harness rule.
+	const harnessDescendant =
+		lane === "A" &&
+		policy.schema === "g6-c32-budget-policy/2" &&
+		isR5AttributionPlanId(policy.workPlan.id)
+			? { assertHarnessOnlyPaths: assertR5HarnessOnlyPaths }
+			: undefined;
 	// All raw dependencies are checked above before existing verifiers can read them.
 	const bound =
 		lane === "A"
 			? verifyRetainedBoundFreeze(boundRoot, {
 					repositoryPath: context.repoRoot,
+					harnessDescendant,
 				})
 			: verifyBoundFreeze(boundRoot, { repositoryPath: context.repoRoot });
 	const sourceSha = bound.semanticFreeze.authority.candidate.commit,
@@ -464,8 +476,6 @@ function loadCampaign(
 			context.contract.objective.planSha256
 	)
 		fail("B frozen plan digest differs from the contract objective");
-	const policyBytes = context.read(reference.policyPath),
-		policy = validateBudgetPolicy(JSON.parse(policyBytes.toString("utf8")));
 	if (
 		policy.schema !== "g6-c32-budget-policy/2" ||
 		policy.lifecycle !== (lane === "A" ? "attribution-only" : "ladder-only") ||

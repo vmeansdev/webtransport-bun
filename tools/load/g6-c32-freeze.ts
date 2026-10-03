@@ -744,14 +744,38 @@ export function createSemanticFreeze(
 	return validateSemanticFreezeRecord(record);
 }
 
-function sameCampaignInputPaths(record: SemanticFreezeRecord): boolean {
+/** Inputs added after a sealed campaign was frozen. A retained (historical)
+ * freeze may carry the exact earlier set; a new freeze must carry them all. */
+const LATER_CAMPAIGN_INPUT_PATHS = [
+	"tools/load/g6-generator-fanout.ts",
+	"tools/load/g6-client-merge.ts",
+] as const;
+const RETAINED_CAMPAIGN_INPUT_PATH_SETS: readonly (readonly string[])[] = [
+	DEFAULT_CAMPAIGN_INPUT_PATHS,
+	DEFAULT_CAMPAIGN_INPUT_PATHS.filter(
+		(path) => !(LATER_CAMPAIGN_INPUT_PATHS as readonly string[]).includes(path),
+	),
+];
+
+function samePaths(
+	record: SemanticFreezeRecord,
+	paths: readonly string[],
+): boolean {
 	return (
-		record.authority.campaignInputs.length ===
-			DEFAULT_CAMPAIGN_INPUT_PATHS.length &&
+		record.authority.campaignInputs.length === paths.length &&
 		record.authority.campaignInputs.every(
-			(identity, index) =>
-				identity.path === DEFAULT_CAMPAIGN_INPUT_PATHS[index],
+			(identity, index) => identity.path === paths[index],
 		)
+	);
+}
+
+function sameCampaignInputPaths(record: SemanticFreezeRecord): boolean {
+	return samePaths(record, DEFAULT_CAMPAIGN_INPUT_PATHS);
+}
+
+function sameRetainedCampaignInputPaths(record: SemanticFreezeRecord): boolean {
+	return RETAINED_CAMPAIGN_INPUT_PATH_SETS.some((paths) =>
+		samePaths(record, paths),
 	);
 }
 
@@ -849,10 +873,22 @@ function frozenGitInput(
 	return { bytes: blob.stdout, mode };
 }
 
+/**
+ * Opt-in for a sealed run whose harness has since advanced: the current HEAD
+ * must descend from the frozen commit, and every supported-harness input whose
+ * current bytes or mode differ must be accepted by `assertHarnessOnlyPaths`
+ * (the caller's harness allowlist). Retained bytes must still equal the frozen
+ * Git blobs; the caller must separately enforce source continuity.
+ */
+export type RetainedHarnessDescendant = Readonly<{
+	assertHarnessOnlyPaths: (paths: readonly string[]) => void;
+}>;
+
 function verifyRetainedSemanticFreeze(
 	value: unknown,
 	boundRoot: string,
 	repositoryPath: string,
+	harnessDescendant?: RetainedHarnessDescendant,
 ): SemanticFreezeRecord {
 	const record = validateSemanticFreezeRecord(value);
 	if (record.envelope.phase !== "SEMANTIC_FREEZE")
@@ -861,7 +897,7 @@ function verifyRetainedSemanticFreeze(
 		record.authority.freezeGenerator.schemaVersion !==
 			SEMANTIC_FREEZE_SCHEMA_VERSION ||
 		record.authority.freezeGenerator.path !== SEMANTIC_FREEZE_GENERATOR_PATH ||
-		!sameCampaignInputPaths(record)
+		!sameRetainedCampaignInputPaths(record)
 	)
 		fail(
 			"retained semantic freeze does not contain the complete fixed input set",
@@ -885,6 +921,18 @@ function verifyRetainedSemanticFreeze(
 	]);
 	if (actualTree.status !== 0 || actualTree.stdout.trim() !== tree)
 		fail("retained candidate differs from frozen Git tree");
+	if (
+		harnessDescendant &&
+		defaultRunGit(repository, [
+			"--no-replace-objects",
+			"merge-base",
+			"--is-ancestor",
+			commit,
+			"HEAD",
+		]).status !== 0
+	)
+		fail("retained candidate is not an ancestor of the current harness");
+	const advancedHarnessPaths: string[] = [];
 	const inputRoot = requireDirectory(
 		join(boundRoot, "semantic/inputs"),
 		"retained semantic input root",
@@ -937,8 +985,13 @@ function verifyRetainedSemanticFreeze(
 				hashBytes(currentInspection.readBytes(current.absolute)) !==
 					identity.sha256 ||
 				mode !== frozen?.mode
-			)
-				fail(`retained input differs from supported harness: ${identity.path}`);
+			) {
+				if (!harnessDescendant)
+					fail(
+						`retained input differs from supported harness: ${identity.path}`,
+					);
+				advancedHarnessPaths.push(identity.path);
+			}
 		}
 	}
 	const policy = validateBudgetPolicy(
@@ -969,6 +1022,8 @@ function verifyRetainedSemanticFreeze(
 		record.authority,
 		deps,
 	);
+	if (harnessDescendant && advancedHarnessPaths.length > 0)
+		harnessDescendant.assertHarnessOnlyPaths(advancedHarnessPaths);
 	currentInspection.verifyHead();
 	return record;
 }
@@ -1670,6 +1725,7 @@ function verifyBoundFreezeEvidence(
 	options: {
 		repositoryPath?: string;
 		expectedStatus?: "INCOMPLETE" | "BOUND";
+		harnessDescendant?: RetainedHarnessDescendant;
 	},
 	retained: boolean,
 ): Omit<VerifiedBoundFreeze, "shellEnvironment"> {
@@ -1727,7 +1783,12 @@ function verifyBoundFreezeEvidence(
 		"semantic freeze",
 		(value) =>
 			retained
-				? verifyRetainedSemanticFreeze(value, root, repositoryPath)
+				? verifyRetainedSemanticFreeze(
+						value,
+						root,
+						repositoryPath,
+						options.harnessDescendant,
+					)
 				: verifySemanticFreeze(value, { repositoryPath }),
 	);
 	const semanticApproval = parseCanonicalRecord(
@@ -2052,7 +2113,10 @@ export function verifyBoundFreeze(
 /** Replays a BOUND evidence tree without granting approval to dispatch it now. */
 export function verifyRetainedBoundFreeze(
 	rootPath: string,
-	options: { repositoryPath?: string } = {},
+	options: {
+		repositoryPath?: string;
+		harnessDescendant?: RetainedHarnessDescendant;
+	} = {},
 ): VerifiedRetainedBoundFreeze {
 	return {
 		kind: "g6-c32-retained-bound-evidence/1",
@@ -2061,6 +2125,7 @@ export function verifyRetainedBoundFreeze(
 			{
 				repositoryPath: options.repositoryPath,
 				expectedStatus: "BOUND",
+				harnessDescendant: options.harnessDescendant,
 			},
 			true,
 		),

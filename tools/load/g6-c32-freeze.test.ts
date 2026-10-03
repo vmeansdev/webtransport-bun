@@ -1932,6 +1932,100 @@ describe("G6 c32 atomic host-bound freeze", () => {
 		);
 	}, 120_000);
 
+	test("historical replay admits harness-only descendants only through the caller allowlist", async () => {
+		const fixture = await makeBindingFixture();
+		let tick = 1n;
+		const result = await bindHostFreeze(fixture.bindInput, {
+			clock: {
+				wallNow: () => "2026-08-30T12:30:00.000Z",
+				monotonicNowNs: () => tick++,
+			},
+			randomId: () => "harness-descendant",
+		});
+		const frozenHead = git(fixture.root, "rev-parse", "HEAD");
+		writeFixture(
+			fixture.root,
+			"tools/load/g6-c32-freeze-model.ts",
+			"advanced harness semantics\n",
+		);
+		git(fixture.root, "add", "tools/load/g6-c32-freeze-model.ts");
+		git(fixture.root, "commit", "--quiet", "-m", "Advance harness fixture");
+		let seen: readonly string[] = [];
+		const allow = {
+			assertHarnessOnlyPaths: (paths: readonly string[]) => {
+				seen = paths;
+			},
+		};
+		expect(
+			verifyRetainedBoundFreeze(result.root, {
+				repositoryPath: fixture.root,
+				harnessDescendant: allow,
+			}).semanticFreeze,
+		).toEqual(fixture.semanticFreeze);
+		expect(seen).toEqual(["tools/load/g6-c32-freeze-model.ts"]);
+		expect(() =>
+			verifyRetainedBoundFreeze(result.root, {
+				repositoryPath: fixture.root,
+				harnessDescendant: {
+					assertHarnessOnlyPaths: () => {
+						throw Error("not a harness path");
+					},
+				},
+			}),
+		).toThrow(/not a harness path/);
+		// A HEAD that does not descend from the frozen commit is refused.
+		git(fixture.root, "checkout", "--quiet", "--orphan", "unrelated");
+		git(fixture.root, "commit", "--quiet", "-m", "Unrelated history");
+		expect(git(fixture.root, "rev-parse", "HEAD")).not.toBe(frozenHead);
+		expect(() =>
+			verifyRetainedBoundFreeze(result.root, {
+				repositoryPath: fixture.root,
+				harnessDescendant: allow,
+			}),
+		).toThrow(/not an ancestor of the current harness/);
+	}, 120_000);
+
+	test("historical replay accepts only the exact pre-fan-out input set", async () => {
+		const fixture = await makeBindingFixture();
+		let tick = 1n;
+		const result = await bindHostFreeze(fixture.bindInput, {
+			clock: {
+				wallNow: () => "2026-08-30T12:30:00.000Z",
+				monotonicNowNs: () => tick++,
+			},
+			randomId: () => "pre-fanout-set",
+		});
+		for (const [name, drop] of [
+			[
+				"earlier",
+				["tools/load/g6-generator-fanout.ts", "tools/load/g6-client-merge.ts"],
+			],
+			["partial", ["tools/load/g6-client-merge.ts"]],
+		] as const) {
+			const copy = join(fixture.provisioningRoot, `input-set-${name}`);
+			cpSync(result.root, copy, { recursive: true });
+			const freeze = structuredClone(fixture.semanticFreeze);
+			freeze.authority.campaignInputs = freeze.authority.campaignInputs.filter(
+				({ path }) => !(drop as readonly string[]).includes(path),
+			);
+			for (const path of drop)
+				unlinkSync(join(copy, `semantic/inputs/${path}`));
+			writeFixture(
+				copy,
+				"semantic/semantic-freeze.json",
+				canonicalJson(
+					makeAuthorityRecord(freeze.schema, freeze.envelope, freeze.authority),
+				),
+			);
+			resealBoundFixture(copy);
+			const verify = () =>
+				verifyRetainedBoundFreeze(copy, { repositoryPath: fixture.root });
+			if (name === "partial")
+				expect(verify).toThrow(/complete fixed input set/);
+			else expect(verify).not.toThrow(/complete fixed input set/);
+		}
+	}, 120_000);
+
 	test("historical replay cannot opt into an INCOMPLETE staging tree", async () => {
 		const fixture = await makeBindingFixture();
 		let tick = 1n;
