@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import type { R5Decision } from "./g6-capacity-attribution-r5.ts";
 import { CAPACITY_NATIVE_PROOF_TESTS } from "./g6-capacity-proof-catalog.ts";
 import {
+	assertR5HarnessOnlyPaths,
 	batchOwnershipTestsPassed,
 	expectedR5DecisionFields,
 	expectedR5LadderPlanId,
@@ -203,6 +204,7 @@ describe("r5 recorded B override", () => {
 		authoritySha256: sha(authorityBytes),
 		generatorProcesses: 4,
 		reason: "User-authorized B despite bGo=false.",
+		bSourceSha: "e".repeat(40),
 	};
 	const noGo = (overrides: Partial<R5Decision> = {}) =>
 		decision({
@@ -293,6 +295,14 @@ describe("r5 recorded B override", () => {
 			[{ ...override, generatorProcesses: "4" }, "from 2 to 16"],
 			[{ ...override, reason: " " }, "reason"],
 			[{ ...override, authorityPath: "" }, "authorityPath"],
+			[{ ...override, bSourceSha: "E".repeat(40) }, "bSourceSha must be"],
+			[{ ...override, bSourceSha: "e".repeat(39) }, "bSourceSha must be"],
+			[
+				Object.fromEntries(
+					Object.entries(override).filter(([key]) => key !== "bSourceSha"),
+				),
+				"missing or unknown fields",
+			],
 			[null, "must be structured evidence"],
 		] as const)
 			expect(() => validateOverride(noGo(), { bOverride })).toThrow(message);
@@ -362,4 +372,44 @@ describe("r5CellSummaries", () => {
 			),
 		).toThrow("read Xon-1");
 	});
+});
+
+test("a harness-only B source may change only tools/load, tools/offbox, docs, .omx and AGENTS.md", () => {
+	expect(() =>
+		assertR5HarnessOnlyPaths([
+			"tools/load/g6-generator-fanout.ts",
+			"tools/offbox/linux-generator-entry-g6.sh",
+			"docs/plan.md",
+			".omx/state.json",
+			"AGENTS.md",
+		]),
+	).not.toThrow();
+	expect(() => assertR5HarnessOnlyPaths([])).not.toThrow();
+	for (const path of [
+		"crates/native/src/lib.rs",
+		"vendor/wtransport/src/driver/mod.rs",
+		"packages/client/index.ts",
+		"Cargo.toml",
+		"Cargo.lock",
+		"package.json",
+		"bun.lock",
+		"bun.lockb",
+		"tsconfig.json",
+	])
+		expect(() => assertR5HarnessOnlyPaths(["tools/load/x.ts", path])).toThrow(
+			`changes product/build input ${path}`,
+		);
+	for (const path of [
+		"README.md",
+		"tools/other/x.ts",
+		"tools/loader/x.ts",
+		"docs",
+		"crates2/x.rs",
+		"src/AGENTS.md",
+	])
+		expect(() => assertR5HarnessOnlyPaths([path])).toThrow(
+			`changes non-harness path ${path}`,
+		);
+	for (const path of ["", "/abs", "tools/load/../crates/x.rs", "tools//load"])
+		expect(() => assertR5HarnessOnlyPaths([path])).toThrow("invalid path");
 });

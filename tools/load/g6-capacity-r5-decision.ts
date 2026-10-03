@@ -298,12 +298,16 @@ export type R5BOverride = Readonly<{
 	/** Generator processes B runs on its one generator host (2..16). */
 	generatorProcesses: number;
 	reason: string;
+	/** The B source commit the override declares; must equal B's actual
+	 * source. A B source other than A''s must be a harness-only descendant. */
+	bSourceSha: string;
 }>;
 export const R5_B_OVERRIDE_KEYS = [
 	"authorityPath",
 	"authoritySha256",
 	"generatorProcesses",
 	"reason",
+	"bSourceSha",
 ] as const;
 export const R5_DECISION_KEYS = [
 	"schema",
@@ -500,8 +504,54 @@ export function validateR5BOverride(
 	)
 		fail("r5 bOverride generatorProcesses must be an integer from 2 to 16");
 	text(row.reason, "r5 bOverride reason");
+	if (
+		typeof row.bSourceSha !== "string" ||
+		!/^[0-9a-f]{40}$/.test(row.bSourceSha)
+	)
+		fail("r5 bOverride bSourceSha must be a 40 lowercase hex commit");
 	if (!readAuthority) fail("r5 bOverride authority cannot be read");
 	if (digest(readAuthority(authorityPath)) !== row.authoritySha256)
 		fail("r5 bOverride authority bytes differ from authoritySha256");
 	return row as unknown as R5BOverride;
+}
+
+/** Paths a harness-only B source may change relative to A' (E1 under a
+ * recorded override). Everything else, including every product, generator
+ * and build input, is refused. */
+const R5_HARNESS_PREFIXES = ["tools/load/", "tools/offbox/", "docs/", ".omx/"];
+const R5_HARNESS_FILES = ["AGENTS.md"];
+/** Named explicitly so a future allowlist edit cannot silently admit them. */
+const R5_PRODUCT_PREFIXES = ["crates/", "vendor/", "packages/"];
+const R5_PRODUCT_FILES = [
+	"Cargo.toml",
+	"Cargo.lock",
+	"package.json",
+	"bun.lock",
+	"bun.lockb",
+	"tsconfig.json",
+];
+
+/** Fails unless every changed path is on the harness allowlist. */
+export function assertR5HarnessOnlyPaths(paths: readonly string[]): void {
+	for (const path of paths) {
+		if (
+			typeof path !== "string" ||
+			path.length === 0 ||
+			path.startsWith("/") ||
+			path
+				.split("/")
+				.some((part) => part === "" || part === "." || part === "..")
+		)
+			fail("r5 B source change lists an invalid path");
+		if (
+			R5_PRODUCT_FILES.includes(path) ||
+			R5_PRODUCT_PREFIXES.some((prefix) => path.startsWith(prefix))
+		)
+			fail(`r5 B source changes product/build input ${path}`);
+		if (
+			!R5_HARNESS_FILES.includes(path) &&
+			!R5_HARNESS_PREFIXES.some((prefix) => path.startsWith(prefix))
+		)
+			fail(`r5 B source changes non-harness path ${path}`);
+	}
 }

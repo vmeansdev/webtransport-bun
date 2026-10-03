@@ -84,6 +84,7 @@ import {
 	capacityLocalProofArgv,
 } from "./g6-capacity-proof-catalog.ts";
 import {
+	assertR5HarnessOnlyPaths,
 	batchOwnershipTestsPassed,
 	expectedR5LadderPlanId,
 	isR5AttributionPlanId,
@@ -148,6 +149,10 @@ export type CapacityR5LadderBinding = Readonly<{
 	mechanismClaim: "detailed-probe" | "none";
 	/** Disclosed whenever B ran under a recorded user override of bGo=false. */
 	bOverride?: R5BOverride;
+	/** E1: B ran A''s exact source, or (override only) a harness-only descendant. */
+	sourceContinuity: "identical" | "harness-only";
+	/** Paths changed from A''s source to B's (empty when identical). */
+	sourceChangedPaths: readonly string[];
 }>;
 export type CapacityGoalAdaptersResult = {
 	fatalReasons: string[];
@@ -719,10 +724,78 @@ function attribution(context: EvidenceContext, campaign: Campaign) {
 }
 const isR5 = (campaign: Campaign) =>
 	isR5AttributionPlanId(campaign.policy.workPlan.id);
+/**
+ * E1 continuity between A''s and B's source commits in the evidence
+ * repository: identical, or B descends from A and changes only harness paths
+ * (no product, generator or build input). Anything else throws.
+ */
+function r5SourceContinuity(
+	context: EvidenceContext,
+	aSha: string,
+	bSha: string,
+): { kind: "identical" | "harness-only"; changedPaths: string[] } {
+	if (aSha === bSha) return { kind: "identical", changedPaths: [] };
+	const git = (args: readonly string[]) =>
+		spawnSync(
+			"git",
+			["--no-replace-objects", "-C", context.repoRoot, ...args],
+			{
+				encoding: "utf8",
+				maxBuffer: 64 * 1024 * 1024,
+				timeout: 30000,
+			},
+		);
+	for (const sha of [aSha, bSha]) {
+		const result = git(["rev-parse", "--verify", `${sha}^{commit}`]);
+		if (
+			!/^[a-f0-9]{40}$/.test(sha) ||
+			result.error ||
+			result.status !== 0 ||
+			result.stdout.trim() !== sha
+		)
+			fail("r5 A'/B source is not a commit in the evidence repository");
+	}
+	const ancestor = git(["merge-base", "--is-ancestor", aSha, bSha]);
+	if (ancestor.error || (ancestor.status !== 0 && ancestor.status !== 1))
+		fail("cannot verify r5 B source ancestry");
+	if (ancestor.status !== 0)
+		fail("r5 B source does not descend from the A' source");
+	const diff = git([
+		"-c",
+		"core.quotePath=false",
+		"diff",
+		"--no-ext-diff",
+		"--no-renames",
+		"--name-only",
+		"-z",
+		aSha,
+		bSha,
+	]);
+	if (diff.error || diff.status !== 0)
+		fail("cannot list the r5 A'-to-B source changes");
+	const changedPaths = diff.stdout.split("\0").filter(Boolean).sort();
+	assertR5HarnessOnlyPaths(changedPaths);
+	return { kind: "harness-only", changedPaths };
+}
+/** The A' source plus, only when B is its harness-only descendant (identical
+ * product, generator and build inputs), the final B source. */
+function nativeEquivalentSources(
+	context: EvidenceContext,
+	aSha: string,
+): string[] {
+	const bSha = context.contract.objective.sourceSha;
+	if (bSha === aSha) return [aSha];
+	try {
+		r5SourceContinuity(context, aSha, bSha);
+		return [aSha, bSha];
+	} catch {
+		return [aSha];
+	}
+}
 /** The named batch ownership tests passed in the source-bound local native receipt. */
 function localBatchOwnership(
 	context: EvidenceContext,
-	sourceSha: string,
+	sourceShas: readonly string[],
 ): boolean {
 	try {
 		const local = context.contract.localVerification.receipts.find(
@@ -734,7 +807,7 @@ function localBatchOwnership(
 			out = context.read(command.stdoutPath),
 			err = context.read(command.stderrPath);
 		if (
-			native.sourceSha !== sourceSha ||
+			!sourceShas.includes(native.sourceSha as string) ||
 			command.exitCode !== 0 ||
 			command.signal ||
 			digest(out) !== command.stdoutSha256 ||
@@ -775,7 +848,10 @@ function attributionR5(context: EvidenceContext, campaign: Campaign) {
 	return evaluateR5Attribution({
 		cells,
 		expectedSourceSha: campaign.sourceSha,
-		batchOwnershipTestsPassed: localBatchOwnership(context, campaign.sourceSha),
+		batchOwnershipTestsPassed: localBatchOwnership(
+			context,
+			nativeEquivalentSources(context, campaign.sourceSha),
+		),
 	});
 }
 /**
@@ -810,8 +886,13 @@ function assertR5Ladder(
 	if (b.policy.workPlan.id !== id)
 		fail(`r5 B work plan must be ${id} for the recorded calibration`);
 	same(b.policy.workPlan, makeCapacityLadderWorkPlan(id), "r5 B work DAG");
-	if (b.sourceSha !== a.sourceSha)
+	// E1: without a recorded override B runs A''s exact source. An override must
+	// declare B's source; a different one must be a harness-only descendant.
+	if (b.sourceSha !== a.sourceSha && bOverride === undefined)
 		fail("r5 B source differs from the A' source (E1 continuity)");
+	if (bOverride !== undefined && bOverride.bSourceSha !== b.sourceSha)
+		fail("r5 bOverride bSourceSha differs from B's actual source");
+	const continuity = r5SourceContinuity(context, a.sourceSha, b.sourceSha);
 	same(
 		b.policy.workProfiles,
 		makeCandidateLadderWorkProfiles(
@@ -844,6 +925,8 @@ function assertR5Ladder(
 		calibrationDisposition: disposition,
 		mechanismClaim: decision.probeInB ? "detailed-probe" : "none",
 		...(bOverride ? { bOverride } : {}),
+		sourceContinuity: continuity.kind,
+		sourceChangedPaths: continuity.changedPaths,
 	};
 }
 function diagnosticCell(

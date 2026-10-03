@@ -621,7 +621,10 @@ test("r5 B under a recorded user override (SELECTED, bGo=false) with 4 generator
 			bOverride: {
 				authorityPath: "evidence/b-override-authority.txt",
 				generatorProcesses: 4,
+				bSourceSha: f.campaignA.sourceSha,
 			},
+			sourceContinuity: "identical",
+			sourceChangedPaths: [],
 		},
 	});
 	expect(accepted.r5?.claims.join("\n")).toContain(
@@ -670,4 +673,86 @@ test("r5 B with clientProcesses but no recorded override is refused", async () =
 	const f = await build({ bClientProcesses: 4 });
 	expect(f.r5Decision).toMatchObject({ status: "SELECTED", bGo: true });
 	refused(f, "unrecorded fan-out", /r5 B candidate profile differs/);
+}, 600_000);
+
+/** SELECTED with bGo=false (see the override test above), B fanned out to 4. */
+const overrideOptions = {
+	calibration: "interference",
+	ackMs: { "Xoff-2": 26, "XB-1": 17, "XB-2": 17 },
+	bClientProcesses: 4,
+	bOverride: true,
+} as const;
+async function buildOverride(
+	extra: NonNullable<
+		NonNullable<Parameters<typeof completeGoalAdaptersFixture>[1]>["r5"]
+	>,
+) {
+	const f = await completeGoalAdaptersFixture(processFixture().proof, {
+		r5: { ...overrideOptions, ...extra },
+		aOutcomes: { "Xoff-2": "MISS" },
+	});
+	roots.push(f.repoRoot);
+	expect(f.r5Decision).toMatchObject({ status: "SELECTED", bGo: false });
+	return f;
+}
+
+test("r5 override B on a harness-only descendant of the A' source passes and discloses the changed paths", async () => {
+	const f = await buildOverride({ bSourceChange: "harness" });
+	expect(f.campaignB.sourceSha).not.toBe(f.campaignA.sourceSha);
+	const accepted = evaluateCapacityGoal(f);
+	expect(accepted).toMatchObject({
+		status: "PASS",
+		exitCode: 0,
+		reasons: [],
+		r5: {
+			sourceContinuity: "harness-only",
+			sourceChangedPaths: ["tools/load/g6-fixture-b-harness-only.ts"],
+			bOverride: { bSourceSha: f.campaignB.sourceSha },
+		},
+	});
+	expect(accepted.r5?.claims.join("\n")).toContain(
+		"harness-only descendant of the A' source; changed paths: tools/load/g6-fixture-b-harness-only.ts",
+	);
+	// The override must declare B's actual source.
+	const restore = resignDecision(f, (decision) => {
+		(decision.bOverride as Row).bSourceSha = f.campaignA.sourceSha;
+	});
+	refused(
+		f,
+		"bSourceSha mismatched",
+		"bOverride bSourceSha differs from B's actual source",
+	);
+	restore();
+	expect(evaluateCapacityGoal(f).exitCode).toBe(0);
+}, 900_000);
+
+test("r5 override B whose source changes a product path is refused", async () => {
+	const f = await buildOverride({ bSourceChange: "crates" });
+	refused(
+		f,
+		"product change under override",
+		"changes product/build input crates/native/src/fixture_b_product.rs",
+	);
+}, 900_000);
+
+test("r5 override B whose source does not descend from the A' source is refused", async () => {
+	const f = await buildOverride({
+		bSourceChange: "harness",
+		bNotDescendant: true,
+	});
+	refused(
+		f,
+		"non-descendant B",
+		"r5 B source does not descend from the A' source",
+	);
+}, 900_000);
+
+test("r5 B on a different (even harness-only) source without an override keeps strict E1", async () => {
+	const f = await build({ bSourceChange: "harness" });
+	expect(f.r5Decision).toMatchObject({ status: "SELECTED", bGo: true });
+	refused(
+		f,
+		"different source without override",
+		"r5 B source differs from the A' source (E1 continuity)",
+	);
 }, 600_000);

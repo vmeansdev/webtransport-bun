@@ -219,6 +219,11 @@ export type R5FixtureOptions = {
 	noCandidate?: boolean;
 	/** Replace the prepared vendored wtransport gate stdout (E3 tamper). */
 	vendoredGateStdout?: string;
+	/** Commit one B-only change after A' (E1 continuity edges): a harness file
+	 * under tools/load, or a product file under crates/ or vendor/. */
+	bSourceChange?: "harness" | "crates" | "vendor";
+	/** Make that B commit an unrelated root (B does not descend from A'). */
+	bNotDescendant?: boolean;
 	/** Per-A'-cell client ACK p99 (ms), e.g. an S4 MISS that withholds B (bGo=false). */
 	ackMs?: Readonly<Record<string, number>>;
 	/** Scale one A' cell's offered moves (offered-work parity edge). */
@@ -368,6 +373,18 @@ export async function completeGoalAdaptersFixture(
 			"-m",
 			"Change synthetic native candidate B",
 		);
+	}
+	if (r5?.bSourceChange) {
+		if (r5.bNotDescendant)
+			git(repoRoot, "checkout", "--quiet", "--orphan", "b-unrelated");
+		const changePath = {
+			harness: "tools/load/g6-fixture-b-harness-only.ts",
+			crates: "crates/native/src/fixture_b_product.rs",
+			vendor: "vendor/wtransport/src/fixture_b_product.rs",
+		}[r5.bSourceChange];
+		write(repoRoot, changePath, "// Synthetic B-only source change\n");
+		git(repoRoot, "add", changePath);
+		git(repoRoot, "commit", "--quiet", "-m", "Synthetic B-only source change");
 	}
 	const r5BSendPath = r5?.bSendPath ?? r5?.sendPath ?? "stock",
 		r5BProbe = r5?.bProbe ?? r5?.calibration !== "interference";
@@ -558,6 +575,7 @@ export async function completeGoalAdaptersFixture(
 				authoritySha256: sha(readFileSync(join(repoRoot, authorityPath))),
 				generatorProcesses: r5.bClientProcesses ?? 4,
 				reason: "Synthetic: user-authorized B with fanned-out generator.",
+				bSourceSha: b.sourceSha,
 			};
 		}
 	} else {
@@ -601,7 +619,8 @@ export async function completeGoalAdaptersFixture(
 		verdict: "APPROVE",
 		unconditional: true,
 		recordedAt: at(seconds),
-		sourceSha: b.sourceSha,
+		// r5 reviews bind the A' decision to the A' source it was recorded at.
+		sourceSha: r5 ? a.sourceSha : b.sourceSha,
 		decisionSha256: sha(readFileSync(join(repoRoot, decisionPath))),
 		afterArchitectReceiptArtifactSha256: after,
 	});

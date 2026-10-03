@@ -2153,6 +2153,11 @@ export function evaluateCapacityGoal(input: {
 											`B ran under a recorded user override of A' bGo=false with ${r5.bOverride.generatorProcesses} generator processes (authority sha256 ${r5.bOverride.authoritySha256})`,
 										]
 									: []),
+								...(r5.sourceContinuity === "harness-only"
+									? [
+											`B source ${r5.bOverride?.bSourceSha ?? contract.objective.sourceSha} is a harness-only descendant of the A' source; changed paths: ${r5.sourceChangedPaths.join(", ") || "(none)"}`,
+										]
+									: []),
 							],
 						},
 					}
