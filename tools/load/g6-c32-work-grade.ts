@@ -49,6 +49,22 @@ export function gradeWorkCell(input: WorkGradeInput): WorkGrade {
 					"server datagram pump counters contradict the work profile",
 				);
 		}
+		if (p.clientProcesses !== undefined) {
+			// The registered generator fan-out must be the one the scan ran and
+			// the one its merged client report covers. A single-process scan
+			// emits the unmerged report, which carries no count and means 1.
+			if ((scan.config as RecordValue).clientProcesses !== p.clientProcesses)
+				throw Error("scan clientProcesses differs from the work profile");
+			const merged = report as RecordValue;
+			if (
+				(Object.hasOwn(merged, "clientProcesses")
+					? merged.clientProcesses
+					: 1) !== p.clientProcesses
+			)
+				throw Error(
+					"merged client report clientProcesses differs from the work profile",
+				);
+		}
 		for (const field of [
 			"udpSendBatchErrors",
 			"udpSendBatchCongestionDropped",

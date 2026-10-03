@@ -287,7 +287,24 @@ export type R5CandidateDecisionRecord = Readonly<{
 	}>[];
 	selectedAlternativeId: (typeof R5_DECISION_ALTERNATIVES)[number];
 	selectionExplanation: string;
+	/** Explicit, recorded user authorization to run B although the A'
+	 * recompute is SELECTED with bGo=false. Never inferred or defaulted. */
+	bOverride?: R5BOverride;
 }>;
+export type R5BOverride = Readonly<{
+	/** Repository-relative path of the retained authorization bytes. */
+	authorityPath: string;
+	authoritySha256: string;
+	/** Generator processes B runs on its one generator host (2..16). */
+	generatorProcesses: number;
+	reason: string;
+}>;
+export const R5_B_OVERRIDE_KEYS = [
+	"authorityPath",
+	"authoritySha256",
+	"generatorProcesses",
+	"reason",
+] as const;
 export const R5_DECISION_KEYS = [
 	"schema",
 	"recordedAt",
@@ -353,6 +370,8 @@ export function validateR5CandidateDecision(input: {
 		bCreateAt: string | null;
 	};
 	readEvidence: (path: string) => Buffer;
+	/** Reads a bOverride authority file; an override without it is refused. */
+	readAuthority?: (path: string) => Buffer;
 	validateReviews: (
 		reviews: { architect: unknown; critic: unknown },
 		bound: {
@@ -363,9 +382,15 @@ export function validateR5CandidateDecision(input: {
 		},
 	) => void;
 }): R5CandidateDecisionRecord {
+	const parsed = object(
+		JSON.parse(input.decisionBytes.toString()),
+		"r5 candidate decision",
+	);
 	const decision = exact(
-			JSON.parse(input.decisionBytes.toString()),
-			R5_DECISION_KEYS,
+			parsed,
+			Object.hasOwn(parsed, "bOverride")
+				? [...R5_DECISION_KEYS, "bOverride"]
+				: R5_DECISION_KEYS,
 			"r5 candidate decision",
 		),
 		expected = input.expected;
@@ -387,6 +412,12 @@ export function validateR5CandidateDecision(input: {
 	))
 		if (canonicalJson(decision[key]) !== canonicalJson(value))
 			fail(`r5 decision ${key} differs from the A' recompute`);
+	if (Object.hasOwn(decision, "bOverride"))
+		validateR5BOverride(
+			decision.bOverride,
+			input.recomputed,
+			input.readAuthority,
+		);
 	text(decision.scopeStatement, "r5 scope statement");
 	text(decision.selectionExplanation, "r5 selection explanation");
 	if (
@@ -433,4 +464,44 @@ export function validateR5CandidateDecision(input: {
 		},
 	);
 	return decision as unknown as R5CandidateDecisionRecord;
+}
+
+/**
+ * A recorded B override is legal only where the A' recompute selected a
+ * candidate but withheld B (SELECTED, bGo=false); it never rewrites any
+ * recomputed field, and its authority bytes must hash to the recorded digest.
+ */
+export function validateR5BOverride(
+	value: unknown,
+	recomputed: R5Decision,
+	readAuthority: ((path: string) => Buffer) | undefined,
+): R5BOverride {
+	const row = exact(value, R5_B_OVERRIDE_KEYS, "r5 bOverride");
+	if (
+		recomputed.status !== "SELECTED" ||
+		recomputed.bGo !== false ||
+		recomputed.sendPath === null ||
+		recomputed.probeInB === null
+	)
+		fail(
+			`r5 bOverride is legal only for SELECTED with bGo=false (recompute is ${recomputed.status} with bGo=${recomputed.bGo})`,
+		);
+	const authorityPath = text(row.authorityPath, "r5 bOverride authorityPath");
+	if (
+		typeof row.authoritySha256 !== "string" ||
+		!/^[0-9a-f]{64}$/.test(row.authoritySha256)
+	)
+		fail("r5 bOverride authoritySha256 must be 64 lowercase hex");
+	if (
+		typeof row.generatorProcesses !== "number" ||
+		!Number.isSafeInteger(row.generatorProcesses) ||
+		row.generatorProcesses < 2 ||
+		row.generatorProcesses > 16
+	)
+		fail("r5 bOverride generatorProcesses must be an integer from 2 to 16");
+	text(row.reason, "r5 bOverride reason");
+	if (!readAuthority) fail("r5 bOverride authority cannot be read");
+	if (digest(readAuthority(authorityPath)) !== row.authoritySha256)
+		fail("r5 bOverride authority bytes differ from authoritySha256");
+	return row as unknown as R5BOverride;
 }

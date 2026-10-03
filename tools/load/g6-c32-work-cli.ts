@@ -57,6 +57,8 @@ export function workCellArguments(node: WorkNode, p: WorkProfile): string[] {
 			(() => {
 				throw Error("work profile lacks datagramPump; refusing to launch");
 			})(),
+		// Position 26: generator processes on the one generator host.
+		p.clientProcesses ?? 1,
 	].map(String);
 }
 

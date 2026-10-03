@@ -2542,6 +2542,60 @@ describe("r5 contract v2 (budget top-up and pump ladder profile)", () => {
 			rmSync(fixture.root, { force: true, recursive: true });
 		}
 	});
+	test("ladder profile clientProcesses is optional, exact and an integer from 1 to 16", () => {
+		const fixture = scenario();
+		try {
+			const contract = contractOf(fixture);
+			expect(
+				validateCapacityGoalContract(contract).ladder.profile,
+			).not.toHaveProperty("clientProcesses");
+			for (const clientProcesses of [1, 4, 16]) {
+				contract.ladder.profile = {
+					...RAW_PROFILE,
+					datagramPump: "pump",
+					clientProcesses,
+				};
+				expect(
+					validateCapacityGoalContract(contract).ladder.profile,
+				).toMatchObject({ clientProcesses });
+			}
+			for (const clientProcesses of [0, 17, 1.5, "4", null]) {
+				contract.ladder.profile = {
+					...RAW_PROFILE,
+					datagramPump: "pump",
+					clientProcesses,
+				};
+				expect(() => validateCapacityGoalContract(contract)).toThrow(
+					"clientProcesses must be an integer from 1 to 16",
+				);
+			}
+		} finally {
+			rmSync(fixture.root, { force: true, recursive: true });
+		}
+	});
+	test("a fanned-out contract refuses raw rated cells lacking the process echo", () => {
+		const fixture = scenario({
+			breakContract(contract) {
+				(contract.ladder as Record<string, unknown>).profile = {
+					...RAW_PROFILE,
+					clientProcesses: 4,
+				};
+			},
+		});
+		try {
+			const result = runEvaluator(
+				fixture.repoRoot,
+				fixture.evidenceRoot,
+				fixture.contractPath,
+			);
+			expect(result.exitCode).toBe(2);
+			expect(parseStdout(result.stdout).reasons.join("\n")).toContain(
+				"L5000-1: scan command SCAN_CLIENT_PROCESSES differs",
+			);
+		} finally {
+			rmSync(fixture.root, { force: true, recursive: true });
+		}
+	}, 15000);
 	test("a pump contract refuses raw rated cells lacking the datagram echo", () => {
 		const fixture = scenario({
 			breakContract(contract) {

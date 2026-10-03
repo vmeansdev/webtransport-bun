@@ -69,6 +69,7 @@ import {
 	clientReportsForDriverCheck,
 } from "./g6-datagram-driver.ts";
 import { type G6EmitterMode, resolveEmitterMode } from "./g6-emitter-mode.ts";
+import { demultiplexFanout, ownedFanoutScript } from "./g6-generator-fanout.ts";
 import { DEFAULT_MAX_BYTES } from "./g6-linux-probe.ts";
 import {
 	NATIVE_PHASES,
@@ -1810,49 +1811,50 @@ async function main(): Promise<void> {
 				`g6-sharded-scan: refusing diagnostic dispatch without a fresh BPF pre-arm witness: ${JSON.stringify(bpfPreArm)}`,
 			);
 		}
+		const generatorArgsFor = (plan: (typeof clientPlans)[number]): string[] => [
+			"env",
+			`WT_LINUXGEN_CLONE=${OFFBOX_CLONE}`,
+			`WT_MACGEN_CLONE=${OFFBOX_CLONE}`,
+			`WTRANSPORT_DATAGRAM_PUMP=${WTRANSPORT_DATAGRAM_PUMP_ENV}`,
+			// MMO_CLIENT_QOS (optional): macOS thread QoS class for the
+			// generator's threads; the report discloses what was achieved.
+			...(process.env.MMO_CLIENT_QOS
+				? [`MMO_CLIENT_QOS=${process.env.MMO_CLIENT_QOS}`]
+				: []),
+			"bash",
+			OFFBOX_ENTRY_SCRIPT,
+			"--candidate",
+			CANDIDATE_SHA,
+			"--bin",
+			"mmo-client",
+			"--deadline",
+			String(deadlineSec),
+			// MMO_CLIENT_RSS_LIMIT_MB (optional) — when set on the
+			// conductor's env, the linux entry script exports it on
+			// the gen before spawning mmo-client. Default (unset)
+			// keeps the mmo-client's built-in 12 GB RSS guard.
+			...(process.env.MMO_CLIENT_RSS_LIMIT_MB
+				? ["--rss-limit", process.env.MMO_CLIENT_RSS_LIMIT_MB]
+				: []),
+			"--",
+			...(DIAGNOSTIC ? ["--diagnostic-host-udp"] : []),
+			// Linux binds to 127.0.0.x succeed (unlike macOS), which
+			// pins the source to loopback and breaks sendmsg to the
+			// VPC (EINVAL on sendmsg from loopback to non-loopback).
+			// The parent's macOS runs never hit this because macOS's
+			// bind to 127.0.0.x fails and falls back to the default
+			// bind. We pass --bind-default unconditionally; mmo-client
+			// accepts it on both OSes, and after `--` the linux entry
+			// script's case-statement is out of the way.
+			...(FIXED_SOURCE_PORT_BASE === null ? ["--bind-default"] : []),
+			"--url",
+			`https://${SERVER_ADDRESS}:${PORT}`,
+			...clientArgsFor(plan),
+		];
 		const spawnClient = (
 			plan: (typeof clientPlans)[number],
 		): ReturnType<typeof spawn> => {
-			const generatorArgs = [
-				"env",
-				`WT_LINUXGEN_CLONE=${OFFBOX_CLONE}`,
-				`WT_MACGEN_CLONE=${OFFBOX_CLONE}`,
-				`WTRANSPORT_DATAGRAM_PUMP=${WTRANSPORT_DATAGRAM_PUMP_ENV}`,
-				// MMO_CLIENT_QOS (optional): macOS thread QoS class for the
-				// generator's threads; the report discloses what was achieved.
-				...(process.env.MMO_CLIENT_QOS
-					? [`MMO_CLIENT_QOS=${process.env.MMO_CLIENT_QOS}`]
-					: []),
-				"bash",
-				OFFBOX_ENTRY_SCRIPT,
-				"--candidate",
-				CANDIDATE_SHA,
-				"--bin",
-				"mmo-client",
-				"--deadline",
-				String(deadlineSec),
-				// MMO_CLIENT_RSS_LIMIT_MB (optional) — when set on the
-				// conductor's env, the linux entry script exports it on
-				// the gen before spawning mmo-client. Default (unset)
-				// keeps the mmo-client's built-in 12 GB RSS guard.
-				...(process.env.MMO_CLIENT_RSS_LIMIT_MB
-					? ["--rss-limit", process.env.MMO_CLIENT_RSS_LIMIT_MB]
-					: []),
-				"--",
-				...(DIAGNOSTIC ? ["--diagnostic-host-udp"] : []),
-				// Linux binds to 127.0.0.x succeed (unlike macOS), which
-				// pins the source to loopback and breaks sendmsg to the
-				// VPC (EINVAL on sendmsg from loopback to non-loopback).
-				// The parent's macOS runs never hit this because macOS's
-				// bind to 127.0.0.x fails and falls back to the default
-				// bind. We pass --bind-default unconditionally; mmo-client
-				// accepts it on both OSes, and after `--` the linux entry
-				// script's case-statement is out of the way.
-				...(FIXED_SOURCE_PORT_BASE === null ? ["--bind-default"] : []),
-				"--url",
-				`https://${SERVER_ADDRESS}:${PORT}`,
-				...clientArgsFor(plan),
-			];
+			const generatorArgs = generatorArgsFor(plan);
 			return spawn(
 				"ssh",
 				[
@@ -1970,10 +1972,41 @@ async function main(): Promise<void> {
 		// starts only after the previous one prints its built binary (or
 		// exits); the barrier timeout is the connect timeout, which covers a
 		// serialised build.
+		// Owned work cells run N generator processes inside ONE owned process
+		// group: a fan-out wrapper starts them in order and tags their output,
+		// which is split back into per-process streams here.
+		const fanoutClients =
+			GENERATOR_WORK_OWNER !== null && CLIENT_PROCESSES > 1
+				? (() => {
+						const fanout = spawn(
+							"ssh",
+							[
+								...OFFBOX_SSH_OPTIONS,
+								OFFBOX_SSH,
+								...workGeneratorSshArguments(GENERATOR_WORK_OWNER, [
+									"bash",
+									"-c",
+									ownedFanoutScript(clientPlans.map(generatorArgsFor)),
+								]),
+							],
+							{ stdio: ["ignore", "pipe", "pipe"] },
+						);
+						trackChildClose(fanout);
+						clients.push(fanout);
+						return demultiplexFanout(fanout, clientPlans.length, (line) =>
+							console.error(`[generator fan-out] ${line}`),
+						);
+					})()
+				: null;
 		for (const plan of clientPlans) {
-			const child = spawnClient(plan);
-			trackChildClose(child);
-			clients.push(child);
+			const child =
+				fanoutClients === null
+					? spawnClient(plan)
+					: (fanoutClients[plan.index] as unknown as ReturnType<typeof spawn>);
+			if (fanoutClients === null) {
+				trackChildClose(child);
+				clients.push(child);
+			}
 			const index = plan.index;
 			clientDones.push(
 				new Promise<number>((res) => {

@@ -410,6 +410,78 @@ run_cell_once ${workCellArguments(requiredFixture(makeCandidateAttributionWorkPl
 	expect(receipt.action.args[3]).not.toContain('\\"');
 });
 
+test("cell argument 26 is the validated generator process count passed as SCAN_CLIENT_PROCESSES", () => {
+	const root = mkdtempSync(join(tmpdir(), "g6-client-processes-"));
+	roots.push(root);
+	const node = requiredFixture(
+		makeCapacityLadderWorkPlan("g6-capacity-ladder-b-r5").nodes[0],
+	);
+	const common = { ...workProfileFixture, datagramPump: "pump" as const };
+	const argv = (clientProcesses?: number) =>
+		workCellArguments(
+			node,
+			requiredFixture(
+				makeCandidateLadderWorkProfiles(common, {
+					sendPath: "stock",
+					probe: true,
+					...(clientProcesses === undefined ? {} : { clientProcesses }),
+				}).candidate,
+			),
+		);
+	// The work CLI appends the count as the new final position, after datagramPump.
+	expect(argv()).toHaveLength(26);
+	expect(argv().slice(-2)).toEqual(["pump", "1"]);
+	expect(argv(4).slice(-2)).toEqual(["pump", "4"]);
+	const run = (args: readonly string[]) => {
+		const log = join(root, `calls-${args.length}-${args.at(-1)}`);
+		const result = spawnSync(
+			"bash",
+			[
+				"-c",
+				`${extractFunction(source(), "run_cell_once")}
+G6_C32_EVIDENCE_ROOT=${JSON.stringify(root)}
+G6_C32_REMOTE_ROOT=/remote
+G6_C32_SHARDS=24
+G6_C32_RUN_ID=fixture
+FIXED_SOURCE_PORT_BASE=20000
+WORK_ENABLED=0
+before_new_work() { printf 'admitted\n' >>${JSON.stringify(log)}; }
+admit_budget_cell() { return 0; }
+next_operation_sequence() { printf 1; }
+rfc3339_now() { printf '2100-01-01T00:00:00.000Z'; }
+gro_remote_script() { printf 'FAKE-GRO'; }
+capture_operation() { case "$2" in *-scan) shift 3; printf '%s\n' "$*" >>${JSON.stringify(log)}; return 90;; *) return 0;; esac; }
+run_cell_once ${args.map((arg) => `'${arg}'`).join(" ")}
+exit $?`,
+			],
+			{ encoding: "utf8", timeout: 4000 },
+		);
+		return {
+			status: result.status,
+			calls: existsSync(log) ? readFileSync(log, "utf8") : "",
+		};
+	};
+	for (const [args, expected] of [
+		[argv(), "1"],
+		[argv(4), "4"],
+		[argv().slice(0, 25), "1"],
+	] as const) {
+		const { calls } = run(args);
+		expect(calls).toContain(
+			`SCAN_DATAGRAM_PUMP=pump SCAN_CLIENT_PROCESSES=${expected} G6_BPF_READY_RECEIPT=`,
+		);
+		expect(calls.split("SCAN_CLIENT_PROCESSES=").length - 1).toBe(1);
+	}
+	for (const invalid of ["0", "17", "1.5", "four", "-1", "04"]) {
+		const { status, calls } = run([...argv().slice(0, 25), invalid]);
+		expect(status).toBe(74);
+		// Refused before any budget admission or remote action.
+		expect(calls).toBe("");
+	}
+	// biome-ignore lint/suspicious/noTemplateCurlyInString: pins a literal bash default, not a JS template
+	expect(source()).toContain("local client_processes=${26:-1}");
+});
+
 function extractFunction(script: string, name: string): string {
 	const start = script.indexOf(`${name}() {`);
 	expect(start).toBeGreaterThan(-1);

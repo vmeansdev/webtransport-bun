@@ -195,6 +195,124 @@ test("r5 decision record must equal the recompute, the window and the pre-regist
 		expect(() => validate(decision(), edit)).toThrow(message);
 });
 
+describe("r5 recorded B override", () => {
+	const authorityBytes = "User authorizes B with 4 generator processes.\n";
+	const authorityPath = "evidence/b-override-authority.txt";
+	const override = {
+		authorityPath,
+		authoritySha256: sha(authorityBytes),
+		generatorProcesses: 4,
+		reason: "User-authorized B despite bGo=false.",
+	};
+	const noGo = (overrides: Partial<R5Decision> = {}) =>
+		decision({
+			bGo: false,
+			bGoReasons: ["B arm Xon did not pass S1-S5 in both A' replicates"],
+			...overrides,
+		});
+	function validateOverride(
+		recomputed: R5Decision,
+		edit: Record<string, unknown>,
+		reader: ((path: string) => Buffer) | null = (path) => {
+			if (path !== authorityPath) throw Error(`unexpected read ${path}`);
+			return Buffer.from(authorityBytes);
+		},
+	) {
+		return validateR5CandidateDecision({
+			decisionBytes: JSON.stringify(record(recomputed, edit)),
+			architect: "architect",
+			critic: "critic",
+			recomputed,
+			expected: {
+				sourceSha: "c".repeat(40),
+				aDigests,
+				aSealedAt: "2026-10-01T00:00:00.000Z",
+				bCreateAt: "2026-10-03T00:00:00.000Z",
+			},
+			readEvidence: () => Buffer.from(""),
+			...(reader ? { readAuthority: reader } : {}),
+			validateReviews: () => undefined,
+		});
+	}
+
+	test("is legal only for SELECTED with bGo=false and leaves every recomputed field intact", () => {
+		const accepted = validateOverride(noGo(), { bOverride: override });
+		expect(accepted.bOverride).toEqual(override);
+		// The recompute still says no B plan; the override does not rewrite it.
+		expect(accepted).toMatchObject({ bGo: false, bWorkPlanId: null });
+		expect(validateOverride(noGo(), {}).bOverride).toBeUndefined();
+		expect(() => validateOverride(decision(), { bOverride: override })).toThrow(
+			"legal only for SELECTED with bGo=false",
+		);
+		for (const recomputed of [
+			noGo({
+				status: "NO_CANDIDATE",
+				candidate: null,
+				sendPath: null,
+				probeInB: null,
+			}),
+			noGo({
+				status: "INCOMPLETE",
+				candidate: null,
+				sendPath: null,
+				probeInB: null,
+			}),
+		])
+			expect(() =>
+				validateOverride(recomputed, { bOverride: override }),
+			).toThrow("legal only for SELECTED with bGo=false");
+	});
+
+	test("refuses a hash mismatch, an unreadable authority and forged or extra fields", () => {
+		expect(() =>
+			validateOverride(noGo(), {
+				bOverride: { ...override, authoritySha256: "0".repeat(64) },
+			}),
+		).toThrow("authority bytes differ from authoritySha256");
+		expect(() =>
+			validateOverride(noGo(), { bOverride: override }, () =>
+				Buffer.from(`${authorityBytes} (edited)`),
+			),
+		).toThrow("authority bytes differ from authoritySha256");
+		expect(() =>
+			validateOverride(noGo(), { bOverride: override }, null),
+		).toThrow("authority cannot be read");
+		for (const [bOverride, message] of [
+			[{ ...override, extra: true }, "missing or unknown fields"],
+			[
+				Object.fromEntries(
+					Object.entries(override).filter(([key]) => key !== "reason"),
+				),
+				"missing or unknown fields",
+			],
+			[{ ...override, authoritySha256: "A".repeat(64) }, "64 lowercase hex"],
+			[{ ...override, authoritySha256: "a".repeat(63) }, "64 lowercase hex"],
+			[{ ...override, generatorProcesses: 1 }, "from 2 to 16"],
+			[{ ...override, generatorProcesses: 17 }, "from 2 to 16"],
+			[{ ...override, generatorProcesses: 2.5 }, "from 2 to 16"],
+			[{ ...override, generatorProcesses: "4" }, "from 2 to 16"],
+			[{ ...override, reason: " " }, "reason"],
+			[{ ...override, authorityPath: "" }, "authorityPath"],
+			[null, "must be structured evidence"],
+		] as const)
+			expect(() => validateOverride(noGo(), { bOverride })).toThrow(message);
+		// Forging the go decision or a B plan alongside the override is refused
+		// by recompute equality, never accepted as part of the override.
+		for (const [edit, message] of [
+			[{ bGo: true }, "bGo differs from the A' recompute"],
+			[{ bGoReasons: [] }, "bGoReasons differs from the A' recompute"],
+			[
+				{ bWorkPlanId: "g6-capacity-ladder-b-r5" },
+				"bWorkPlanId differs from the A' recompute",
+			],
+			[{ bOverride: override, extra: true }, "missing or unknown fields"],
+		] as const)
+			expect(() =>
+				validateOverride(noGo(), { bOverride: override, ...edit }),
+			).toThrow(message);
+	});
+});
+
 describe("r5CellSummaries", () => {
 	const never = (nodeId: string): never => {
 		throw new Error(`read ${nodeId}`);

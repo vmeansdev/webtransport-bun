@@ -579,3 +579,95 @@ test("r5 a trailing XB INVALID (raw S5 session error) only removes batch64; a no
 		/B exists although the A' decision is INCOMPLETE/,
 	);
 }, 600_000);
+
+test("r5 B under a recorded user override (SELECTED, bGo=false) with 4 generator processes passes and is disclosed", async () => {
+	// Recorded probe interference puts B on Xoff; an Xoff-2 S4 MISS (26 ms > 25)
+	// keeps C-PUMP SELECTED (median Xoff ACK 18 ms < A0 20 ms) but sets bGo=false.
+	const f = await completeGoalAdaptersFixture(processFixture().proof, {
+		r5: {
+			calibration: "interference",
+			// XB keeps no 15% ACK edge over the raised Xoff median: stock B.
+			ackMs: { "Xoff-2": 26, "XB-1": 17, "XB-2": 17 },
+			bClientProcesses: 4,
+			bOverride: true,
+		},
+		aOutcomes: { "Xoff-2": "MISS" },
+	});
+	roots.push(f.repoRoot);
+	expect(f.r5Decision).toMatchObject({
+		status: "SELECTED",
+		sendPath: "stock",
+		probeInB: false,
+		calibration: { disposition: "interference" },
+		bGo: false,
+	});
+	// The override keeps the E2 probe-off plan for the recorded interference.
+	expect(f.campaignB.policy.workPlan.id).toBe(
+		"g6-capacity-ladder-b-r5-probe-off",
+	);
+	expect(f.campaignB.policy.workProfiles.candidate).toMatchObject({
+		clientProcesses: 4,
+	});
+	expect(f.contract.ladder.profile).toMatchObject({ clientProcesses: 4 });
+	const accepted = evaluateCapacityGoal(f);
+	expect(accepted).toMatchObject({
+		status: "PASS",
+		exitCode: 0,
+		reasons: [],
+		r5: {
+			sendPath: "stock",
+			probeInB: false,
+			mechanismClaim: "none",
+			bOverride: {
+				authorityPath: "evidence/b-override-authority.txt",
+				generatorProcesses: 4,
+			},
+		},
+	});
+	expect(accepted.r5?.claims.join("\n")).toContain(
+		"recorded user override of A' bGo=false with 4 generator processes",
+	);
+	// The authority bytes must hash to the recorded digest.
+	let restore = tamper(
+		f,
+		"evidence/b-override-authority.txt",
+		(text) => `${text}edited\n`,
+	);
+	refused(f, "edited override authority", /authority bytes differ/);
+	restore();
+	// Without the override record, bGo=false still forbids B.
+	restore = resignDecision(f, (decision) => {
+		delete decision.bOverride;
+	});
+	refused(
+		f,
+		"B without override",
+		"B exists although the A' decision is SELECTED with bGo=false",
+	);
+	restore();
+	// The override's process count must be the one B actually ran.
+	restore = resignDecision(f, (decision) => {
+		(decision.bOverride as Row).generatorProcesses = 2;
+	});
+	refused(f, "override count differs from B", /r5 B candidate profile differs/);
+	restore();
+	// A merged client report covering fewer processes is refused.
+	restore = tamper(
+		f,
+		bCell(f, "L40000-1"),
+		json((scan) => {
+			const report = client(scan);
+			report.clientProcesses = 3;
+			scan.clientStdout = `mmo-client: json ${JSON.stringify(report)}\n`;
+		}),
+	);
+	refused(f, "merged report count differs");
+	restore();
+	expect(evaluateCapacityGoal(f).exitCode).toBe(0);
+}, 900_000);
+
+test("r5 B with clientProcesses but no recorded override is refused", async () => {
+	const f = await build({ bClientProcesses: 4 });
+	expect(f.r5Decision).toMatchObject({ status: "SELECTED", bGo: true });
+	refused(f, "unrecorded fan-out", /r5 B candidate profile differs/);
+}, 600_000);

@@ -211,10 +211,16 @@ export type R5FixtureOptions = {
 	bPlanId?: R5LadderPlanId;
 	bProbe?: boolean;
 	bSendPath?: "stock" | "batch64";
+	/** B profile generator processes (clientProcesses), echoed by B's raw cells. */
+	bClientProcesses?: number;
+	/** Record a user-authorized B override (generatorProcesses = bClientProcesses ?? 4). */
+	bOverride?: boolean;
 	/** Make A0 cheaper than C-PUMP so no candidate is selected. */
 	noCandidate?: boolean;
 	/** Replace the prepared vendored wtransport gate stdout (E3 tamper). */
 	vendoredGateStdout?: string;
+	/** Per-A'-cell client ACK p99 (ms), e.g. an S4 MISS that withholds B (bGo=false). */
+	ackMs?: Readonly<Record<string, number>>;
 	/** Scale one A' cell's offered moves (offered-work parity edge). */
 	offeredMovesSkew?: Readonly<Record<string, number>>;
 };
@@ -232,7 +238,11 @@ function r5ArmMetrics(nodeId: string, r5: R5FixtureOptions) {
 			: arm === "XB" && r5.sendPath === "batch64"
 				? 4
 				: 10;
-	return { generatorCpuMs, serverCpuMs, ackMs };
+	return {
+		generatorCpuMs,
+		serverCpuMs,
+		ackMs: r5.ackMs?.[nodeId] ?? ackMs,
+	};
 }
 function histogramJson(ms: number): unknown {
 	const histogram = new LatencyHistogram();
@@ -366,6 +376,9 @@ export async function completeGoalAdaptersFixture(
 				makeCandidateLadderWorkProfiles(r5Common, {
 					sendPath: r5BSendPath,
 					probe: r5BProbe,
+					...(r5?.bClientProcesses === undefined
+						? {}
+						: { clientProcesses: r5.bClientProcesses }),
 				}).candidate,
 			)
 		: {
@@ -533,6 +546,20 @@ export async function completeGoalAdaptersFixture(
 			selectionExplanation:
 				"Synthetic mechanical application of the pre-registered r5 rule.",
 		};
+		if (r5.bOverride) {
+			const authorityPath = "evidence/b-override-authority.txt";
+			write(
+				repoRoot,
+				authorityPath,
+				"Synthetic user authorization: run B despite A' bGo=false.\n",
+			);
+			decision.bOverride = {
+				authorityPath,
+				authoritySha256: sha(readFileSync(join(repoRoot, authorityPath))),
+				generatorProcesses: r5.bClientProcesses ?? 4,
+				reason: "Synthetic: user-authorized B with fanned-out generator.",
+			};
+		}
 	} else {
 		const aResult = evaluateSendPathAttribution({
 			root: a.workRoot,
@@ -1658,6 +1685,9 @@ export async function completeGoalAdaptersFixture(
 					pumpsSpawned: pump ? 128 : 0,
 					pumpsLive: 0,
 				};
+				// A fanned-out generator emits one merged report naming its count.
+				if (p.clientProcesses !== undefined && p.clientProcesses > 1)
+					client.clientProcesses = p.clientProcesses;
 				const steady = record(record(client.windows).steady);
 				const steadyDrain = record(record(client.windows).steadyDrain);
 				const metrics =
@@ -1805,7 +1835,11 @@ export async function completeGoalAdaptersFixture(
 				if (r5 && name === "scan.receipt.json")
 					receipt.action.args = receipt.action.args.map((arg: string) =>
 						arg.includes("SCAN_UDP_SEND_BATCH=")
-							? `SCAN_DATAGRAM_PUMP=${p.datagramPump} ${arg
+							? `SCAN_DATAGRAM_PUMP=${p.datagramPump} ${
+									p.clientProcesses === undefined
+										? ""
+										: `SCAN_CLIENT_PROCESSES=${p.clientProcesses} `
+								}${arg
 									.replace(
 										/SCAN_UDP_SEND_BATCH=\d+ /,
 										`SCAN_UDP_SEND_BATCH=${p.udpSendBatch} `,

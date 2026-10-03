@@ -191,3 +191,107 @@ test("attribution retains ambiguous send pressure without censoring an ACK-only 
 		expect(gradeWorkCell(broken)).toMatchObject({ outcome: "INVALID" });
 	}
 });
+
+function fannedGradeFixture(clientProcesses?: number) {
+	return workGradeFixture({
+		profile: {
+			...workProfileFixture,
+			shards: 1,
+			...(clientProcesses === undefined ? {} : { clientProcesses }),
+		},
+	});
+}
+function editClientReport(
+	input: ReturnType<typeof workGradeFixture>,
+	change: (report: Record<string, unknown>) => void,
+) {
+	const report = JSON.parse(
+		input.scan.clientStdout.slice("mmo-client: json ".length),
+	);
+	change(report);
+	input.scan.clientStdout = `mmo-client: json ${JSON.stringify(report)}\n`;
+}
+function editScanCommand(
+	input: ReturnType<typeof workGradeFixture>,
+	change: (command: string) => string,
+) {
+	const args = [...input.operation.action.args];
+	args[3] = change(requireDefined(args[3]));
+	input.operation.action.args = args;
+}
+function invalid(input: ReturnType<typeof workGradeFixture>, reason: RegExp) {
+	const grade = gradeWorkCell(input);
+	expect(grade.outcome).toBe("INVALID");
+	expect(grade.reasons.join("; ")).toMatch(reason);
+}
+
+test("a registered generator fan-out must be echoed by the scan config, merged report and command", () => {
+	const base = fannedGradeFixture(4);
+	expect(base.scan.config).toMatchObject({ clientProcesses: 4 });
+	expect(base.operation.action.args[3]).toContain("SCAN_CLIENT_PROCESSES=4 ");
+	expect(gradeWorkCell(base).outcome).toBe("PASS");
+
+	const config = fannedGradeFixture(4);
+	(config.scan.config as Record<string, unknown>).clientProcesses = 1;
+	invalid(config, /clientProcesses differs from (frozen|the work) profile/);
+
+	const merged = fannedGradeFixture(4);
+	editClientReport(merged, (report) => {
+		report.clientProcesses = 3;
+	});
+	invalid(
+		merged,
+		/merged client report clientProcesses differs from the work profile/,
+	);
+
+	// An unmerged (single-process) report cannot certify a 4-process cell.
+	const unmerged = fannedGradeFixture(4);
+	editClientReport(unmerged, (report) => {
+		delete report.clientProcesses;
+	});
+	invalid(
+		unmerged,
+		/merged client report clientProcesses differs from the work profile/,
+	);
+
+	const command = fannedGradeFixture(4);
+	editScanCommand(command, (text) =>
+		text.replace("SCAN_CLIENT_PROCESSES=4 ", "SCAN_CLIENT_PROCESSES=2 "),
+	);
+	invalid(command, /SCAN_CLIENT_PROCESSES differs/);
+
+	const missing = fannedGradeFixture(4);
+	editScanCommand(missing, (text) =>
+		text.replace("SCAN_CLIENT_PROCESSES=4 ", ""),
+	);
+	invalid(missing, /SCAN_CLIENT_PROCESSES differs/);
+});
+
+test("a profile without clientProcesses admits only the single-process launcher default", () => {
+	const plain = fannedGradeFixture();
+	expect(plain.operation.action.args[3]).not.toContain("SCAN_CLIENT_PROCESSES");
+	expect(gradeWorkCell(plain).outcome).toBe("PASS");
+	const launcherDefault = fannedGradeFixture();
+	editScanCommand(launcherDefault, (text) =>
+		text.replace(
+			"SCAN_REFLECT_RING_BYPASS=",
+			"SCAN_CLIENT_PROCESSES=1 SCAN_REFLECT_RING_BYPASS=",
+		),
+	);
+	expect(gradeWorkCell(launcherDefault).outcome).toBe("PASS");
+	const unregistered = fannedGradeFixture();
+	editScanCommand(unregistered, (text) =>
+		text.replace(
+			"SCAN_REFLECT_RING_BYPASS=",
+			"SCAN_CLIENT_PROCESSES=4 SCAN_REFLECT_RING_BYPASS=",
+		),
+	);
+	invalid(unregistered, /SCAN_CLIENT_PROCESSES differs/);
+	// An explicit single-process profile accepts the unmerged report.
+	const one = fannedGradeFixture(1);
+	expect(gradeWorkCell(one).outcome).toBe("PASS");
+	editClientReport(one, (report) => {
+		report.clientProcesses = 2;
+	});
+	invalid(one, /merged client report clientProcesses/);
+});

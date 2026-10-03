@@ -26,6 +26,10 @@ export type WorkProfile = {
 	 * Absent only in historical policies sealed before the knob existed; it is
 	 * never defaulted, so their artifact digests are unchanged. */
 	datagramPump?: "pump" | "legacy";
+	/** Generator processes on the one generator host (1..16). Absent in every
+	 * policy sealed before the knob existed and never defaulted, so their
+	 * artifact digests are unchanged; the launcher runs absent as 1. */
+	clientProcesses?: number;
 };
 export type WorkProfiles = Record<string, WorkProfile>;
 const KEYS = [
@@ -66,7 +70,19 @@ function exact(value: Record<string, unknown>, keys: string[]) {
 }
 function profile(value: unknown): WorkProfile {
 	const p = object(value);
-	exact(p, Object.hasOwn(p, "datagramPump") ? [...KEYS, "datagramPump"] : KEYS);
+	exact(p, [
+		...KEYS,
+		...(["datagramPump", "clientProcesses"] as const).filter((key) =>
+			Object.hasOwn(p, key),
+		),
+	]);
+	if (
+		Object.hasOwn(p, "clientProcesses") &&
+		(!Number.isSafeInteger(p.clientProcesses) ||
+			(p.clientProcesses as number) < 1 ||
+			(p.clientProcesses as number) > 16)
+	)
+		fail("clientProcesses must be an integer from 1 to 16");
 	if (
 		Object.hasOwn(p, "datagramPump") &&
 		p.datagramPump !== "pump" &&
@@ -185,18 +201,28 @@ export function makeCandidateAttributionWorkProfiles(
  * record selects one through policy, so B's source equals A''s source. */
 export function makeCandidateLadderWorkProfiles(
 	common: WorkProfile,
-	choice: { sendPath: "stock" | "batch64"; probe: boolean },
+	choice: {
+		sendPath: "stock" | "batch64";
+		probe: boolean;
+		/** Generator processes for every B cell; only the choice sets it. */
+		clientProcesses?: number;
+	},
 ): WorkProfiles {
-	const p = profile({ ...common, datagramPump: "pump" });
-	return {
-		candidate: {
-			...p,
-			datagramPump: "pump",
-			reflectRingBypass: "off",
-			udpSendBatch: choice.sendPath === "batch64" ? 64 : 0,
-			detailedProbe: choice.probe,
-		},
-	};
+	const { clientProcesses: _inherited, ...p } = profile({
+		...common,
+		datagramPump: "pump",
+	});
+	const candidate = profile({
+		...p,
+		datagramPump: "pump",
+		reflectRingBypass: "off",
+		udpSendBatch: choice.sendPath === "batch64" ? 64 : 0,
+		detailedProbe: choice.probe,
+		...(choice.clientProcesses === undefined
+			? {}
+			: { clientProcesses: choice.clientProcesses }),
+	});
+	return { candidate };
 }
 
 const R5_KEYS = [...KEYS, "datagramPump"];
@@ -219,6 +245,9 @@ export function validateWorkProfiles(
 		if (plan.nodes.some((node) => node.kind !== "attribution-r4"))
 			fail("attribution-r4 plans contain only attribution-r4 cells");
 		const base = result.Xoff ?? fail("attribution-r4 lacks the Xoff profile");
+		// A' attribution arms always ran one generator process.
+		if (Object.values(result).some((p) => p.clientProcesses !== undefined))
+			fail("attribution-r4 profiles never carry clientProcesses");
 		const expected = makeCandidateAttributionWorkProfiles(base);
 		exact(result, Object.keys(expected));
 		for (const name of Object.keys(expected))

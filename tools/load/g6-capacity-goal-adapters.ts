@@ -89,6 +89,7 @@ import {
 	isR5AttributionPlanId,
 	isR5LadderPlanId,
 	R5_VENDORED_WTRANSPORT_GATE_ID,
+	type R5BOverride,
 	r5CellSummaries,
 	validateR5CandidateDecision,
 	vendoredWtransportTestsPassed,
@@ -145,6 +146,8 @@ export type CapacityR5LadderBinding = Readonly<{
 	calibrationDisposition: "non-interference" | "interference";
 	/** E2: a probe-off ladder makes no detailed-probe mechanism claim. */
 	mechanismClaim: "detailed-probe" | "none";
+	/** Disclosed whenever B ran under a recorded user override of bGo=false. */
+	bOverride?: R5BOverride;
 }>;
 export type CapacityGoalAdaptersResult = {
 	fatalReasons: string[];
@@ -491,6 +494,7 @@ function loadCampaign(
 						"reflectRingBypass",
 						"detailedProbe",
 						"datagramPump",
+						"clientProcesses",
 					].includes(key)
 				) &&
 				(profile as unknown as Row)[key] !== expected
@@ -774,16 +778,22 @@ function attributionR5(context: EvidenceContext, campaign: Campaign) {
 		batchOwnershipTestsPassed: localBatchOwnership(context, campaign.sourceSha),
 	});
 }
-/** B exists only for a SELECTED, go decision, and runs exactly its encoded variant. */
+/**
+ * B exists only for a SELECTED decision that is go, or that carries a
+ * validated recorded user override of bGo=false, and runs exactly its encoded
+ * variant (with the override's generator process count, never otherwise).
+ */
 function assertR5Ladder(
 	context: EvidenceContext,
 	a: Campaign,
 	b: Campaign,
 	decision: R5Decision,
+	bOverride: R5BOverride | undefined,
 ): CapacityR5LadderBinding {
 	if (
 		decision.status !== "SELECTED" ||
-		!decision.bGo ||
+		(!decision.bGo && bOverride === undefined) ||
+		(decision.bGo && bOverride !== undefined) ||
 		decision.sendPath === null ||
 		decision.probeInB === null
 	)
@@ -806,11 +816,22 @@ function assertR5Ladder(
 		b.policy.workProfiles,
 		makeCandidateLadderWorkProfiles(
 			requireDefined(a.policy.workProfiles.Xoff),
-			{ sendPath: decision.sendPath, probe: decision.probeInB },
+			{
+				sendPath: decision.sendPath,
+				probe: decision.probeInB,
+				...(bOverride ? { clientProcesses: bOverride.generatorProcesses } : {}),
+			},
 		),
 		"r5 B candidate profile",
 	);
 	const profile = context.contract.ladder.profile;
+	if (
+		profile.clientProcesses !==
+		(bOverride ? bOverride.generatorProcesses : undefined)
+	)
+		fail(
+			"contract ladder clientProcesses differs from the recorded r5 B override",
+		);
 	if (
 		profile.datagramPump !== "pump" ||
 		profile.udpSendBatch !== (decision.sendPath === "batch64" ? 64 : 0) ||
@@ -822,6 +843,7 @@ function assertR5Ladder(
 		probeInB: decision.probeInB,
 		calibrationDisposition: disposition,
 		mechanismClaim: decision.probeInB ? "detailed-probe" : "none",
+		...(bOverride ? { bOverride } : {}),
 	};
 }
 function diagnosticCell(
@@ -1893,7 +1915,7 @@ export function evaluateCapacityGoalAdapters(
 				if (isR5(a)) {
 					const decision = attributionR5(context, a);
 					assertCampaignSequence(context, a, b);
-					validateR5CandidateDecision({
+					const decisionRecord = validateR5CandidateDecision({
 						decisionBytes: context.read(value.decisionPath),
 						architect: context.json(value.architectPath),
 						critic: context.json(value.criticPath),
@@ -1905,9 +1927,16 @@ export function evaluateCapacityGoalAdapters(
 							bCreateAt: b.firstCreate.recordedAt,
 						},
 						readEvidence,
+						readAuthority: (path) => context.read(path),
 						validateReviews: validateCandidateReviews,
 					});
-					r5 = assertR5Ladder(context, a, b, decision);
+					r5 = assertR5Ladder(
+						context,
+						a,
+						b,
+						decision,
+						decisionRecord.bOverride,
+					);
 				} else {
 					if (b.policy.workPlan.id !== "g6-capacity-ladder-b")
 						fail("historical A requires the historical B ladder plan");

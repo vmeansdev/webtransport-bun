@@ -268,6 +268,9 @@ export function workScanWitness(input: {
 		...(p.datagramPump === undefined
 			? {}
 			: { SCAN_DATAGRAM_PUMP: p.datagramPump }),
+		...(p.clientProcesses === undefined
+			? {}
+			: { SCAN_CLIENT_PROCESSES: p.clientProcesses }),
 		G6_BPF_READY_RECEIPT: `${remote}/g6-shard-bpf-ready.json`,
 		SCAN_LINUX_PROBE_ENABLED: p.detailedProbe ? 1 : 0,
 		SCAN_LINUX_PROBE_OUT: `${remote}/linux-probe.jsonl`,
@@ -535,6 +538,9 @@ export function workGradeFixture(
 				profile.datagramPump === "pump" ? node.requestedSessions : 0,
 			pumpsLive: 0,
 		};
+	// A fanned-out generator emits one merged report naming its process count.
+	if (profile.clientProcesses !== undefined && profile.clientProcesses > 1)
+		client.clientProcesses = profile.clientProcesses;
 	scan.clientStdout = `mmo-client: json ${JSON.stringify(client)}\n`;
 	const share = (total: number, index: number) =>
 		Math.floor(total / profile.shards) +

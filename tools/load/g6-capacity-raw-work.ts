@@ -325,6 +325,13 @@ export function validateScanCommand(
 	if (datagramPump !== undefined) fixed.SCAN_DATAGRAM_PUMP = datagramPump;
 	else if (Object.hasOwn(env, "SCAN_DATAGRAM_PUMP"))
 		fail("scan command sets a datagram path the registered profile lacks");
+	// Generator process count: the profile's exact value when registered;
+	// otherwise the launcher may only pass the single-process scan default.
+	const clientProcesses = (p as { clientProcesses?: number }).clientProcesses;
+	if (clientProcesses !== undefined)
+		fixed.SCAN_CLIENT_PROCESSES = clientProcesses;
+	else if (Object.hasOwn(env, "SCAN_CLIENT_PROCESSES"))
+		fixed.SCAN_CLIENT_PROCESSES = 1;
 	for (const [key, value] of Object.entries(fixed))
 		if (env[key] !== String(value))
 			fail(`scan command ${key} differs from registered host/profile`);

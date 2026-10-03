@@ -120,7 +120,11 @@ type CompanionRunBinding = RawRunPaths &
 
 /** r5 ladders add the wtransport datagram read path; it is never defaulted. */
 type LadderProfile = Readonly<
-	Required<SuccessorGradeRequest["profile"]> & { datagramPump?: "pump" }
+	Required<SuccessorGradeRequest["profile"]> & {
+		datagramPump?: "pump";
+		/** r5 B under a recorded override: generator processes (1..16). */
+		clientProcesses?: number;
+	}
 >;
 
 const FIXED_PROFILE = {
@@ -668,9 +672,20 @@ function validateLadderProfile(value: unknown): LadderProfile {
 			...Object.keys(FIXED_PROFILE),
 			"udpSendBatch",
 			...(Object.hasOwn(value, "datagramPump") ? ["datagramPump"] : []),
+			...(Object.hasOwn(value, "clientProcesses") ? ["clientProcesses"] : []),
 		],
 		"contract.ladder.profile",
 	);
+	if (
+		Object.hasOwn(value, "clientProcesses") &&
+		(typeof value.clientProcesses !== "number" ||
+			!Number.isSafeInteger(value.clientProcesses) ||
+			value.clientProcesses < 1 ||
+			value.clientProcesses > 16)
+	)
+		fail(
+			"contract.ladder.profile.clientProcesses must be an integer from 1 to 16",
+		);
 	if (Object.hasOwn(value, "datagramPump") && value.datagramPump !== "pump")
 		fail("contract.ladder.profile.datagramPump must be the pump candidate");
 	for (const [field, expected] of Object.entries(FIXED_PROFILE)) {
@@ -687,6 +702,9 @@ function validateLadderProfile(value: unknown): LadderProfile {
 		...FIXED_PROFILE,
 		udpSendBatch: value.udpSendBatch,
 		...(value.datagramPump === "pump" ? { datagramPump: "pump" as const } : {}),
+		...(typeof value.clientProcesses === "number"
+			? { clientProcesses: value.clientProcesses }
+			: {}),
 	};
 }
 
@@ -1443,7 +1461,12 @@ function loadRawRun(
 				: config[field];
 		if (observed !== expected)
 			fail(`scan ${field} differs from registered profile`);
-		if (field !== "pacerPps" && dispatch[field] !== expected)
+		// The diagnostic dispatch carries no generator process count.
+		if (
+			field !== "pacerPps" &&
+			field !== "clientProcesses" &&
+			dispatch[field] !== expected
+		)
 			fail(`diagnostic ${field} differs from registered profile`);
 	}
 	if (config.steadySeconds !== 120)
@@ -1484,6 +1507,22 @@ function loadRawRun(
 	)
 		fail("client fixedSourcePortBase differs from registered profile");
 	validateClientPorts(report, contract.ladder.profile);
+	const clientProcesses = contract.ladder.profile.clientProcesses;
+	if (clientProcesses !== undefined) {
+		// The scan config echo is checked with the profile above; the merged
+		// client report must cover exactly the registered generator processes
+		// (a single-process scan emits the unmerged report, meaning 1).
+		if (config.clientProcesses !== clientProcesses)
+			fail("scan clientProcesses differs from registered profile");
+		if (
+			(Object.hasOwn(report, "clientProcesses")
+				? report.clientProcesses
+				: 1) !== clientProcesses
+		)
+			fail(
+				"merged client report clientProcesses differs from registered profile",
+			);
+	}
 	const datagramPump = contract.ladder.profile.datagramPump;
 	if (datagramPump !== undefined) {
 		// Both roles must prove the registered datagram read path carried traffic.
@@ -2102,11 +2141,19 @@ export function evaluateCapacityGoal(input: {
 				? {
 						r5: {
 							...r5,
-							claims: probeOff
-								? [
-										"no mechanism claim: B ran probe-off after A' recorded detailed-probe interference",
-									]
-								: [],
+							claims: [
+								...(probeOff
+									? [
+											"no mechanism claim: B ran probe-off after A' recorded detailed-probe interference",
+										]
+									: []),
+								// The override is disclosed, never folded into a go decision.
+								...(r5.bOverride
+									? [
+											`B ran under a recorded user override of A' bGo=false with ${r5.bOverride.generatorProcesses} generator processes (authority sha256 ${r5.bOverride.authoritySha256})`,
+										]
+									: []),
+							],
 						},
 					}
 				: {}),

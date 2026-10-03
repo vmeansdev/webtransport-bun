@@ -36,9 +36,18 @@ export function readGeneratorWorkOwner(
 	const values = keys.map((key) => environment[key]);
 	if (values.every((value) => value === undefined)) return null;
 	const [runId, nodeId, remoteRoot, bootId] = values;
-	if (!runId || !nodeId || !remoteRoot || !bootId || clientProcesses !== 1)
+	// Several processes run inside the one owned group (g6-generator-fanout).
+	if (
+		!runId ||
+		!nodeId ||
+		!remoteRoot ||
+		!bootId ||
+		!Number.isSafeInteger(clientProcesses) ||
+		clientProcesses < 1 ||
+		clientProcesses > 16
+	)
 		throw Error(
-			"work generator requires complete authority and exactly one client process",
+			"work generator requires complete authority and 1..16 client processes",
 		);
 	const owner: WorkProcessOwner = {
 		runId,

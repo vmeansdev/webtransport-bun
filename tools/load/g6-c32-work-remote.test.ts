@@ -15,7 +15,7 @@ const generatorEnvironment = {
 		"/root/webtransport-bun/.scratch/bare-metal-campaign/runs/run-a",
 	G6_OFFBOX_WORK_BOOT_ID: "11111111-1111-4111-8111-111111111111",
 };
-test("generator ownership accepts only a complete canonical singleton authority", () => {
+test("generator ownership accepts only a complete canonical authority for 1..16 processes", () => {
 	expect(readGeneratorWorkOwner({}, 1)).toBeNull();
 	expect(readGeneratorWorkOwner(generatorEnvironment, 1)?.role).toBe(
 		"generator",
@@ -36,7 +36,15 @@ test("generator ownership accepts only a complete canonical singleton authority"
 				1,
 			),
 		).toThrow();
-	expect(() => readGeneratorWorkOwner(generatorEnvironment, 2)).toThrow();
+	// The fan-out runs 1..16 processes inside the one owned group.
+	for (const clientProcesses of [2, 4, 16])
+		expect(
+			readGeneratorWorkOwner(generatorEnvironment, clientProcesses)?.role,
+		).toBe("generator");
+	for (const clientProcesses of [0, 17, 1.5, Number.NaN])
+		expect(() =>
+			readGeneratorWorkOwner(generatorEnvironment, clientProcesses),
+		).toThrow("1..16 client processes");
 });
 test("owned generator launch preserves the tracked entry and every argument boundary", () => {
 	const owner = readGeneratorWorkOwner(generatorEnvironment, 1);

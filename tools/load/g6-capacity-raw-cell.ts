@@ -455,6 +455,12 @@ export function validateCapacityRawCell(
 	for (const [key, value] of Object.entries(expected))
 		if (config[key] !== value || dispatch[key] !== value)
 			fail(`raw ${key} differs from frozen profile`);
+	// The diagnostic dispatch has no process count; the scan config echoes it.
+	if (
+		p.clientProcesses !== undefined &&
+		config.clientProcesses !== p.clientProcesses
+	)
+		fail("raw clientProcesses differs from frozen profile");
 	if (
 		config.steadySeconds !== G6_SHARDED_VALIDITY.steadySeconds ||
 		![null, 0, "0"].includes(config.pacerPps as null | number | string)

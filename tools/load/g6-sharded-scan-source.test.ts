@@ -721,8 +721,14 @@ describe("g6 sharded scan source-bound configuration", () => {
 		// Generator processes spawn one at a time: their entry scripts share
 		// one clone and raced on git fetch/checkout when spawned together.
 		expect(source).toContain("for (const plan of clientPlans) {");
-		expect(source).toContain(
-			"const child = spawnClient(plan);\n\t\t\ttrackChildClose(child);\n\t\t\tclients.push(child);",
+		// Unowned processes are spawned and tracked one by one; an owned work
+		// cell's processes share one tracked fan-out process instead.
+		expect(source).toMatch(/fanoutClients === null\s*\?\s*spawnClient\(plan\)/);
+		expect(source).toMatch(
+			/if \(fanoutClients === null\) \{\s*trackChildClose\(child\);\s*clients\.push\(child\);/,
+		);
+		expect(source).toMatch(
+			/trackChildClose\(fanout\);\s*clients\.push\(fanout\);/,
 		);
 		expect(source).toContain(
 			'if (line.startsWith("macgen: binary=")) built();',
