@@ -740,10 +740,12 @@ test("r5 override B whose source does not descend from the A' source is refused"
 		bSourceChange: "harness",
 		bNotDescendant: true,
 	});
+	// The retained A' replay refuses a non-descendant harness before the
+	// adapter's own E1 continuity check is reached.
 	refused(
 		f,
 		"non-descendant B",
-		"r5 B source does not descend from the A' source",
+		"retained candidate is not an ancestor of the current harness",
 	);
 }, 900_000);
 
