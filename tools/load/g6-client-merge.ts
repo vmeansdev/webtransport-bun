@@ -23,6 +23,33 @@ export type ClientProcessPlan = {
 };
 
 /**
+ * The `index`-th of `processes` even shares of `total` (remainders to the
+ * lowest indices), so the shares always sum to exactly `total`. The connect
+ * shape (concurrency, rate) must be split this way: the merged report sums
+ * the per-process values and the grader compares that sum with the frozen
+ * profile, so rounding each share would misstate the registered shape.
+ */
+export function evenShare(
+	total: number,
+	processes: number,
+	index: number,
+): number {
+	if (
+		!Number.isSafeInteger(total) ||
+		total < 0 ||
+		!Number.isInteger(processes) ||
+		processes < 1 ||
+		!Number.isInteger(index) ||
+		index < 0 ||
+		index >= processes
+	)
+		throw new Error(
+			`cannot take share ${index} of ${total} across ${processes} processes`,
+		);
+	return Math.floor(total / processes) + (index < total % processes ? 1 : 0);
+}
+
+/**
  * Split one rung across `processes` generator processes. Sessions and
  * endpoints are divided evenly (remainders go to the lowest indices); with a
  * fixed source-port base each process gets its own contiguous port range so

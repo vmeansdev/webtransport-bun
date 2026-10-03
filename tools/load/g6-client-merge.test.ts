@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
 	allocateClientProcesses,
+	evenShare,
 	mergeClientReports,
 	mergeHistograms,
 } from "./g6-client-merge.ts";
@@ -227,5 +228,35 @@ describe("g6 client merge", () => {
 		expect(() =>
 			mergeClientReports([report({}), report({ schema: "mmo-client/1" })]),
 		).toThrow(/schema/);
+	});
+});
+
+describe("evenShare", () => {
+	test("connect shape shares sum to exactly the registered totals", () => {
+		for (const [total, n] of [
+			[50, 4],
+			[250, 4],
+			[500, 3],
+			[7, 7],
+			[0, 4],
+		] as const) {
+			const shares = Array.from({ length: n }, (_, i) =>
+				evenShare(total, n, i),
+			);
+			expect(shares.reduce((a, b) => a + b, 0)).toBe(total);
+			expect(Math.max(...shares) - Math.min(...shares)).toBeLessThanOrEqual(1);
+		}
+		expect([0, 1, 2, 3].map((i) => evenShare(50, 4, i))).toEqual([
+			13, 13, 12, 12,
+		]);
+		expect([0, 1, 2, 3].map((i) => evenShare(250, 4, i))).toEqual([
+			63, 63, 62, 62,
+		]);
+	});
+	test("rejects impossible shares", () => {
+		expect(() => evenShare(10, 0, 0)).toThrow();
+		expect(() => evenShare(10, 2, 2)).toThrow();
+		expect(() => evenShare(-1, 2, 0)).toThrow();
+		expect(() => evenShare(1.5, 2, 0)).toThrow();
 	});
 });

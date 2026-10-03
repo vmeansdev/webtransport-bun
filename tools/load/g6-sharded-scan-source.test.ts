@@ -812,8 +812,17 @@ describe("g6 sharded scan source-bound configuration", () => {
 		// and their reports merge into the one mmo-client/2 line every grader
 		// reads; process 0's phase markers drive the shard boundaries.
 		expect(source).toContain(
-			'import {\n\tallocateClientProcesses,\n\tmergeClientReports,\n} from "./g6-client-merge.ts";',
+			'import {\n\tallocateClientProcesses,\n\tevenShare,\n\tmergeClientReports,\n} from "./g6-client-merge.ts";',
 		);
+		// The connect shape is split into exact shares: the merged report sums
+		// them and the grader compares the sum with the frozen profile.
+		expect(source).toContain(
+			"String(evenShare(CONNECT_CONCURRENCY, CLIENT_PROCESSES, plan.index)),",
+		);
+		expect(source).toContain(
+			"String(evenShare(CONNECT_RATE_PER_SEC, CLIENT_PROCESSES, plan.index)),",
+		);
+		expect(source).not.toContain("CONNECT_CONCURRENCY / CLIENT_PROCESSES");
 		expect(source).toContain(
 			'const CLIENT_PROCESSES = parsePositiveIntegerEnv("SCAN_CLIENT_PROCESSES", 1);',
 		);

@@ -62,6 +62,7 @@ import {
 import { trackChildClose, waitForChildClose } from "./g6-child-lifecycle.ts";
 import {
 	allocateClientProcesses,
+	evenShare,
 	mergeClientReports,
 } from "./g6-client-merge.ts";
 import {
@@ -1740,6 +1741,10 @@ async function main(): Promise<void> {
 					Math.ceil(DRAIN_GRACE_MS / 1000) +
 					IDLE_SECONDS),
 		);
+		if (CONNECT_CONCURRENCY < CLIENT_PROCESSES)
+			throw new Error(
+				`g6-sharded-scan: connect concurrency ${CONNECT_CONCURRENCY} cannot be split across ${CLIENT_PROCESSES} client processes`,
+			);
 		const clientPlans = allocateClientProcesses({
 			processes: CLIENT_PROCESSES,
 			sessions: SESSIONS,
@@ -1773,9 +1778,9 @@ async function main(): Promise<void> {
 			"--endpoints",
 			String(plan.endpoints),
 			"--connect-concurrency",
-			String(Math.max(1, Math.round(CONNECT_CONCURRENCY / CLIENT_PROCESSES))),
+			String(evenShare(CONNECT_CONCURRENCY, CLIENT_PROCESSES, plan.index)),
 			"--connect-rate-per-sec",
-			String(Math.round(CONNECT_RATE_PER_SEC / CLIENT_PROCESSES)),
+			String(evenShare(CONNECT_RATE_PER_SEC, CLIENT_PROCESSES, plan.index)),
 			...(plan.fixedSourcePortBase === null
 				? []
 				: ["--fixed-source-port-base", String(plan.fixedSourcePortBase)]),
