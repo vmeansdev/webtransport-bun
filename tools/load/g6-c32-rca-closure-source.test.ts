@@ -190,6 +190,18 @@ describe("g6 c32 RCA closure source contract", () => {
 		expect(controller).toContain("exec 9>>/tmp/bench.lock");
 		expect(controller).toContain("flock -w 30 9");
 		expect(controller).toContain("/tmp/bench.lock.owner");
+		// Release stops this run's remote holder (its sleep child inherits fd 9
+		// and the shell gets no SIGHUP without a pty) before requiring a free lock.
+		const release = controller.slice(
+			controller.indexOf("release_continuous_lock_raw() {"),
+			controller.indexOf("cleanup_campaign() {"),
+		);
+		expect(release).toContain('pkill -P \\"\\$owner_pid\\"');
+		expect(release).toContain("*$release_run*)");
+		expect(release).toContain(
+			"for release_attempt in 1 2 3 4 5 6 7 8 9 10; do flock -n /tmp/bench.lock true && exit 0; sleep 1; done; exit 92",
+		);
+		expect(release).not.toContain("jq ");
 		expect(controller).toContain('"recordedAt"');
 		expect(controller).not.toContain("exec 9>/tmp/bench.lock");
 		expect(controller.indexOf("acquire_continuous_lock")).toBeLessThan(
