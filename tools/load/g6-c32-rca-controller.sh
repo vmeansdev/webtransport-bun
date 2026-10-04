@@ -655,11 +655,12 @@ release_continuous_lock_raw() {
       WORK_CUTOFF=$("$G6_C32_OFFRUNNER_BUN" -e 'console.log(new Date(Math.min(Date.parse(process.argv[1]), Date.now()+20000)).toISOString())' "$DEADLINE")
       # Killing the local ssh client does not end the remote lock shell (no
       # pty, no SIGHUP), and its sleep child inherits fd 9, so the lock would
-      # outlive the run. Stop this run's recorded holder and its children,
-      # then require the lock to become free.
+      # outlive the run. Freeze this run's recorded holder first (a stopped
+      # shell cannot start a fresh sleep that would inherit fd 9), kill its
+      # children, then the holder, and require the lock to become free.
       local release_run
       printf -v release_run '%q' "$G6_C32_RUN_ID"
-      g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" "owner=\$(sed -n 's/.*\"runId\":\"\([^\"]*\)\",\"pid\":\([0-9][0-9]*\)}\$/\1 \2/p' /tmp/bench.lock.owner 2>/dev/null); owner_run=\${owner% *}; owner_pid=\${owner##* }; if [ \"\$owner_run\" = $release_run ]; then case \"\$owner_pid\" in ''|*[!0-9]*) exit 92;; esac; if [ -r /proc/\$owner_pid/cmdline ]; then case \"\$(tr '\\0' ' ' </proc/\$owner_pid/cmdline)\" in *$release_run*) pkill -P \"\$owner_pid\" 2>/dev/null || true; kill \"\$owner_pid\" 2>/dev/null || true;; *) exit 93;; esac; fi; fi; for release_attempt in 1 2 3 4 5 6 7 8 9 10; do flock -n /tmp/bench.lock true && exit 0; sleep 1; done; exit 92" || return 92
+      g6_ssh root@"$G6_C32_SERVER_PUBLIC_IPV4" "owner=\$(sed -n 's/.*\"runId\":\"\([^\"]*\)\",\"pid\":\([0-9][0-9]*\)}\$/\1 \2/p' /tmp/bench.lock.owner 2>/dev/null); owner_run=\${owner% *}; owner_pid=\${owner##* }; if [ \"\$owner_run\" = $release_run ]; then case \"\$owner_pid\" in ''|*[!0-9]*) exit 92;; esac; if [ -r /proc/\$owner_pid/cmdline ]; then case \"\$(tr '\\0' ' ' </proc/\$owner_pid/cmdline)\" in *$release_run*) kill -STOP \"\$owner_pid\" 2>/dev/null || true; pkill -KILL -P \"\$owner_pid\" 2>/dev/null || true; kill -KILL \"\$owner_pid\" 2>/dev/null || true;; *) exit 93;; esac; fi; fi; for release_attempt in 1 2 3 4 5 6 7 8 9 10; do flock -n /tmp/bench.lock true && exit 0; sleep 1; done; exit 92" || return 92
     fi
   fi
 }

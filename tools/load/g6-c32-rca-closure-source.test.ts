@@ -196,7 +196,11 @@ describe("g6 c32 RCA closure source contract", () => {
 			controller.indexOf("release_continuous_lock_raw() {"),
 			controller.indexOf("cleanup_campaign() {"),
 		);
-		expect(release).toContain('pkill -P \\"\\$owner_pid\\"');
+		// Stop before killing children: a running holder can start a fresh
+		// sleep (inheriting fd 9) between the two kills.
+		expect(release).toContain(
+			'kill -STOP \\"\\$owner_pid\\" 2>/dev/null || true; pkill -KILL -P \\"\\$owner_pid\\" 2>/dev/null || true; kill -KILL \\"\\$owner_pid\\"',
+		);
 		expect(release).toContain("*$release_run*)");
 		expect(release).toContain(
 			"for release_attempt in 1 2 3 4 5 6 7 8 9 10; do flock -n /tmp/bench.lock true && exit 0; sleep 1; done; exit 92",

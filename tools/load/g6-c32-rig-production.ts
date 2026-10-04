@@ -3581,7 +3581,7 @@ process.stdout.write(JSON.stringify(record) + "\\n");
 				}
 			}
 			cleanupFunction.push(
-				`if [ -f /tmp/bench.lock.owner ]; then owner_run=$(jq -r .runId /tmp/bench.lock.owner 2>/dev/null || true); owner_pid=$(jq -r .pid /tmp/bench.lock.owner 2>/dev/null || true); if [ "$owner_run" = ${shellQuote(context.runId)} ]; then case "$owner_pid" in ''|*[!0-9]*) exit 92;; esac; if [ -r "/proc/$owner_pid/cmdline" ]; then owner_command=$(tr '\\0' ' ' <"/proc/$owner_pid/cmdline"); case "$owner_command" in *${shellQuote(context.runId)}*) kill "$owner_pid" 2>/dev/null || true;; *) exit 93;; esac; fi; rm -f /tmp/bench.lock.owner; fi; fi`,
+				`if [ -f /tmp/bench.lock.owner ]; then owner_run=$(jq -r .runId /tmp/bench.lock.owner 2>/dev/null || true); owner_pid=$(jq -r .pid /tmp/bench.lock.owner 2>/dev/null || true); if [ "$owner_run" = ${shellQuote(context.runId)} ]; then case "$owner_pid" in ''|*[!0-9]*) exit 92;; esac; if [ -r "/proc/$owner_pid/cmdline" ]; then owner_command=$(tr '\\0' ' ' <"/proc/$owner_pid/cmdline"); case "$owner_command" in *${shellQuote(context.runId)}*) kill -STOP "$owner_pid" 2>/dev/null || true; pkill -KILL -P "$owner_pid" 2>/dev/null || true; kill -KILL "$owner_pid" 2>/dev/null || true;; *) exit 93;; esac; fi; rm -f /tmp/bench.lock.owner; fi; fi`,
 				"for lock_attempt in 1 2 3 4 5; do flock -n /tmp/bench.lock true && break; sleep 1; done; flock -n /tmp/bench.lock true",
 			);
 		}
