@@ -3,6 +3,7 @@ import {
 	makeAttributionWorkPlan,
 	makeCandidateAttributionWorkPlan,
 	makeCapacityLadderWorkPlan,
+	makeSendBufferAbWorkPlan,
 } from "./g6-c32-capacity-work.ts";
 import { requireDefined } from "./g6-c32-freeze-model.ts";
 import { workProfileFixture } from "./g6-c32-work-fixture.test-helper.ts";
@@ -10,6 +11,8 @@ import {
 	makeAttributionWorkProfiles,
 	makeCandidateAttributionWorkProfiles,
 	makeCandidateLadderWorkProfiles,
+	makeSendBufferWorkProfiles,
+	SNDBUF_AB_BYTES,
 	validateWorkProfiles,
 } from "./g6-c32-work-profile.ts";
 
@@ -119,4 +122,60 @@ test("r5 B profiles carry clientProcesses only when chosen; A' arms never do", (
 			XB: { ...attribution.XB, clientProcesses: 4 },
 		}),
 	).toThrow("attribution-r4 profiles never carry clientProcesses");
+});
+
+test("send-buffer A/B binds the closed B arm and differs only in a 4 MiB server send buffer", () => {
+	const common = { ...workProfileFixture, datagramPump: "pump" as const };
+	const candidate = requireDefined(
+		makeCandidateLadderWorkProfiles(common, {
+			sendPath: "stock",
+			probe: false,
+			clientProcesses: 4,
+		}).candidate,
+	);
+	const ab = makeSendBufferWorkProfiles(candidate);
+	expect(ab.D).toEqual(candidate);
+	expect(ab.S).toEqual({
+		...candidate,
+		serverUdpSendBufferBytes: SNDBUF_AB_BYTES,
+	});
+	for (const order of ["ds", "sd"] as const) {
+		const plan = makeSendBufferAbWorkPlan(order);
+		expect(plan.nodes.map(({ id }) => id)).toEqual(
+			order === "ds" ? ["D50k", "S50k"] : ["S50k", "D50k"],
+		);
+		expect(
+			plan.nodes.every(
+				(node) =>
+					node.kind === "attribution-r4" &&
+					node.requestedSessions === 50000 &&
+					node.activeWorkloadSessions === 50000 &&
+					node.profile === node.id.slice(0, 1),
+			),
+		).toBe(true);
+		expect(validateWorkProfiles(plan, ab)).toEqual(ab);
+		for (const bad of [
+			{ ...ab, S: { ...requireDefined(ab.S), connectConcurrency: 60 } },
+			{ ...ab, S: { ...requireDefined(ab.S), serverUdpSendBufferBytes: 0 } },
+			{
+				...ab,
+				D: {
+					...requireDefined(ab.D),
+					serverUdpSendBufferBytes: SNDBUF_AB_BYTES,
+				},
+			},
+			{ D: ab.D },
+		])
+			expect(() => validateWorkProfiles(plan, bad)).toThrow();
+	}
+	// Only the closed probe-off fan-out arm may be the base.
+	expect(() =>
+		makeSendBufferWorkProfiles({ ...candidate, detailedProbe: true }),
+	).toThrow(/r5 probe-off ladder candidate/);
+	const { clientProcesses: _drop, ...single } = candidate;
+	expect(() => makeSendBufferWorkProfiles(single)).toThrow();
+	// Other plans still refuse these arm names.
+	expect(() =>
+		validateWorkProfiles(makeCandidateAttributionWorkPlan(), ab),
+	).toThrow();
 });

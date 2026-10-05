@@ -225,6 +225,30 @@ export function makeCandidateLadderWorkProfiles(
 	return { candidate };
 }
 
+/** Post-closure 50k send-buffer A/B: `D` is the r5 probe-off ladder
+ * candidate exactly (the closed B arm); `S` differs only in a 4 MiB server
+ * UDP send buffer. Source-encoded so policy can bind nothing else. */
+export const SNDBUF_AB_PLAN_IDS = [
+	"g6-sndbuf-50k-ab-ds",
+	"g6-sndbuf-50k-ab-sd",
+] as const;
+export const SNDBUF_AB_BYTES = 4_194_304;
+export function makeSendBufferWorkProfiles(
+	candidate: WorkProfile,
+): WorkProfiles {
+	const D = profile(candidate);
+	if (
+		D.datagramPump !== "pump" ||
+		D.reflectRingBypass !== "off" ||
+		D.udpSendBatch !== 0 ||
+		D.detailedProbe !== false ||
+		D.serverUdpSendBufferBytes !== 0 ||
+		D.clientProcesses === undefined
+	)
+		fail("send-buffer A/B base must be the r5 probe-off ladder candidate");
+	return { D, S: profile({ ...D, serverUdpSendBufferBytes: SNDBUF_AB_BYTES }) };
+}
+
 const R5_KEYS = [...KEYS, "datagramPump"];
 const R5_LADDER_IDS = new Set([
 	"g6-capacity-ladder-b-r5",
@@ -241,6 +265,22 @@ export function validateWorkProfiles(
 	const result = Object.fromEntries(
 		plan.profiles.map((name) => [name, profile(entries[name])]),
 	);
+	if ((SNDBUF_AB_PLAN_IDS as readonly string[]).includes(plan.id)) {
+		if (plan.nodes.some((node) => node.kind !== "attribution-r4"))
+			fail("send-buffer A/B plans contain only attribution-r4 cells");
+		exact(result, ["D", "S"]);
+		const expected = makeSendBufferWorkProfiles(requireDefined(result.D));
+		for (const name of ["D", "S"])
+			if (
+				[...R5_KEYS, "clientProcesses"].some(
+					(key) =>
+						requireDefined(result[name])[key as keyof WorkProfile] !==
+						requireDefined(expected[name])[key as keyof WorkProfile],
+				)
+			)
+				fail("send-buffer A/B arms differ beyond the send buffer");
+		return result;
+	}
 	if (plan.nodes.some((node) => node.kind === "attribution-r4")) {
 		if (plan.nodes.some((node) => node.kind !== "attribution-r4"))
 			fail("attribution-r4 plans contain only attribution-r4 cells");

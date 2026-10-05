@@ -181,3 +181,36 @@ export function makeCapacityLadderWorkPlan(
 		nodes,
 	});
 }
+
+/** Post-closure 50k send-buffer A/B on one pair: two full-rate 50k cells,
+ * `D` (default buffer) and `S` (4 MiB), order counterbalanced across pairs.
+ * attribution-r4 semantics: S1-S4 MISS is measured and continues. */
+export function makeSendBufferAbWorkPlan(order: "ds" | "sd"): WorkPlan {
+	const cells = order === "ds" ? ["D50k", "S50k"] : ["S50k", "D50k"];
+	return validateWorkPlan({
+		schema: "g6-c32-work-plan/1",
+		id: `g6-sndbuf-50k-ab-${order}`,
+		setupMaximumSeconds: 2100,
+		controlMaximumSeconds: 60,
+		teardownReserveSeconds: 600,
+		activeMaximumSeconds: 3120,
+		profiles: ["D", "S"],
+		entry: requireDefined(cells[0]),
+		nodes: cells.map(
+			(id, index): WorkNode => ({
+				id,
+				label: id,
+				kind: "attribution-r4",
+				profile: id.slice(0, 1),
+				requestedSessions: 50000,
+				activeWorkloadSessions: 50000,
+				maximumSeconds: 480,
+				next: {
+					PASS: cells[index + 1] ?? COMPLETE,
+					MISS: cells[index + 1] ?? COMPLETE,
+					INVALID: INCOMPLETE,
+				},
+			}),
+		),
+	});
+}
