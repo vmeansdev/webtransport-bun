@@ -179,3 +179,36 @@ test("send-buffer A/B binds the closed B arm and differs only in a 4 MiB server 
 		validateWorkProfiles(makeCandidateAttributionWorkPlan(), ab),
 	).toThrow();
 });
+
+test("probe send-buffer A/B turns the detailed probe on in both arms and nothing else", () => {
+	const common = { ...workProfileFixture, datagramPump: "pump" as const };
+	const candidate = requireDefined(
+		makeCandidateLadderWorkProfiles(common, {
+			sendPath: "stock",
+			probe: false,
+			clientProcesses: 4,
+		}).candidate,
+	);
+	const plain = makeSendBufferWorkProfiles(candidate);
+	const probed = makeSendBufferWorkProfiles(candidate, true);
+	expect(probed.D).toEqual({ ...candidate, detailedProbe: true });
+	expect(probed.S).toEqual({
+		...candidate,
+		detailedProbe: true,
+		serverUdpSendBufferBytes: SNDBUF_AB_BYTES,
+	});
+	const plan = makeSendBufferAbWorkPlan("sd", true);
+	expect(plan.id).toBe("g6-sndbuf-50k-ab-sd-probe");
+	expect(plan.nodes.map(({ id }) => id)).toEqual(["S50k", "D50k"]);
+	expect(validateWorkProfiles(plan, probed)).toEqual(probed);
+	expect(() => validateWorkProfiles(plan, plain)).toThrow(/probe setting/);
+	expect(() =>
+		validateWorkProfiles(makeSendBufferAbWorkPlan("sd"), probed),
+	).toThrow(/probe setting/);
+	expect(() =>
+		validateWorkProfiles(plan, {
+			...probed,
+			S: { ...requireDefined(probed.S), detailedProbe: false },
+		}),
+	).toThrow();
+});

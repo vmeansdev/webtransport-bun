@@ -231,21 +231,27 @@ export function makeCandidateLadderWorkProfiles(
 export const SNDBUF_AB_PLAN_IDS = [
 	"g6-sndbuf-50k-ab-ds",
 	"g6-sndbuf-50k-ab-sd",
+	"g6-sndbuf-50k-ab-ds-probe",
+	"g6-sndbuf-50k-ab-sd-probe",
 ] as const;
 export const SNDBUF_AB_BYTES = 4_194_304;
+/** `probe` turns the detailed Linux probe on in both arms (the grader can
+ * then attest the effective send buffer); nothing else changes. */
 export function makeSendBufferWorkProfiles(
 	candidate: WorkProfile,
+	probe = false,
 ): WorkProfiles {
-	const D = profile(candidate);
+	const base = profile(candidate);
 	if (
-		D.datagramPump !== "pump" ||
-		D.reflectRingBypass !== "off" ||
-		D.udpSendBatch !== 0 ||
-		D.detailedProbe !== false ||
-		D.serverUdpSendBufferBytes !== 0 ||
-		D.clientProcesses === undefined
+		base.datagramPump !== "pump" ||
+		base.reflectRingBypass !== "off" ||
+		base.udpSendBatch !== 0 ||
+		base.detailedProbe !== false ||
+		base.serverUdpSendBufferBytes !== 0 ||
+		base.clientProcesses === undefined
 	)
 		fail("send-buffer A/B base must be the r5 probe-off ladder candidate");
+	const D = probe ? profile({ ...base, detailedProbe: true }) : base;
 	return { D, S: profile({ ...D, serverUdpSendBufferBytes: SNDBUF_AB_BYTES }) };
 }
 
@@ -269,7 +275,14 @@ export function validateWorkProfiles(
 		if (plan.nodes.some((node) => node.kind !== "attribution-r4"))
 			fail("send-buffer A/B plans contain only attribution-r4 cells");
 		exact(result, ["D", "S"]);
-		const expected = makeSendBufferWorkProfiles(requireDefined(result.D));
+		const probe = plan.id.endsWith("-probe");
+		const D = requireDefined(result.D);
+		if (D.detailedProbe !== probe)
+			fail("send-buffer A/B probe setting differs from the plan");
+		const expected = makeSendBufferWorkProfiles(
+			profile({ ...D, detailedProbe: false }),
+			probe,
+		);
 		for (const name of ["D", "S"])
 			if (
 				[...R5_KEYS, "clientProcesses"].some(
