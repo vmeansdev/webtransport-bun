@@ -1196,6 +1196,14 @@ function hashFromOutput(stdout: string, operationId: string): string {
 	return match[1];
 }
 
+/**
+ * The loopback forwarder (g6-server) the sharded arms run on the generator:
+ * built by the same preparation step, beside the retained mmo-client.
+ */
+export function generatorForwarderRemotePath(generatorRemotePath: string) {
+	return `${dirname(generatorRemotePath)}/g6-server`;
+}
+
 export async function prepareHosts(
 	options: PrepareHostsOptions,
 ): Promise<HostPreparationReceipt> {
@@ -1325,8 +1333,13 @@ export async function prepareHosts(
 			"set -euo pipefail",
 			`cd ${shellQuote(authority.source.remoteCheckoutPath)}`,
 			"export PATH=/root/.cargo/bin:/opt/g6/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-			`rustup run ${shellQuote(authority.rust.toolchain)} cargo build -p reference --bin mmo-client --release --locked`,
+			// g6-server is built beside mmo-client: the sharded arms run it on
+			// the generator as the V-F / V-S loopback forwarder through the same
+			// entry script, which would otherwise build it inside the first
+			// arms cell's fixed overhead allowance.
+			`rustup run ${shellQuote(authority.rust.toolchain)} cargo build -p reference --bin mmo-client --bin g6-server --release --locked`,
 			`test -x ${shellQuote(authority.artifacts.generatorRemotePath)}`,
+			`test -x ${shellQuote(generatorForwarderRemotePath(authority.artifacts.generatorRemotePath))}`,
 		].join("; "),
 	);
 

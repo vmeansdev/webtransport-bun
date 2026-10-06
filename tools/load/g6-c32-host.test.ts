@@ -15,6 +15,7 @@ import {
 	assertNoPackageInstallationAfterPrepared,
 	captureKnownHosts,
 	collectHostIdentityPacket,
+	generatorForwarderRemotePath,
 	type HostIdentityPacket,
 	type HostOperationRequest,
 	type HostOperationResult,
@@ -468,6 +469,28 @@ describe("G6 c32 scripted host preparation", () => {
 			nativeAddonSha256: nativeSha256,
 			generatorSha256,
 		});
+		// The sharded arms' loopback forwarder is built in preparation, not
+		// inside the first arms cell's fixed overhead allowance.
+		const buildGenerator = runner.calls.find(
+			({ operationId }) => operationId === "build-mmo-client",
+		);
+		const buildCommand = [
+			buildGenerator?.command,
+			...(buildGenerator?.args ?? []),
+		]
+			.join(" ")
+			.replaceAll("'\"'\"'", "'");
+		expect(buildCommand).toContain(
+			"cargo build -p reference --bin mmo-client --bin g6-server --release --locked",
+		);
+		expect(buildCommand).toContain(
+			"test -x '/opt/g6/run/source/target/release/g6-server'",
+		);
+		expect(
+			generatorForwarderRemotePath(
+				"/opt/g6/run/source/target/release/mmo-client",
+			),
+		).toBe("/opt/g6/run/source/target/release/g6-server");
 		expect(result.envelope.recordedAt).toMatch(/\.\d{3}Z$/);
 		expect(result.operationReceipts).toHaveLength(runner.calls.length);
 		expect(existsSync(join(paths.root, "preparation-receipt.json"))).toBeTrue();
