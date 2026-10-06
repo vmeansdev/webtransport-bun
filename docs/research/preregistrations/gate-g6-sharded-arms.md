@@ -155,7 +155,7 @@ limits are 2 × the rung. They are reported, not counted as evidence.
 | V-C | rig qualification + PREPARED_HOST on the exact pair | `validateCapacityRawCell` (exact pair, receipts, owners, diagnostic) before arms grading |
 | RAW | per-kind raw-cell expectations | Arms config equals the registration (arm, shards, raid slot, DCID length 20, negctl null, cohort, durations not overridden). Realm census = rung. Roles. Realm source ports are the 128-port pool and raid processes have their own ports. Shard steady wall within ±250 ms. Hotspot: server census at drain player/raid/publisher = rung/40/1, 40 RAID_JOINs, explicit membership. Storm: anchored timeline, cohort shares, no permit pool, window 1,000 ms after sever and 120 s ± 250 ms, one server-clock sever instant on every shard |
 | V-F | every cell, before connect | 10 s floor, exactly 20 driving sessions at the registered per-session rate, against the generator-loopback forwarder (never the shards). `floorReportIsUsable` applies except the host check. INVALID if p99 > **10 ms**, the floor is unusable, or the forwarder rc ≠ 143 |
-| V-S | hotspot cells, before connect | 20 s loopback sink at 1,200/s (1 publisher at 30/s × 40 subscribers). INVALID if delivery (`rxRaid` / (sent × 40)) < **0.995**, or the originator's achieved rate (sent × 40 / 20 s) < **0.995 × 1,200 = 1,194/s**. Raw `scheduleTicksSkipped` is disclosed (§8 item 2) |
+| V-S | hotspot cells, before connect | 20 s loopback sink at 1,200/s (1 publisher at 30/s × 40 subscribers). INVALID if delivery (`rxRaid` / (sent × 40)) < **0.995**, the originator's achieved rate (sent × 40 / 20 s) < **0.995 × 1,200 = 1,194/s**, or the loopback forwarder failed (rc ≠ 143). A skipped tick never fires on its own. Raw `scheduleTicksSkipped` is disclosed (§8 item 2) |
 | V-N | any negative RTT or one-way sample | every histogram, per process, per shard and merged |
 | V-K | recordedTotal − count > 0.1 %; merged ≠ bucket sum | per histogram before merge; merged = bucket-by-bucket sum, per window and per shard |
 | V-D | percentile denominator ≠ delivered − unstamped | per path, including the shard-K subsets |
@@ -197,17 +197,35 @@ Amendments (lead decisions, 2026-10-07):
 1. **R = 500 ms** (`SHARDED_ARMS_V_R_MS = 500`), fixed from the work-item-6
    characterization
    (`.scratch/bare-metal-campaign/g6-sharded-arms/characterization/v-r-characterization-2026-10-07.md`,
-   sha256 `e070f80f…bb078141`). The VM worst case at S1-40k's 2,000-per-process
-   cohort is 171–181 ms, and the derated projection is ≤ 260 ms. The frozen
-   value always wins in the campaign grader. A rehearsal R is accepted only
-   by the stamp evaluator for dry stamps, and that stamp is never
-   authoritative.
+   sha256 `e070f80f…bb078141`). Evidence (OrbStack VM, real eBPF steering,
+   4 shards, 4 generator processes on about 1 vCPU each; latest first
+   reconnect Initial after sever + 1,000 ms, worst process per run):
+
+   | per-process cohort | runs (ms) |
+   |---|---|
+   | 250 (S1-5k shape) | 49.8, 49.0 |
+   | 500 | 69.5, 44.2, 70.0, 63.9, 68.5 |
+   | 1,250 (S2-5k shape) | 110.6, 112.2, 144.2 |
+   | 2,000 (S1-40k shape) | 171.0, 175.2, 180.5 |
+
+   Lateness is a linear per-process queue drain; the upper envelope is
+   55 + 0.075 × cohort-per-process ms. For S1-40k (2,000 per process) the
+   derated projection on the paid generator (no speed-up from more cores,
+   0.7× per-core) is ≤ 260 ms, so R = 500 ms leaves about 1.9× margin over
+   it and 2.8× over the direct VM measurement. S1-40k therefore keeps its
+   8,000 cohort and stays a gate cell. S2-40k (10,000 per process) is not
+   bounded with confidence (about 805 ms without speed-up); see item 3.
+   The frozen value always wins: the campaign grader never substitutes a
+   rehearsal R, and the stamp evaluator refuses `--rehearsal-vr-ms` once R
+   is frozen. A rehearsal R exists only for dry stamps of code where R is
+   unset, and such a stamp is never authoritative.
 2. **V-S tolerance.** The plan read "delivery < 0.995 → INVALID", and the
    reused `falsifierSink` also fired on any originator skip. Registered: the
-   cell is INVALID by V-S only if sink delivery < 0.995 OR the originator's
-   achieved rate < 0.995 × 1,200/s. A skip fraction ≤ 0.5 % is tolerated, and
-   the raw skip count, due ticks and achieved rate are disclosed under
-   `characterization.V-S`.
+   cell is INVALID by V-S only if sink delivery < 0.995, OR the originator's
+   achieved rate < 0.995 × 1,200/s, OR the loopback forwarder failed. A
+   single skipped tick no longer fires on its own; a skip fraction ≤ 0.5 % is
+   tolerated, and the raw skip count, due ticks and achieved rate are
+   disclosed under `characterization.V-S`.
 3. **V-R on S2-40k is reported, not verdict-forcing.** The cell is
    characterization only. The VM envelope does not bound a 10,000-per-process
    cohort within R with confidence (about 805 ms without speed-up). Lateness
@@ -253,6 +271,16 @@ Disclosures:
     The close is abrupt, not a black hole.
 18. Raid co-location makes H1–H3 easier than G6-04's single-instance
     hotspot. Product handshake/accept limiter counters are reported (§5).
+19. V-F′ coverage. H1 and H3 are guarded by the steady-window scheduleLag
+    of the realm processes and the publisher (worst process). S-C1 is
+    guarded by the storm-window survivor scheduleLag. H2 and S-C2 have no
+    V-F′ histogram: H2 is guarded by V-S and H4, and S-C2 (server re-accept
+    completion) by V-R. A named histogram with zero samples (S-C1 in the S2
+    cells, which have no survivors) is recorded as not applicable, never
+    INVALID.
+20. Per-shard harness limits are 2 × the rung, so the S-C2
+    limitExceeded/rateLimited deltas are structurally zero and are reported,
+    not counted as evidence.
 
 ## 9. Budget
 
@@ -265,16 +293,25 @@ Disclosures:
 - Ceiling: **143,544,166 µUSD** (unchanged).
 - The policy chains to the sealed ledger of the last chained run,
   `g6-sndbuf-50k-p2-20261005-02` (`terminal/final-spend-ledger.json`). Its
-  sealed chain total is **117,080,820 µUSD**.
+  sealed chain total is **117,080,820 µUSD**. That ledger is an
+  `attribution-only` seal (P2 ended ATTRIBUTION_COMPLETE); it is used only
+  as the spend predecessor. This run's own lifecycle is `ladder-only` (§8
+  item 14), and nothing from P2's measurements enters this gate.
 - Out-of-chain spend, disclosed and not chained:
   - B-10: 1,394,320 µUSD;
   - B-11: 3,718,188 µUSD;
   - network probes: about 1.13 M µUSD.
 - True spend before this run is therefore about **123.3 M µUSD**. The true
   worst case after this run is about 129.25 M µUSD, which is below the
-  ceiling.
+  ceiling. Remaining against the ceiling: 26,463,346 µUSD in chain and
+  about 20.2 M µUSD in truth, each covering the 5,925,860 µUSD liability.
 
 ## 10. Stop rules and authority
+
+- The semantic freeze binds this document by sha256 together with the
+  grader, the stamp evaluator, the arms harness kinds, the reused clause and
+  floor code, the DCID provider, its BPF reference and the forwarder source
+  (`SHARDED_ARMS_CAMPAIGN_INPUT_PATHS` in `tools/load/g6-c32-freeze.ts`).
 
 - Exactly one pair, with no automatic recreation.
 - Sequential, unconditional Architect → Critic approval of the exact
