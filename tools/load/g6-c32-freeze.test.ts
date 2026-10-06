@@ -31,6 +31,7 @@ import {
 	runFreezeCommandCli,
 	runQualificationCli,
 	type SemanticFreezeDependencies,
+	SHARDED_ARMS_CAMPAIGN_INPUT_PATHS,
 	validateLockedExactPair,
 	verifyBoundFreeze,
 	verifyRetainedBoundFreeze,
@@ -1701,6 +1702,25 @@ describe("G6 c32 atomic host-bound freeze", () => {
 		).toBe("INCOMPLETE\n");
 	}, 120_000);
 
+	test("freezes the g6-sharded-arms/1 gate, grader, evaluator and arms kinds", () => {
+		for (const path of [
+			"docs/research/preregistrations/gate-g6-sharded-arms.md",
+			"tools/load/g6-sharded-arms-grade.ts",
+			"tools/load/g6-sharded-arms-evaluate.ts",
+			"tools/load/g6-sharded-arms.ts",
+			"tools/load/g6-shard-arms.ts",
+			"crates/reference/src/g6_sharding.rs",
+			"crates/reference/src/g6_server.rs",
+			"examples/quic-lb/steer_by_cid.bpf.c",
+		] as const)
+			expect(DEFAULT_CAMPAIGN_INPUT_PATHS).toContain(path);
+		expect(
+			DEFAULT_CAMPAIGN_INPUT_PATHS.slice(
+				-SHARDED_ARMS_CAMPAIGN_INPUT_PATHS.length,
+			),
+		).toEqual([...SHARDED_ARMS_CAMPAIGN_INPUT_PATHS]);
+	});
+
 	test("freezes the executable real Linux process-group proof input", () => {
 		expect(DEFAULT_CAMPAIGN_INPUT_PATHS).toContain(
 			"tools/load/g6-c32-linux-work-process-proof.ts",
@@ -1985,7 +2005,7 @@ describe("G6 c32 atomic host-bound freeze", () => {
 		).toThrow(/not an ancestor of the current harness/);
 	}, 120_000);
 
-	test("historical replay accepts only the exact pre-fan-out input set", async () => {
+	test("historical replay accepts only the exact pre-fan-out and pre-arms input sets", async () => {
 		const fixture = await makeBindingFixture();
 		let tick = 1n;
 		const result = await bindHostFreeze(fixture.bindInput, {
@@ -1995,12 +2015,19 @@ describe("G6 c32 atomic host-bound freeze", () => {
 			},
 			randomId: () => "pre-fanout-set",
 		});
+		const arms = [...SHARDED_ARMS_CAMPAIGN_INPUT_PATHS];
 		for (const [name, drop] of [
 			[
 				"earlier",
-				["tools/load/g6-generator-fanout.ts", "tools/load/g6-client-merge.ts"],
+				[
+					"tools/load/g6-generator-fanout.ts",
+					"tools/load/g6-client-merge.ts",
+					...arms,
+				],
 			],
-			["partial", ["tools/load/g6-client-merge.ts"]],
+			["pre-arms", arms],
+			["partial", ["tools/load/g6-client-merge.ts", ...arms]],
+			["partial-arms", ["tools/load/g6-sharded-arms-grade.ts"]],
 		] as const) {
 			const copy = join(fixture.provisioningRoot, `input-set-${name}`);
 			cpSync(result.root, copy, { recursive: true });
@@ -2020,7 +2047,7 @@ describe("G6 c32 atomic host-bound freeze", () => {
 			resealBoundFixture(copy);
 			const verify = () =>
 				verifyRetainedBoundFreeze(copy, { repositoryPath: fixture.root });
-			if (name === "partial")
+			if (name === "partial" || name === "partial-arms")
 				expect(verify).toThrow(/complete fixed input set/);
 			else expect(verify).not.toThrow(/complete fixed input set/);
 		}

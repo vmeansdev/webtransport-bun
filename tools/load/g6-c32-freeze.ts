@@ -85,6 +85,28 @@ export const SEMANTIC_FREEZE_GENERATOR_PATH = "tools/load/g6-c32-freeze.ts";
 export const FORBIDDEN_MISE_NODE_PATH =
 	"/Users/vmeansdev/.local/share/mise/installs/node/23.9.0/bin/node";
 
+/**
+ * The inputs g6-sharded-arms/1 added (earlier sealed freezes lack them): the
+ * registered gate, its grader and stamp evaluator, the reused G6 clause and
+ * floor code, the arms harness kinds on both roles, the DCID placement
+ * provider and its BPF reference, and the loopback forwarder (g6-server).
+ */
+export const SHARDED_ARMS_CAMPAIGN_INPUT_PATHS = [
+	"docs/research/preregistrations/gate-g6-sharded-arms.md",
+	"tools/load/g6-sharded-arms-grade.ts",
+	"tools/load/g6-sharded-arms-evaluate.ts",
+	"tools/load/g6-sharded-arms.ts",
+	"tools/load/g6-shard-arms.ts",
+	"tools/load/g6-classify.ts",
+	"tools/load/g6-plan.ts",
+	"tools/load/g6-bpf-map.ts",
+	"tools/offbox/generator-report.ts",
+	"crates/reference/src/g6_sharding.rs",
+	"crates/reference/src/g6_server.rs",
+	"crates/reference/src/g6_protocol.rs",
+	"examples/quic-lb/steer_by_cid.bpf.c",
+] as const;
+
 export const DEFAULT_CAMPAIGN_INPUT_PATHS = [
 	"crates/native/src/datagram_reflector.rs",
 	"crates/native/src/lib.rs",
@@ -166,6 +188,8 @@ export const DEFAULT_CAMPAIGN_INPUT_PATHS = [
 	"tools/load/g6-capacity-attribution-r5.ts",
 	"tools/load/g6-capacity-r5-decision.ts",
 	"tools/load/g6-capacity-local-receipt.ts",
+	// g6-sharded-arms/1 (see SHARDED_ARMS_CAMPAIGN_INPUT_PATHS).
+	...SHARDED_ARMS_CAMPAIGN_INPUT_PATHS,
 ] as const;
 
 export type CreateSemanticFreezeInput = {
@@ -750,9 +774,15 @@ const LATER_CAMPAIGN_INPUT_PATHS = [
 	"tools/load/g6-generator-fanout.ts",
 	"tools/load/g6-client-merge.ts",
 ] as const;
+const PRE_ARMS_CAMPAIGN_INPUT_PATHS = DEFAULT_CAMPAIGN_INPUT_PATHS.filter(
+	(path) =>
+		!(SHARDED_ARMS_CAMPAIGN_INPUT_PATHS as readonly string[]).includes(path),
+);
 const RETAINED_CAMPAIGN_INPUT_PATH_SETS: readonly (readonly string[])[] = [
 	DEFAULT_CAMPAIGN_INPUT_PATHS,
-	DEFAULT_CAMPAIGN_INPUT_PATHS.filter(
+	// Sealed before g6-sharded-arms/1 (B-12, the send-buffer pairs).
+	PRE_ARMS_CAMPAIGN_INPUT_PATHS,
+	PRE_ARMS_CAMPAIGN_INPUT_PATHS.filter(
 		(path) => !(LATER_CAMPAIGN_INPUT_PATHS as readonly string[]).includes(path),
 	),
 ];
