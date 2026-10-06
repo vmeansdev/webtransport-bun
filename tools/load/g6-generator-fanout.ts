@@ -24,11 +24,7 @@ export function ownedFanoutScript(
 	const lines = ["set -u", "d=$(mktemp -d)", "trap 'rm -rf \"$d\"' EXIT"];
 	argvs.forEach((argv, index) => {
 		if (argv.length === 0) throw Error("empty generator argv");
-		const cmd = argv.map(quote).join(" ");
-		lines.push(
-			`( set -o pipefail; ${cmd} 2> >(sed -u 's/^/@@E${index}@@ /' >&2) | tee "$d/o${index}" | sed -u 's/^/@@O${index}@@ /'; echo $? > "$d/rc${index}" ) &`,
-			`until grep -q '^macgen: binary=' "$d/o${index}" 2>/dev/null || [ -e "$d/rc${index}" ]; do sleep 0.2; done`,
-		);
+		lines.push(`${taggedPipeline(index, argv)} &`, untilBuilt(index));
 	});
 	lines.push(
 		"wait",
@@ -39,10 +35,23 @@ export function ownedFanoutScript(
 	return lines.join("\n");
 }
 
+/**
+ * Tag every line of one stream and write it whole. All N taggers share the
+ * fan-out's stdout (and stderr) pipe, and a line longer than PIPE_BUF is not
+ * written atomically: the realm processes print their final reports (hundreds
+ * of KB each) at the same barrier-aligned instant, and per-line `sed -u`
+ * writes interleaved them into an unparseable report (VM rehearsal,
+ * 2026-10-06). The taggers therefore hold one exclusive lock per stream for
+ * each whole line. perl is in every Linux base image and on macOS.
+ */
+function tagger(tag: string, stream: "out" | "err"): string {
+	return `G6_FANOUT_LOCK="$d/${stream}.lock" perl -ne 'BEGIN { $| = 1; open(L, ">>", $ENV{G6_FANOUT_LOCK}) or die "fan-out lock: $!" } flock(L, 2); print q{${tag} }, $_; flock(L, 8)'`;
+}
+
 function taggedPipeline(index: number, argv: readonly string[]): string {
 	if (argv.length === 0) throw Error("empty generator argv");
 	const cmd = argv.map(quote).join(" ");
-	return `( set -o pipefail; ${cmd} 2> >(sed -u 's/^/@@E${index}@@ /' >&2) | tee "$d/o${index}" | sed -u 's/^/@@O${index}@@ /'; echo $? > "$d/rc${index}" )`;
+	return `( set -o pipefail; ${cmd} 2> >(${tagger(`@@E${index}@@`, "err")} >&2) | tee "$d/o${index}" | ${tagger(`@@O${index}@@`, "out")}; echo $? > "$d/rc${index}" )`;
 }
 
 function untilBuilt(index: number): string {

@@ -1,5 +1,8 @@
 import { expect, test } from "bun:test";
 import { spawn } from "node:child_process";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createInterface } from "node:readline";
 import {
 	armsFanoutScript,
@@ -49,6 +52,52 @@ test("fan-out script starts every process in order and exits with the worst stat
 	expect(lines.map((l) => l.code)).toEqual([3, 3, 3]);
 	expect(untagged).toEqual([]);
 });
+
+test("fan-out keeps simultaneous long lines whole (no interleaving past PIPE_BUF)", async () => {
+	// Every process prints large lines at the same instant (a shared go file),
+	// as the realm processes print their final reports after the barrier.
+	const n = 4;
+	const go = join(mkdtempSync(join(tmpdir(), "g6-fanout-")), "go");
+	const script = ownedFanoutScript(
+		Array.from({ length: n }, (_, i) => [
+			"python3",
+			"-c",
+			[
+				"import os, sys, time",
+				'print("macgen: binary=x", flush=True)',
+				`while not os.path.exists(${JSON.stringify(go)}): time.sleep(0.005)`,
+				`for k in range(5): sys.stdout.write("J${i}" + str(k) * 300000 + "\\n"); sys.stdout.flush()`,
+				'sys.stdout.write("tail\\n")',
+			].join("\n"),
+		]),
+	);
+	const child = spawn("bash", ["-c", script], {
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	const untagged: string[] = [];
+	const clients = demultiplexFanout(child, n, (line) => untagged.push(line));
+	const outs = Promise.all(
+		clients.map(
+			(client) =>
+				new Promise<string[]>((resolve) => {
+					const out: string[] = [];
+					createInterface({ input: client.stdout }).on("line", (l) =>
+						out.push(l),
+					);
+					client.once("exit", () => setTimeout(() => resolve(out), 20));
+				}),
+		),
+	);
+	setTimeout(() => writeFileSync(go, ""), 3000);
+	const lines = await outs;
+	expect(untagged.length).toBe(0);
+	for (const [i, out] of lines.entries())
+		expect(out).toEqual([
+			"macgen: binary=x",
+			...[0, 1, 2, 3, 4].map((k) => `J${i}${String(k).repeat(300_000)}`),
+			"tail",
+		]);
+}, 20_000);
 
 test("fan-out refuses fewer than two or more than sixteen processes", () => {
 	expect(() => ownedFanoutScript([["true"]])).toThrow("2..16");
