@@ -57,6 +57,7 @@ import {
 } from "./g6-bpf-map.ts";
 import {
 	readGeneratorWorkOwner,
+	shellQuote,
 	workGeneratorSshArguments,
 } from "./g6-c32-work-remote.ts";
 import { trackChildClose, waitForChildClose } from "./g6-child-lifecycle.ts";
@@ -70,7 +71,11 @@ import {
 	clientReportsForDriverCheck,
 } from "./g6-datagram-driver.ts";
 import { type G6EmitterMode, resolveEmitterMode } from "./g6-emitter-mode.ts";
-import { demultiplexFanout, ownedFanoutScript } from "./g6-generator-fanout.ts";
+import {
+	armsFanoutScript,
+	demultiplexFanout,
+	ownedFanoutScript,
+} from "./g6-generator-fanout.ts";
 import { DEFAULT_MAX_BYTES } from "./g6-linux-probe.ts";
 import {
 	NATIVE_PHASES,
@@ -86,6 +91,26 @@ import {
 	UPSTREAM_PAYLOAD_BYTES,
 } from "./g6-plan.ts";
 import { resolveServerGroMode } from "./g6-server-gro.ts";
+import { isArmsPhase } from "./g6-shard-arms.ts";
+import {
+	ARMS_REGISTERED,
+	armsBarrierParties,
+	armsDeadlineSec,
+	compareShardCounts,
+	floorFacts,
+	histogramMaxNs,
+	precheckPlan,
+	raidPlacementFacts,
+	raidProcessArgs,
+	raidSourcePortBase,
+	realmArmsArgs,
+	resolveArmsConfig,
+	type ShardCounts,
+	sinkFacts,
+	skewMs,
+	steeringDelta,
+	sumShardCounts,
+} from "./g6-sharded-arms.ts";
 import { createShardBoundaryController } from "./g6-sharded-boundary-controller.ts";
 import {
 	GENERATOR_SAMPLE_SEPARATOR,
@@ -336,6 +361,13 @@ if (WORKLOAD_ACTIVE_SESSIONS > SESSIONS) {
 const FIXED_SOURCE_PORT_BASE = parseOptionalPortEnv(
 	"SCAN_FIXED_SOURCE_PORT_BASE",
 );
+// SCAN_ARM selects the sharded arms (plan 2026-10-06-g6-sharded-arms r6):
+// steady (default; nothing below changes), hotspot or storm.
+const ARMS = resolveArmsConfig(process.env, {
+	shards: SHARDS,
+	sessions: SESSIONS,
+	activeSessions: WORKLOAD_ACTIVE_SESSIONS,
+});
 const LINUX_PROBE_MAX_BYTES = parsePositiveIntegerEnv(
 	"SCAN_LINUX_PROBE_MAX_BYTES",
 	DEFAULT_MAX_BYTES,
@@ -433,6 +465,8 @@ type Shard = {
 		raid: number;
 		publisher: number;
 	} | null;
+	// Sharded arms: the shard's "arms" echo at each boundary, keyed by phase.
+	armsEchoes: Record<string, unknown>;
 	stderrTail: string[];
 	// DIAGNOSTIC: per-shard lifecycle (every child.on('exit') with timestamp
 	// and signal name; the post-run SIGKILL cleanup at line ~408 is recorded
@@ -1187,6 +1221,7 @@ async function main(): Promise<void> {
 				marks: {},
 				sessionsAtSteady: null,
 				sessionsByKindAtSteady: null,
+				armsEchoes: {},
 				stderrTail: [],
 				lifecycle: [],
 				boundaryArrivedAt: [],
@@ -1243,6 +1278,7 @@ async function main(): Promise<void> {
 					pacerStats?: Record<string, unknown>;
 					sendPathDiagnostics?: unknown;
 					sendPathProducerSha256?: string;
+					arms?: unknown;
 					error?: string;
 				};
 				try {
@@ -1394,29 +1430,34 @@ async function main(): Promise<void> {
 						child.kill("SIGTERM");
 					}
 				} else if (msg.ev === "boundary" && msg.snap) {
-					try {
-						const phase = msg.phase as NativePhase | "stop";
-						if (phase !== "stop" && !NATIVE_PHASES.slice(1).includes(phase))
-							throw Error("invalid native boundary phase");
-						if (shard.sendPathBoundaries[phase])
-							throw Error("duplicate native boundary");
-						shard.sendPathBoundaries[phase] = parseNativeSendPath(
-							msg.sendPathDiagnostics,
-							{
-								enabled: NATIVE_SEND_PATH_ENABLED,
-								phase: NATIVE_SEND_PATH_ENABLED
-									? phase === "stop"
-										? "idle"
-										: phase
-									: "unarmed",
-								finalized: false,
-							},
-						);
-					} catch (error) {
-						failShard(error);
-						child.kill("SIGTERM");
-						return;
-					}
+					if (msg.arms !== undefined)
+						shard.armsEchoes[msg.phase ?? "unknown"] = msg.arms;
+					// Arms boundaries (sever / storm / post-storm) cut no native
+					// send-path phase; only the steady path's are parsed here.
+					if (!isArmsPhase(msg.phase))
+						try {
+							const phase = msg.phase as NativePhase | "stop";
+							if (phase !== "stop" && !NATIVE_PHASES.slice(1).includes(phase))
+								throw Error("invalid native boundary phase");
+							if (shard.sendPathBoundaries[phase])
+								throw Error("duplicate native boundary");
+							shard.sendPathBoundaries[phase] = parseNativeSendPath(
+								msg.sendPathDiagnostics,
+								{
+									enabled: NATIVE_SEND_PATH_ENABLED,
+									phase: NATIVE_SEND_PATH_ENABLED
+										? phase === "stop"
+											? "idle"
+											: phase
+										: "unarmed",
+									finalized: false,
+								},
+							);
+						} catch (error) {
+							failShard(error);
+							child.kill("SIGTERM");
+							return;
+						}
 					if (msg.phase === "stop") {
 						shard.stopBoundaryReceived = true;
 					}
@@ -1441,6 +1482,7 @@ async function main(): Promise<void> {
 		const broadcast = async (
 			cmd: string,
 			phase: string | null,
+			extra: Record<string, unknown> = {},
 		): Promise<BoundarySnapshot[]> => {
 			kernelMarks[phase ?? cmd] = readKernelUdp() as Record<
 				string,
@@ -1451,7 +1493,7 @@ async function main(): Promise<void> {
 					shards.map((shard) => {
 						const boundary = shard.boundaries.wait();
 						shard.child.stdin!.write(
-							`${JSON.stringify(phase ? { cmd, phase } : { cmd })}\n`,
+							`${JSON.stringify(phase ? { cmd, phase, ...extra } : { cmd })}\n`,
 						);
 						return boundary;
 					}),
@@ -1741,6 +1783,14 @@ async function main(): Promise<void> {
 					Math.ceil(DRAIN_GRACE_MS / 1000) +
 					IDLE_SECONDS),
 		);
+		const generatorDeadlineSec =
+			ARMS.arm === "steady"
+				? deadlineSec
+				: armsDeadlineSec(ARMS, {
+						connectTimeoutSeconds: CONNECT_TIMEOUT_SECONDS,
+						drainMs: DRAIN_GRACE_MS,
+						idleSeconds: IDLE_SECONDS,
+					});
 		if (CONNECT_CONCURRENCY < CLIENT_PROCESSES)
 			throw new Error(
 				`g6-sharded-scan: connect concurrency ${CONNECT_CONCURRENCY} cannot be split across ${CLIENT_PROCESSES} client processes`,
@@ -1754,6 +1804,11 @@ async function main(): Promise<void> {
 		});
 		// One barrier id per scan: mmo-client accepts [A-Za-z0-9._-] only.
 		const clientPhaseBarrierId = `g6-scan-${startedAt.replace(/[^A-Za-z0-9._-]/g, "-")}-${process.pid}`;
+		const armsBarrier = {
+			id: clientPhaseBarrierId,
+			dir: CLIENT_PHASE_BARRIER_DIR,
+			timeoutMs: CONNECT_TIMEOUT_SECONDS * 1000,
+		};
 		// The connect shape (concurrency, rate) is split like the sessions, so
 		// N processes together present the registered shape, not N times it.
 		const clientArgsFor = (plan: (typeof clientPlans)[number]): string[] => [
@@ -1806,6 +1861,13 @@ async function main(): Promise<void> {
 						String(CONNECT_TIMEOUT_SECONDS * 1000),
 					]
 				: []),
+			// Sharded arms only (empty for steady); appended so the realm keeps
+			// its registered steady argv and mmo-client takes the later value.
+			...realmArmsArgs(ARMS, {
+				realmProcesses: CLIENT_PROCESSES,
+				index: plan.index,
+				barrier: armsBarrier,
+			}),
 		];
 		console.log(
 			`g6-sharded-scan: shards=${SHARDS} sessions=${SESSIONS} paced=${PACED} url=https://${SERVER_ADDRESS}:${PORT} started-at=${startedAt}`,
@@ -1833,7 +1895,7 @@ async function main(): Promise<void> {
 			"--bin",
 			"mmo-client",
 			"--deadline",
-			String(deadlineSec),
+			String(generatorDeadlineSec),
 			// MMO_CLIENT_RSS_LIMIT_MB (optional) — when set on the
 			// conductor's env, the linux entry script exports it on
 			// the gen before spawning mmo-client. Default (unset)
@@ -1871,6 +1933,140 @@ async function main(): Promise<void> {
 			);
 		};
 		const clientStdout: string[] = [];
+
+		// === SHARDED ARMS (plan 2026-10-06-g6-sharded-arms r6) ===
+		// Inert for the steady arm: no sever marker is ever printed there, and
+		// no raid or pre-check process is launched.
+		const armsEntryArgv = (bin: string, args: readonly string[]): string[] => [
+			"env",
+			`WT_LINUXGEN_CLONE=${OFFBOX_CLONE}`,
+			`WT_MACGEN_CLONE=${OFFBOX_CLONE}`,
+			`WTRANSPORT_DATAGRAM_PUMP=${WTRANSPORT_DATAGRAM_PUMP_ENV}`,
+			...(process.env.MMO_CLIENT_QOS
+				? [`MMO_CLIENT_QOS=${process.env.MMO_CLIENT_QOS}`]
+				: []),
+			"bash",
+			OFFBOX_ENTRY_SCRIPT,
+			"--candidate",
+			CANDIDATE_SHA,
+			"--bin",
+			bin,
+			"--deadline",
+			String(generatorDeadlineSec),
+			...(process.env.MMO_CLIENT_RSS_LIMIT_MB
+				? ["--rss-limit", process.env.MMO_CLIENT_RSS_LIMIT_MB]
+				: []),
+			"--",
+			...args,
+		];
+		const raidRoles =
+			ARMS.arm === "hotspot"
+				? (["publisher", "raid-subscriber"] as const)
+				: ([] as const);
+		const raidArgvs = raidRoles.map((role) =>
+			armsEntryArgv("mmo-client", [
+				...(FIXED_SOURCE_PORT_BASE === null ? ["--bind-default"] : []),
+				"--url",
+				`https://${SERVER_ADDRESS}:${PORT}`,
+				...raidProcessArgs(ARMS, role, {
+					realmProcesses: CLIENT_PROCESSES,
+					barrier: armsBarrier,
+					drainMs: DRAIN_GRACE_MS,
+					idleSeconds: IDLE_SECONDS,
+					payloadBytes: UPSTREAM_PAYLOAD_BYTES,
+					preregistrationSha256: PREREG_SHA,
+					startedAt,
+					connectTimeoutSeconds: CONNECT_TIMEOUT_SECONDS,
+					fixedSourcePortBase: raidSourcePortBase(
+						FIXED_SOURCE_PORT_BASE,
+						ENDPOINTS,
+						role,
+					),
+				}),
+			]),
+		);
+		const precheck = precheckPlan(ARMS, {
+			id: clientPhaseBarrierId,
+			barrierDir: CLIENT_PHASE_BARRIER_DIR,
+			preregistrationSha256: PREREG_SHA,
+			startedAt,
+			moveIntervalMs: Math.round(1000 / MOVE_HZ),
+			actionEvery: actionEveryNthTick(),
+			payloadBytes: UPSTREAM_PAYLOAD_BYTES,
+			drainMs: DRAIN_GRACE_MS,
+		});
+		type SteerSnapshot = {
+			tsMs: number;
+			steerStatsSum: { steered: number; fallback: number } | null;
+			steerStatsRaw: string | null;
+			slotPackets: SlotPacketSample;
+		};
+		// V-W: steer_stats bracket the storm window, taken immediately before
+		// the broadcast that opens / closes it (as the steady brackets are).
+		const captureSteer = (): SteerSnapshot => {
+			const raw = dumpBpfMap(`${PIN_DIR}/steer_stats`);
+			return {
+				tsMs: Date.now(),
+				steerStatsSum: raw === null ? null : sumPerCpuSteerStats(raw),
+				steerStatsRaw: raw,
+				slotPackets: captureSlotPackets(),
+			};
+		};
+		const armsRun: {
+			severAtMs: number | null;
+			stormStartAtMs: number | null;
+			stormEndAtMs: number | null;
+			steerStart: SteerSnapshot | null;
+			steerEnd: SteerSnapshot | null;
+			clientMarkers: Record<string, number>;
+			stormEnd: Promise<void> | null;
+		} = {
+			severAtMs: null,
+			stormStartAtMs: null,
+			stormEndAtMs: null,
+			steerStart: null,
+			steerEnd: null,
+			clientMarkers: {},
+			stormEnd: null,
+		};
+		const broadcastStormBoundary = async (
+			phase: "storm" | "post-storm",
+		): Promise<void> => {
+			const snaps = await broadcast("phase", phase);
+			for (const [index, snap] of snaps.entries()) {
+				const shard = shards[index] as Shard;
+				if (phase === "storm") shard.marks.stormStart = snap;
+				else shard.marks.stormEnd = snap;
+			}
+		};
+		// The server-clock sever instant is this host's clock when process 0's
+		// sever marker arrives; every shard gets it, and the storm window is
+		// anchored at it: [sever + 1,000 ms, + the registered window].
+		const armsSever = async (): Promise<void> => {
+			if (ARMS.arm !== "storm" || armsRun.severAtMs !== null)
+				throw Error("g6-sharded-scan: unexpected sever marker");
+			const severAtMs = Date.now();
+			armsRun.severAtMs = severAtMs;
+			const snaps = await broadcast("phase", "sever", { severAtMs });
+			for (const [index, snap] of snaps.entries()) {
+				// The steadyDrain window ends at the sever, as in bench-g6.
+				(shards[index] as Shard).marks.drainEnd = snap;
+			}
+			const at = (offsetMs: number) =>
+				Bun.sleep(Math.max(0, severAtMs + offsetMs - Date.now()));
+			const stormEnd = (async () => {
+				await at(ARMS.stormReconnectDelayMs);
+				armsRun.steerStart = captureSteer();
+				armsRun.stormStartAtMs = Date.now();
+				await broadcastStormBoundary("storm");
+				await at(ARMS.stormReconnectDelayMs + ARMS.stormWindowSeconds * 1000);
+				armsRun.steerEnd = captureSteer();
+				armsRun.stormEndAtMs = Date.now();
+				await broadcastStormBoundary("post-storm");
+			})();
+			stormEnd.catch(() => {});
+			armsRun.stormEnd = stormEnd;
+		};
 
 		const applyMarks = async (kind: string): Promise<void> => {
 			if (kind === "steady") {
@@ -1924,14 +2120,21 @@ async function main(): Promise<void> {
 				for (const [index, snap] of snaps.entries()) {
 					(shards[index] as Shard).marks.drainStart = snap;
 				}
+			} else if (kind === "sever") {
+				await armsSever();
+			} else if (kind === "storm" || kind === "post-storm") {
+				// The client's own storm flips: recorded, never broadcast — the
+				// shard boundaries follow the server-clock timers armed at sever.
+				armsRun.clientMarkers[kind] = Date.now();
 			} else if (kind === "idle") {
+				if (armsRun.stormEnd !== null) await armsRun.stormEnd;
 				if (DIAGNOSTIC) captureServerHostUdp("idle");
 				if (linuxProbe !== null) await setLinuxProbePhase(linuxProbe, "idle");
 				const snaps = await broadcast("phase", "idle");
 				if (DIAGNOSTIC) captureInterfaceMarks("idle");
 				for (const [index, snap] of snaps.entries()) {
 					const shard = shards[index] as Shard;
-					shard.marks.drainEnd = snap;
+					shard.marks.drainEnd ??= snap;
 					shard.marks.idleStart = snap;
 				}
 			} else if (kind === "stop") {
@@ -1980,29 +2183,94 @@ async function main(): Promise<void> {
 		// Owned work cells run N generator processes inside ONE owned process
 		// group: a fan-out wrapper starts them in order and tags their output,
 		// which is split back into per-process streams here.
+		// Arms cells always fan out: the generator-loopback pre-checks (V-F,
+		// V-S) and the raid processes run inside the same one group, tagged
+		// after the realm processes.
+		const armsMainArgvs = [...clientPlans.map(generatorArgsFor), ...raidArgvs];
+		const fanoutScript =
+			precheck === null
+				? ownedFanoutScript(clientPlans.map(generatorArgsFor))
+				: armsFanoutScript({
+						main: armsMainArgvs,
+						precheck: {
+							...precheck,
+							forwarder: armsEntryArgv("g6-server", precheck.forwarder),
+							floor: armsEntryArgv("mmo-client", precheck.floor),
+							sink:
+								precheck.sink === null
+									? null
+									: {
+											subscriber: armsEntryArgv(
+												"mmo-client",
+												precheck.sink.subscriber,
+											),
+											publisher: armsEntryArgv(
+												"mmo-client",
+												precheck.sink.publisher,
+											),
+										},
+						},
+					});
+		const fanoutCount =
+			precheck === null ? clientPlans.length : armsMainArgvs.length + 4;
 		const fanoutClients =
-			GENERATOR_WORK_OWNER !== null && CLIENT_PROCESSES > 1
+			(GENERATOR_WORK_OWNER !== null && CLIENT_PROCESSES > 1) ||
+			precheck !== null
 				? (() => {
 						const fanout = spawn(
 							"ssh",
 							[
 								...OFFBOX_SSH_OPTIONS,
 								OFFBOX_SSH,
-								...workGeneratorSshArguments(GENERATOR_WORK_OWNER, [
-									"bash",
-									"-c",
-									ownedFanoutScript(clientPlans.map(generatorArgsFor)),
-								]),
+								...(GENERATOR_WORK_OWNER === null
+									? [`bash -c ${shellQuote(fanoutScript)}`]
+									: workGeneratorSshArguments(GENERATOR_WORK_OWNER, [
+											"bash",
+											"-c",
+											fanoutScript,
+										])),
 							],
 							{ stdio: ["ignore", "pipe", "pipe"] },
 						);
 						trackChildClose(fanout);
 						clients.push(fanout);
-						return demultiplexFanout(fanout, clientPlans.length, (line) =>
+						return demultiplexFanout(fanout, fanoutCount, (line) =>
 							console.error(`[generator fan-out] ${line}`),
 						);
 					})()
 				: null;
+		// Arms side processes: raid publisher / subscriber, then the
+		// pre-checks, in the fan-out's tag order.
+		const armsLabels =
+			precheck === null
+				? []
+				: [
+						...raidRoles,
+						"forwarder",
+						"floor",
+						...(precheck.sink === null
+							? []
+							: ["sink-subscriber", "sink-publisher"]),
+					];
+		const armsOutput: Record<string, { stdout: string[]; stderr: string[] }> =
+			{};
+		const armsOutputDones: Promise<void>[] = [];
+		for (const [offset, label] of armsLabels.entries()) {
+			const client = fanoutClients?.[CLIENT_PROCESSES + offset];
+			if (client === undefined) throw Error(`missing arms process ${label}`);
+			const output = { stdout: [] as string[], stderr: [] as string[] };
+			armsOutput[label] = output;
+			const lines = createInterface({ input: client.stdout });
+			armsOutputDones.push(
+				new Promise<void>((resolve) => lines.once("close", resolve)),
+			);
+			lines.on("line", (line) => output.stdout.push(line));
+			createInterface({ input: client.stderr }).on("line", (line) => {
+				if (output.stderr.length < SHARD_STDERR_TAIL_LINES)
+					output.stderr.push(line);
+				console.error(`[${label} stderr] ${line}`);
+			});
+		}
 		for (const plan of clientPlans) {
 			const child =
 				fanoutClients === null
@@ -2047,6 +2315,7 @@ async function main(): Promise<void> {
 
 		const clientExit = Math.max(...(await Promise.all(clientDones)));
 		await Promise.all(clientOutputDones);
+		await Promise.all(armsOutputDones);
 		await markerChain;
 		if (CLIENT_PROCESSES === 1) {
 			clientStdout.push(...(perClientStdout[0] as string[]));
@@ -2212,7 +2481,7 @@ async function main(): Promise<void> {
 			};
 		});
 		const pickWindows = (
-			name: "steady" | "steadyDrain" | "lifetime",
+			name: "steady" | "steadyDrain" | "lifetime" | "storm",
 		): { windows: BoundarySnapshot[]; entries: ShardWindowMetrics[] } => {
 			const windows: BoundarySnapshot[] = [];
 			const entries: ShardWindowMetrics[] = [];
@@ -2276,6 +2545,301 @@ async function main(): Promise<void> {
 			},
 		};
 
+		// Sharded arms evidence: the merged reports' arms blocks, the raid and
+		// pre-check processes' reports, and the facts later graders recompute
+		// from these raw fields (per-shard counts client vs server, raid
+		// placement, skews, V-R, the storm window's steering and admission).
+		function buildArmsResult(): Record<string, unknown> {
+			const marker = "mmo-client: json ";
+			const reportOf = (lines: readonly string[] | undefined) => {
+				for (const line of lines ?? []) {
+					const at = line.indexOf(marker);
+					if (at < 0) continue;
+					try {
+						return JSON.parse(line.slice(at + marker.length)) as Record<
+							string,
+							unknown
+						>;
+					} catch {
+						return null;
+					}
+				}
+				return null;
+			};
+			const rcOf = (label: string): number | null => {
+				const line = armsOutput[label]?.stdout.find((l) =>
+					l.startsWith("precheck: rc="),
+				);
+				return line === undefined ? null : Number(line.slice(13));
+			};
+			const obj = (v: unknown): Record<string, unknown> =>
+				v !== null && typeof v === "object" && !Array.isArray(v)
+					? (v as Record<string, unknown>)
+					: {};
+			const realmReports = perClientStdout.map((lines) => reportOf(lines));
+			const realmMerged = realmReports.every((r) => r !== null)
+				? mergeClientReports(realmReports)
+				: null;
+			const realmArms = obj(realmMerged?.arms);
+			const publisher = reportOf(armsOutput.publisher?.stdout);
+			const subscriber = reportOf(armsOutput["raid-subscriber"]?.stdout);
+			const byShardAt = (report: unknown, key: string) =>
+				(obj(obj(obj(report).arms).sessionsByShard)[key] ??
+					null) as ShardCounts | null;
+			const serverAt = (
+				pick: (shard: Shard) => number | null,
+			): ShardCounts | null => {
+				const out: ShardCounts = {};
+				for (const shard of shards) {
+					const value = pick(shard);
+					if (value === null) return null;
+					out[String(shard.serverId)] = value;
+				}
+				return out;
+			};
+			const metricOf = (
+				snap: BoundarySnapshot | null | undefined,
+				key: string,
+			) => {
+				const value = (snap?.metrics as Record<string, unknown> | undefined)?.[
+					key
+				];
+				return typeof value === "number" ? value : null;
+			};
+			const sumOver = (pick: (shard: Shard) => number | null) => {
+				let total = 0;
+				for (const shard of shards) {
+					const value = pick(shard);
+					if (value === null) return null;
+					total += value;
+				}
+				return total;
+			};
+			const raidParts =
+				ARMS.arm === "hotspot"
+					? [
+							byShardAt(publisher, "steadyEntry"),
+							byShardAt(subscriber, "steadyEntry"),
+						]
+					: [];
+			const steadyEntry = compareShardCounts(
+				sumShardCounts([
+					(obj(realmArms.sessionsByShard).steadyEntry ??
+						null) as ShardCounts | null,
+					...raidParts,
+				]),
+				serverAt((shard) => shard.sessionsAtSteady),
+				SHARDS,
+			);
+			const floorReport = reportOf(armsOutput.floor?.stdout);
+			const precheckResult = {
+				forwarder: {
+					rc: rcOf("forwarder"),
+					stdout: armsOutput.forwarder?.stdout ?? [],
+					stderr: armsOutput.forwarder?.stderr ?? [],
+				},
+				floor: {
+					rc: rcOf("floor"),
+					facts: floorFacts(floorReport),
+					report: floorReport,
+					transcript: armsOutput.floor?.stdout ?? [],
+				},
+				sink:
+					ARMS.arm === "hotspot"
+						? (() => {
+								const sub = reportOf(armsOutput["sink-subscriber"]?.stdout);
+								const pub = reportOf(armsOutput["sink-publisher"]?.stdout);
+								return {
+									rc: {
+										subscriber: rcOf("sink-subscriber"),
+										publisher: rcOf("sink-publisher"),
+									},
+									facts: sinkFacts(sub, pub),
+									subscriberReport: sub,
+									publisherReport: pub,
+								};
+							})()
+						: null,
+			};
+			const raid =
+				ARMS.arm === "hotspot"
+					? {
+							publisher,
+							subscriber,
+							publisherStdout: armsOutput.publisher?.stdout ?? [],
+							subscriberStdout: armsOutput["raid-subscriber"]?.stdout ?? [],
+							membershipEchoAt: "drain",
+							membership: shards.map((shard) => {
+								const echo = obj(shard.armsEchoes.drain);
+								const tokens = obj(echo.raidMembers).tokens;
+								const kinds = obj(echo.sessionKinds);
+								return {
+									serverId: shard.serverId,
+									raidTokens: Array.isArray(tokens) ? (tokens as number[]) : [],
+									publisherSessions:
+										typeof kinds.publisher === "number" ? kinds.publisher : 0,
+								};
+							}),
+							placement: raidPlacementFacts(
+								ARMS,
+								shards.map((shard) => {
+									const echo = obj(shard.armsEchoes.drain);
+									const tokens = obj(echo.raidMembers).tokens;
+									const kinds = obj(echo.sessionKinds);
+									return {
+										serverId: shard.serverId,
+										raidTokens: Array.isArray(tokens)
+											? (tokens as number[])
+											: [],
+										publisherSessions:
+											typeof kinds.publisher === "number" ? kinds.publisher : 0,
+									};
+								}),
+							),
+							steadyEntrySkewMs: skewMs(
+								[...realmReports, publisher, subscriber].map(
+									(report) =>
+										obj(obj(report).phaseBarrier).steadyEnterUnixMs as
+											| number
+											| undefined,
+								),
+							),
+						}
+					: null;
+			const severAt = armsRun.severAtMs;
+			const stormEndAt = armsRun.stormEndAtMs;
+			const realmStorm = obj(realmArms.storm);
+			const storm =
+				ARMS.arm === "storm"
+					? {
+							cohort: ARMS.stormCohort,
+							severAtMs: severAt,
+							stormStartAtMs: armsRun.stormStartAtMs,
+							stormEndAtMs: stormEndAt,
+							clientMarkerArrivalMs: armsRun.clientMarkers,
+							severSkewMs: realmStorm.severSkewMs ?? null,
+							reconnectInitialLateMaxNs: histogramMaxNs(
+								realmStorm.reconnectInitialLate,
+							),
+							reconnectInitials: realmStorm.reconnectInitials ?? null,
+							processes: realmStorm.processes ?? null,
+							steering: {
+								start:
+									armsRun.steerStart === null
+										? null
+										: {
+												tsMs: armsRun.steerStart.tsMs,
+												steerStatsSum: armsRun.steerStart.steerStatsSum,
+												steerStatsRaw: armsRun.steerStart.steerStatsRaw,
+												slotPackets: armsRun.steerStart.slotPackets.sums,
+											},
+								end:
+									armsRun.steerEnd === null
+										? null
+										: {
+												tsMs: armsRun.steerEnd.tsMs,
+												steerStatsSum: armsRun.steerEnd.steerStatsSum,
+												steerStatsRaw: armsRun.steerEnd.steerStatsRaw,
+												slotPackets: armsRun.steerEnd.slotPackets.sums,
+											},
+								delta: steeringDelta(
+									armsRun.steerStart?.steerStatsSum ?? null,
+									armsRun.steerEnd?.steerStatsSum ?? null,
+								),
+								perSlotDelta: diffSlotPackets(
+									armsRun.steerStart?.slotPackets.sums ?? null,
+									armsRun.steerEnd?.slotPackets.sums ?? null,
+									null,
+								),
+								perSlotKeyedBy: "slot",
+							},
+							server: {
+								// Accepts after the server-clock sever, up to the storm
+								// window's close: S-C2's re-accept count.
+								reAcceptedThroughWindowClose:
+									severAt === null || stormEndAt === null
+										? null
+										: sumOver((shard) => {
+												const accepts = obj(
+													shard.armsEchoes.stop,
+												).acceptMsAfterSever;
+												return Array.isArray(accepts)
+													? (accepts as number[]).filter(
+															(t) => t > severAt && t <= stormEndAt,
+														).length
+													: null;
+											}),
+								sessionsActiveAtWindowClose: sumOver((shard) =>
+									metricOf(shard.marks.stormEnd, "sessionsActive"),
+								),
+								limitExceededDelta: sumOver((shard) => {
+									const a = metricOf(
+										shard.marks.stormStart,
+										"limitExceededCount",
+									);
+									const b = metricOf(
+										shard.marks.stormEnd,
+										"limitExceededCount",
+									);
+									return a === null || b === null ? null : b - a;
+								}),
+								rateLimitedDelta: sumOver((shard) => {
+									const a = metricOf(
+										shard.marks.stormStart,
+										"rateLimitedCount",
+									);
+									const b = metricOf(shard.marks.stormEnd, "rateLimitedCount");
+									return a === null || b === null ? null : b - a;
+								}),
+								handshakesInFlightAtClose: sumOver((shard) =>
+									metricOf(shard.marks.stormEnd, "handshakesInFlight"),
+								),
+								perShard: shards.map((shard) => {
+									const echo = obj(shard.armsEchoes.stop);
+									return {
+										serverId: shard.serverId,
+										severAtMs: echo.severAtMs ?? null,
+										acceptsAfterSever: echo.acceptsAfterSever ?? null,
+										acceptMsAfterSever: echo.acceptMsAfterSever ?? null,
+										acceptSeriesPerSecond: echo.acceptSeriesPerSecond ?? null,
+										stormSamples: echo.stormSamples ?? null,
+									};
+								}),
+							},
+							// V-P re-run at storm end: reconnects placed by their own
+							// opening DCIDs vs the shards' own session counts.
+							sessionsByShardAtStormEnd: compareShardCounts(
+								(obj(realmArms.sessionsByShard).stormEnd ??
+									null) as ShardCounts | null,
+								serverAt((shard) =>
+									metricOf(shard.marks.stormEnd, "sessionsActive"),
+								),
+								SHARDS,
+							),
+						}
+					: null;
+			return {
+				schema: "g6-sharded-arms-scan/1",
+				config: { ...ARMS, registered: ARMS_REGISTERED },
+				barrierParties: armsBarrierParties(ARMS, CLIENT_PROCESSES),
+				realm: realmMerged === null ? null : { arms: realmMerged.arms ?? null },
+				sessionsByShardAtSteady: steadyEntry,
+				precheck: precheckResult,
+				raid,
+				storm,
+				shardEchoes: shards.map((shard) => ({
+					serverId: shard.serverId,
+					echoes: Object.fromEntries(
+						Object.entries(shard.armsEchoes).map(([phase, echo]) => {
+							// Raw per-accept instants stay in storm.server.perShard.
+							const { acceptMsAfterSever: _drop, ...rest } = obj(echo);
+							return [phase, rest];
+						}),
+					),
+				})),
+			};
+		}
+
 		const result = {
 			schema: "g6-sharded-scan/3",
 			startedAt,
@@ -2316,9 +2880,13 @@ async function main(): Promise<void> {
 				steadyDrain: sumWindows(steadyDrainWindows),
 				lifetime: sumWindows(lifetimeWindows),
 				bpfSlotPackets,
+				...(ARMS.arm === "storm"
+					? { storm: sumWindows(pickWindows("storm")) }
+					: {}),
 			},
 			kernelMarks,
 			clientStdout: clientStdout.join("\n"),
+			...(precheck === null ? {} : { arms: buildArmsResult() }),
 		};
 		await Promise.all(
 			shards.map((shard) => shard.boundaries.finalize([], () => {})),

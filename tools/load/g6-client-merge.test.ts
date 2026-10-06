@@ -260,3 +260,102 @@ describe("evenShare", () => {
 		expect(() => evenShare(1.5, 2, 0)).toThrow();
 	});
 });
+
+// biome-ignore lint/suspicious/noExplicitAny: the test reads nested report JSON
+type Json = any;
+
+describe("sharded arms block merge", () => {
+	const armsBlock = (over: {
+		steadyEntry: Record<string, number>;
+		rtt: LatencyHistogramJson;
+		severUnixMs: number;
+		late: LatencyHistogramJson;
+	}) => ({
+		shardCount: 2,
+		targetSlot: null,
+		targetServerId: null,
+		dcidLen: 20,
+		serverCidLen: 11,
+		dcidHashPlaced: true,
+		placement: "fnv1a32-first8-mod-shardCount",
+		raidMembership: "legacy",
+		raidJoinsSent: 0,
+		sessionsByShard: {
+			steadyEntry: over.steadyEntry,
+			stormEnd: over.steadyEntry,
+			idle: null,
+		},
+		shards: {
+			"1": { steadyDrain: { rxAck: 3, rtt: over.rtt } },
+			"2": { steadyDrain: { rxAck: 1, rtt: over.rtt } },
+		},
+		storm: {
+			timeline: "anchored",
+			cohort: 5,
+			reconnectDelayMs: 1000,
+			severUnixMs: over.severUnixMs,
+			stormStartUnixMs: over.severUnixMs + 1000,
+			severedClosed: 5,
+			reconnectInitials: 5,
+			initialIssueClock: "dcid-provider-call",
+			reconnectInitialLate: over.late,
+		},
+	});
+
+	test("counts sum per shard, histograms merge, storm instants stay per process", () => {
+		const a = {
+			schema: "mmo-client/2",
+			sessionsOk: 3,
+			arms: armsBlock({
+				steadyEntry: { "1": 2, "2": 1 },
+				rtt: hist([1_000_000, 2_000_000]),
+				severUnixMs: 10_000,
+				late: hist([3_000_000]),
+			}),
+		};
+		const b = {
+			schema: "mmo-client/2",
+			sessionsOk: 2,
+			arms: armsBlock({
+				steadyEntry: { "1": 0, "2": 2 },
+				rtt: hist([5_000_000]),
+				severUnixMs: 10_040,
+				late: hist([9_000_000]),
+			}),
+		};
+		const merged = mergeClientReports([a, b]);
+		const arms = merged.arms as Record<string, Json>;
+		expect(arms.shardCount).toBe(2);
+		expect(arms.dcidLen).toBe(20);
+		expect(arms.sessionsByShard.steadyEntry).toEqual({ "1": 2, "2": 3 });
+		expect(arms.sessionsByShard.idle).toBeNull();
+		expect(arms.shards["1"].steadyDrain.rxAck).toBe(6);
+		expect(arms.shards["2"].steadyDrain.rtt.count).toBe(3);
+		expect(arms.storm.cohort).toBe(10);
+		expect(arms.storm.severSkewMs).toBe(40);
+		expect(arms.storm.reconnectInitialLate.count).toBe(2);
+		expect(arms.storm.processes.map((p: Json) => p.severUnixMs)).toEqual([
+			10_000, 10_040,
+		]);
+		expect(arms.storm.processes[1].reconnectInitialLateMaxNs).toBe(
+			hist([9_000_000]).maxNs,
+		);
+		// A single process still gets the merged shape.
+		const single = mergeClientReports([a]).arms as Record<string, Json>;
+		expect(single.storm.severSkewMs).toBe(0);
+		// Steady-path reports carry no arms block and gain none.
+		expect(
+			"arms" in
+				mergeClientReports([
+					{ schema: "mmo-client/2" },
+					{ schema: "mmo-client/2" },
+				]),
+		).toBe(false);
+		expect(() => mergeClientReports([a, { schema: "mmo-client/2" }])).toThrow(
+			"arms block missing",
+		);
+		expect(() =>
+			mergeClientReports([a, { ...b, arms: { ...b.arms, dcidLen: 11 } }]),
+		).toThrow("arms.dcidLen");
+	});
+});

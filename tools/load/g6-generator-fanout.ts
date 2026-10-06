@@ -39,6 +39,90 @@ export function ownedFanoutScript(
 	return lines.join("\n");
 }
 
+function taggedPipeline(index: number, argv: readonly string[]): string {
+	if (argv.length === 0) throw Error("empty generator argv");
+	const cmd = argv.map(quote).join(" ");
+	return `( set -o pipefail; ${cmd} 2> >(sed -u 's/^/@@E${index}@@ /' >&2) | tee "$d/o${index}" | sed -u 's/^/@@O${index}@@ /'; echo $? > "$d/rc${index}" )`;
+}
+
+function untilBuilt(index: number): string {
+	return `until grep -q '^macgen: binary=' "$d/o${index}" 2>/dev/null || [ -e "$d/rc${index}" ]; do sleep 0.2; done`;
+}
+
+/**
+ * The sharded arms' generator fan-out: ONE owned process group (the owner
+ * file is written once per cell) that first runs the generator-loopback
+ * pre-checks — the forwarder (g6-server on 127.0.0.1), the V-F floor and,
+ * in hotspot cells, the V-S sink — and only then starts the main processes
+ * exactly as {@link ownedFanoutScript} does. Main processes are tagged
+ * 0..M-1; the pre-check processes M (forwarder), M+1 (floor), M+2 (sink
+ * subscriber), M+3 (sink publisher). The exit status is the worst MAIN
+ * status: the forwarder is stopped by signal on purpose, and a failed
+ * pre-check is evidence for the grader (its tagged `precheck: rc=` line),
+ * not a reason to abort the cell.
+ */
+export function armsFanoutScript(input: {
+	main: readonly (readonly string[])[];
+	precheck: {
+		dir: string;
+		readyPath: string;
+		certPath: string;
+		keyPath: string;
+		forwarder: readonly string[];
+		floor: readonly string[];
+		sink: {
+			subscriber: readonly string[];
+			publisher: readonly string[];
+		} | null;
+	};
+}): string {
+	const m = input.main.length;
+	const pre = input.precheck;
+	if (m < 1 || m + 4 > FANOUT_MAX_PROCESSES)
+		throw Error(
+			`arms fan-out needs 1..${FANOUT_MAX_PROCESSES - 4} main processes`,
+		);
+	if (!/^\/tmp\/g6-arms-precheck-[A-Za-z0-9._-]+$/.test(pre.dir))
+		throw Error("arms pre-check dir must be /tmp/g6-arms-precheck-<id>");
+	const [fw, floor, sub, pub] = [m, m + 1, m + 2, m + 3];
+	const lines = [
+		"set -u",
+		"d=$(mktemp -d)",
+		`pre=${quote(pre.dir)}`,
+		`trap 'rm -rf "$d" "$pre"' EXIT`,
+		'mkdir -p "$pre"',
+		`openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 2 -nodes -keyout ${quote(pre.keyPath)} -out ${quote(pre.certPath)} -subj /CN=localhost -addext 'subjectAltName = DNS:localhost,IP:127.0.0.1' >/dev/null 2>&1 || echo "@@E${fw}@@ precheck: certificate generation failed" >&2`,
+		`${taggedPipeline(fw, pre.forwarder)} &`,
+		`until [ -e ${quote(pre.readyPath)} ] || [ -e "$d/rc${fw}" ]; do sleep 0.2; done`,
+		taggedPipeline(floor, pre.floor),
+	];
+	if (pre.sink !== null) {
+		lines.push(
+			`${taggedPipeline(sub, pre.sink.subscriber)} &`,
+			"sinksub=$!",
+			untilBuilt(sub),
+			taggedPipeline(pub, pre.sink.publisher),
+			'wait "$sinksub"',
+		);
+	}
+	// Our own session only (setsid / ssh): never another host process.
+	lines.push(
+		"pkill -TERM -s 0 -x g6-server 2>/dev/null || true",
+		"wait",
+		`for i in ${[fw, floor, ...(pre.sink === null ? [] : [sub, pub])].join(" ")}; do echo "@@O$i@@ precheck: rc=$(cat "$d/rc$i" 2>/dev/null || echo 255)"; done`,
+	);
+	input.main.forEach((argv, index) => {
+		lines.push(`${taggedPipeline(index, argv)} &`, untilBuilt(index));
+	});
+	lines.push(
+		"wait",
+		"rc=0",
+		`for i in $(seq 0 ${m - 1}); do r=$(cat "$d/rc$i" 2>/dev/null || echo 255); [ "$r" -gt "$rc" ] && rc=$r; done`,
+		'exit "$rc"',
+	);
+	return lines.join("\n");
+}
+
 export type FanoutClient = EventEmitter & {
 	stdout: Readable;
 	stderr: Readable;

@@ -3,6 +3,7 @@ import { G6_CLOSEOUT_SPEC_ID, G6_CLOSEOUT_SPEC_PATH } from "./g6-plan.ts";
 export type PhaseMarker =
 	| { kind: "steady" }
 	| { kind: "drain" }
+	| { kind: "sever" }
 	| { kind: "storm"; cohort: number | null }
 	| { kind: "post-storm" }
 	| { kind: "idle" }
@@ -659,6 +660,8 @@ export function readPhaseMarker(line: string): PhaseMarker | null {
 	if (line.includes("phase steady")) return { kind: "steady" };
 	if (line.includes("phase drain")) return { kind: "drain" };
 	if (line.includes("phase post-storm")) return { kind: "post-storm" };
+	// Sharded arms' anchored storm only (mmo-client --storm-timeline anchored).
+	if (line.includes("phase sever")) return { kind: "sever" };
 	if (line.includes("phase idle")) return { kind: "idle" };
 	if (line.includes("phase stop")) return { kind: "stop" };
 	if (line.includes("phase storm")) {

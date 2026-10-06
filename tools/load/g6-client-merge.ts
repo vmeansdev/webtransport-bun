@@ -191,6 +191,117 @@ function maxOf(records: Rec[], key: string): number {
 	);
 }
 
+function asRec(value: unknown): Rec | null {
+	return value !== null && typeof value === "object" && !Array.isArray(value)
+		? (value as Rec)
+		: null;
+}
+
+function sumKeyed(parts: unknown[]): Rec | null {
+	const out: Record<string, number> = {};
+	for (const part of parts) {
+		const counts = asRec(part);
+		if (counts === null) return null;
+		for (const [key, value] of Object.entries(counts)) {
+			if (typeof value !== "number") return null;
+			out[key] = (out[key] ?? 0) + value;
+		}
+	}
+	return out;
+}
+
+/**
+ * The sharded arms' block (mmo-client `arms`, present only in hotspot and
+ * storm cells). Generic summing would add shard counts and instants, so it
+ * is merged by meaning: placement facts from the first process, per-shard
+ * session counts summed key by key, per-shard windows merged like the
+ * process-wide ones (histograms bucket by bucket), and the anchored storm's
+ * per-process instants kept per process with the cross-process sever skew
+ * (V-T) and the merged first-Initial lateness (V-R) beside them.
+ */
+export function mergeArmsBlocks(recs: Rec[]): Rec {
+	const blocks = recs.map((r) => asRec(r.arms));
+	const first = blocks[0];
+	if (first === null || first === undefined || blocks.some((b) => b === null))
+		throw new Error("arms block missing from some client processes");
+	const present = blocks as Rec[];
+	for (const key of ["shardCount", "dcidLen", "raidMembership"]) {
+		if (present.some((b) => b[key] !== first[key]))
+			throw new Error(`client processes disagree on arms.${key}`);
+	}
+	const byShard = present.map((b) => asRec(b.sessionsByShard) ?? {});
+	const shards =
+		first.shards === null
+			? null
+			: mergeRecords(present.map((b) => (asRec(b.shards) ?? {}) as Rec));
+	const storms = present.map((b) => asRec(b.storm));
+	const firstStorm = storms[0];
+	let storm: Rec | null = null;
+	if (firstStorm !== null && firstStorm !== undefined) {
+		if (storms.some((s) => s === null))
+			throw new Error("storm block missing from some client processes");
+		const all = storms as Rec[];
+		const sum = (key: string) =>
+			all.reduce<number>(
+				(acc, s) => acc + (typeof s[key] === "number" ? (s[key] as number) : 0),
+				0,
+			);
+		const lateness = all.map((s) => s.reconnectInitialLate).filter(isHistogram);
+		const sever = all.map((s) => s.severUnixMs);
+		const severKnown = sever.every((v) => typeof v === "number");
+		storm = {
+			timeline: firstStorm.timeline,
+			cohort: sum("cohort"),
+			reconnectDelayMs: firstStorm.reconnectDelayMs,
+			severedClosed: sum("severedClosed"),
+			reconnectInitials: sum("reconnectInitials"),
+			initialIssueClock: firstStorm.initialIssueClock,
+			reconnectInitialLate:
+				lateness.length === all.length ? mergeHistograms(lateness) : null,
+			severSkewMs: severKnown
+				? Math.max(...(sever as number[])) - Math.min(...(sever as number[]))
+				: null,
+			processes: all.map((s) => ({
+				cohort: s.cohort,
+				severUnixMs: s.severUnixMs,
+				severMonotonicNs: s.severMonotonicNs,
+				stormStartUnixMs: s.stormStartUnixMs,
+				stormEndUnixMs: s.stormEndUnixMs,
+				severBarrier: s.severBarrier,
+				severedClosed: s.severedClosed,
+				reconnectInitials: s.reconnectInitials,
+				reconnectInitialLateMaxNs: isHistogram(s.reconnectInitialLate)
+					? s.reconnectInitialLate.count > 0
+						? s.reconnectInitialLate.maxNs
+						: null
+					: null,
+			})),
+		};
+	}
+	return {
+		shardCount: first.shardCount,
+		targetSlot: first.targetSlot,
+		targetServerId: first.targetServerId,
+		dcidLen: first.dcidLen,
+		serverCidLen: first.serverCidLen,
+		dcidHashPlaced: first.dcidHashPlaced,
+		placement: first.placement,
+		raidMembership: first.raidMembership,
+		raidJoinsSent: present.reduce<number>(
+			(acc, b) =>
+				acc + (typeof b.raidJoinsSent === "number" ? b.raidJoinsSent : 0),
+			0,
+		),
+		sessionsByShard: {
+			steadyEntry: sumKeyed(byShard.map((b) => b.steadyEntry)),
+			stormEnd: sumKeyed(byShard.map((b) => b.stormEnd)),
+			idle: sumKeyed(byShard.map((b) => b.idle)),
+		},
+		shards,
+		storm,
+	};
+}
+
 export function mergeClientReports(reports: unknown[]): Rec {
 	const recs = reports.filter(
 		(r): r is Rec => r !== null && typeof r === "object",
@@ -204,7 +315,12 @@ export function mergeClientReports(reports: unknown[]): Rec {
 			);
 		}
 	}
-	if (recs.length === 1) return { ...first, clientProcesses: 1 };
+	if (recs.length === 1)
+		return {
+			...first,
+			...(first.arms !== undefined ? { arms: mergeArmsBlocks(recs) } : {}),
+			clientProcesses: 1,
+		};
 	const summed = mergeRecords(recs);
 	const acceptMs = recs.map((r) => (r.acceptMs ?? {}) as Rec);
 	return {
@@ -229,6 +345,7 @@ export function mergeClientReports(reports: unknown[]): Rec {
 		phaseBarrier: first.phaseBarrier,
 		config: first.config,
 		hostUdp: first.hostUdp,
+		...(first.arms !== undefined ? { arms: mergeArmsBlocks(recs) } : {}),
 		clientProcesses: recs.length,
 	};
 }
