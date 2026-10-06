@@ -55,6 +55,7 @@ describe("sharded arms configuration", () => {
 		expect(hotspot.durationsOverridden).toBe(false);
 		expect(hotspot.raidTargetSlot).toBe(0);
 		expect(hotspot.raidDcidLen).toBe(20);
+		expect(hotspot.realmNegctlDcidLen).toBeNull();
 		const storm = resolveArmsConfig(
 			{ SCAN_ARM: "storm", SCAN_STORM_COHORT: "1000" },
 			base,
@@ -129,6 +130,26 @@ describe("generator argv", () => {
 		expect(armsBarrierParties(cfg, 4)).toBe(6);
 		expect(argv).not.toContain("--target-shard");
 		expect(argv).not.toContain("--storm-cohort");
+		expect(argv).not.toContain("--dcid-len");
+	});
+
+	test("negative control: only realm process 0 opens with the 11-octet DCID", () => {
+		const cfg = resolveArmsConfig(
+			{ SCAN_ARM: "hotspot", SCAN_NEGCTL_REALM_DCID_LEN: "11" },
+			base,
+		);
+		expect(cfg.realmNegctlDcidLen).toBe(11);
+		const argvs = [0, 1, 2, 3].map((index) =>
+			realmArmsArgs(cfg, { realmProcesses: 4, index, barrier }),
+		);
+		expect(after(argvs[0] ?? [], "--dcid-len")).toBe("11");
+		for (const argv of argvs.slice(1)) expect(argv).not.toContain("--dcid-len");
+		expect(() =>
+			resolveArmsConfig(
+				{ SCAN_ARM: "hotspot", SCAN_NEGCTL_REALM_DCID_LEN: "7" },
+				base,
+			),
+		).toThrow("8..20");
 	});
 
 	test("storm realm: exact cohort shares by global index, anchored timeline", () => {

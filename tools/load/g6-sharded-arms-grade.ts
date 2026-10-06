@@ -1360,6 +1360,7 @@ function rawCellExpectations(ctx: Ctx): FalsifierResult {
 			? { raidTargetSlot: ctx.targetServerId - 1 }
 			: {}),
 		raidDcidLen: R.dcidLen,
+		realmNegctlDcidLen: null,
 		stormCohort: cell.cohort,
 		steadySeconds:
 			cell.arm === "storm" ? R.stormSteadySeconds : R.hotspotSteadySeconds,

@@ -44,6 +44,11 @@ export type ArmsConfig = {
 	shards: number;
 	raidTargetSlot: number;
 	raidDcidLen: number;
+	/**
+	 * Negative control only: realm process 0 opens with this DCID length
+	 * (11 = CID_LEN, so the kernel hash places it). null is registered.
+	 */
+	realmNegctlDcidLen: number | null;
 	stormCohort: number;
 	steadySeconds: number;
 	stormWindowSeconds: number;
@@ -130,6 +135,11 @@ export function resolveArmsConfig(
 			8,
 			20,
 		),
+		realmNegctlDcidLen:
+			env.SCAN_NEGCTL_REALM_DCID_LEN === undefined ||
+			env.SCAN_NEGCTL_REALM_DCID_LEN === ""
+				? null
+				: intEnv(env, "SCAN_NEGCTL_REALM_DCID_LEN", 0, 8, 20),
 		stormCohort,
 		steadySeconds,
 		stormWindowSeconds,
@@ -187,6 +197,9 @@ export function realmArmsArgs(
 	const common = [
 		"--shard-count",
 		String(cfg.shards),
+		...(cfg.realmNegctlDcidLen !== null && input.index === 0
+			? ["--dcid-len", String(cfg.realmNegctlDcidLen)]
+			: []),
 		"--steady-secs",
 		String(cfg.steadySeconds),
 		...barrierArgs(

@@ -419,6 +419,7 @@ export function armsScanFixture(arm: "hotspot" | "storm"): {
 				shards: FIXTURE.shards,
 				raidTargetSlot: 0,
 				raidDcidLen: 20,
+				realmNegctlDcidLen: null,
 				stormCohort: cohort,
 				steadySeconds,
 				stormWindowSeconds: 120,
