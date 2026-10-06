@@ -5,6 +5,10 @@ import {
 	type WorkPlan,
 	type WorkTarget,
 } from "./g6-c32-work-plan.ts";
+import {
+	SHARDED_ARMS_CELLS,
+	SHARDED_ARMS_REGISTERED,
+} from "./g6-sharded-arms-grade.ts";
 
 const COMPLETE: WorkTarget = { terminal: "COMPLETE" };
 const INCOMPLETE: WorkTarget = { terminal: "INCOMPLETE" };
@@ -211,6 +215,47 @@ export function makeSendBufferAbWorkPlan(
 				next: {
 					PASS: cells[index + 1] ?? COMPLETE,
 					MISS: cells[index + 1] ?? COMPLETE,
+					INVALID: INCOMPLETE,
+				},
+			}),
+		),
+	});
+}
+
+export const SHARDED_ARMS_PLAN_ID = "g6-sharded-arms";
+
+/** Sharded arms (pre-registration g6-sharded-arms/1, plan r6) on one pair:
+ * H5k, H40k, S1-5k, S2-5k, S1-40k, S2-40k in that order, every cell on the
+ * closed 40k candidate profile. Whole-cell maxima hotspot 480 s, storm 600 s;
+ * setup 2100 s, control 60 s, teardown 600 s (5,520 s active). PASS and MISS
+ * continue; INVALID stops INCOMPLETE (stamped hotspot cells stand). Each
+ * cell's arm, sessions and cohort come from SHARDED_ARMS_CELLS by node id. */
+export function makeShardedArmsWorkPlan(): WorkPlan {
+	const cells = SHARDED_ARMS_CELLS;
+	return validateWorkPlan({
+		schema: "g6-c32-work-plan/1",
+		id: SHARDED_ARMS_PLAN_ID,
+		setupMaximumSeconds: 2100,
+		controlMaximumSeconds: 60,
+		teardownReserveSeconds: 600,
+		activeMaximumSeconds: 5520,
+		profiles: ["candidate"],
+		entry: requireDefined(cells[0]).id,
+		nodes: cells.map(
+			(cell, index): WorkNode => ({
+				id: cell.id,
+				label: cell.id,
+				kind: cell.arm,
+				profile: "candidate",
+				requestedSessions: cell.sessions,
+				activeWorkloadSessions: cell.sessions,
+				maximumSeconds:
+					cell.arm === "hotspot"
+						? SHARDED_ARMS_REGISTERED.hotspotMaximumSeconds
+						: SHARDED_ARMS_REGISTERED.stormMaximumSeconds,
+				next: {
+					PASS: cells[index + 1]?.id ?? COMPLETE,
+					MISS: cells[index + 1]?.id ?? COMPLETE,
 					INVALID: INCOMPLETE,
 				},
 			}),

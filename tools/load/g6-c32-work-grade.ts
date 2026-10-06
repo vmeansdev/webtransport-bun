@@ -11,6 +11,12 @@ import {
 	validateCapacityRawCell,
 } from "./g6-capacity-raw-cell.ts";
 import { assertGeneratorDatagramDriver } from "./g6-datagram-driver.ts";
+import {
+	frozenVR,
+	gradeShardedArmsCell,
+	SHARDED_ARMS_REGISTERED,
+	shardedArmsCell,
+} from "./g6-sharded-arms-grade.ts";
 import { G6_SHARDED_CLAUSES } from "./g6-sharded-grade.ts";
 
 export type WorkGradeInput = CapacityRawCellInput;
@@ -77,6 +83,39 @@ export function gradeWorkCell(input: WorkGradeInput): WorkGrade {
 				)
 			)
 				throw Error(`unsafe output or missing ${field}`);
+		}
+		if (node.kind === "hotspot" || node.kind === "storm") {
+			// Sharded arms (g6-sharded-arms/1): the raw cell above is the rig's
+			// exact-pair / PREPARED_HOST evidence (V-C); every clause and
+			// falsifier is recomputed from the raw scan by the arms grader. The
+			// steady-path evaluators (RCA cell, successor S1-S5) do not apply.
+			const arms = gradeShardedArmsCell(
+				{
+					cell: shardedArmsCell(node.id),
+					scan,
+					expectCandidate: input.expectCandidate,
+					registrationSha256: input.registrationSha256,
+					shards: p.shards,
+					clientProcesses: p.clientProcesses ?? 1,
+					endpoints: p.endpoints,
+					fixedSourcePortBase: p.fixedSourcePortBase,
+					rig: { qualified: true, reasons: [] },
+					vR: frozenVR(),
+					raidTargetSlot: SHARDED_ARMS_REGISTERED.raidTargetSlot,
+				},
+				String((scan as unknown as { startedAt?: unknown }).startedAt),
+			);
+			// A clause INCOMPLETE is not a registered outcome: it stops the run.
+			if (arms.verdict === "INVALID" || arms.verdict === "INCOMPLETE")
+				throw Error(
+					[`sharded arms ${arms.verdict}`, ...arms.invalidReasons].join("; "),
+				);
+			return {
+				schema: "g6-c32-work-grade/1",
+				nodeId: node.id,
+				outcome: arms.verdict,
+				reasons: arms.clauses.flatMap((clause) => clause.reasons),
+			};
 		}
 		const qualityRequest = {
 			rung: node.requestedSessions,

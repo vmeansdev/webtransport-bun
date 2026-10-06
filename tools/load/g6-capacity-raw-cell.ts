@@ -12,6 +12,7 @@ import type { WorkNode } from "./g6-c32-work-plan.ts";
 import type { WorkProfile } from "./g6-c32-work-profile.ts";
 import { validateCapacityDiagnosticCoverage } from "./g6-capacity-diagnostic-coverage.ts";
 import {
+	type ArmsRawShape,
 	type RawPairIdentity,
 	validateClientPorts,
 	validateRawLifecycle,
@@ -19,6 +20,10 @@ import {
 	validateScanCommand,
 } from "./g6-capacity-raw-work.ts";
 import type { NativeSendPathSnapshot } from "./g6-native-send-path.ts";
+import {
+	SHARDED_ARMS_REGISTERED,
+	shardedArmsCell,
+} from "./g6-sharded-arms-grade.ts";
 import type { ParsedLinuxProbeJsonl } from "./g6-sharded-diagnostic.ts";
 import {
 	G6_SHARDED_VALIDITY,
@@ -365,10 +370,28 @@ function validateAttributionInputs(
 	}
 }
 
+/** The registered raw shape of a sharded-arms node; null for other kinds. */
+export function armsRawShape(node: WorkNode): ArmsRawShape | null {
+	if (node.kind !== "hotspot" && node.kind !== "storm") return null;
+	const cell = shardedArmsCell(node.id);
+	if (cell.arm !== node.kind || cell.sessions !== node.requestedSessions)
+		fail("sharded-arms node differs from its registered cell");
+	return {
+		arm: cell.arm,
+		cohort: cell.cohort,
+		raidTargetSlot: SHARDED_ARMS_REGISTERED.raidTargetSlot,
+		steadySeconds:
+			cell.arm === "storm"
+				? SHARDED_ARMS_REGISTERED.stormSteadySeconds
+				: SHARDED_ARMS_REGISTERED.hotspotSteadySeconds,
+	};
+}
+
 export function validateCapacityRawCell(
 	input: CapacityRawCellInput,
 ): ValidatedCapacityRawCell {
 	const { node, profile: p } = input;
+	const arms = armsRawShape(node);
 	if (
 		!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(text(input.runId, "run ID")) ||
 		!/^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$/.test(text(node.id, "node ID")) ||
@@ -428,6 +451,7 @@ export function validateCapacityRawCell(
 		node.activeWorkloadSessions,
 		text(scan.startedAt, "scan start"),
 		p.detailedProbe,
+		arms,
 	);
 	const config = object(scan.config, "scan.config"),
 		dispatch = object(diagnostic.dispatch, "diagnostic.dispatch");
@@ -490,8 +514,8 @@ export function validateCapacityRawCell(
 			"raw client differs from frozen source, start, configuration or workload",
 		);
 	validateClientPorts(report, p);
-	validateRawNumbers(scan, report);
-	validateRawLifecycle(diagnostic, scan, operation, p.shards);
+	validateRawNumbers(scan, report, arms);
+	validateRawLifecycle(diagnostic, scan, operation, p.shards, arms);
 	const steering = steeredTotal(
 		text(input.postRunSteeringText, "post-run steering"),
 	);

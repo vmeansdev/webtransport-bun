@@ -480,6 +480,28 @@ exit $?`,
 	}
 	// biome-ignore lint/suspicious/noTemplateCurlyInString: pins a literal bash default, not a JS template
 	expect(source()).toContain("local client_processes=${26:-1}");
+	// Sharded arms (positions 27-29): the arm env reaches the scan, and only
+	// for an arms cell; a bad arm, cohort or slot is refused before admission.
+	const hot = run([...argv(4), "hotspot", "0", "0"]).calls;
+	expect(hot).toContain(
+		"SCAN_CLIENT_PROCESSES=4 SCAN_ARM=hotspot SCAN_RAID_TARGET_SLOT=0 G6_BPF_READY_RECEIPT=",
+	);
+	expect(hot).not.toContain("SCAN_STORM_COHORT");
+	// Distinct last arguments keep each call in its own log.
+	const storm = run([...argv(4), "storm", "8000", "2"]).calls;
+	expect(storm).toContain(
+		"SCAN_CLIENT_PROCESSES=4 SCAN_ARM=storm SCAN_STORM_COHORT=8000 G6_BPF_READY_RECEIPT=",
+	);
+	expect(run([...argv(4), "steady", "0", "3"]).calls).not.toContain("SCAN_ARM");
+	for (const bad of [
+		["raid", "0", "7"],
+		["storm", "-1", "8"],
+		["hotspot", "0", "x"],
+	]) {
+		const { status, calls } = run([...argv(4), ...bad]);
+		expect(status).toBe(74);
+		expect(calls).toBe("");
+	}
 });
 
 function extractFunction(script: string, name: string): string {

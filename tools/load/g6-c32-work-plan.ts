@@ -7,7 +7,14 @@ export type WorkTarget = string | { terminal: WorkTerminal };
 export type WorkNode = {
 	id: string;
 	label: string;
-	kind: "attribution" | "attribution-r4" | "ladder" | "companion";
+	kind:
+		| "attribution"
+		| "attribution-r4"
+		| "ladder"
+		| "companion"
+		/** Sharded arms (g6-sharded-arms/1): full-rate realm + raid / storm. */
+		| "hotspot"
+		| "storm";
 	profile: string;
 	requestedSessions: number;
 	activeWorkloadSessions: number;
@@ -124,7 +131,9 @@ function node(value: unknown, profiles: readonly string[]): WorkNode {
 		object.kind !== "attribution" &&
 		object.kind !== "attribution-r4" &&
 		object.kind !== "ladder" &&
-		object.kind !== "companion"
+		object.kind !== "companion" &&
+		object.kind !== "hotspot" &&
+		object.kind !== "storm"
 	)
 		fail(`unknown cell kind ${String(object.kind)}`);
 	const requestedSessions = integer(

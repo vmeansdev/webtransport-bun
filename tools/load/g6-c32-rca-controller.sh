@@ -1104,6 +1104,19 @@ run_cell_once() {
   # (SCAN_CLIENT_PROCESSES); 1 is the historical single-process generator.
   local client_processes=${26:-1}
   case "$client_processes" in [1-9]|1[0-6]) ;; *) return 74 ;; esac
+  # Positions 27-29, sharded arms only (g6-sharded-arms/1): the arm, the
+  # storm cohort and the raid slot, from the source-encoded cell table. Absent
+  # = the steady arm, and the scan env is exactly the historical one.
+  local arm=${27:-steady} storm_cohort=${28:-0} raid_target_slot=${29:-0}
+  local arms_env=""
+  case "$storm_cohort" in ''|*[!0-9]*) return 74 ;; esac
+  case "$raid_target_slot" in ''|*[!0-9]*) return 74 ;; esac
+  case "$arm" in
+    steady) ;;
+    hotspot) arms_env="SCAN_ARM=hotspot SCAN_RAID_TARGET_SLOT=$raid_target_slot" ;;
+    storm) arms_env="SCAN_ARM=storm SCAN_STORM_COHORT=$storm_cohort" ;;
+    *) return 74 ;;
+  esac
   local generator_entry_script="$GENERATOR_CLONE/tools/offbox/linux-generator-entry-g6.sh"
   local work_owner_env=""
   local emitter_mode=native-mirror pacer_env=""
@@ -1172,7 +1185,7 @@ run_cell_once() {
   if [ "${WORK_ENABLED:-0}" = 1 ]; then scan_runner=(work_scan "$cell" "$remote_dir"); fi
   capture_operation "$local_dir/scan" "$cell-scan" RUNNING \
     "${scan_runner[@]}" env \
-    "SCAN_DIAGNOSTIC=1 SCAN_NATIVE_SEND_PATH_DIAGNOSTICS=$native_diagnostics SCAN_SHARDS=$G6_C32_SHARDS SCAN_SESSIONS=$sessions SCAN_WORKLOAD_ACTIVE_SESSIONS=$active_sessions SCAN_ENDPOINTS=$endpoints SCAN_CONNECT_CONCURRENCY=$concurrency SCAN_CONNECT_RATE_PER_SEC=$rate SCAN_FIXED_SOURCE_PORT_BASE=$FIXED_SOURCE_PORT_BASE SCAN_ACK_REFLECTOR=$ack_reflector SCAN_SERVER_WORKERS=$server_workers SCAN_SERVER_GRO=$server_gro SCAN_SERVER_RECV_RUNTIME=$server_recv_runtime SCAN_ACK_CADENCE=$ack_cadence SCAN_SERVER_UDP_SNDBUF_BYTES=$server_udp_sndbuf_bytes SCAN_UDP_SEND_BATCH=$udp_send_batch SCAN_SERVER_UDP_SEND_EAGAIN_MODE=$server_udp_send_eagain_mode SCAN_REFLECT_RING_BYPASS=$reflect_ring_bypass SCAN_DATAGRAM_PUMP=$datagram_pump SCAN_CLIENT_PROCESSES=$client_processes G6_BPF_READY_RECEIPT=$remote_dir/g6-shard-bpf-ready.json SCAN_LINUX_PROBE_ENABLED=$probe SCAN_LINUX_PROBE_OUT=$remote_dir/linux-probe.jsonl SCAN_POST_RUN_STEERING_OUT=$remote_dir/post-run-steering.json SCAN_OUT=$remote_dir/g6-sharded-scan.json SCAN_DIAGNOSTIC_OUT=$remote_dir/g6-sharded-diagnostic.json G6_OFFBOX_SSH=root@$G6_C32_GENERATOR_PRIVATE_IPV4 G6_OFFBOX_ENTRY_SCRIPT=$generator_entry_script G6_OFFBOX_CLONE=$GENERATOR_CLONE G6_CANDIDATE_SHA=$G6_C32_CANDIDATE_COMMIT G6_PREREGISTRATION_SHA256=$G6_C32_REGISTRATION_SHA256 G6_SERVER_ADDRESS=$G6_C32_SERVER_PRIVATE_IPV4 G6_EMITTER_MODE=$emitter_mode $pacer_env $work_owner_env bash -lc \"cd '$SERVER_CLONE' && exec '$REMOTE_BUN' tools/load/g6-sharded-scan.ts\"" \
+    "SCAN_DIAGNOSTIC=1 SCAN_NATIVE_SEND_PATH_DIAGNOSTICS=$native_diagnostics SCAN_SHARDS=$G6_C32_SHARDS SCAN_SESSIONS=$sessions SCAN_WORKLOAD_ACTIVE_SESSIONS=$active_sessions SCAN_ENDPOINTS=$endpoints SCAN_CONNECT_CONCURRENCY=$concurrency SCAN_CONNECT_RATE_PER_SEC=$rate SCAN_FIXED_SOURCE_PORT_BASE=$FIXED_SOURCE_PORT_BASE SCAN_ACK_REFLECTOR=$ack_reflector SCAN_SERVER_WORKERS=$server_workers SCAN_SERVER_GRO=$server_gro SCAN_SERVER_RECV_RUNTIME=$server_recv_runtime SCAN_ACK_CADENCE=$ack_cadence SCAN_SERVER_UDP_SNDBUF_BYTES=$server_udp_sndbuf_bytes SCAN_UDP_SEND_BATCH=$udp_send_batch SCAN_SERVER_UDP_SEND_EAGAIN_MODE=$server_udp_send_eagain_mode SCAN_REFLECT_RING_BYPASS=$reflect_ring_bypass SCAN_DATAGRAM_PUMP=$datagram_pump SCAN_CLIENT_PROCESSES=$client_processes ${arms_env:+$arms_env }G6_BPF_READY_RECEIPT=$remote_dir/g6-shard-bpf-ready.json SCAN_LINUX_PROBE_ENABLED=$probe SCAN_LINUX_PROBE_OUT=$remote_dir/linux-probe.jsonl SCAN_POST_RUN_STEERING_OUT=$remote_dir/post-run-steering.json SCAN_OUT=$remote_dir/g6-sharded-scan.json SCAN_DIAGNOSTIC_OUT=$remote_dir/g6-sharded-diagnostic.json G6_OFFBOX_SSH=root@$G6_C32_GENERATOR_PRIVATE_IPV4 G6_OFFBOX_ENTRY_SCRIPT=$generator_entry_script G6_OFFBOX_CLONE=$GENERATOR_CLONE G6_CANDIDATE_SHA=$G6_C32_CANDIDATE_COMMIT G6_PREREGISTRATION_SHA256=$G6_C32_REGISTRATION_SHA256 G6_SERVER_ADDRESS=$G6_C32_SERVER_PRIVATE_IPV4 G6_EMITTER_MODE=$emitter_mode $pacer_env $work_owner_env bash -lc \"cd '$SERVER_CLONE' && exec '$REMOTE_BUN' tools/load/g6-sharded-scan.ts\"" \
     || { [ "${WORK_ENABLED:-0}" != 1 ] || return 79; }
   capture_operation "$local_dir/copy" "$cell-copy" RUNNING \
     g6_scp -r root@"$G6_C32_SERVER_PUBLIC_IPV4":"$remote_dir/." "$local_dir/" \

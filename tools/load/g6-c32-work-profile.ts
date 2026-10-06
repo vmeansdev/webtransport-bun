@@ -255,6 +255,33 @@ export function makeSendBufferWorkProfiles(
 	return { D, S: profile({ ...D, serverUdpSendBufferBytes: SNDBUF_AB_BYTES }) };
 }
 
+/** Sharded arms (g6-sharded-arms/1): every cell runs the closed 40k
+ * deployment exactly — the r5 probe-off ladder candidate (pump, stock send
+ * path, probe off, default send buffer) with 24 shards and 4 generator
+ * processes. Source-encoded so policy can bind nothing else. */
+export const SHARDED_ARMS_PLAN_IDS = ["g6-sharded-arms"] as const;
+export const SHARDED_ARMS_SHARDS = 24;
+export const SHARDED_ARMS_CLIENT_PROCESSES = 4;
+export function makeShardedArmsWorkProfiles(
+	candidate: WorkProfile,
+): WorkProfiles {
+	const base = profile(candidate);
+	if (
+		base.datagramPump !== "pump" ||
+		base.reflectRingBypass !== "off" ||
+		base.udpSendBatch !== 0 ||
+		base.detailedProbe !== false ||
+		base.serverUdpSendBufferBytes !== 0 ||
+		base.pacerPps !== 0 ||
+		base.shards !== SHARDED_ARMS_SHARDS ||
+		base.clientProcesses !== SHARDED_ARMS_CLIENT_PROCESSES
+	)
+		fail(
+			"sharded arms run the closed 40k deployment: r5 probe-off ladder candidate, 24 shards, 4 generator processes",
+		);
+	return { candidate: base };
+}
+
 const R5_KEYS = [...KEYS, "datagramPump"];
 const R5_LADDER_IDS = new Set([
 	"g6-capacity-ladder-b-r5",
@@ -271,6 +298,28 @@ export function validateWorkProfiles(
 	const result = Object.fromEntries(
 		plan.profiles.map((name) => [name, profile(entries[name])]),
 	);
+	const armsKinds = plan.nodes.filter(
+		(node) => node.kind === "hotspot" || node.kind === "storm",
+	);
+	if ((SHARDED_ARMS_PLAN_IDS as readonly string[]).includes(plan.id)) {
+		if (armsKinds.length !== plan.nodes.length)
+			fail("sharded-arms plans contain only hotspot and storm cells");
+		exact(result, ["candidate"]);
+		const expected = makeShardedArmsWorkProfiles(
+			requireDefined(result.candidate),
+		);
+		if (
+			[...R5_KEYS, "clientProcesses"].some(
+				(key) =>
+					requireDefined(result.candidate)[key as keyof WorkProfile] !==
+					requireDefined(expected.candidate)[key as keyof WorkProfile],
+			)
+		)
+			fail("sharded-arms profile differs from the closed 40k deployment");
+		return result;
+	}
+	if (armsKinds.length > 0)
+		fail("hotspot and storm cells run only in a sharded-arms plan");
 	if ((SNDBUF_AB_PLAN_IDS as readonly string[]).includes(plan.id)) {
 		if (plan.nodes.some((node) => node.kind !== "attribution-r4"))
 			fail("send-buffer A/B plans contain only attribution-r4 cells");

@@ -24,6 +24,10 @@ import type { WorkProfile } from "./g6-c32-work-profile.ts";
 import { deriveWorkAuthority } from "./g6-capacity-work-authority.ts";
 import { linuxProbeProducerSha256 } from "./g6-linux-probe.ts";
 import { nativeSendPathProducerSha256 } from "./g6-native-send-path.ts";
+import {
+	SHARDED_ARMS_REGISTERED,
+	shardedArmsCell,
+} from "./g6-sharded-arms-grade.ts";
 
 /** Fixed positional adapter to the existing cell implementation, not a schedule. */
 export function workCellArguments(node: WorkNode, p: WorkProfile): string[] {
@@ -59,7 +63,24 @@ export function workCellArguments(node: WorkNode, p: WorkProfile): string[] {
 			})(),
 		// Position 26: generator processes on the one generator host.
 		p.clientProcesses ?? 1,
+		// Positions 27-29, sharded arms only: arm, storm cohort and raid slot
+		// from the source-encoded cell table (g6-sharded-arms/1).
+		...armsCellArguments(node),
 	].map(String);
+}
+
+/** The scan env a sharded-arms cell adds (SCAN_ARM, SCAN_STORM_COHORT,
+ * SCAN_RAID_TARGET_SLOT); empty for every other kind. */
+export function armsCellArguments(node: WorkNode): (string | number)[] {
+	if (node.kind !== "hotspot" && node.kind !== "storm") return [];
+	const cell = shardedArmsCell(node.id);
+	if (
+		cell.arm !== node.kind ||
+		cell.sessions !== node.requestedSessions ||
+		cell.sessions !== node.activeWorkloadSessions
+	)
+		throw Error("sharded-arms node differs from its registered cell");
+	return [cell.arm, cell.cohort, SHARDED_ARMS_REGISTERED.raidTargetSlot];
 }
 
 export async function runWorkCli(args: readonly string[]): Promise<unknown> {

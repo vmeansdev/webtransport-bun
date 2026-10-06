@@ -34,7 +34,34 @@ function requireCount(value: unknown, label: string): number {
 	return requireSafeInteger(value, label);
 }
 
-export function validateRawNumbers(scan: JsonRecord, report: JsonRecord): void {
+/** Raw-cell shape a sharded-arms kind registers (g6-sharded-arms/1). */
+export type ArmsRawShape = {
+	arm: "hotspot" | "storm";
+	cohort: number;
+	raidTargetSlot: number;
+	/** Registered steady window: hotspot 120 s, storm 60 s. */
+	steadySeconds: number;
+};
+
+const STEADY_PHASES = ["connect", "steady", "drain", "idle", "stop"];
+const STORM_PHASES = [
+	"connect",
+	"steady",
+	"drain",
+	"sever",
+	"storm",
+	"post-storm",
+	"idle",
+	"stop",
+];
+
+export function validateRawNumbers(
+	scan: JsonRecord,
+	report: JsonRecord,
+	arms: ArmsRawShape | null = null,
+): void {
+	const steadySeconds =
+		arms?.steadySeconds ?? G6_SHARDED_VALIDITY.steadySeconds;
 	for (const key of [
 		"sessionsRequested",
 		"sessionsOk",
@@ -86,7 +113,7 @@ export function validateRawNumbers(scan: JsonRecord, report: JsonRecord): void {
 				fail(`shard ${index} ${phase} wallMs is invalid`);
 			if (
 				phase === "steady" &&
-				Math.abs(boundary.wallMs - G6_SHARDED_VALIDITY.steadySeconds * 1000) >
+				Math.abs(boundary.wallMs - steadySeconds * 1000) >
 					G6_SHARDED_VALIDITY.steadyWallMsTolerance
 			)
 				fail(`shard ${index} steady wallMs does not cover the rated window`);
@@ -153,11 +180,14 @@ export function validateRawLifecycle(
 	scan: JsonRecord,
 	operation: OperationReceipt,
 	shards: number,
+	arms: ArmsRawShape | null = null,
 ): void {
+	const steadySeconds =
+		arms?.steadySeconds ?? G6_SHARDED_VALIDITY.steadySeconds;
 	const lifecycle = diagnostic.perShardLifecycle;
 	if (!Array.isArray(lifecycle) || lifecycle.length !== shards)
 		fail("lifecycle shard evidence is missing");
-	const phases = ["connect", "steady", "drain", "idle", "stop"];
+	const phases = arms?.arm === "storm" ? STORM_PHASES : STEADY_PHASES;
 	const scanIds = (scan.shards as JsonRecord[]).map((shard) => shard.serverId);
 	const lifecycleIds = lifecycle.map((shard) =>
 		requireSafeInteger(
@@ -209,7 +239,7 @@ export function validateRawLifecycle(
 		if (steadyAt === undefined || drainAt === undefined)
 			fail("missing steady interval");
 		if (
-			Math.abs(drainAt - steadyAt - G6_SHARDED_VALIDITY.steadySeconds * 1000) >
+			Math.abs(drainAt - steadyAt - steadySeconds * 1000) >
 			G6_SHARDED_VALIDITY.steadyWallMsTolerance
 		)
 			fail("lifecycle steady interval does not cover the rated window");
@@ -246,6 +276,7 @@ export function validateScanCommand(
 	active: number,
 	startedAt: string,
 	detailedProbe = true,
+	arms: ArmsRawShape | null = null,
 ): void {
 	const { action } = operation;
 	const work = action.command === "work_scan";
@@ -332,6 +363,13 @@ export function validateScanCommand(
 		fixed.SCAN_CLIENT_PROCESSES = clientProcesses;
 	else if (Object.hasOwn(env, "SCAN_CLIENT_PROCESSES"))
 		fixed.SCAN_CLIENT_PROCESSES = 1;
+	// Sharded arms: the arm's env, exactly from the registered cell; every
+	// other cell may not carry it (the allowed set below refuses it).
+	if (arms !== null) {
+		fixed.SCAN_ARM = arms.arm;
+		if (arms.arm === "storm") fixed.SCAN_STORM_COHORT = arms.cohort;
+		else fixed.SCAN_RAID_TARGET_SLOT = arms.raidTargetSlot;
+	}
 	for (const [key, value] of Object.entries(fixed))
 		if (env[key] !== String(value))
 			fail(`scan command ${key} differs from registered host/profile`);
