@@ -161,10 +161,14 @@ async function main(): Promise<void> {
 	let vR: VRThreshold | null = frozenVR();
 	const rehearsalVr = arg("rehearsal-vr-ms");
 	if (rehearsalVr !== null) {
-		if (vR !== null)
-			throw Error("R is frozen; a rehearsal R cannot replace it");
+		if (!/^\d+$/.test(rehearsalVr))
+			throw Error("--rehearsal-vr-ms must be an integer");
+		// A dry stamp may grade at another R; the stamp is then never
+		// authoritative (any override clears `authoritative`).
+		overrides.push(
+			`V-R R = ${rehearsalVr} ms (rehearsal; ${vR === null ? "R not frozen" : `replaces the frozen ${vR.ms} ms`})`,
+		);
 		vR = { ms: Number(rehearsalVr), source: "rehearsal" };
-		overrides.push(`V-R R = ${rehearsalVr} ms (rehearsal; R not frozen)`);
 	}
 	const shapes = new Map<string, { sessions: number; cohort: number }>();
 	for (const spec of args("rehearsal-shape")) {

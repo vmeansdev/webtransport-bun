@@ -45,7 +45,6 @@ import {
 	falsifierHistograms,
 	falsifierIngestReality,
 	falsifierLittle,
-	falsifierSink,
 	type HistogramFacts,
 	type HotspotFacts,
 	type SteadyArmFacts,
@@ -57,6 +56,8 @@ import {
 	RAID_MEMBERS,
 	RAID_PUBLISHER_HZ,
 	rttBudgetMs,
+	SINK_DELIVERY_FLOOR,
+	SINK_HEADROOM_FACTOR,
 	SNAPSHOT_HZ,
 	snapshotDatagrams,
 } from "./g6-plan.ts";
@@ -181,6 +182,12 @@ export const SHARDED_ARMS_REGISTERED = Object.freeze({
 	/** V-S: 1.5 x 800/s. */
 	sinkSeconds: 20,
 	sinkArmDownstreamPps: RAID_MEMBERS * RAID_PUBLISHER_HZ,
+	/**
+	 * V-S originator tolerance: the sink is INVALID only if delivery < 0.995
+	 * or the originator's achieved rate < 0.995 x 1,200/s (a skip fraction of
+	 * at most 0.5 % is tolerated; the raw skip count is disclosed).
+	 */
+	sinkOriginatorRateFloor: 0.995,
 	/** Boundary wall tolerance (gate-g6-sharded steadyWallMsTolerance). */
 	wallToleranceMs: 250,
 	/** The forwarder is stopped by the fan-out's SIGTERM after the checks. */
@@ -189,10 +196,12 @@ export const SHARDED_ARMS_REGISTERED = Object.freeze({
 
 /**
  * V-R's R (ms): fixed before freeze from work item 6's generator
- * characterization. `null` means not yet frozen, and storm cells then refuse
- * to grade (an INVALID with that reason), never a guessed bound.
+ * characterization (.scratch/bare-metal-campaign/g6-sharded-arms/
+ * characterization/v-r-characterization-2026-10-07.md: VM worst case 181 ms
+ * at S1-40k's 2,000-per-process cohort; derated projection <= 260 ms).
+ * Frozen at 500 ms; a rehearsal R can never replace it (`frozenVR` wins).
  */
-export const SHARDED_ARMS_V_R_MS: number | null = null;
+export const SHARDED_ARMS_V_R_MS: number | null = 500;
 
 export type VRThreshold = {
 	ms: number;
@@ -444,7 +453,13 @@ const DISCLOSURES_STORM = [
 	"V-R uses the quinn DCID-provider call time as the first-Initial issue clock (initialIssueClock dcid-provider-call), not a wire send time.",
 	"The server storm window is timed from the scan host's receipt of process 0's sever marker; client survivor windows from each process's own sever instant.",
 	"Idle timeout 300 s; S-C2's 120 s window derives from a 60 s default; abrupt application close, not black-hole.",
-	"S-C1 survivor upstream at the server = JS-classified survivor datagrams (rxSurvivors: moves; the native ACK reflector consumes actions before the JS loop) + survivor actions whose reflection the survivor received (client stormSurvivors.rxAck), a lower bound. The uncorrected moves-only ratio is reported beside. Needs freeze sign-off.",
+	"S-C1 survivor upstream at the server = JS-classified survivor datagrams (rxSurvivors: moves; the native ACK reflector consumes actions before the JS loop) + survivor actions whose reflection the survivor received (client stormSurvivors.rxAck), a lower bound. The uncorrected moves-only ratio is reported beside.",
+];
+const DISCLOSURES_HOTSPOT = [
+	"V-S tolerates originator schedule skips: INVALID only if sink delivery < 0.995 or the originator's achieved rate < 0.995 x 1,200/s; the raw skip count is disclosed (characterization V-S).",
+];
+const DISCLOSURES_CHARACTERIZATION_STORM = [
+	"V-R on a characterization cell (S2-40k) is reported, not verdict-forcing: an Initial later than R is recorded under 'V-R (reported)'; V-R's raw-integrity checks still force.",
 ];
 
 /* ------------------------------------------------------------------------ */
@@ -805,17 +820,25 @@ function vFloor(ctx: Ctx, runDateIso: string): FalsifierResult {
 	};
 }
 
-/** V-S: hotspot cells' 20 s loopback sink at 1,200/s. */
-function vSink(ctx: Ctx): FalsifierResult {
+/**
+ * V-S: hotspot cells' 20 s loopback sink at 1,200/s. INVALID only if sink
+ * delivery < 0.995 or the originator's achieved rate < 0.995 x 1,200/s; a
+ * skip fraction <= 0.5 % is tolerated and the raw skip count disclosed.
+ */
+function vSink(ctx: { arms: Row }): {
+	falsifier: FalsifierResult;
+	facts: Record<string, unknown>;
+} {
 	const reasons: string[] = [];
+	const R = SHARDED_ARMS_REGISTERED;
+	const requiredPps = SINK_HEADROOM_FACTOR * R.sinkArmDownstreamPps;
+	const floorPps = R.sinkOriginatorRateFloor * requiredPps;
 	const sink = obj(at(ctx.arms, "precheck.sink"), "precheck.sink");
 	if (at(sink, "rc.subscriber") !== 0 || at(sink, "rc.publisher") !== 0)
 		reasons.push("V-S: sink process rc not 0");
 	const sub = maybeObj(sink.subscriberReport);
 	const pub = maybeObj(sink.publisherReport);
-	let offered: number | null = null;
-	let delivery: number | null = null;
-	let saturated = false;
+	const facts: Record<string, unknown> = { requiredPps, floorPps };
 	if (sub === null || pub === null) reasons.push("V-S: sink reports missing");
 	else {
 		if (sub.sessionsOk !== RAID_MEMBERS || sub.role !== "raid-subscriber")
@@ -825,25 +848,32 @@ function vSink(ctx: Ctx): FalsifierResult {
 		const pubSteady = window(pub, "steady");
 		const sent = int(pubSteady.sent, "sink publisher sent");
 		const due = int(pubSteady.scheduleTicksDue, "sink publisher due");
+		const skipped = int(pubSteady.scheduleTicksSkipped, "sink skipped");
 		const received = atInt(sub, "windows.steadyDrain.rxRaid");
 		const expected = sent * RAID_MEMBERS;
-		offered = expected / SHARDED_ARMS_REGISTERED.sinkSeconds;
-		delivery = expected > 0 ? received / expected : null;
-		saturated =
-			int(pubSteady.scheduleTicksSkipped, "sink skipped") > 0 ||
-			sent < 0.99 * due;
+		const achievedPps = expected / R.sinkSeconds;
+		const delivery = expected > 0 ? received / expected : null;
+		Object.assign(facts, {
+			publisherSent: sent,
+			publisherTicksDue: due,
+			publisherTicksSkipped: skipped,
+			skipFraction: due > 0 ? skipped / due : null,
+			achievedPps,
+			expected,
+			received,
+			delivery,
+		});
+		if (delivery === null) reasons.push("V-S: the sink pre-check sent nothing");
+		else if (delivery < SINK_DELIVERY_FLOOR)
+			reasons.push(
+				`V-S: pre-check delivery ${delivery.toFixed(5)} < ${SINK_DELIVERY_FLOOR}`,
+			);
+		if (achievedPps < floorPps)
+			reasons.push(
+				`V-S: originator achieved ${achievedPps.toFixed(1)} pps < ${R.sinkOriginatorRateFloor} x ${requiredPps} = ${floorPps.toFixed(1)} pps (${skipped} of ${due} ticks skipped)`,
+			);
 	}
-	const base = falsifierSink({
-		armDownstreamPps: SHARDED_ARMS_REGISTERED.sinkArmDownstreamPps,
-		precheckOfferedPps: offered,
-		precheckDeliveryRatio: delivery,
-		precheckOriginatorSaturated: saturated,
-	});
-	return {
-		...base,
-		fired: base.fired || reasons.length > 0,
-		reasons: [...reasons, ...base.reasons],
-	};
+	return { falsifier: run("V-S", reasons), facts };
 }
 
 /** V-N / V-K / V-D over every histogram, per process and per shard, before and after merge. */
@@ -1224,15 +1254,21 @@ function vBarrier(ctx: Ctx): FalsifierResult {
 	return run("V-B", reasons);
 }
 
-/** V-R: every cohort reconnect's first Initial within R ms of sever + 1,000 ms. */
-function vReconnectIssue(ctx: Ctx): FalsifierResult {
+/**
+ * V-R: every cohort reconnect's first Initial within R ms of sever + 1,000 ms.
+ * `late` holds the threshold findings (an Initial later than R); `reasons`
+ * the raw-integrity ones. On a gate cell both force; on the characterization
+ * cell (S2-40k) `late` is reported only.
+ */
+function vReconnectIssue(ctx: Ctx): { reasons: string[]; late: string[] } {
 	const reasons: string[] = [];
+	const lateReasons: string[] = [];
 	const R = ctx.input.vR;
 	if (R === null) {
 		reasons.push(
 			"V-R: R is not frozen (SHARDED_ARMS_V_R_MS = null); a storm cell is not graded without it",
 		);
-		return run("V-R", reasons);
+		return { reasons, late: lateReasons };
 	}
 	const P = ctx.input.clientProcesses;
 	let total = 0;
@@ -1263,7 +1299,7 @@ function vReconnectIssue(ctx: Ctx): FalsifierResult {
 			);
 		const maxMs = (bucketSum(late) > 0 ? late.maxNs : 0) / 1e6;
 		if (maxMs > R.ms)
-			reasons.push(
+			lateReasons.push(
 				`V-R process ${i}: latest first Initial ${maxMs.toFixed(3)} ms > R ${R.ms} ms`,
 			);
 	}
@@ -1285,10 +1321,10 @@ function vReconnectIssue(ctx: Ctx): FalsifierResult {
 	)
 		reasons.push("V-R: merged lateness is not the bucket sum of the processes");
 	if ((bucketSum(merged) > 0 ? merged.maxNs : 0) / 1e6 > R.ms)
-		reasons.push(
+		lateReasons.push(
 			`V-R merged: latest first Initial ${(merged.maxNs / 1e6).toFixed(3)} ms > R ${R.ms} ms`,
 		);
-	return run("V-R", reasons);
+	return { reasons, late: lateReasons };
 }
 
 /** V-W: storm-window fallback fraction from the raw steer_stats dumps. */
@@ -1640,7 +1676,10 @@ export function gradeShardedArmsCell(
 	const { cell } = input;
 	const disclosures = [
 		...DISCLOSURES_COMMON,
-		...(cell.arm === "storm" ? DISCLOSURES_STORM : []),
+		...(cell.arm === "storm" ? DISCLOSURES_STORM : DISCLOSURES_HOTSPOT),
+		...(cell.arm === "storm" && cell.role === "characterization"
+			? DISCLOSURES_CHARACTERIZATION_STORM
+			: []),
 	];
 	const base = {
 		schema: "g6-sharded-arms-cell/1" as const,
@@ -1690,7 +1729,7 @@ export function gradeShardedArmsCell(
 	guard("V-B", () => vBarrier(ctx));
 	try {
 		if (cell.arm === "hotspot")
-			gradeHotspot(ctx, clauses, reportedBeside, guard);
+			gradeHotspot(ctx, clauses, reportedBeside, guard, characterization);
 		else
 			gradeStorm(
 				ctx,
@@ -1738,6 +1777,7 @@ function gradeHotspot(
 	clauses: ArmsClause[],
 	reportedBeside: ClauseResult[],
 	guard: (id: string, f: () => FalsifierResult) => void,
+	characterization: Record<string, unknown>,
 ): void {
 	const K = ctx.targetServerId;
 	const shardK = ctx.shardById.get(K) ?? fail(`raid shard ${K} missing`);
@@ -1851,7 +1891,11 @@ function gradeHotspot(
 			reasons: [...reasons, ...verdict.reasons],
 		};
 	});
-	guard("V-S", () => vSink(ctx));
+	guard("V-S", () => {
+		const r = vSink(ctx);
+		characterization["V-S"] = r.facts;
+		return r.falsifier;
+	});
 }
 
 function gradeStorm(
@@ -1958,7 +2002,21 @@ function gradeStorm(
 		gated: cell.gatedClauses.includes("S-C2"),
 	});
 	guard("V-T", () => vSeverSkew(ctx));
-	guard("V-R", () => vReconnectIssue(ctx));
+	const vrReported: FalsifierResult[] = [];
+	guard("V-R", () => {
+		const r = vReconnectIssue(ctx);
+		if (cell.role !== "characterization")
+			return run("V-R", [...r.reasons, ...r.late]);
+		// S2-40k: an Initial later than R is reported, not verdict-forcing.
+		vrReported.push({
+			id: "V-R (reported)",
+			fired: r.late.length > 0,
+			reasons: r.late,
+			scope: "characterization",
+		});
+		return run("V-R", r.reasons);
+	});
+	falsifiers.push(...vrReported);
 	let steeringFacts: Record<string, unknown> = {};
 	guard("V-W", () => {
 		const r = vSteering(ctx);

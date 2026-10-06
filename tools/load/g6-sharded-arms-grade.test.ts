@@ -104,9 +104,9 @@ describe("registration", () => {
 		expect(SHARDED_ARMS_REGISTERED.stormMaximumSeconds).toBe(600);
 	});
 
-	test("R is a typed placeholder until freeze", () => {
-		expect(SHARDED_ARMS_V_R_MS).toBeNull();
-		expect(frozenVR()).toBeNull();
+	test("R is frozen at 500 ms (work item 6 characterization)", () => {
+		expect(SHARDED_ARMS_V_R_MS).toBe(500);
+		expect(frozenVR()).toEqual({ ms: 500, source: "frozen" });
 	});
 });
 
@@ -212,6 +212,39 @@ describe("failing signatures: one per falsifier", () => {
 			}),
 			"V-S",
 		);
+	});
+
+	const sinkPublisher = (scan: Row, sent: number, skipped: number) => {
+		const sink = o(o(o(scan.arms).precheck).sink);
+		const w = o(o(o(sink.publisherReport).windows).steady);
+		w.sent = sent;
+		w.scheduleTicksFired = sent;
+		w.scheduleTicksSkipped = skipped;
+		w.scheduleTicksDue = sent + skipped;
+		o(o(o(sink.subscriberReport).windows).steadyDrain).rxRaid = sent * 40;
+	};
+
+	test("V-S: a skip fraction of 0.5 % is tolerated and disclosed", () => {
+		const v = grade(
+			gradeInput("hotspot", (scan) => sinkPublisher(scan, 597, 3)),
+		);
+		expect(v.falsifiers.find((f) => f.id === "V-S")?.fired).toBe(false);
+		expect(v.verdict).toBe("PASS");
+		expect(o(v.characterization["V-S"])).toMatchObject({
+			publisherTicksSkipped: 3,
+			publisherTicksDue: 600,
+			achievedPps: 1194,
+			floorPps: 1194,
+			delivery: 1,
+		});
+	});
+
+	test("V-S: an originator below 0.995 x 1,200/s is INVALID", () => {
+		const v = expectInvalidBy(
+			gradeInput("hotspot", (scan) => sinkPublisher(scan, 596, 4)),
+			"V-S",
+		);
+		expect(v.invalidReasons.join(" ")).toContain("4 of 600 ticks skipped");
 	});
 
 	test("V-N: a negative RTT sample in one process", () => {
@@ -410,6 +443,41 @@ describe("failing signatures: one per falsifier", () => {
 			),
 			"V-R",
 		);
+	});
+
+	test("V-R on the characterization cell (S2-40k) is reported, not verdict-forcing", () => {
+		const input = gradeInput("storm", (scan) => {
+			for (const which of [-1, ...Array(FIXTURE.processes).keys()])
+				editRealmReport(scan, which, (r) => {
+					const storm = o(o(r.arms).storm);
+					storm.reconnectInitialLate = hist(300_000_000, Number(storm.cohort));
+				});
+		});
+		input.cell = {
+			...input.cell,
+			id: "S2-40k",
+			role: "characterization",
+			gatedClauses: ["S-C2"],
+		};
+		const v = grade(input);
+		expect(v.verdict).toBe("PASS");
+		expect(v.verdictForce).toBe(false);
+		expect(v.falsifiers.find((f) => f.id === "V-R")?.fired).toBe(false);
+		const reported = v.falsifiers.find((f) => f.id === "V-R (reported)");
+		expect(reported?.fired).toBe(true);
+		expect(reported?.scope).toBe("characterization");
+		expect(reported?.reasons.join(" ")).toContain("> R 250 ms");
+		expect(v.disclosures.join(" ")).toContain("S2-40k) is reported");
+	});
+
+	test("V-R raw integrity still forces on the characterization cell", () => {
+		const input = gradeInput("storm", (scan) =>
+			editRealmReport(scan, 0, (r) => {
+				o(o(r.arms).storm).initialIssueClock = "wire";
+			}),
+		);
+		input.cell = { ...input.cell, id: "S2-40k", role: "characterization" };
+		expectInvalidBy(input, "V-R");
 	});
 
 	test("V-R: without a frozen R a storm cell refuses to grade", () => {

@@ -179,15 +179,24 @@ describe("gradeWorkCell: sharded arms from a full raw work cell", () => {
 		expect(grade.reasons.join(" ")).not.toContain("sharded arms");
 	});
 
-	test("storm refuses while R is not frozen; grades with a rehearsal R", () => {
+	test("storm grades with the frozen R; a rehearsal R never replaces it", () => {
+		expect(SHARDED_ARMS_V_R_MS).toBe(500);
 		const input = armsWorkCell("S1-5k");
-		if (SHARDED_ARMS_V_R_MS === null) {
-			const refused = gradeWorkCell(input);
-			expect(refused.outcome).toBe("INVALID");
-			expect(refused.reasons.join(" ")).toContain("R is not frozen");
-		}
-		const grade = gradeWorkCell(input, { rehearsalVR: REHEARSAL_VR });
-		expect(grade).toMatchObject({ nodeId: "S1-5k", outcome: "PASS" });
+		expect(gradeWorkCell(input)).toMatchObject({
+			nodeId: "S1-5k",
+			outcome: "PASS",
+		});
+		// 400 ms is within the frozen 500 ms; a 250 ms rehearsal R is ignored.
+		const late = armsWorkCell("S1-5k", (scan) => {
+			for (const which of [-1, 0, 1])
+				editRealmReport(scan, which, (r) => {
+					const storm = o(o(r.arms).storm);
+					storm.reconnectInitialLate = hist(400_000_000, Number(storm.cohort));
+				});
+		});
+		expect(gradeWorkCell(late, { rehearsalVR: REHEARSAL_VR }).outcome).toBe(
+			"PASS",
+		);
 	});
 
 	test("storm MISS: a re-accept after the window closes (S-C2, from raw instants)", () => {
@@ -211,7 +220,7 @@ describe("gradeWorkCell: sharded arms from a full raw work cell", () => {
 					editRealmReport(scan, which, (r) => {
 						const storm = o(o(r.arms).storm);
 						storm.reconnectInitialLate = hist(
-							400_000_000,
+							600_000_000,
 							Number(storm.cohort),
 						);
 					});
