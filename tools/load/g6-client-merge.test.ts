@@ -359,3 +359,59 @@ describe("sharded arms block merge", () => {
 		).toThrow("arms.dcidLen");
 	});
 });
+
+describe("storm summary merge", () => {
+	const summary = (over: Record<string, unknown>) => ({
+		concurrency: null,
+		cohort: 0,
+		ran: false,
+		windowSec: 120,
+		reconnectOk: 0,
+		reconnectErr: 0,
+		reconnectTotalMs: 0,
+		reconnectMeanMs: null,
+		reconnectMs: { p50: null, p90: null, p99: null, max: null },
+		...over,
+	});
+	test("a steady process set keeps the first process's summary verbatim", () => {
+		const a = { schema: "mmo-client/2", storm: summary({}) };
+		const merged = mergeClientReports([a, { ...a }]);
+		expect(JSON.stringify(merged.storm)).toBe(JSON.stringify(a.storm));
+	});
+	test("a storm sums counts across processes and takes the worst percentile", () => {
+		const a = {
+			schema: "mmo-client/2",
+			storm: summary({
+				cohort: 50,
+				ran: true,
+				reconnectOk: 50,
+				reconnectTotalMs: 1000,
+				reconnectMeanMs: 20,
+				reconnectMs: { p50: 20, p90: 25, p99: 30, max: 31 },
+			}),
+		};
+		const b = {
+			schema: "mmo-client/2",
+			storm: summary({
+				cohort: 50,
+				ran: true,
+				reconnectOk: 49,
+				reconnectErr: 1,
+				reconnectTotalMs: 1960,
+				reconnectMeanMs: 40,
+				reconnectMs: { p50: 40, p90: 45, p99: 50, max: 51 },
+			}),
+		};
+		expect(mergeClientReports([a, b]).storm).toEqual(
+			summary({
+				cohort: 100,
+				ran: true,
+				reconnectOk: 99,
+				reconnectErr: 1,
+				reconnectTotalMs: 2960,
+				reconnectMeanMs: 2960 / 99,
+				reconnectMs: { p50: 40, p90: 45, p99: 50, max: 51 },
+			}),
+		);
+	});
+});

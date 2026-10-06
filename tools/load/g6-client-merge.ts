@@ -302,6 +302,54 @@ export function mergeArmsBlocks(recs: Rec[]): Rec {
 	};
 }
 
+/**
+ * The top-level storm summary across processes: counts sum, the mean is
+ * recomputed from the summed total, and reconnect percentiles (separate
+ * populations) take the worst process. A process set that never stormed
+ * (every steady cell) merges to exactly the first process's summary.
+ */
+function mergeStormSummaries(recs: Rec[]): unknown {
+	const storms = recs.map((r) => asRec(r.storm));
+	const first = storms[0];
+	if (
+		first === null ||
+		first === undefined ||
+		storms.some((s) => s === null) ||
+		!storms.some((s) => s?.ran === true)
+	)
+		return recs[0]?.storm;
+	const all = storms as Rec[];
+	const sum = (key: string) =>
+		all.reduce<number>(
+			(acc, s) => acc + (typeof s[key] === "number" ? (s[key] as number) : 0),
+			0,
+		);
+	const worst = (key: string) => {
+		const values = all
+			.map((s) => asRec(s.reconnectMs)?.[key])
+			.filter((v): v is number => typeof v === "number");
+		return values.length === 0 ? null : Math.max(...values);
+	};
+	// reconnect latencies are recorded once per successful reconnect.
+	const reconnectOk = sum("reconnectOk");
+	const reconnectTotalMs = sum("reconnectTotalMs");
+	return {
+		...first,
+		cohort: sum("cohort"),
+		ran: true,
+		reconnectOk,
+		reconnectErr: sum("reconnectErr"),
+		reconnectTotalMs,
+		reconnectMeanMs: reconnectOk > 0 ? reconnectTotalMs / reconnectOk : null,
+		reconnectMs: {
+			p50: worst("p50"),
+			p90: worst("p90"),
+			p99: worst("p99"),
+			max: worst("max"),
+		},
+	};
+}
+
 export function mergeClientReports(reports: unknown[]): Rec {
 	const recs = reports.filter(
 		(r): r is Rec => r !== null && typeof r === "object",
@@ -341,7 +389,7 @@ export function mergeClientReports(reports: unknown[]): Rec {
 			p99: maxOf(acceptMs, "p99"),
 			max: maxOf(acceptMs, "max"),
 		},
-		storm: first.storm,
+		storm: mergeStormSummaries(recs),
 		phaseBarrier: first.phaseBarrier,
 		config: first.config,
 		hostUdp: first.hostUdp,
