@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { rollUpShardedArms } from "./g6-sharded-arms-evaluate.ts";
+import { resolveVR, rollUpShardedArms } from "./g6-sharded-arms-evaluate.ts";
 import type { ShardedArmsCellVerdict } from "./g6-sharded-arms-grade.ts";
 import { SHARDED_ARMS_CELLS } from "./g6-sharded-arms-grade.ts";
 
@@ -111,5 +111,29 @@ describe("g6-sharded-arms stamp roll-up", () => {
 			},
 		);
 		expect(dry.authoritative).toBe(false);
+	});
+});
+
+describe("V-R's R in the stamp", () => {
+	test("the frozen 500 ms R is used when no rehearsal R is given", () => {
+		const overrides: string[] = [];
+		expect(resolveVR(null, overrides)).toEqual({ ms: 500, source: "frozen" });
+		expect(overrides).toEqual([]);
+	});
+
+	test("a frozen R wins: a rehearsal R is refused, never substituted", () => {
+		const overrides: string[] = [];
+		expect(() => resolveVR("100", overrides)).toThrow("R is frozen at 500 ms");
+		expect(overrides).toEqual([]);
+	});
+
+	test("before R is frozen a rehearsal R grades, non-authoritatively", () => {
+		const overrides: string[] = [];
+		expect(resolveVR("250", overrides, null)).toEqual({
+			ms: 250,
+			source: "rehearsal",
+		});
+		expect(overrides).toEqual(["V-R R = 250 ms (rehearsal; R not frozen)"]);
+		expect(() => resolveVR("2.5", [], null)).toThrow("integer");
 	});
 });

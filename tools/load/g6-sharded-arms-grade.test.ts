@@ -239,6 +239,27 @@ describe("failing signatures: one per falsifier", () => {
 		});
 	});
 
+	test("V-S: a single skipped tick does not fire on its own", () => {
+		const v = grade(
+			gradeInput("hotspot", (scan) => sinkPublisher(scan, 599, 1)),
+		);
+		expect(v.falsifiers.find((f) => f.id === "V-S")?.fired).toBe(false);
+		expect(v.verdict).toBe("PASS");
+		expect(o(v.characterization["V-S"]).publisherTicksSkipped).toBe(1);
+	});
+
+	test("V-S: a failed loopback forwarder invalidates the sink check", () => {
+		const { verdict, falsifier } = fired(
+			gradeInput("hotspot", (scan) => {
+				o(o(o(scan.arms).precheck).forwarder).rc = 1;
+			}),
+			"V-S",
+		);
+		expect(falsifier?.fired).toBe(true);
+		expect(falsifier?.reasons.join(" ")).toContain("forwarder rc 1");
+		expect(verdict.verdict).toBe("INVALID");
+	});
+
 	test("V-S: an originator below 0.995 x 1,200/s is INVALID", () => {
 		const v = expectInvalidBy(
 			gradeInput("hotspot", (scan) => sinkPublisher(scan, 596, 4)),
@@ -615,6 +636,45 @@ describe("clauses on this deployment's own bars", () => {
 		expect(v.clauses.find((c) => c.id === "S-C1")?.verdict).toBe("MISS");
 		expect(v.reportedBeside[0]?.verdict).toBe("PASS");
 		expect(v.verdict).toBe("MISS");
+	});
+
+	test("S-C1 reports the rxAck-corrected and the uncorrected survivor delivery", () => {
+		const v = grade(gradeInput("storm"));
+		const gated = v.clauses.find((c) => c.id === "S-C1");
+		const beside = v.reportedBeside.find((c) => c.id.startsWith("S-C1 (G6"));
+		for (const c of [gated, beside]) {
+			const obs = o(c?.observed);
+			const moves = obs.survivorMovesJs as number;
+			const acks = obs.survivorAcksReflected as number;
+			expect(moves).toBeGreaterThan(0);
+			expect(acks).toBeGreaterThan(0);
+			expect(typeof obs.delivery).toBe("number");
+			expect(typeof obs.deliveryUncorrected).toBe("number");
+			// The corrected ratio adds the reflected survivor actions.
+			expect(obs.delivery as number).toBeCloseTo(
+				(obs.deliveryUncorrected as number) * ((moves + acks) / moves),
+				9,
+			);
+		}
+		expect(gated?.verdict).toBe("PASS");
+	});
+
+	test("S-C1 without the reflected survivor actions (uncorrected) MISSes delivery", () => {
+		const v = grade(
+			gradeInput("storm", (scan) => {
+				for (const which of [
+					-1,
+					...Array.from({ length: FIXTURE.processes }, (_, i) => i),
+				])
+					editRealmReport(scan, which, (r) => {
+						o(o(r.windows).stormSurvivors).rxAck = 0;
+						o(o(r.windows).stormSurvivors).rtt = hist(5_000_000, 0);
+					});
+			}),
+		);
+		const sc1 = v.clauses.find((c) => c.id === "S-C1");
+		expect(o(sc1?.observed).survivorAcksReflected).toBe(0);
+		expect(sc1?.reasons.join(" ")).toContain("survivor upstream delivery");
 	});
 
 	test("S-C2 from the raw accept instants, not the scan's count", () => {

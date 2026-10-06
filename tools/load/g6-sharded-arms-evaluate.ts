@@ -21,7 +21,7 @@
  *     [--fixed-source-port-base B] [--rig-qualified 1] \
  *     --cell H5k=<scan.json> [--cell ...] [--out stamp.json]
  *   Rehearsal-only (the stamp is then marked non-authoritative):
- *     --rehearsal-vr-ms R  --rehearsal-shape <cell>:<sessions>:<cohort>
+ *     --rehearsal-vr-ms R (refused once R is frozen)  --rehearsal-shape <cell>:<sessions>:<cohort>
  *     --rehearsal-raid-target-slot K
  */
 import { readFileSync, writeFileSync } from "node:fs";
@@ -137,6 +137,27 @@ function args(name: string): string[] {
 		}
 	return out;
 }
+/**
+ * V-R's R for a stamp. The frozen R (SHARDED_ARMS_V_R_MS) always wins: a
+ * rehearsal R is accepted only while R is not frozen (the stamp is then
+ * non-authoritative), and is refused once R is frozen.
+ */
+export function resolveVR(
+	rehearsalVr: string | null,
+	overrides: string[],
+	frozen: VRThreshold | null = frozenVR(),
+): VRThreshold | null {
+	if (rehearsalVr === null) return frozen;
+	if (frozen !== null)
+		throw Error(
+			`R is frozen at ${frozen.ms} ms; --rehearsal-vr-ms ${rehearsalVr} cannot replace it`,
+		);
+	if (!/^\d+$/.test(rehearsalVr))
+		throw Error("--rehearsal-vr-ms must be an integer");
+	overrides.push(`V-R R = ${rehearsalVr} ms (rehearsal; R not frozen)`);
+	return { ms: Number(rehearsalVr), source: "rehearsal" };
+}
+
 function arg(name: string): string | null {
 	const all = args(name);
 	if (all.length > 1) throw Error(`--${name} repeated`);
@@ -158,18 +179,7 @@ async function main(): Promise<void> {
 	const registrationSha256 = arg("registration-sha256");
 	if (!expectCandidate || !registrationSha256)
 		throw Error("--expect-candidate and --registration-sha256 are required");
-	let vR: VRThreshold | null = frozenVR();
-	const rehearsalVr = arg("rehearsal-vr-ms");
-	if (rehearsalVr !== null) {
-		if (!/^\d+$/.test(rehearsalVr))
-			throw Error("--rehearsal-vr-ms must be an integer");
-		// A dry stamp may grade at another R; the stamp is then never
-		// authoritative (any override clears `authoritative`).
-		overrides.push(
-			`V-R R = ${rehearsalVr} ms (rehearsal; ${vR === null ? "R not frozen" : `replaces the frozen ${vR.ms} ms`})`,
-		);
-		vR = { ms: Number(rehearsalVr), source: "rehearsal" };
-	}
+	const vR = resolveVR(arg("rehearsal-vr-ms"), overrides);
 	const shapes = new Map<string, { sessions: number; cohort: number }>();
 	for (const spec of args("rehearsal-shape")) {
 		const [id, sessions, cohort] = spec.split(":");

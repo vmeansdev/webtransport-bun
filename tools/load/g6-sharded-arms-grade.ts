@@ -456,7 +456,7 @@ const DISCLOSURES_STORM = [
 	"S-C1 survivor upstream at the server = JS-classified survivor datagrams (rxSurvivors: moves; the native ACK reflector consumes actions before the JS loop) + survivor actions whose reflection the survivor received (client stormSurvivors.rxAck), a lower bound. The uncorrected moves-only ratio is reported beside.",
 ];
 const DISCLOSURES_HOTSPOT = [
-	"V-S tolerates originator schedule skips: INVALID only if sink delivery < 0.995 or the originator's achieved rate < 0.995 x 1,200/s; the raw skip count is disclosed (characterization V-S).",
+	"V-S tolerates originator schedule skips: INVALID only if sink delivery < 0.995, the originator's achieved rate < 0.995 x 1,200/s, or the loopback forwarder failed; the raw skip count is disclosed (characterization V-S).",
 ];
 const DISCLOSURES_CHARACTERIZATION_STORM = [
 	"V-R on a characterization cell (S2-40k) is reported, not verdict-forcing: an Initial later than R is recorded under 'V-R (reported)'; V-R's raw-integrity checks still force.",
@@ -822,8 +822,9 @@ function vFloor(ctx: Ctx, runDateIso: string): FalsifierResult {
 
 /**
  * V-S: hotspot cells' 20 s loopback sink at 1,200/s. INVALID only if sink
- * delivery < 0.995 or the originator's achieved rate < 0.995 x 1,200/s; a
- * skip fraction <= 0.5 % is tolerated and the raw skip count disclosed.
+ * delivery < 0.995, the originator's achieved rate < 0.995 x 1,200/s, or the
+ * loopback forwarder failed; a skipped tick never fires on its own (a skip
+ * fraction <= 0.5 % is tolerated) and the raw skip count is disclosed.
  */
 function vSink(ctx: { arms: Row }): {
 	falsifier: FalsifierResult;
@@ -833,6 +834,16 @@ function vSink(ctx: { arms: Row }): {
 	const R = SHARDED_ARMS_REGISTERED;
 	const requiredPps = SINK_HEADROOM_FACTOR * R.sinkArmDownstreamPps;
 	const floorPps = R.sinkOriginatorRateFloor * requiredPps;
+	// The sink is driven through the loopback forwarder; a failed forwarder
+	// (recorded by the scan, not aborted) invalidates the sink check too.
+	const forwarder = obj(
+		at(ctx.arms, "precheck.forwarder"),
+		"precheck.forwarder",
+	);
+	if (forwarder.rc !== R.forwarderStoppedRc)
+		reasons.push(
+			`V-S: loopback forwarder rc ${String(forwarder.rc)} — not stopped by the fan-out (${R.forwarderStoppedRc}); the forwarder failed`,
+		);
 	const sink = obj(at(ctx.arms, "precheck.sink"), "precheck.sink");
 	if (at(sink, "rc.subscriber") !== 0 || at(sink, "rc.publisher") !== 0)
 		reasons.push("V-S: sink process rc not 0");
