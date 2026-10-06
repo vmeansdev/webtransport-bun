@@ -16,6 +16,7 @@ import {
 	gradeShardedArmsCell,
 	SHARDED_ARMS_REGISTERED,
 	shardedArmsCell,
+	type VRThreshold,
 } from "./g6-sharded-arms-grade.ts";
 import { G6_SHARDED_CLAUSES } from "./g6-sharded-grade.ts";
 
@@ -33,7 +34,15 @@ function object(value: unknown): RecordValue {
 	return value as RecordValue;
 }
 
-export function gradeWorkCell(input: WorkGradeInput): WorkGrade {
+/**
+ * `rehearsalVR` exists for tests and dry stamps only: a paid cell is graded
+ * with the frozen R (`SHARDED_ARMS_V_R_MS`, which always wins), and a storm
+ * cell refuses to grade while R is not frozen.
+ */
+export function gradeWorkCell(
+	input: WorkGradeInput,
+	options: { rehearsalVR?: VRThreshold } = {},
+): WorkGrade {
 	const reasons: string[] = [];
 	const { node, profile: p, scan } = input;
 	try {
@@ -100,7 +109,7 @@ export function gradeWorkCell(input: WorkGradeInput): WorkGrade {
 					endpoints: p.endpoints,
 					fixedSourcePortBase: p.fixedSourcePortBase,
 					rig: { qualified: true, reasons: [] },
-					vR: frozenVR(),
+					vR: frozenVR() ?? options.rehearsalVR ?? null,
 					raidTargetSlot: SHARDED_ARMS_REGISTERED.raidTargetSlot,
 				},
 				String((scan as unknown as { startedAt?: unknown }).startedAt),

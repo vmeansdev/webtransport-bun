@@ -25,6 +25,27 @@ export const FIXTURE = Object.freeze({
 
 type Row = Record<string, unknown>;
 
+/**
+ * The cell shape a fixture is built for. The defaults are the small grader
+ * fixture; the work-grade test scales it to a registered cell's sessions
+ * (e.g. 2 x 2,500 sessions on 2 shards for H5k / S1-5k).
+ */
+export type ArmsFixtureShape = {
+	shards: number;
+	processes: number;
+	endpoints: number;
+	base: number;
+	sessionsPerProcess: number;
+	/** Storm only: each process's first locals, all placed on shard 1. */
+	cohortPerProcess: number;
+	steadyEnterMs: number;
+	candidate: string;
+	registration: string;
+};
+const DEFAULT_SHAPE: ArmsFixtureShape = { ...FIXTURE, cohortPerProcess: 1 };
+/** The shape of the fixture being built (set by armsScanFixture). */
+let F: ArmsFixtureShape = DEFAULT_SHAPE;
+
 export function hist(valueNs: number, count: number) {
 	const h = new LatencyHistogram();
 	for (let i = 0; i < count; i += 1) h.record(valueNs);
@@ -77,7 +98,7 @@ function report(role: string, extra: Row): Row {
 		preRegistration: {
 			id: "g6-mmo-closeout/1",
 			path: "docs/research/preregistrations/gate-g6-mmo-closeout.md",
-			sha256: FIXTURE.registration,
+			sha256: F.registration,
 		},
 		role,
 		sessionsErr: 0,
@@ -92,13 +113,13 @@ function barrier(parties: number, offset: number) {
 		id: "b",
 		role: "x",
 		parties,
-		steadyEnterUnixMs: FIXTURE.steadyEnterMs + offset,
+		steadyEnterUnixMs: F.steadyEnterMs + offset,
 	};
 }
 
 function armsBlock(extra: Row): Row {
 	return {
-		shardCount: FIXTURE.shards,
+		shardCount: F.shards,
 		targetSlot: null,
 		targetServerId: null,
 		dcidLen: 20,
@@ -145,7 +166,7 @@ function floorTranscript(): string[] {
 		},
 	});
 	return [
-		`macgen: head=${FIXTURE.candidate} dirty=no build=ok buildSec=0`,
+		`macgen: head=${F.candidate} dirty=no build=ok buildSec=0`,
 		`macgen: binary=/g/mmo-client sha256=${"a".repeat(64)}`,
 		`mmo-client: json ${JSON.stringify(floor)}`,
 		"macgen: exit=0",
@@ -154,19 +175,25 @@ function floorTranscript(): string[] {
 }
 
 /** Build a hotspot or storm cell artifact. */
-export function armsScanFixture(arm: "hotspot" | "storm"): {
+export function armsScanFixture(
+	arm: "hotspot" | "storm",
+	shape: Partial<ArmsFixtureShape> = {},
+): {
 	scan: Row;
 	cell: ShardedArmsCell;
 } {
-	const P = FIXTURE.processes;
-	const n = FIXTURE.sessionsPerProcess;
+	F = { ...DEFAULT_SHAPE, ...shape };
+	const P = F.processes;
+	const n = F.sessionsPerProcess;
 	const sessions = P * n;
-	const cohortPerProcess = arm === "storm" ? 1 : 0;
+	if (n % F.shards !== 0)
+		throw Error("fixture: sessionsPerProcess must split evenly over shards");
+	const cohortPerProcess = arm === "storm" ? F.cohortPerProcess : 0;
 	const cohort = cohortPerProcess * P;
 	const steadySeconds = arm === "storm" ? 60 : 120;
 	const snaps = SNAP_PER_SESSION(steadySeconds);
 	// Each process puts half its sessions on each shard.
-	const perShard = n / FIXTURE.shards;
+	const perShard = n / F.shards;
 	const realmWindows = (k: number) => ({
 		steady: clientWindow(k, { sends: 40, snapshots: 0, acks: 0 }),
 		steadyDrain: clientWindow(k, { sends: 0, snapshots: snaps, acks: 5 }),
@@ -195,7 +222,7 @@ export function armsScanFixture(arm: "hotspot" | "storm"): {
 				},
 			);
 		const shardsBlock: Row = {};
-		for (let s = 1; s <= FIXTURE.shards; s += 1) {
+		for (let s = 1; s <= F.shards; s += 1) {
 			const k = perShard * (total / n);
 			const w: Row = realmWindows(k);
 			if (arm === "storm")
@@ -207,7 +234,7 @@ export function armsScanFixture(arm: "hotspot" | "storm"): {
 			shardsBlock[String(s)] = w;
 		}
 		const steadyEntry = Object.fromEntries(
-			Array.from({ length: FIXTURE.shards }, (_, s) => [
+			Array.from({ length: F.shards }, (_, s) => [
 				String(s + 1),
 				perShard * (total / n),
 			]),
@@ -220,10 +247,10 @@ export function armsScanFixture(arm: "hotspot" | "storm"): {
 			phaseBarrier: barrier(P + (arm === "hotspot" ? 2 : 0), i < 0 ? 0 : i * 5),
 			windows,
 			client: {
-				endpoints: FIXTURE.endpoints,
+				endpoints: F.endpoints,
 				endpointSourceAddresses: Array.from(
-					{ length: FIXTURE.endpoints },
-					(_, e) => `0.0.0.0:${FIXTURE.base + e}`,
+					{ length: F.endpoints },
+					(_, e) => `0.0.0.0:${F.base + e}`,
 				),
 			},
 			storm: {
@@ -258,7 +285,7 @@ export function armsScanFixture(arm: "hotspot" | "storm"): {
 											cohort: cohortPerProcess,
 											reconnectDelayMs: 1000,
 											severBarrier: { parties: P },
-											severUnixMs: FIXTURE.steadyEnterMs + 60_000 + i * 3,
+											severUnixMs: F.steadyEnterMs + 60_000 + i * 3,
 											severedClosed: cohortPerProcess,
 											reconnectInitials: cohortPerProcess,
 											initialIssueClock: "dcid-provider-call",
@@ -280,7 +307,7 @@ export function armsScanFixture(arm: "hotspot" | "storm"): {
 	const raidPerSec = 20;
 	const raidSent = raidPerSec * 120;
 	const realmOnShard = perShard * P;
-	const shards = Array.from({ length: FIXTURE.shards }, (_, s) => {
+	const shards = Array.from({ length: F.shards }, (_, s) => {
 		const id = s + 1;
 		const raid = arm === "hotspot" && id === 1 ? raidSent : 0;
 		const upstream = realmOnShard * 40;
@@ -321,7 +348,7 @@ export function armsScanFixture(arm: "hotspot" | "storm"): {
 			},
 		};
 	});
-	const severAt = FIXTURE.steadyEnterMs + 60_010;
+	const severAt = F.steadyEnterMs + 60_010;
 	const tokens = Array.from({ length: 40 }, (_, i) => i + 1);
 	const echoes = shards.map((shard) => {
 		const k = shard.serverId === 1 && arm === "hotspot";
@@ -356,7 +383,7 @@ export function armsScanFixture(arm: "hotspot" | "storm"): {
 	});
 	const raidReport = (role: "publisher" | "raid-subscriber") => {
 		const pub = role === "publisher";
-		const port = FIXTURE.base + FIXTURE.endpoints + (pub ? 0 : 1);
+		const port = F.base + F.endpoints + (pub ? 0 : 1);
 		return report(role, {
 			sessionsRequested: pub ? 1 : 40,
 			activeWorkloadSessions: pub ? 1 : 40,
@@ -380,7 +407,12 @@ export function armsScanFixture(arm: "hotspot" | "storm"): {
 				targetServerId: 1,
 				raidJoinsSent: pub ? 0 : 40,
 				sessionsByShard: {
-					steadyEntry: { "1": pub ? 1 : 40, "2": 0 },
+					steadyEntry: Object.fromEntries(
+						Array.from({ length: F.shards }, (_, i) => [
+							String(i + 1),
+							i === 0 ? (pub ? 1 : 40) : 0,
+						]),
+					),
 					stormEnd: null,
 				},
 				shards: {},
@@ -407,8 +439,8 @@ export function armsScanFixture(arm: "hotspot" | "storm"): {
 	const scan: Row = {
 		schema: "g6-sharded-scan/3",
 		startedAt: "2026-10-06T00:00:00.000Z",
-		candidateSha: FIXTURE.candidate,
-		config: { shards: FIXTURE.shards, clientProcesses: P, steadySeconds: 120 },
+		candidateSha: F.candidate,
+		config: { shards: F.shards, clientProcesses: P, steadySeconds: 120 },
 		clientExit: 0,
 		shards,
 		clientStdout,
@@ -416,7 +448,7 @@ export function armsScanFixture(arm: "hotspot" | "storm"): {
 			schema: "g6-sharded-arms-scan/1",
 			config: {
 				arm,
-				shards: FIXTURE.shards,
+				shards: F.shards,
 				raidTargetSlot: 0,
 				raidDcidLen: 20,
 				realmNegctlDcidLen: null,
