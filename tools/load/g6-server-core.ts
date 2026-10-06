@@ -1,10 +1,10 @@
+import { DATAGRAM_MIRROR_MAX } from "../../packages/webtransport/src/datagram-mirror.ts";
 import {
-	emitterSliceBounds,
-	nextEmitterWindowState,
 	type EmitterPhase,
 	type EmitterWindowState,
+	emitterSliceBounds,
+	nextEmitterWindowState,
 } from "./g6-artifact.ts";
-import { DATAGRAM_MIRROR_MAX } from "../../packages/webtransport/src/datagram-mirror.ts";
 import {
 	EMITTER_SLICE_HZ,
 	SNAPSHOT_HZ,
@@ -18,9 +18,9 @@ import {
 	CLASS_RAID,
 	CLASS_RAID_JOIN,
 	CLASS_SNAPSHOT,
-	STAMP_BYTES_V3,
 	decodeStamp,
 	encodeStamp,
+	STAMP_BYTES_V3,
 	writeReflection,
 } from "./latency-stamp.ts";
 
@@ -200,6 +200,12 @@ export function createG6ServerCore(options: {
 	phaseState: { current: EmitterPhase };
 	state: () => ServerState;
 	severAtMs: () => number | null;
+	/**
+	 * Called once per session that joins the raid, with the member token its
+	 * RAID_JOIN stamp carried in the sequence field (0 when the client sends
+	 * none). The sharded hotspot echoes these per shard to validate placement.
+	 */
+	onRaidJoin?: (token: number) => void;
 	instrumentation?: G6ServerCoreInstrumentation;
 	dueAccounting?: G6ServerCoreDueAccounting;
 	/**
@@ -324,7 +330,10 @@ export function createG6ServerCore(options: {
 
 				if (stamp.klass === CLASS_RAID_JOIN) {
 					player.kind = "raid";
-					if (!raidMembers.includes(player)) raidMembers.push(player);
+					if (!raidMembers.includes(player)) {
+						raidMembers.push(player);
+						options.onRaidJoin?.(stamp.sequence);
+					}
 					continue;
 				}
 

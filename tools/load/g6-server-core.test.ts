@@ -1,25 +1,25 @@
 import { describe, expect, test } from "bun:test";
 import type { EmitterPhase } from "./g6-artifact.ts";
 import {
+	createG6ServerCore,
+	freshG6ServerState,
+	type G6ServerCoreDueAccounting,
+	type G6ServerCoreMirror,
+	type G6ServerCorePacedMirror,
+	type G6ServerCorePlan,
+	REGISTERED_G6_SERVER_CORE_PLAN,
+	reconcileReflectorCounters,
+} from "./g6-server-core.ts";
+import {
 	CLASS_ACK,
 	CLASS_ACTION,
 	CLASS_RAID,
 	CLASS_RAID_JOIN,
 	CLASS_SNAPSHOT,
-	STAMP_BYTES_V3,
 	decodeStamp,
 	encodeStamp,
+	STAMP_BYTES_V3,
 } from "./latency-stamp.ts";
-import {
-	REGISTERED_G6_SERVER_CORE_PLAN,
-	createG6ServerCore,
-	freshG6ServerState,
-	reconcileReflectorCounters,
-	type G6ServerCoreDueAccounting,
-	type G6ServerCoreMirror,
-	type G6ServerCorePlan,
-	type G6ServerCorePacedMirror,
-} from "./g6-server-core.ts";
 
 type FakeSession = {
 	sendDatagramBatch: (datagrams: readonly Uint8Array[]) => Promise<{
@@ -128,6 +128,31 @@ function makeCore(
 }
 
 describe("g6 server core", () => {
+	test("reports each raid joiner's member token once", async () => {
+		const tokens: number[] = [];
+		const stateRef = { value: freshG6ServerState() };
+		const core = createG6ServerCore({
+			clock: { now: () => 1 },
+			nowMs: () => 1,
+			phaseState: { current: "connect" as EmitterPhase },
+			state: () => stateRef.value,
+			severAtMs: () => null,
+			onRaidJoin: (token) => tokens.push(token),
+		});
+		const { session } = queueSession([
+			stampedDatagram(CLASS_RAID_JOIN, { sequence: 41 }),
+			stampedDatagram(CLASS_RAID_JOIN, { sequence: 41 }),
+		]);
+		const legacy = queueSession([
+			stampedDatagram(CLASS_RAID_JOIN, { sequence: 0 }),
+		]);
+		core.onSession(session);
+		core.onSession(legacy.session);
+		await flushAsyncWork();
+		expect(tokens).toEqual([41, 0]);
+		expect(core.raidMembers.length).toBe(2);
+	});
+
 	test("decodes ACTION stamps and reflects one unbatched ACK", async () => {
 		const { core, stateRef, severRef } = makeCore({
 			nowNs: [100, 125],

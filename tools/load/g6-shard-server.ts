@@ -36,6 +36,17 @@ import {
 	type ReflectorCounters,
 	reconcileReflectorCounters,
 } from "./g6-server-core.ts";
+import {
+	applyArmsPhase,
+	armsEcho,
+	emitterPhaseFor,
+	freshShardArmsState,
+	isArmsPhase,
+	isShardPhase,
+	recordStormSample,
+	STORM_SAMPLE_INTERVAL_MS,
+	stormSample,
+} from "./g6-shard-arms.ts";
 import { createMonotonicClock } from "./latency-clock.ts";
 import {
 	CLASS_ACK,
@@ -92,6 +103,10 @@ async function main(): Promise<void> {
 	const clock = await createMonotonicClock(false);
 	const phaseState: { current: EmitterPhase } = { current: "connect" };
 	const state = freshG6ServerState();
+	// Sharded arms (storm sever instant, admission series, raid membership
+	// echo). Inert on the steady path: no sever ever arrives, so severAtMs
+	// stays null exactly as before.
+	const arms = freshShardArmsState();
 	let pacedMirror: G6ServerCorePacedMirror | null = null;
 	let unpacedMirror: G6ServerCoreMirror | null = null;
 
@@ -101,7 +116,10 @@ async function main(): Promise<void> {
 		nowMs: () => Date.now(),
 		phaseState,
 		state: () => state,
-		severAtMs: () => null,
+		severAtMs: () => arms.severAtMs,
+		onRaidJoin: (token) => {
+			arms.raidMemberTokens.push(token);
+		},
 		pacedMirror: () => pacedMirror,
 		unpacedMirror: () => unpacedMirror,
 	});
@@ -190,6 +208,26 @@ async function main(): Promise<void> {
 		);
 	};
 
+	const sessionKinds = () => ({
+		player: core.players.filter(
+			(player) => player.alive && player.kind === "player",
+		).length,
+		raid: core.players.filter(
+			(player) => player.alive && player.kind === "raid",
+		).length,
+		publisher: core.players.filter(
+			(player) => player.alive && player.kind === "publisher",
+		).length,
+	});
+	const armsEchoNow = (full: boolean) =>
+		armsEcho({
+			state: arms,
+			acceptSeries: state.acceptSeries,
+			sessionKinds: sessionKinds(),
+			full,
+		});
+	let stormSampler: ReturnType<typeof setInterval> | null = null;
+
 	const boundary = (): BoundarySnapshot => {
 		const metrics = server.metricsSnapshot();
 		reflectorCounters = reconcileReflectorCounters(state, reflectorCounters, {
@@ -217,17 +255,7 @@ async function main(): Promise<void> {
 			metrics: {
 				...(metrics as unknown as Record<string, unknown>),
 				serverWorkers,
-				g6SessionKinds: {
-					player: core.players.filter(
-						(player) => player.alive && player.kind === "player",
-					).length,
-					raid: core.players.filter(
-						(player) => player.alive && player.kind === "raid",
-					).length,
-					publisher: core.players.filter(
-						(player) => player.alive && player.kind === "publisher",
-					).length,
-				},
+				g6SessionKinds: sessionKinds(),
 			},
 		};
 	};
@@ -305,34 +333,52 @@ async function main(): Promise<void> {
 	for await (const raw of rl) {
 		const line = raw.trim();
 		if (line === "") continue;
-		const msg = JSON.parse(line) as { cmd: string; phase?: EmitterPhase };
+		const msg = JSON.parse(line) as {
+			cmd: string;
+			phase?: unknown;
+			severAtMs?: unknown;
+		};
 		if (msg.cmd === "phase" && msg.phase) {
-			if (
-				msg.phase !== "connect" &&
-				msg.phase !== "steady" &&
-				msg.phase !== "drain" &&
-				msg.phase !== "idle"
-			)
+			if (!isShardPhase(msg.phase))
 				throw Error("unsupported shard measurement phase");
+			applyArmsPhase(arms, { phase: msg.phase, severAtMs: msg.severAtMs });
+			// The native send-path cuts know only the steady path's phases; an
+			// arms boundary reads the live snapshot without cutting a phase.
 			const sendPathDiagnostics = await readNativeSendPath(
 				server.__sendPathDiagnostics,
-				msg.phase,
+				isArmsPhase(msg.phase) ? undefined : msg.phase,
 				nativeSendPathEnabled,
 			);
-			phaseState.current = msg.phase;
+			phaseState.current = emitterPhaseFor(msg.phase, phaseState.current);
+			if (msg.phase === "sever" && stormSampler === null) {
+				const sample = () =>
+					recordStormSample(
+						arms,
+						stormSample(
+							Date.now(),
+							server.metricsSnapshot() as unknown as Record<string, unknown>,
+						),
+					);
+				sample();
+				stormSampler = setInterval(sample, STORM_SAMPLE_INTERVAL_MS);
+			}
 			emit({
 				ev: "boundary",
 				phase: msg.phase,
 				snap: boundary(),
 				pacerStats: pacerStats(),
 				sendPathDiagnostics,
+				arms: armsEchoNow(false),
 			});
 		} else if (msg.cmd === "stop") {
+			if (stormSampler !== null) clearInterval(stormSampler);
+			stormSampler = null;
 			emit({
 				ev: "boundary",
 				phase: "stop",
 				snap: boundary(),
 				pacerStats: pacerStats(),
+				arms: armsEchoNow(true),
 				sendPathDiagnostics: await readNativeSendPath(
 					server.__sendPathDiagnostics,
 					undefined,
