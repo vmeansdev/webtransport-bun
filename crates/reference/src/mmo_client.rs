@@ -32,12 +32,18 @@
 #[allow(dead_code)]
 mod g6_protocol;
 #[allow(dead_code)]
+mod g6_sharding;
+#[allow(dead_code)]
 mod latency_probe;
 mod receiver_diagnostic;
 
 use g6_protocol::{
     action_every_nth_tick, class_for_tick, first_tick_offset, observe_tick, ticks_due_after,
     TickObservation, UPSTREAM_PAYLOAD_BYTES,
+};
+use g6_sharding::{
+    placement_slot, server_id_for_slot, DcidPlan, DcidRng, OpeningRecord, OPENING,
+    REGISTERED_DCID_LEN, SERVER_CID_LEN,
 };
 use latency_probe::{
     monotonic_ns, read_stamp, write_stamp_v3, AtomicHistogram, CLASS_ACK, CLASS_RAID,
@@ -47,7 +53,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{watch, Semaphore};
@@ -95,6 +101,12 @@ const PHASE_STORM: u8 = 3;
 const PHASE_POST: u8 = 4;
 const PHASE_IDLE: u8 = 5;
 const PHASE_STOP: u8 = 6;
+/// Anchored storm only (`--storm-timeline anchored`, the sharded arms): the
+/// cohort is closed at this flip, survivors are receive-only, and the storm
+/// window — reconnects and the survivor send window — opens one reconnect
+/// delay later, so client and server windows share one anchor
+/// (sever + 1,000 ms).
+const PHASE_SEVER: u8 = 7;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SendWindowKind {
@@ -202,9 +214,35 @@ struct Options {
     /// registered configuration: a pool is a semaphore, and a semaphore is what
     /// the retracted accept-rate figures were actually measuring.
     storm_concurrency: usize,
+    /// Sharded arms: shard count of the deployment (`MAX_INSTANCES`). Enables
+    /// the client-chosen opening DCID and per-shard attribution.
+    shard_count: Option<u32>,
+    /// Sharded arms: draw opening DCIDs that place on this sockarray slot
+    /// (server id = slot + 1).
+    target_slot: Option<u32>,
+    /// Opening DCID length; 20 is registered, 11 is the negative control.
+    dcid_len: usize,
+    /// Only `raid-subscriber` sessions send RAID_JOIN, each carrying a member
+    /// token, and a realm process refuses a passive tail.
+    raid_membership_explicit: bool,
+    /// Sever at a barrier-coordinated instant; open the storm window one
+    /// reconnect delay later (see `PHASE_SEVER`).
+    storm_anchored: bool,
 }
 
 impl Options {
+    fn arms_enabled(&self) -> bool {
+        self.shard_count.is_some() || self.raid_membership_explicit || self.storm_anchored
+    }
+
+    fn dcid_plan(&self) -> Option<DcidPlan> {
+        self.shard_count.map(|shard_count| DcidPlan {
+            len: self.dcid_len,
+            shard_count,
+            target_slot: self.target_slot,
+        })
+    }
+
     fn defaults() -> Options {
         Options {
             role: Role::Realm,
@@ -239,6 +277,11 @@ impl Options {
             storm_window: Duration::from_secs(120),
             post_storm: Duration::from_secs(60),
             storm_concurrency: 0,
+            shard_count: None,
+            target_slot: None,
+            dcid_len: REGISTERED_DCID_LEN,
+            raid_membership_explicit: false,
+            storm_anchored: false,
         }
     }
 }
@@ -734,6 +777,19 @@ fn sample_quic(registry: &ConnRegistry) -> QuicTap {
     tap
 }
 
+/// One shard's share of the measurement populations, attributed by each
+/// session's own opening DCID (sharded arms only). Same windows, same
+/// counters, same histograms as the process-wide ones, so the conductor can
+/// merge them bucket by bucket across processes.
+#[derive(Default)]
+struct ShardStats {
+    /// Sessions currently connected to this shard by this process.
+    live: AtomicI64,
+    steady: WindowStats,
+    steady_drain: WindowStats,
+    storm_survivors: WindowStats,
+}
+
 /// Everything a session task shares with the run.
 struct Shared {
     steady: WindowStats,
@@ -746,11 +802,56 @@ struct Shared {
     latencies: Mutex<Vec<u64>>,
     reconnect_latencies: Mutex<Vec<u64>>,
     connect_start_offsets_ns: Mutex<Vec<u64>>,
+    /// Indexed by sockarray slot; empty unless `--shard-count` is set.
+    shards: Vec<ShardStats>,
+    /// Anchored storm: monotonic sever instant + reconnect delay, the instant
+    /// every cohort reconnect is registered to issue its first Initial at.
+    storm_reconnect_anchor_ns: AtomicU64,
+    /// Anchored storm: first-Initial issue instant minus the anchor, per
+    /// cohort reconnect (V-R reads its maximum).
+    reconnect_initial_late: AtomicHistogram,
+    reconnect_initials: AtomicU64,
+    /// Cohort sessions closed at the sever flip.
+    severed_closed: AtomicU64,
+    raid_joins_sent: AtomicU64,
 }
 
 impl Shared {
+    fn shard(&self, slot: Option<u32>) -> Option<&ShardStats> {
+        slot.and_then(|slot| self.shards.get(slot as usize))
+    }
+
+    fn shard_live(&self, slot: Option<u32>, delta: i64) {
+        if let Some(shard) = self.shard(slot) {
+            shard.live.fetch_add(delta, Ordering::Relaxed);
+        }
+    }
+
+    fn shard_live_snapshot(&self) -> Option<Vec<i64>> {
+        if self.shards.is_empty() {
+            return None;
+        }
+        Some(
+            self.shards
+                .iter()
+                .map(|shard| shard.live.load(Ordering::Relaxed))
+                .collect(),
+        )
+    }
+
+    #[cfg(test)]
     fn new(capacity: usize) -> Shared {
+        Self::with_shards(capacity, 0)
+    }
+
+    fn with_shards(capacity: usize, shard_count: usize) -> Shared {
         Shared {
+            shards: (0..shard_count).map(|_| ShardStats::default()).collect(),
+            storm_reconnect_anchor_ns: AtomicU64::new(0),
+            reconnect_initial_late: AtomicHistogram::new(),
+            reconnect_initials: AtomicU64::new(0),
+            severed_closed: AtomicU64::new(0),
+            raid_joins_sent: AtomicU64::new(0),
             steady: WindowStats::default(),
             steady_drain: WindowStats::default(),
             storm_survivors: WindowStats::default(),
@@ -914,10 +1015,25 @@ fn endpoint_index(session_index: usize, endpoint_count: usize) -> usize {
     session_index % endpoint_count.max(1)
 }
 
+/// Install the sharded arms' opening-DCID provider on one endpoint's config.
+/// Without it the endpoint keeps quinn's default provider.
+fn with_dcid_provider(
+    mut config: ClientConfig,
+    provider: &Option<g6_sharding::DcidProvider>,
+) -> ClientConfig {
+    if let Some(provider) = provider {
+        config
+            .quic_config_mut()
+            .initial_dst_cid_provider(Arc::clone(provider));
+    }
+    config
+}
+
 fn build_endpoints(
     count: usize,
     bind_default: bool,
     fixed_source_port_base: Option<u16>,
+    dcid_provider: Option<g6_sharding::DcidProvider>,
 ) -> Result<EndpointPool, Box<dyn std::error::Error>> {
     validate_endpoint_configuration(
         count,
@@ -938,9 +1054,11 @@ fn build_endpoints(
                 .keep_alive_interval(Some(KEEP_ALIVE))
                 .max_idle_timeout(Some(MAX_IDLE))?
                 .build();
-            endpoint = Some(Endpoint::client(config).map_err(|error| {
-                format!("mmo-client: fixed source bind {addr} failed: {error}")
-            })?);
+            endpoint = Some(
+                Endpoint::client(with_dcid_provider(config, &dcid_provider)).map_err(|error| {
+                    format!("mmo-client: fixed source bind {addr} failed: {error}")
+                })?,
+            );
         } else if count > 1 && !bind_default {
             let octet = u8::try_from(1 + (k % 250)).unwrap_or(1);
             let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, octet, 1)), 0);
@@ -950,7 +1068,7 @@ fn build_endpoints(
                 .keep_alive_interval(Some(KEEP_ALIVE))
                 .max_idle_timeout(Some(MAX_IDLE))?
                 .build();
-            match Endpoint::client(config) {
+            match Endpoint::client(with_dcid_provider(config, &dcid_provider)) {
                 Ok(e) => {
                     distinct_source_ips += 1;
                     endpoint = Some(e);
@@ -967,7 +1085,7 @@ fn build_endpoints(
                     .keep_alive_interval(Some(KEEP_ALIVE))
                     .max_idle_timeout(Some(MAX_IDLE))?
                     .build();
-                Endpoint::client(config)?
+                Endpoint::client(with_dcid_provider(config, &dcid_provider))?
             }
         };
         source_addresses.push(endpoint.local_addr()?);
@@ -1179,10 +1297,45 @@ fn parse_args() -> Result<Options, Box<dyn std::error::Error>> {
                 o.storm_concurrency =
                     parse_or_default("--storm-concurrency", args.next(), o.storm_concurrency)
             }
+            "--send-interval-us" => {
+                let micros: u64 = parse_strict("--send-interval-us", args.next())?;
+                if micros == 0 {
+                    return Err("mmo-client: --send-interval-us must be positive".into());
+                }
+                o.send_interval = Duration::from_micros(micros);
+            }
+            "--shard-count" => o.shard_count = Some(parse_strict("--shard-count", args.next())?),
+            "--target-shard" => o.target_slot = Some(parse_strict("--target-shard", args.next())?),
+            "--dcid-len" => o.dcid_len = parse_strict("--dcid-len", args.next())?,
+            "--raid-membership" => {
+                o.raid_membership_explicit = match args.next().as_deref() {
+                    Some("explicit") => true,
+                    Some("legacy") => false,
+                    other => {
+                        return Err(format!(
+                        "mmo-client: --raid-membership must be explicit or legacy, got {other:?}"
+                    )
+                        .into())
+                    }
+                }
+            }
+            "--storm-timeline" => {
+                o.storm_anchored = match args.next().as_deref() {
+                    Some("anchored") => true,
+                    Some("legacy") => false,
+                    other => {
+                        return Err(format!(
+                            "mmo-client: --storm-timeline must be anchored or legacy, got {other:?}"
+                        )
+                        .into())
+                    }
+                }
+            }
             _ => {}
         }
     }
     validate_connect_concurrency(o.connect_concurrency)?;
+    validate_arms_options(&o)?;
     o.receiver_diagnostic.validate(o.endpoints)?;
     validate_active_workload_sessions(o.sessions, o.active_workload_sessions)?;
     validate_endpoint_configuration(
@@ -1192,6 +1345,37 @@ fn parse_args() -> Result<Options, Box<dyn std::error::Error>> {
         current_nofile_soft_limit(),
     )?;
     Ok(o)
+}
+
+/// The sharded arms' option set must be coherent before anything connects:
+/// a target or a non-default DCID length means nothing without the shard
+/// count, an explicit-membership realm must not carry a passive tail (that
+/// tail is what used to send RAID_JOIN), and an anchored storm needs a cohort.
+fn validate_arms_options(o: &Options) -> Result<(), Box<dyn std::error::Error>> {
+    match o.dcid_plan() {
+        Some(plan) => plan.validate()?,
+        None => {
+            if o.target_slot.is_some() || o.dcid_len != REGISTERED_DCID_LEN {
+                return Err(
+                    "mmo-client: --target-shard and --dcid-len require --shard-count".into(),
+                );
+            }
+        }
+    }
+    if o.raid_membership_explicit
+        && o.role == Role::Realm
+        && o.active_workload_sessions
+            .is_some_and(|active| active != o.sessions)
+    {
+        return Err(
+            "mmo-client: --raid-membership explicit requires --active-sessions == --sessions for a realm"
+                .into(),
+        );
+    }
+    if o.storm_anchored && o.storm_cohort == 0 {
+        return Err("mmo-client: --storm-timeline anchored requires --storm-cohort > 0".into());
+    }
+    Ok(())
 }
 
 fn validate_pre_registration_sha256(
@@ -1367,8 +1551,17 @@ mod phase_barrier_naming_tests {
 
 async fn wait_for_phase_barrier(
     options: &Options,
+    stage: Option<&str>,
 ) -> Result<Option<PhaseBarrierProof>, Box<dyn std::error::Error>> {
-    let Some(id) = options.phase_barrier_id.as_deref() else {
+    // A later rendezvous of the same parties (the anchored storm's sever)
+    // uses its own id, so its ready and release files never collide with the
+    // steady-entry barrier's.
+    let staged_id = options
+        .phase_barrier_id
+        .as_deref()
+        .zip(stage)
+        .map(|(id, stage)| format!("{id}-{stage}"));
+    let Some(id) = staged_id.as_deref().or(options.phase_barrier_id.as_deref()) else {
         if options.phase_barrier_dir.is_some() || options.phase_barrier_parties > 0 {
             return Err(
                 "mmo-client: --phase-barrier-id is required when phase barrier options are set"
@@ -1691,9 +1884,15 @@ async fn run(
         options.endpoints,
         options.bind_default,
         options.fixed_source_port_base,
+        options.dcid_plan().map(|plan| {
+            g6_sharding::provider(plan, Arc::new(DcidRng::from_entropy()), monotonic_ns)
+        }),
     )?;
     diagnostic.start(&source_addresses).await?;
-    let shared = Arc::new(Shared::new(options.sessions));
+    let shared = Arc::new(Shared::with_shards(
+        options.sessions,
+        options.shard_count.unwrap_or(0) as usize,
+    ));
     let permits = Arc::new(Semaphore::new(options.connect_concurrency));
     // Zero means no pool. `Semaphore::new(usize::MAX >> 3)` is tokio's own
     // effectively-unbounded value; using it rather than skipping the acquire
@@ -1756,12 +1955,23 @@ async fn run(
                 );
             }
             let started = Instant::now();
-            let connected = endpoint.connect(&options.url).await;
+            let opening = Arc::new(OpeningRecord::default());
+            let connected = OPENING
+                .scope(Arc::clone(&opening), endpoint.connect(&options.url))
+                .await;
             let elapsed_ms = started.elapsed().as_millis() as u64;
             drop(permit);
+            // The shard this connection was placed on, from the DCID quinn
+            // actually used (sharded arms only).
+            let opening_slot = opening.take().and_then(|o| {
+                options
+                    .shard_count
+                    .and_then(|count| placement_slot(&o.dcid, count))
+            });
             let conn = match connected {
                 Ok(conn) => {
                     shared.sessions.ok.fetch_add(1, Ordering::Relaxed);
+                    shared.shard_live(opening_slot, 1);
                     if let Ok(mut l) = shared.latencies.lock() {
                         l.push(elapsed_ms);
                     }
@@ -1796,6 +2006,7 @@ async fn run(
                 &options,
                 phase_offset,
                 shared.as_ref(),
+                opening_slot,
             )
             .await;
         }));
@@ -1829,11 +2040,12 @@ async fn run(
     let quic_before_steady = sample_quic(&shared.registry);
     let cpu_before_steady = self_cpu_ms();
     let rss_before_steady = self_rss_mb();
-    let mut phase_barrier = wait_for_phase_barrier(&options).await?;
+    let mut phase_barrier = wait_for_phase_barrier(&options, None).await?;
     if let Some(proof) = phase_barrier.as_mut() {
         proof.steady_enter_unix_ms = unix_now_ms()?;
         proof.steady_enter_monotonic_ns = monotonic_ns();
     }
+    let shards_at_steady = shared.shard_live_snapshot();
     host_udp_samples.steady = options.diagnostic_host_udp.then(sample_host_udp).flatten();
     diagnostic.boundary("steady", || {
         let _ = phase_tx.send((PHASE_STEADY, tokio::time::Instant::now()));
@@ -1853,7 +2065,38 @@ async fn run(
     tokio::time::sleep(options.drain).await;
 
     let storm_ran = options.storm_cohort > 0;
-    if storm_ran {
+    let mut anchored = AnchoredStorm::default();
+    if storm_ran && options.storm_anchored {
+        // Every realm process severs together: a second rendezvous of the
+        // same barrier parties, then the sever flip on this process's clock.
+        anchored.sever_barrier = wait_for_phase_barrier(&options, Some("sever")).await?;
+        let sever_at = tokio::time::Instant::now();
+        let sever_ns = monotonic_ns();
+        anchored.sever_unix_ms = Some(unix_now_ms()?);
+        anchored.sever_monotonic_ns = Some(sever_ns);
+        shared.storm_reconnect_anchor_ns.store(
+            sever_ns.saturating_add(options.storm_reconnect_delay.as_nanos() as u64),
+            Ordering::Relaxed,
+        );
+        let _ = phase_tx.send((PHASE_SEVER, sever_at));
+        println!("mmo-client: phase sever cohort={}", options.storm_cohort);
+        tokio::time::sleep_until(sever_at + options.storm_reconnect_delay).await;
+        anchored.storm_start_unix_ms = Some(unix_now_ms()?);
+        anchored.storm_start_monotonic_ns = Some(monotonic_ns());
+        diagnostic.boundary("storm", || {
+            let _ = phase_tx.send((PHASE_STORM, tokio::time::Instant::now()));
+        })?;
+        println!("mmo-client: phase storm cohort={}", options.storm_cohort);
+        tokio::time::sleep(options.storm_window).await;
+        anchored.shards_at_storm_end = shared.shard_live_snapshot();
+        anchored.storm_end_unix_ms = Some(unix_now_ms()?);
+        anchored.storm_end_monotonic_ns = Some(monotonic_ns());
+        diagnostic.boundary("post-storm", || {
+            let _ = phase_tx.send((PHASE_POST, tokio::time::Instant::now()));
+        })?;
+        println!("mmo-client: phase post-storm");
+        tokio::time::sleep(options.post_storm).await;
+    } else if storm_ran {
         diagnostic.boundary("storm", || {
             let _ = phase_tx.send((PHASE_STORM, tokio::time::Instant::now()));
         })?;
@@ -1867,6 +2110,7 @@ async fn run(
     }
 
     host_udp_samples.idle = options.diagnostic_host_udp.then(sample_host_udp).flatten();
+    let shards_at_idle = shared.shard_live_snapshot();
     diagnostic.boundary("idle", || {
         let _ = phase_tx.send((PHASE_IDLE, tokio::time::Instant::now()));
     })?;
@@ -1928,11 +2172,29 @@ async fn run(
     // Which datagram read path this generator's wtransport drivers actually
     // used, so a paired campaign arm cannot be mislabeled by its environment.
     let host_udp_field = format!(
-        "\"datagramDriver\":{},{}",
+        "\"datagramDriver\":{},{}{}",
         datagram_driver_json(wtransport::datagram_driver_stats()),
         host_udp_json(options.diagnostic_host_udp, &host_udp_samples)
             .map(|json| format!("\"hostUdp\":{json},"))
-            .unwrap_or_default()
+            .unwrap_or_default(),
+        // Sharded arms only: absent from every steady-path report.
+        if options.arms_enabled() {
+            format!(
+                "\"arms\":{},",
+                arms_json(
+                    &options,
+                    &shared,
+                    ArmsSnapshots {
+                        steady_entry: shards_at_steady.as_deref(),
+                        storm_end: anchored.shards_at_storm_end.as_deref(),
+                        idle: shards_at_idle.as_deref(),
+                    },
+                    &anchored,
+                )
+            )
+        } else {
+            String::new()
+        }
     );
 
     let json = format!(
@@ -2058,6 +2320,135 @@ async fn run(
     Ok(())
 }
 
+/// The anchored storm's process-level instants (sharded arms). Unix ms are
+/// for cross-process skew (V-T, all generator processes share one host
+/// clock); monotonic ns are this process's own anchors.
+#[derive(Default)]
+struct AnchoredStorm {
+    sever_barrier: Option<PhaseBarrierProof>,
+    sever_unix_ms: Option<u64>,
+    sever_monotonic_ns: Option<u64>,
+    storm_start_unix_ms: Option<u64>,
+    storm_start_monotonic_ns: Option<u64>,
+    storm_end_unix_ms: Option<u64>,
+    storm_end_monotonic_ns: Option<u64>,
+    shards_at_storm_end: Option<Vec<i64>>,
+}
+
+struct ArmsSnapshots<'a> {
+    steady_entry: Option<&'a [i64]>,
+    storm_end: Option<&'a [i64]>,
+    idle: Option<&'a [i64]>,
+}
+
+/// `{"1":n,...}` keyed by server id (slot + 1), or null.
+fn shard_counts_json(counts: Option<&[i64]>) -> String {
+    match counts {
+        None => "null".to_string(),
+        Some(counts) => format!(
+            "{{{}}}",
+            counts
+                .iter()
+                .enumerate()
+                .map(|(slot, n)| format!("\"{}\":{n}", server_id_for_slot(slot as u32)))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    }
+}
+
+/// The sharded arms' block of the mmo-client/2 report: placement, raid
+/// membership, per-shard populations, and the anchored storm's instants.
+fn arms_json(
+    options: &Options,
+    shared: &Shared,
+    snapshots: ArmsSnapshots<'_>,
+    anchored: &AnchoredStorm,
+) -> String {
+    let shards = if shared.shards.is_empty() {
+        "null".to_string()
+    } else {
+        format!(
+            "{{{}}}",
+            shared
+                .shards
+                .iter()
+                .enumerate()
+                .map(|(slot, shard)| format!(
+                    "\"{}\":{{\"steady\":{},\"steadyDrain\":{},\"stormSurvivors\":{}}}",
+                    server_id_for_slot(slot as u32),
+                    shard.steady.to_json(),
+                    shard.steady_drain.to_json(),
+                    shard.storm_survivors.to_json(),
+                ))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
+    let storm = if options.storm_anchored {
+        format!(
+            concat!(
+                "{{\"timeline\":\"anchored\",\"cohort\":{},\"reconnectDelayMs\":{},",
+                "\"severBarrier\":{},\"severUnixMs\":{},\"severMonotonicNs\":{},",
+                "\"stormStartUnixMs\":{},\"stormStartMonotonicNs\":{},",
+                "\"stormEndUnixMs\":{},\"stormEndMonotonicNs\":{},",
+                "\"severedClosed\":{},\"reconnectInitials\":{},",
+                "\"initialIssueClock\":\"dcid-provider-call\",",
+                "\"reconnectInitialLate\":{}}}"
+            ),
+            options.storm_cohort,
+            options.storm_reconnect_delay.as_millis(),
+            anchored
+                .sever_barrier
+                .as_ref()
+                .map(PhaseBarrierProof::to_json)
+                .unwrap_or_else(|| "null".to_string()),
+            json_u64(anchored.sever_unix_ms),
+            json_u64(anchored.sever_monotonic_ns),
+            json_u64(anchored.storm_start_unix_ms),
+            json_u64(anchored.storm_start_monotonic_ns),
+            json_u64(anchored.storm_end_unix_ms),
+            json_u64(anchored.storm_end_monotonic_ns),
+            shared.severed_closed.load(Ordering::Relaxed),
+            shared.reconnect_initials.load(Ordering::Relaxed),
+            shared.reconnect_initial_late.to_json(),
+        )
+    } else {
+        "null".to_string()
+    };
+    format!(
+        concat!(
+            "{{\"shardCount\":{},\"targetSlot\":{},\"targetServerId\":{},",
+            "\"dcidLen\":{},\"serverCidLen\":{},\"dcidHashPlaced\":{},",
+            "\"placement\":\"fnv1a32-first8-mod-shardCount\",",
+            "\"raidMembership\":\"{}\",\"raidJoinsSent\":{},",
+            "\"sessionsByShard\":{{\"steadyEntry\":{},\"stormEnd\":{},\"idle\":{}}},",
+            "\"shards\":{},\"storm\":{}}}"
+        ),
+        json_u64(options.shard_count.map(u64::from)),
+        json_u64(options.target_slot.map(u64::from)),
+        json_u64(
+            options
+                .target_slot
+                .map(|slot| u64::from(server_id_for_slot(slot)))
+        ),
+        options.dcid_len,
+        SERVER_CID_LEN,
+        g6_sharding::hash_placed(options.dcid_len),
+        if options.raid_membership_explicit {
+            "explicit"
+        } else {
+            "legacy"
+        },
+        shared.raid_joins_sent.load(Ordering::Relaxed),
+        shard_counts_json(snapshots.steady_entry),
+        shard_counts_json(snapshots.storm_end),
+        shard_counts_json(snapshots.idle),
+        shards,
+        storm,
+    )
+}
+
 /* -------------------------------------------------------------------------- */
 /* Session task                                                                */
 /* -------------------------------------------------------------------------- */
@@ -2083,6 +2474,7 @@ fn registered_window_duration(kind: SendWindowKind, options: &Options) -> Durati
 #[allow(clippy::too_many_arguments)]
 fn account_window_ticks(
     shared: &Shared,
+    shard: Option<&ShardStats>,
     track_schedule: bool,
     kind: SendWindowKind,
     started_at: tokio::time::Instant,
@@ -2104,10 +2496,18 @@ fn account_window_ticks(
         SendWindowKind::Steady => {
             shared.steady.record_due(due);
             shared.steady.record_unpresented(unpresented);
+            if let Some(shard) = shard {
+                shard.steady.record_due(due);
+                shard.steady.record_unpresented(unpresented);
+            }
         }
         SendWindowKind::Storm if !severed => {
             shared.storm_survivors.record_due(due);
             shared.storm_survivors.record_unpresented(unpresented);
+            if let Some(shard) = shard {
+                shard.storm_survivors.record_due(due);
+                shard.storm_survivors.record_unpresented(unpresented);
+            }
         }
         SendWindowKind::Post | SendWindowKind::Storm => {}
     }
@@ -2166,6 +2566,7 @@ fn open_send_window(
 #[allow(clippy::too_many_arguments)]
 fn sync_send_window(
     shared: &Shared,
+    shard: Option<&ShardStats>,
     track_schedule: bool,
     active: &mut Option<ActiveSendWindow>,
     desired: Option<SendWindowKind>,
@@ -2180,6 +2581,7 @@ fn sync_send_window(
     if let Some(window) = active.take() {
         account_window_ticks(
             shared,
+            shard,
             track_schedule,
             window.kind,
             window.started_at,
@@ -2198,6 +2600,7 @@ fn sync_send_window(
 #[allow(clippy::too_many_arguments)]
 fn record_reconnect_failure(
     shared: &Shared,
+    shard: Option<&ShardStats>,
     track_schedule: bool,
     active_window: &mut Option<ActiveSendWindow>,
     options: &Options,
@@ -2207,6 +2610,7 @@ fn record_reconnect_failure(
 ) {
     sync_send_window(
         shared,
+        shard,
         track_schedule,
         active_window,
         None,
@@ -2226,20 +2630,29 @@ fn record_reconnect_failure(
 /// disconnect of a severed storm session is not a loss; every other receive
 /// failure is, and a survivor failure must remain visible in S-C1 without
 /// borrowing a whole-realm counter.
-fn record_session_loss(phase: u8, severed: bool, shared: &Shared) {
-    if severed && phase == PHASE_STORM {
+fn record_session_loss(phase: u8, severed: bool, shared: &Shared, shard: Option<&ShardStats>) {
+    if severed && (phase == PHASE_STORM || phase == PHASE_SEVER) {
         return;
     }
     shared.sessions.lost.fetch_add(1, Ordering::Relaxed);
     shared.lifetime.record_session_loss();
     if phase_records_steady_drain(phase) {
         shared.steady_drain.record_session_loss();
+        if let Some(shard) = shard {
+            shard.steady_drain.record_session_loss();
+        }
         if phase == PHASE_STEADY {
             shared.steady.record_session_loss();
+            if let Some(shard) = shard {
+                shard.steady.record_session_loss();
+            }
         }
     }
     if phase_records_storm_survivors(phase, severed) {
         shared.storm_survivors.record_session_loss();
+        if let Some(shard) = shard {
+            shard.storm_survivors.record_session_loss();
+        }
     }
 }
 
@@ -2249,45 +2662,38 @@ fn record_session_loss(phase: u8, severed: bool, shared: &Shared) {
 /// does the ack carry a usable token, whose clock is the token on — is one
 /// place, and so the "record a round trip measured from zero" mistake has to be
 /// made deliberately rather than by omission.
-fn record_arrival(payload: &[u8], now_ns: u64, severed: bool, phase: u8, shared: &Shared) {
+fn record_arrival(
+    payload: &[u8],
+    now_ns: u64,
+    severed: bool,
+    phase: u8,
+    shared: &Shared,
+    shard: Option<&ShardStats>,
+) {
+    // Lifetime always; steadyDrain and the survivor window when the phase
+    // says so — process-wide first, then this session's shard's copy.
+    let steady_drain = phase_records_steady_drain(phase);
+    let survivors = phase_records_storm_survivors(phase, severed);
+    let windows: [Option<&WindowStats>; 5] = [
+        Some(&shared.lifetime),
+        steady_drain.then_some(&shared.steady_drain),
+        survivors.then_some(&shared.storm_survivors),
+        shard.filter(|_| steady_drain).map(|s| &s.steady_drain),
+        shard.filter(|_| survivors).map(|s| &s.storm_survivors),
+    ];
+    let windows = || windows.iter().flatten();
     let Some(stamp) = read_stamp(payload) else {
-        shared.lifetime.record_unstamped();
-        if phase_records_steady_drain(phase) {
-            shared.steady_drain.record_unstamped();
-        }
-        if phase_records_storm_survivors(phase, severed) {
-            shared.storm_survivors.record_unstamped();
-        }
+        windows().for_each(|w| w.record_unstamped());
         return;
     };
-    shared.lifetime.record_class(stamp.class);
-    if phase_records_steady_drain(phase) {
-        shared.steady_drain.record_class(stamp.class);
-    }
-    if phase_records_storm_survivors(phase, severed) {
-        shared.storm_survivors.record_class(stamp.class);
-    }
+    windows().for_each(|w| w.record_class(stamp.class));
 
     if stamp.class == CLASS_RAID {
         // Publisher and subscriber are two processes on ONE host, so `actual`
         // is a client-clock instant here and the one-way is honest. It is the
         // only one-way this gate can make; the client↔server legs are RTT-only.
-        shared
-            .lifetime
-            .one_way
-            .record_signed(now_ns as i64 - stamp.actual_ns as i64);
-        if phase_records_steady_drain(phase) {
-            shared
-                .steady_drain
-                .one_way
-                .record_signed(now_ns as i64 - stamp.actual_ns as i64);
-        }
-        if phase_records_storm_survivors(phase, severed) {
-            shared
-                .storm_survivors
-                .one_way
-                .record_signed(now_ns as i64 - stamp.actual_ns as i64);
-        }
+        let one_way = now_ns as i64 - stamp.actual_ns as i64;
+        windows().for_each(|w| w.one_way.record_signed(one_way));
         return;
     }
 
@@ -2297,32 +2703,14 @@ fn record_arrival(payload: &[u8], now_ns: u64, severed: bool, phase: u8, shared:
     if stamp.echo_actual_ns == 0 {
         // The server did not reflect. Counted, never recorded: a round trip
         // measured from the epoch is not a small number, it is a wrong one.
-        shared.lifetime.record_ack_unreflected();
-        if phase_records_steady_drain(phase) {
-            shared.steady_drain.record_ack_unreflected();
-        }
-        if phase_records_storm_survivors(phase, severed) {
-            shared.storm_survivors.record_ack_unreflected();
-        }
+        windows().for_each(|w| w.record_ack_unreflected());
         return;
     }
     let rtt = now_ns as i64 - stamp.echo_actual_ns as i64;
     if stamp.hold_ns > 0 {
-        shared.lifetime.server_hold.record(stamp.hold_ns);
-        if phase_records_steady_drain(phase) {
-            shared.steady_drain.server_hold.record(stamp.hold_ns);
-        }
-        if phase_records_storm_survivors(phase, severed) {
-            shared.storm_survivors.server_hold.record(stamp.hold_ns);
-        }
+        windows().for_each(|w| w.server_hold.record(stamp.hold_ns));
     }
-    shared.lifetime.rtt.record_signed(rtt);
-    if phase_records_steady_drain(phase) {
-        shared.steady_drain.rtt.record_signed(rtt);
-    }
-    if phase_records_storm_survivors(phase, severed) {
-        shared.storm_survivors.rtt.record_signed(rtt);
-    }
+    windows().for_each(|w| w.rtt.record_signed(rtt));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2335,7 +2723,12 @@ async fn hold_session(
     options: &Options,
     phase_offset: f64,
     shared: &Shared,
+    opening_slot: Option<u32>,
 ) {
+    // The shard this session's current connection was placed on, from its own
+    // opening DCID; it changes only when a severed session reconnects.
+    let mut slot = opening_slot;
+    let mut reconnect_pending = false;
     let active_workload_sessions = options.active_workload_sessions.unwrap_or(options.sessions);
     let passive_realm =
         options.role == Role::Realm && !session_drives_workload(index, active_workload_sessions);
@@ -2351,10 +2744,21 @@ async fn hold_session(
     // session says what it is exactly once. This applies both to raid audience
     // sessions and to the matched-throughput companion's passive realm tail.
     // The marker is sent before measurement and excluded from every rate.
+    //
+    // Explicit membership (the sharded hotspot): only raid-subscriber
+    // sessions join, and each carries a member token (its index + 1) in the
+    // sequence field so the server can echo exactly which sessions it holds.
     if receive_only {
         let now = monotonic_ns();
-        write_stamp_v3(&mut payload, now, now, 0, CLASS_RAID_JOIN);
-        let _ = conn.send_datagram(&payload);
+        let token = if options.raid_membership_explicit && options.role == Role::RaidSubscriber {
+            index as u64 + 1
+        } else {
+            0
+        };
+        write_stamp_v3(&mut payload, now, now, token, CLASS_RAID_JOIN);
+        if conn.send_datagram(&payload).is_ok() {
+            shared.raid_joins_sent.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     while phase.borrow().0 == PHASE_CONNECT {
@@ -2379,6 +2783,7 @@ async fn hold_session(
         };
         sync_send_window(
             shared,
+            shared.shard(slot),
             track_schedule,
             &mut active_send_window,
             desired,
@@ -2390,6 +2795,86 @@ async fn hold_session(
 
         if current == PHASE_STOP {
             break;
+        }
+
+        // Anchored storm (sharded arms): close at the barrier-coordinated sever
+        // flip, then reconnect exactly when the driver opens the storm window
+        // (sever + reconnect delay) — one watch notification wakes the whole
+        // cohort, and each reconnect's first-Initial issue instant is recorded
+        // against that anchor for V-R.
+        if options.storm_anchored {
+            // A session that first observes the storm flip (the watch keeps
+            // only the latest phase) still severs, then reconnects at once; its
+            // late Initial is what V-R exists to see.
+            if matches!(current, PHASE_SEVER | PHASE_STORM) && severed && !severed_yet {
+                severed_yet = true;
+                reconnect_pending = true;
+                conn.close(SEVER_CLOSE_CODE.into(), b"g6 storm sever");
+                shared.severed_closed.fetch_add(1, Ordering::Relaxed);
+                shared.shard_live(slot, -1);
+                if current == PHASE_SEVER {
+                    continue;
+                }
+            }
+            if reconnect_pending && current == PHASE_STORM {
+                reconnect_pending = false;
+                let permit = storm_permits.clone().acquire_owned().await.ok();
+                let record = Arc::new(OpeningRecord::default());
+                let started = Instant::now();
+                let call_ns = monotonic_ns();
+                let reconnected = OPENING
+                    .scope(Arc::clone(&record), endpoint.connect(&options.url))
+                    .await;
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                drop(permit);
+                let opening = record.take();
+                let issued_ns = opening.as_ref().map_or(call_ns, |o| o.issued_ns);
+                let anchor = shared.storm_reconnect_anchor_ns.load(Ordering::Relaxed);
+                shared
+                    .reconnect_initial_late
+                    .record_signed(issued_ns as i64 - anchor as i64);
+                shared.reconnect_initials.fetch_add(1, Ordering::Relaxed);
+                match reconnected {
+                    Ok(fresh) => {
+                        slot = opening.as_ref().and_then(|o| {
+                            options
+                                .shard_count
+                                .and_then(|count| placement_slot(&o.dcid, count))
+                        });
+                        shared.shard_live(slot, 1);
+                        shared.sessions.reconnect_ok.fetch_add(1, Ordering::Relaxed);
+                        if let Ok(mut l) = shared.reconnect_latencies.lock() {
+                            l.push(elapsed_ms);
+                        }
+                        if let Ok(mut live) = shared.registry.lock() {
+                            live.push(fresh.quic_connection().clone());
+                        }
+                        conn = fresh;
+                    }
+                    Err(e) => {
+                        record_reconnect_failure(
+                            shared,
+                            shared.shard(slot),
+                            track_schedule,
+                            &mut active_send_window,
+                            options,
+                            phase_offset,
+                            severed,
+                            e.to_string(),
+                        );
+                        return;
+                    }
+                }
+                continue;
+            }
+            if reconnect_pending {
+                // Closed and waiting for the storm flip: never touch the
+                // closed connection, whose receive would read as a loss.
+                if phase.changed().await.is_err() {
+                    break;
+                }
+                continue;
+            }
         }
 
         // The storm, from this session's side: sever, wait the retry delay,
@@ -2419,6 +2904,7 @@ async fn hold_session(
                 Err(e) => {
                     record_reconnect_failure(
                         shared,
+                        shared.shard(slot),
                         track_schedule,
                         &mut active_send_window,
                         options,
@@ -2444,9 +2930,13 @@ async fn hold_session(
                     match received {
                         Ok(d) => record_arrival(
                             d.as_ref(), monotonic_ns(), severed, phase.borrow().0, shared,
+                            shared.shard(slot),
                         ),
                         Err(_) => {
-                            record_session_loss(phase.borrow().0, severed, shared);
+                            record_session_loss(
+                                phase.borrow().0, severed, shared, shared.shard(slot),
+                            );
+                            shared.shard_live(slot, -1);
                             return;
                         }
                     }
@@ -2460,6 +2950,7 @@ async fn hold_session(
                 if changed.is_err() {
                     sync_send_window(
                         shared,
+                        shared.shard(slot),
                         track_schedule,
                         &mut active_send_window,
                         None,
@@ -2478,6 +2969,7 @@ async fn hold_session(
                 if desired_window != active_kind {
                     sync_send_window(
                         shared,
+                        shared.shard(slot),
                         track_schedule,
                         &mut active_send_window,
                         desired_window,
@@ -2498,6 +2990,7 @@ async fn hold_session(
                     spent_window = active_kind;
                     sync_send_window(
                         shared,
+                        shared.shard(slot),
                         track_schedule,
                         &mut active_send_window,
                         None,
@@ -2535,9 +3028,20 @@ async fn hold_session(
                     window.kind
                 };
                 shared.lifetime.record_tick(observation);
+                let shard = shared.shard(slot);
                 match active_kind {
-                    SendWindowKind::Steady => shared.steady.record_tick(observation),
-                    SendWindowKind::Storm if !severed => shared.storm_survivors.record_tick(observation),
+                    SendWindowKind::Steady => {
+                        shared.steady.record_tick(observation);
+                        if let Some(shard) = shard {
+                            shard.steady.record_tick(observation);
+                        }
+                    }
+                    SendWindowKind::Storm if !severed => {
+                        shared.storm_survivors.record_tick(observation);
+                        if let Some(shard) = shard {
+                            shard.storm_survivors.record_tick(observation);
+                        }
+                    }
                     SendWindowKind::Storm | SendWindowKind::Post => {}
                 }
                 let class = if options.role == Role::Publisher {
@@ -2555,8 +3059,18 @@ async fn hold_session(
                 let sent_ok = conn.send_datagram(&payload).is_ok();
                 shared.lifetime.record_send(sent_ok);
                 match active_kind {
-                    SendWindowKind::Steady => shared.steady.record_send(sent_ok),
-                    SendWindowKind::Storm if !severed => shared.storm_survivors.record_send(sent_ok),
+                    SendWindowKind::Steady => {
+                        shared.steady.record_send(sent_ok);
+                        if let Some(shard) = shard {
+                            shard.steady.record_send(sent_ok);
+                        }
+                    }
+                    SendWindowKind::Storm if !severed => {
+                        shared.storm_survivors.record_send(sent_ok);
+                        if let Some(shard) = shard {
+                            shard.storm_survivors.record_send(sent_ok);
+                        }
+                    }
                     SendWindowKind::Storm | SendWindowKind::Post => {}
                 };
             }
@@ -2564,6 +3078,7 @@ async fn hold_session(
                 match received {
                     Ok(d) => record_arrival(
                         d.as_ref(), monotonic_ns(), severed, phase.borrow().0, shared,
+                        shared.shard(slot),
                     ),
                     Err(_) => {
                         // A session lost mid-drive still offered whatever its
@@ -2573,6 +3088,7 @@ async fn hold_session(
                         // counted as lost.
                         sync_send_window(
                             shared,
+                            shared.shard(slot),
                             track_schedule,
                             &mut active_send_window,
                             None,
@@ -2581,7 +3097,8 @@ async fn hold_session(
                             severed,
                             tokio::time::Instant::now(),
                         );
-                        record_session_loss(current, severed, shared);
+                        record_session_loss(current, severed, shared, shared.shard(slot));
+                        shared.shard_live(slot, -1);
                         return;
                     }
                 }
@@ -2914,6 +3431,7 @@ mod tests {
 
             record_reconnect_failure(
                 &shared,
+                None,
                 true,
                 &mut active_window,
                 &options,
@@ -3055,7 +3573,7 @@ mod tests {
         let shared = Shared::new(1);
         let mut buf = [0u8; STAMP_BYTES_V3];
         write_stamp_v3(&mut buf, 0, 0, 1, CLASS_ACK);
-        record_arrival(&buf, monotonic_ns(), false, PHASE_STEADY, &shared);
+        record_arrival(&buf, monotonic_ns(), false, PHASE_STEADY, &shared, None);
         assert_eq!(shared.lifetime.counters.rx_ack.load(Ordering::Relaxed), 1);
         assert_eq!(
             shared
@@ -3077,7 +3595,14 @@ mod tests {
         // The server's half: reflect the client's instant and report its dwell.
         buf[28..36].copy_from_slice(&sent_ns.to_le_bytes());
         buf[36..44].copy_from_slice(&3_000_000u64.to_le_bytes());
-        record_arrival(&buf, sent_ns + 12_000_000, false, PHASE_STEADY, &shared);
+        record_arrival(
+            &buf,
+            sent_ns + 12_000_000,
+            false,
+            PHASE_STEADY,
+            &shared,
+            None,
+        );
         let json = shared.steady_drain.rtt.to_json();
         assert!(json.contains("\"count\":1"), "{json}");
         assert!(json.contains("\"negative\":0"), "{json}");
@@ -3107,7 +3632,7 @@ mod tests {
         write_stamp_v3(&mut buf, 0, 0, 1, CLASS_ACK);
         buf[28..36].copy_from_slice(&sent_ns.to_le_bytes());
 
-        record_arrival(&buf, sent_ns + 1_000_000, true, PHASE_STORM, &shared);
+        record_arrival(&buf, sent_ns + 1_000_000, true, PHASE_STORM, &shared, None);
         assert!(shared.storm_survivors.rtt.to_json().contains("\"count\":0"));
         assert_eq!(
             shared
@@ -3118,7 +3643,7 @@ mod tests {
             0
         );
 
-        record_arrival(&buf, sent_ns + 1_000_000, false, PHASE_STORM, &shared);
+        record_arrival(&buf, sent_ns + 1_000_000, false, PHASE_STORM, &shared, None);
         assert!(shared.storm_survivors.rtt.to_json().contains("\"count\":1"));
         assert_eq!(
             shared
@@ -3131,7 +3656,14 @@ mod tests {
 
         // Outside the storm window a survivor's ack belongs to the steady
         // histogram, not the survivor one.
-        record_arrival(&buf, sent_ns + 1_000_000, false, PHASE_STEADY, &shared);
+        record_arrival(
+            &buf,
+            sent_ns + 1_000_000,
+            false,
+            PHASE_STEADY,
+            &shared,
+            None,
+        );
         assert!(shared.storm_survivors.rtt.to_json().contains("\"count\":1"));
         assert!(shared.steady_drain.rtt.to_json().contains("\"count\":1"));
     }
@@ -3140,7 +3672,7 @@ mod tests {
     fn survivor_loss_accounting_excludes_expected_severed_disconnects() {
         let shared = Shared::new(2);
 
-        record_session_loss(PHASE_STORM, true, &shared);
+        record_session_loss(PHASE_STORM, true, &shared, None);
         assert_eq!(shared.sessions.lost.load(Ordering::Relaxed), 0);
         assert_eq!(
             shared
@@ -3151,7 +3683,7 @@ mod tests {
             0
         );
 
-        record_session_loss(PHASE_STORM, false, &shared);
+        record_session_loss(PHASE_STORM, false, &shared, None);
         assert_eq!(shared.sessions.lost.load(Ordering::Relaxed), 1);
         assert_eq!(
             shared
@@ -3174,7 +3706,7 @@ mod tests {
         let shared = Shared::new(1);
         let mut buf = [0u8; STAMP_BYTES_V3];
         write_stamp_v3(&mut buf, 0, monotonic_ns(), 1, CLASS_SNAPSHOT);
-        record_arrival(&buf, monotonic_ns(), false, PHASE_STEADY, &shared);
+        record_arrival(&buf, monotonic_ns(), false, PHASE_STEADY, &shared, None);
         assert_eq!(
             shared.lifetime.counters.rx_snapshot.load(Ordering::Relaxed),
             1
@@ -3191,7 +3723,7 @@ mod tests {
         buf[28..36].copy_from_slice(&sent_ns.to_le_bytes());
         buf[36..44].copy_from_slice(&2_000_000u64.to_le_bytes());
 
-        record_arrival(&buf, sent_ns + 9_000_000, false, PHASE_DRAIN, &shared);
+        record_arrival(&buf, sent_ns + 9_000_000, false, PHASE_DRAIN, &shared, None);
 
         assert_eq!(
             shared.steady_drain.counters.rx_ack.load(Ordering::Relaxed),
@@ -3250,7 +3782,14 @@ mod tests {
     #[test]
     fn a_foreign_payload_is_counted_as_unstamped() {
         let shared = Shared::new(1);
-        record_arrival(&[0u8; 64], monotonic_ns(), false, PHASE_STEADY, &shared);
+        record_arrival(
+            &[0u8; 64],
+            monotonic_ns(),
+            false,
+            PHASE_STEADY,
+            &shared,
+            None,
+        );
         assert_eq!(
             shared
                 .lifetime
@@ -3389,7 +3928,7 @@ mod tests {
                     .enable_all()
                     .build()
                     .unwrap();
-                rt.block_on(wait_for_phase_barrier(&options))
+                rt.block_on(wait_for_phase_barrier(&options, None))
                     .unwrap()
                     .unwrap()
             }));
@@ -3436,7 +3975,7 @@ mod tests {
             .build()
             .unwrap();
         let err = rt
-            .block_on(wait_for_phase_barrier(&options))
+            .block_on(wait_for_phase_barrier(&options, None))
             .unwrap_err()
             .to_string();
         assert!(err.contains("timed out"), "{err}");
@@ -3457,7 +3996,7 @@ mod tests {
             .build()
             .unwrap();
         let err = rt
-            .block_on(wait_for_phase_barrier(&options))
+            .block_on(wait_for_phase_barrier(&options, None))
             .unwrap_err()
             .to_string();
         assert!(err.contains("phase-barrier-dir is required"), "{err}");
@@ -3602,10 +4141,247 @@ mod tests {
             .build()
             .unwrap();
         let _guard = runtime.enter();
-        let error = match build_endpoints(1, false, Some(port)) {
+        let error = match build_endpoints(1, false, Some(port), None) {
             Ok(_) => panic!("fixed source port collision unexpectedly succeeded"),
             Err(error) => error.to_string(),
         };
         assert!(error.contains("fixed source bind"), "{error}");
+    }
+
+    fn ack_buf(sent_ns: u64) -> [u8; STAMP_BYTES_V3] {
+        let mut buf = [0u8; STAMP_BYTES_V3];
+        write_stamp_v3(&mut buf, 0, 0, 1, CLASS_ACK);
+        buf[28..36].copy_from_slice(&sent_ns.to_le_bytes());
+        buf[36..44].copy_from_slice(&1_000_000u64.to_le_bytes());
+        buf
+    }
+
+    /// Per-shard attribution mirrors the process-wide windows exactly for the
+    /// session's own shard and touches no other shard.
+    #[test]
+    fn per_shard_windows_mirror_the_process_windows_for_the_sessions_shard() {
+        let shared = Shared::with_shards(4, 4);
+        let sent_ns = monotonic_ns();
+        let buf = ack_buf(sent_ns);
+        record_arrival(
+            &buf,
+            sent_ns + 5_000_000,
+            false,
+            PHASE_STEADY,
+            &shared,
+            shared.shard(Some(2)),
+        );
+        record_arrival(
+            &buf,
+            sent_ns + 5_000_000,
+            false,
+            PHASE_STORM,
+            &shared,
+            shared.shard(Some(2)),
+        );
+        record_arrival(
+            &buf,
+            sent_ns + 5_000_000,
+            true,
+            PHASE_STORM,
+            &shared,
+            shared.shard(Some(2)),
+        );
+        let shard = &shared.shards[2];
+        assert_eq!(
+            shared.steady_drain.rtt.to_json(),
+            shard.steady_drain.rtt.to_json()
+        );
+        assert_eq!(
+            shared.storm_survivors.rtt.to_json(),
+            shard.storm_survivors.rtt.to_json()
+        );
+        assert!(shard.storm_survivors.rtt.to_json().contains("\"count\":1"));
+        for other in [0usize, 1, 3] {
+            assert!(shared.shards[other]
+                .steady_drain
+                .rtt
+                .to_json()
+                .contains("\"count\":0"));
+        }
+        // Losses: a steady loss lands in steady + steadyDrain of the shard; a
+        // severed session closing at the sever flip is never a loss.
+        record_session_loss(PHASE_STEADY, false, &shared, shared.shard(Some(1)));
+        assert_eq!(
+            shared.shards[1]
+                .steady
+                .counters
+                .sessions_lost
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            shared.shards[1]
+                .steady_drain
+                .counters
+                .sessions_lost
+                .load(Ordering::Relaxed),
+            1
+        );
+        record_session_loss(PHASE_SEVER, true, &shared, shared.shard(Some(1)));
+        assert_eq!(shared.sessions.lost.load(Ordering::Relaxed), 1);
+        // The live gauge is what sessionsByShard reports.
+        shared.shard_live(Some(3), 1);
+        shared.shard_live(Some(3), 1);
+        shared.shard_live(Some(3), -1);
+        shared.shard_live(None, 1);
+        assert_eq!(shared.shard_live_snapshot(), Some(vec![0, 0, 0, 1]));
+        assert_eq!(Shared::new(1).shard_live_snapshot(), None);
+    }
+
+    #[test]
+    fn sever_phase_has_no_send_window_and_records_no_window() {
+        assert_eq!(send_window_kind(PHASE_SEVER), None);
+        assert!(!phase_records_steady_drain(PHASE_SEVER));
+        assert!(!phase_records_storm_survivors(PHASE_SEVER, false));
+    }
+
+    #[test]
+    fn arms_options_are_validated_as_a_set() {
+        let base = Options::defaults();
+        assert!(validate_arms_options(&base).is_ok());
+        assert!(!base.arms_enabled());
+        let targeted = Options {
+            shard_count: Some(24),
+            target_slot: Some(23),
+            ..Options::defaults()
+        };
+        assert!(validate_arms_options(&targeted).is_ok());
+        assert_eq!(
+            targeted.dcid_plan(),
+            Some(DcidPlan {
+                len: 20,
+                shard_count: 24,
+                target_slot: Some(23)
+            })
+        );
+        assert!(validate_arms_options(&Options {
+            target_slot: Some(24),
+            ..targeted.clone()
+        })
+        .is_err());
+        assert!(validate_arms_options(&Options {
+            shard_count: None,
+            ..targeted.clone()
+        })
+        .is_err());
+        assert!(validate_arms_options(&Options {
+            dcid_len: 11,
+            ..Options::defaults()
+        })
+        .is_err());
+        assert!(validate_arms_options(&Options {
+            dcid_len: 11,
+            ..targeted.clone()
+        })
+        .is_ok());
+        // An explicit-membership realm refuses a passive tail.
+        let explicit = Options {
+            raid_membership_explicit: true,
+            sessions: 10,
+            active_workload_sessions: Some(8),
+            ..Options::defaults()
+        };
+        assert!(validate_arms_options(&explicit).is_err());
+        assert!(validate_arms_options(&Options {
+            active_workload_sessions: Some(10),
+            ..explicit.clone()
+        })
+        .is_ok());
+        assert!(validate_arms_options(&Options {
+            role: Role::RaidSubscriber,
+            ..explicit.clone()
+        })
+        .is_ok());
+        // An anchored storm needs a cohort.
+        assert!(validate_arms_options(&Options {
+            storm_anchored: true,
+            ..Options::defaults()
+        })
+        .is_err());
+        assert!(validate_arms_options(&Options {
+            storm_anchored: true,
+            storm_cohort: 5,
+            ..Options::defaults()
+        })
+        .is_ok());
+    }
+
+    #[test]
+    fn arms_report_is_valid_json_shaped_and_keyed_by_server_id() {
+        let options = Options {
+            shard_count: Some(3),
+            target_slot: Some(1),
+            storm_anchored: true,
+            storm_cohort: 2,
+            raid_membership_explicit: true,
+            ..Options::defaults()
+        };
+        let shared = Shared::with_shards(4, 3);
+        shared.reconnect_initial_late.record_signed(2_000_000);
+        shared.reconnect_initials.fetch_add(1, Ordering::Relaxed);
+        let anchored = AnchoredStorm {
+            sever_unix_ms: Some(10),
+            ..AnchoredStorm::default()
+        };
+        let json = arms_json(
+            &options,
+            &shared,
+            ArmsSnapshots {
+                steady_entry: Some(&[1, 2, 3]),
+                storm_end: None,
+                idle: Some(&[0, 0, 0]),
+            },
+            &anchored,
+        );
+        for needle in [
+            "\"shardCount\":3",
+            "\"targetSlot\":1",
+            "\"targetServerId\":2",
+            "\"dcidLen\":20",
+            "\"serverCidLen\":11",
+            "\"dcidHashPlaced\":true",
+            "\"raidMembership\":\"explicit\"",
+            "\"steadyEntry\":{\"1\":1,\"2\":2,\"3\":3}",
+            "\"stormEnd\":null",
+            "\"shards\":{\"1\":{\"steady\":{",
+            "\"3\":{\"steady\":{",
+            "\"timeline\":\"anchored\"",
+            "\"severUnixMs\":10",
+            "\"reconnectInitials\":1",
+            "\"severBarrier\":null",
+        ] {
+            assert!(json.contains(needle), "{needle} in {json}");
+        }
+        assert_eq!(json.matches('{').count(), json.matches('}').count());
+    }
+
+    #[test]
+    fn staged_phase_barrier_uses_its_own_id() {
+        let dir = unique_phase_barrier_dir("staged");
+        let id = format!("stage-{}", monotonic_ns());
+        let options = phase_barrier_options(Role::Realm, Some(&dir), &id, 1, 1_000);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let steady = rt
+            .block_on(wait_for_phase_barrier(&options, None))
+            .unwrap()
+            .unwrap();
+        let sever = rt
+            .block_on(wait_for_phase_barrier(&options, Some("sever")))
+            .unwrap()
+            .unwrap();
+        assert_eq!(steady.id, id);
+        assert_eq!(sever.id, format!("{id}-sever"));
+        assert!(Path::new(&dir).join(format!("{id}-sever.release")).exists());
+        assert!(sever.release_monotonic_ns >= steady.release_monotonic_ns);
+        let _ = fs::remove_dir_all(&dir);
     }
 }
