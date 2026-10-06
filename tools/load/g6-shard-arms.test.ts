@@ -116,6 +116,41 @@ describe("g6 shard arms state", () => {
 		]);
 		expect(full.stormSamples).toEqual([]);
 		expect(acceptSeriesPerSecond([])).toEqual([]);
+		expect("hotspot" in full).toBe(false);
+		const gaps = [50e6, 49e6];
+		const withHotspot = armsEcho({
+			state,
+			acceptSeries: [],
+			sessionKinds: kinds,
+			full: true,
+			hotspot: {
+				publisherArrivalsSteadyDrain: 3,
+				publisherStampedSteadyDrain: 3,
+				publisherGapsSteadyDrainNs: gaps,
+				ingestToForwardSteadyDrain: { count: 3 },
+			},
+		});
+		gaps.push(1);
+		// A copy: later arrivals never rewrite an emitted echo.
+		expect(withHotspot.hotspot?.publisherGapsSteadyDrainNs).toEqual([
+			50e6, 49e6,
+		]);
+		expect(withHotspot.hotspot?.publisherStampedSteadyDrain).toBe(3);
+		// Only the stop echo (full) carries the raw H4 inputs.
+		expect(
+			armsEcho({
+				state,
+				acceptSeries: [],
+				sessionKinds: kinds,
+				full: false,
+				hotspot: {
+					publisherArrivalsSteadyDrain: 0,
+					publisherStampedSteadyDrain: 0,
+					publisherGapsSteadyDrainNs: [],
+					ingestToForwardSteadyDrain: null,
+				},
+			}),
+		).not.toHaveProperty("hotspot");
 	});
 
 	test("the shard server wires the arms state without changing the steady path", () => {

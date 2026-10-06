@@ -133,11 +133,25 @@ export function recordStormSample(
  * boundary) adds the raw post-sever accept instants and the admission
  * series; the other boundaries carry counts only.
  */
+/**
+ * Shard-side H4 / V-I inputs (gate-g6-mmo §7 ingest reality, plan r6 "cadence
+ * on shard K's publisher arrivals"): the raw steady+drain publisher arrival
+ * gaps on this shard's own clock, its stamped/ingested counts and the
+ * ingest-to-forward dwell. Raw facts only; the grader computes the cadence.
+ */
+export type ShardHotspotRaw = {
+	publisherArrivalsSteadyDrain: number;
+	publisherStampedSteadyDrain: number;
+	publisherGapsSteadyDrainNs: readonly number[];
+	ingestToForwardSteadyDrain: unknown;
+};
+
 export function armsEcho(input: {
 	state: ShardArmsState;
 	acceptSeries: readonly number[];
 	sessionKinds: { player: number; raid: number; publisher: number };
 	full: boolean;
+	hotspot?: ShardHotspotRaw;
 }) {
 	const { state, acceptSeries } = input;
 	const severAtMs = state.severAtMs;
@@ -157,6 +171,16 @@ export function armsEcho(input: {
 					acceptMsAfterSever: afterSever,
 					acceptSeriesPerSecond: acceptSeriesPerSecond(acceptSeries),
 					stormSamples: state.stormSamples,
+					...(input.hotspot === undefined
+						? {}
+						: {
+								hotspot: {
+									...input.hotspot,
+									publisherGapsSteadyDrainNs: [
+										...input.hotspot.publisherGapsSteadyDrainNs,
+									],
+								},
+							}),
 				}
 			: {}),
 	};

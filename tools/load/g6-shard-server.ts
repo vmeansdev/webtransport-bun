@@ -225,6 +225,18 @@ async function main(): Promise<void> {
 			acceptSeries: state.acceptSeries,
 			sessionKinds: sessionKinds(),
 			full,
+			// The stop echo carries shard K's raw H4 inputs (empty elsewhere).
+			...(full
+				? {
+						hotspot: {
+							publisherArrivalsSteadyDrain: state.publisherArrivalsSteadyDrain,
+							publisherStampedSteadyDrain: state.publisherStampedSteadyDrain,
+							publisherGapsSteadyDrainNs: state.publisherGapsSteadyDrain,
+							ingestToForwardSteadyDrain:
+								state.ingestToForwardSteadyDrain.toJson(),
+						},
+					}
+				: {}),
 		});
 	let stormSampler: ReturnType<typeof setInterval> | null = null;
 
