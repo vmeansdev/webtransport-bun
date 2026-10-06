@@ -8,8 +8,11 @@ in, and where a number does not exist, this document says so rather than
 estimating one.
 
 G9 is a final **PASS at 600 sessions/s**. The remaining terminal exceptions are
-G2's **hardware-scoped INCOMPLETE, FINAL**, G6's
-**registered-never-dispatched / NO-VERDICT, FINAL** disposition, and G11-T's
+G2's **hardware-scoped INCOMPLETE, FINAL**, G6's **valid MISS, FINAL**
+(G6-04 under `g6-mmo-closeout/1`, single-instance home rig, all three arms;
+see the G6 status update below — the steady realm arm has since passed at
+40,000 sessions on the sharded DigitalOcean deployment, while the raid-hotspot
+and reconnect-storm arms remain unmeasured there), and G11-T's
 dual reading **C6-app MISS (final) · C6-wire PASS**. These are reported with
 the same weight as the passes: the campaign's bar was *"every gate reaches a
 terminally accounted disposition"*, not *"every gate passes."*
@@ -64,6 +67,39 @@ cleanup/lock/process proof is unretained and unproven. Parser repair
 `883059bb9940db9d22b3fa58ca199697ea1f68e1` was reviewed/pushed but is
 **UNCONSUMED**, not a G6 candidate or rerun authority. No rerun or dispatch is
 authorized without new explicit maintainer authority.
+
+**G6 status update (2026-10-06; supersedes the "no run" summary above for G6
+as a whole — the g6-mmo-02 page itself stays closed as written):**
+
+- **G6-03** (run 32666697490) was stamped MISS and later **superseded to
+  INVALID** (`.scratch/bare-metal-campaign/corrections/g6-mmo-03-invalid-grading-20260824.md`;
+  among others, hotspot H1 was bound to the wrong field).
+- **G6-04** (run 32852265326, candidate `6935e597`, 2026-08-25) is a **valid
+  MISS, terminal under `g6-mmo-closeout/1`**
+  (`.scratch/bare-metal-campaign/stamps/g6-04.md`): the single-instance server
+  passed every steady clause at 500, reached its knee at 2,500 and collapsed at
+  5,000; hotspot missed H1/H2/H3; storm missed S-C1/S-C2 at 1,000 and S-C2 at
+  5,000. The closeout authority licenses no rerun.
+- **Sharded steady realm:** `g6-sharded/1` valid MISS ×3 on S3 duty only;
+  `g6-sharded/2` **PASS at 5,000 and 15,000**, 20,000 refused-final on connect
+  errors (`.scratch/bare-metal-campaign/stamps/g6-sharded-02.md`).
+- **40k capacity closure (2026-10-04):** the unchanged steady workload passed
+  S1–S5 at **40,000 sessions in two independent cells** (S4 ACK p99 3.71 /
+  3.59 ms) on a v5 `g5-48vcpu-96gb-80gb` pair in ric1 — 24 SO_REUSEPORT shards,
+  C-PUMP receive path, stock send path, 4 owned generator processes; source
+  `e43c667f` on `probe/g6-sharded-diagnostic-01`; source-bound goal evaluator
+  PASS and independent audit PASS
+  (`.scratch/bare-metal-campaign/g6-40k-capacity-closure/final-r5-b12/`). 50,000
+  missed S4 (ACK p99 43.97 ms) and is the measured ceiling; a later
+  send-buffer A/B (`.scratch/bare-metal-campaign/g6-50k-sndbuf/`) showed a
+  4 MiB server send buffer removes SndbufErrors without improving the 50k tail
+  (server packet-processing limited, host-dependent). The maintainer set
+  **40,000 sessions as the current capacity bar**. This is a diagnostic-worktree
+  result, not a release or promotion.
+- **Open:** the raid-hotspot and reconnect-storm arms have never been measured
+  on the sharded deployment. Raid fan-out is per shard today (no cross-shard
+  path), so a sharded hotspot needs registered raid co-location or a relay and
+  a new pre-registration; `g6-mmo-closeout/1` does not license reruns.
 
 G9's stamped F-1 finding concerns admission refusals under concurrent ramps;
 see [OPERATIONS.md §Admission control: refusal is load-shaping, not rejection](../OPERATIONS.md#admission-control-refusal-is-load-shaping-not-rejection)
