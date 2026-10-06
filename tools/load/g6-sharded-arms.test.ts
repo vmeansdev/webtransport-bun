@@ -133,17 +133,19 @@ describe("generator argv", () => {
 		expect(argv).not.toContain("--dcid-len");
 	});
 
-	test("negative control: only realm process 0 opens with the 11-octet DCID", () => {
+	test("negative control: every realm process opens with the 11-octet DCID", () => {
 		const cfg = resolveArmsConfig(
 			{ SCAN_ARM: "hotspot", SCAN_NEGCTL_REALM_DCID_LEN: "11" },
 			base,
 		);
 		expect(cfg.realmNegctlDcidLen).toBe(11);
-		const argvs = [0, 1, 2, 3].map((index) =>
-			realmArmsArgs(cfg, { realmProcesses: 4, index, barrier }),
-		);
-		expect(after(argvs[0] ?? [], "--dcid-len")).toBe("11");
-		for (const argv of argvs.slice(1)) expect(argv).not.toContain("--dcid-len");
+		for (const index of [0, 1, 2, 3])
+			expect(
+				after(
+					realmArmsArgs(cfg, { realmProcesses: 4, index, barrier }),
+					"--dcid-len",
+				),
+			).toBe("11");
 		expect(() =>
 			resolveArmsConfig(
 				{ SCAN_ARM: "hotspot", SCAN_NEGCTL_REALM_DCID_LEN: "7" },

@@ -45,8 +45,10 @@ export type ArmsConfig = {
 	raidTargetSlot: number;
 	raidDcidLen: number;
 	/**
-	 * Negative control only: realm process 0 opens with this DCID length
-	 * (11 = CID_LEN, so the kernel hash places it). null is registered.
+	 * Negative control only: every realm process opens with this DCID length
+	 * (11 = CID_LEN, so the kernel hash places it). All of them, because the
+	 * client merge refuses processes that disagree on the length. null is
+	 * registered.
 	 */
 	realmNegctlDcidLen: number | null;
 	stormCohort: number;
@@ -197,7 +199,7 @@ export function realmArmsArgs(
 	const common = [
 		"--shard-count",
 		String(cfg.shards),
-		...(cfg.realmNegctlDcidLen !== null && input.index === 0
+		...(cfg.realmNegctlDcidLen !== null
 			? ["--dcid-len", String(cfg.realmNegctlDcidLen)]
 			: []),
 		"--steady-secs",
