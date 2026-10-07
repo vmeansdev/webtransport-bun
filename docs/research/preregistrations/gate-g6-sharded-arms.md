@@ -372,7 +372,11 @@ corrects §3.2 and §8 item 17 by reference.
    plan `g6-sharded-arms-storm` (`makeShardedArmsStormWorkPlan`): S1-5k,
    S2-5k, S1-40k, S2-40k in that order. Same deployment and single profile
    (§2), same cells, cohorts and roles (§4), storm maximum 600 s, R = 500 ms
-   with V-R reported only on S2-40k, and the same stop rules (§7). Budget,
+   with V-R reported only on S2-40k, and the same stop rules (§7). Run 01
+   sealed a `ladder-only` settlement, and the budget code chains a
+   `ladder-only` policy only on an `attribution-only` seal; it now admits
+   exactly one more chain: the `g6-sharded-arms-storm` plan on a sealed
+   `g6-sharded-arms` settlement of the same campaign. Budget,
    computed as §9: active 2,100 s setup + 60 s control + 4 × 600 s = 4,560 s,
    plus 600 s teardown = 5,160 s; maximum liability
    ceil(1,742,900 × 5,160 / 3,600) × 2 = **4,996,314 µUSD**. The policy

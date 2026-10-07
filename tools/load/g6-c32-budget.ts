@@ -1297,9 +1297,22 @@ export function validatePriorSpendLedger(
 	const ledger = validateSpendLedger(value);
 	const seal = ledger.entries.at(-1);
 	if (!seal) fail("prior spend ledger requires a terminal seal");
+	// The g6-sharded-arms/1 storm-only rerun (pre-registration §11) chains
+	// on run 01's own ladder-only paid settlement: same campaign, the full
+	// arms plan, a versioned work seal. Every other ladder-only policy still
+	// requires A's attribution-only settlement.
+	const armsStormRerun =
+		policy.schema === G6_C32_WORK_BUDGET_POLICY_SCHEMA &&
+		policy.workPlan.id === "g6-sharded-arms-storm" &&
+		seal.schema === G6_C32_WORK_SPEND_LEDGER_SEAL_SCHEMA &&
+		seal.settlement.policy.schema === G6_C32_WORK_BUDGET_POLICY_SCHEMA &&
+		seal.settlement.policy.lifecycle === "ladder-only" &&
+		seal.settlement.policy.campaignId === policy.campaignId &&
+		seal.settlement.policy.workPlan.id === "g6-sharded-arms";
 	if (
 		policy.schema === G6_C32_WORK_BUDGET_POLICY_SCHEMA &&
 		policy.lifecycle === "ladder-only" &&
+		!armsStormRerun &&
 		(seal.schema !== G6_C32_WORK_SPEND_LEDGER_SEAL_SCHEMA ||
 			seal.settlement.policy.lifecycle !== "attribution-only")
 	)

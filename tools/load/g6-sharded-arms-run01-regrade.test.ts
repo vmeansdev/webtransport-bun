@@ -23,8 +23,13 @@ import {
 	budgetPolicyArtifactSha256,
 	maximumLifecycleCost,
 	validateBudgetPolicy,
+	validatePriorSpendLedger,
 } from "./g6-c32-budget.ts";
-import { makeShardedArmsStormWorkPlan } from "./g6-c32-capacity-work.ts";
+import {
+	makeShardedArmsStormWorkPlan,
+	makeShardedArmsWorkPlan,
+} from "./g6-c32-capacity-work.ts";
+import { canonicalArtifactSha256 } from "./g6-c32-freeze-model.ts";
 import { readWorkCellEvidence } from "./g6-c32-work-execution.ts";
 import { gradeWorkCell } from "./g6-c32-work-grade.ts";
 import { readWorkAuthority } from "./g6-capacity-work-authority.ts";
@@ -334,5 +339,71 @@ describe.skipIf(root === null)(
 				);
 			}
 		}, 240_000);
+	},
+);
+
+describe.skipIf(root === null)(
+	"the storm-only rerun chains on run 01's sealed ledger",
+	() => {
+		const run = root as string;
+		const ledger = JSON.parse(
+			readFileSync(join(run, "terminal/final-spend-ledger.json"), "utf8"),
+		);
+		const base = JSON.parse(
+			readFileSync(
+				join(
+					run,
+					"bound/semantic/inputs/.scratch/bare-metal-campaign/plans",
+					`${RUN}-budget.json`,
+				),
+				"utf8",
+			),
+		);
+		const SEALED = 119_114_204;
+		const policy = (
+			workPlan: ReturnType<typeof makeShardedArmsWorkPlan>,
+			stages: Record<string, number>,
+		) => {
+			const active = workPlan.activeMaximumSeconds;
+			return validateBudgetPolicy({
+				...base,
+				runId: "g6-sharded-arms-storm-20261007-02",
+				spentBeforeMicrousd: SEALED,
+				workPlan,
+				allowedStages: Object.keys(stages),
+				cellMaximumSeconds: stages,
+				maximumLifecycleSeconds: active,
+				maximumLifecycleCostMicrousd: maximumLifecycleCost({
+					hourlyMicrousdByRole: base.maximumRoleHourlyMicrousd,
+					executionSeconds: active,
+					teardownReserveSeconds: base.teardownReserveSeconds,
+				}),
+				priorLedger: {
+					path: `.scratch/bare-metal-campaign/provisioning/${RUN}/terminal/final-spend-ledger.json`,
+					sha256: canonicalArtifactSha256(ledger),
+					sealedSpentMicrousd: SEALED,
+				},
+			});
+		};
+
+		test("run 01's sealed total is 119,114,204 (in-chain spend 2,033,384)", () => {
+			const storm = policy(makeShardedArmsStormWorkPlan(), { storm: 600 });
+			expect(storm.maximumLifecycleCostMicrousd).toBe(4_996_314);
+			expect(validatePriorSpendLedger(storm, ledger).sealedTotalMicrousd).toBe(
+				SEALED,
+			);
+			expect(SEALED - 117_080_820).toBe(2_033_384);
+		});
+
+		test("only the storm-only arms plan may chain on a ladder-only seal", () => {
+			// The full six-cell arms plan (a second full run) may not.
+			const full = policy(makeShardedArmsWorkPlan(), {
+				hotspot: 480,
+				storm: 600,
+			});
+			expect(() => validatePriorSpendLedger(full, ledger)).toThrow(
+				"campaign B requires A's versioned paid settlement",
+			);
+		});
 	},
 );
