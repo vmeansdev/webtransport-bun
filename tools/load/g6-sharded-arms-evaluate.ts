@@ -39,7 +39,14 @@
  *     --rehearsal-vr-ms R (refused once R is frozen)  --rehearsal-shape <cell>:<sessions>:<cohort>
  *     --rehearsal-raid-target-slot K
  */
-import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+	existsSync,
+	readdirSync,
+	readFileSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
 import { basename, join } from "node:path";
 import {
 	budgetPolicyArtifactSha256,
@@ -206,11 +213,45 @@ type SealedRun = {
 	authority: ReturnType<typeof readWorkAuthority>;
 };
 
+/** A sealed tree's SHA256SUMS: every listed file must still hash to its
+ * entry (`all`), or just the `required` ones; every required path must be
+ * listed. */
+function verifySealedSums(
+	dir: string,
+	required: readonly string[],
+	all: boolean,
+): void {
+	const listed = new Map<string, string>();
+	for (const line of readFileSync(join(dir, "SHA256SUMS"), "utf8").split(
+		"\n",
+	)) {
+		if (line === "") continue;
+		const m = /^([0-9a-f]{64}) {2}(.+)$/.exec(line);
+		if (m === null) throw Error(`${dir}: malformed SHA256SUMS line`);
+		listed.set(m[2] as string, m[1] as string);
+	}
+	for (const path of required)
+		if (!listed.has(path)) throw Error(`${dir}: ${path} is not sealed`);
+	for (const [path, sum] of listed)
+		if (
+			(all || required.includes(path)) &&
+			createHash("sha256")
+				.update(readFileSync(join(dir, path)))
+				.digest("hex") !== sum
+		)
+			throw Error(`${dir}: sealed ${path} differs from SHA256SUMS`);
+}
+
 function readSealedRun(root: string): SealedRun {
 	const runId = basename(root);
 	if (readFileSync(join(root, "RUN_STATUS"), "utf8").trim() !== "DESTROYED")
 		throw Error(`${runId}: not a sealed, destroyed run`);
 	const campaign = join(root, `campaign-${runId}`);
+	const policyPath = `semantic/inputs/.scratch/bare-metal-campaign/plans/${runId}-budget.json`;
+	// The seals, not only RUN_STATUS: the bound policy and the whole sealed
+	// campaign tree must match their SHA256SUMS.
+	verifySealedSums(join(root, "bound"), [policyPath], false);
+	verifySealedSums(campaign, ["work-authority.json"], true);
 	const authority = readWorkAuthority(campaign);
 	const policy = validateBudgetPolicy(
 		JSON.parse(
@@ -287,6 +328,14 @@ export function stampFromSealedRuns(
 		const sealedPath = join(run.campaign, "work", id, "work-grade.json");
 		if (!existsSync(sealedPath))
 			throw Error(`${run.runId} ${id}: no sealed work grade`);
+		// Every file of the cell is covered by the campaign seal.
+		verifySealedSums(
+			run.campaign,
+			readdirSync(join(run.campaign, "work", id)).map(
+				(name) => `work/${id}/${name}`,
+			),
+			false,
+		);
 		const sealed = JSON.parse(readFileSync(sealedPath, "utf8")) as WorkGrade;
 		const raw = readWorkCellEvidence(
 			run.campaign,

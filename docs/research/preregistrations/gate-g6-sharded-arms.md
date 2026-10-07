@@ -379,8 +379,9 @@ corrects §3.2 and §8 item 17 by reference.
    with V-R reported only on S2-40k, and the same stop rules (§7). Run 01
    sealed a `ladder-only` settlement, and the budget code chains a
    `ladder-only` policy only on an `attribution-only` seal; it now admits
-   exactly one more chain: the `g6-sharded-arms-storm` plan on a sealed
-   `g6-sharded-arms` settlement of the same campaign. Budget,
+   exactly one more chain: the `g6-sharded-arms-storm` plan on the sealed
+   `g6-sharded-arms` settlement of the same campaign whose run id is
+   pinned to `g6-sharded-arms-20261007-01`. Budget,
    computed as §9: active 2,100 s setup + 60 s control + 4 × 600 s = 4,560 s,
    plus 600 s teardown = 5,160 s; maximum liability
    ceil(1,742,900 × 5,160 / 3,600) × 2 = **4,996,314 µUSD**. The policy
@@ -406,7 +407,9 @@ corrects §3.2 and §8 item 17 by reference.
    stamp (`g6-sharded-arms-evaluate.ts` from scan files) reported S1-5k
    **PASS** while the sealed grade is **INVALID**: the stamp tool ran the arms
    grader only, never `validateCapacityRawCell`. Fixed before the rerun:
-   an authoritative stamp now takes sealed run roots, re-grades each cell
+   an authoritative stamp now takes sealed run roots, verifies each run's
+   seals (the whole campaign tree and the bound policy against their
+   `SHA256SUMS`, every file of each consumed cell listed), re-grades each cell
    with the sealed path itself (`readWorkCellEvidence` + `gradeWorkCell`),
    refuses any disagreement with the sealed `work-grade.json` or between the
    arms verdict and that grade (a raw-cell INVALID forces the stamped cell

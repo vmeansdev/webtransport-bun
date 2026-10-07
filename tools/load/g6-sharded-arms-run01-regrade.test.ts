@@ -6,6 +6,7 @@
  * Skipped when the sealed run is not on this machine (it is not in git).
  */
 import { afterAll, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import {
 	constants,
 	copyFileSync,
@@ -213,18 +214,63 @@ describe.skipIf(root === null)(
 					join(campaign, "work/S1-5k", name),
 					constants.COPYFILE_FICLONE,
 				);
+		const sums = (dir: string, paths: readonly string[]) =>
+			writeFileSync(
+				join(dir, "SHA256SUMS"),
+				paths
+					.map(
+						(p) =>
+							`${createHash("sha256")
+								.update(readFileSync(join(dir, p)))
+								.digest("hex")}  ${p}\n`,
+					)
+					.join(""),
+			);
+		const reseal = () => {
+			sums(join(rerun, "bound"), [
+				`semantic/inputs/.scratch/bare-metal-campaign/plans/${RERUN}-budget.json`,
+			]);
+			sums(campaign, [
+				"work-authority.json",
+				...readdirSync(join(campaign, "work/S1-5k"))
+					.filter((name) => name !== "SHA256SUMS")
+					.map((name) => `work/S1-5k/${name}`),
+			]);
+		};
+		const writeGrade = (text: string) => {
+			writeFileSync(join(campaign, "work/S1-5k/work-grade.json"), text);
+			reseal();
+		};
 		const pass = {
 			schema: "g6-c32-work-grade/1" as const,
 			nodeId: "S1-5k",
 			outcome: "PASS" as const,
 			reasons: [],
 		};
-		writeFileSync(
-			join(campaign, "work/S1-5k/work-grade.json"),
-			JSON.stringify(pass),
-		);
+		writeGrade(JSON.stringify(pass));
 		const grade: typeof gradeWorkCell = (input) =>
 			input.runId === RERUN ? pass : gradeWorkCell(input);
+
+		test("the stamp refuses a run whose sealed files differ from SHA256SUMS", () => {
+			const path = join(campaign, "work/S1-5k/scan.stdout");
+			const original = readFileSync(path);
+			writeFileSync(path, Buffer.concat([original, Buffer.from("x")]));
+			try {
+				expect(() =>
+					stampFromSealedRuns(
+						[
+							{ id: "H5k", root: run },
+							{ id: "H40k", root: run },
+							{ id: "S1-5k", root: rerun },
+						],
+						ARGV,
+						grade,
+					),
+				).toThrow("sealed work/S1-5k/scan.stdout differs from SHA256SUMS");
+			} finally {
+				writeFileSync(path, original);
+			}
+		}, 240_000);
 
 		test("hotspot from run 01, storm from the rerun, both run ids disclosed", () => {
 			const stamp = stampFromSealedRuns(
@@ -278,10 +324,7 @@ describe.skipIf(root === null)(
 				input.runId === RERUN
 					? { ...pass, outcome: "MISS" }
 					: gradeWorkCell(input);
-			writeFileSync(
-				join(campaign, "work/S1-5k/work-grade.json"),
-				JSON.stringify({ ...pass, outcome: "MISS" }),
-			);
+			writeGrade(JSON.stringify({ ...pass, outcome: "MISS" }));
 			try {
 				expect(() =>
 					stampFromSealedRuns(
@@ -295,10 +338,7 @@ describe.skipIf(root === null)(
 					),
 				).toThrow("stamp verdict PASS disagrees with the sealed grade MISS");
 			} finally {
-				writeFileSync(
-					join(campaign, "work/S1-5k/work-grade.json"),
-					JSON.stringify(pass),
-				);
+				writeGrade(JSON.stringify(pass));
 			}
 		}, 240_000);
 
@@ -307,8 +347,7 @@ describe.skipIf(root === null)(
 				input.runId === RERUN
 					? { ...pass, outcome: "INVALID", reasons: ["receipt differs"] }
 					: gradeWorkCell(input);
-			writeFileSync(
-				join(campaign, "work/S1-5k/work-grade.json"),
+			writeGrade(
 				JSON.stringify({
 					...pass,
 					outcome: "INVALID",
@@ -333,10 +372,7 @@ describe.skipIf(root === null)(
 				expect(stamp.run).toBe("INCOMPLETE");
 				expect(stamp.arms.storm.verdict).toBe("INVALID");
 			} finally {
-				writeFileSync(
-					join(campaign, "work/S1-5k/work-grade.json"),
-					JSON.stringify(pass),
-				);
+				writeGrade(JSON.stringify(pass));
 			}
 		}, 240_000);
 	},
