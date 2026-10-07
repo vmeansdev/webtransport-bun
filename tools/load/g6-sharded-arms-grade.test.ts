@@ -150,6 +150,7 @@ describe("baseline fixtures grade PASS from raw fields", () => {
 			"V-G",
 			"V-P",
 			"V-B",
+			"S-C1 accounting",
 			"V-T",
 			"V-R",
 			"V-W",
@@ -499,6 +500,42 @@ describe("failing signatures: one per falsifier", () => {
 		);
 		input.cell = { ...input.cell, id: "S2-40k", role: "characterization" };
 		expectInvalidBy(input, "V-R");
+	});
+
+	test("V-R: a missing lateness maxNs is raw-integrity INVALID, even on S2-40k", () => {
+		const input = gradeInput("storm", (scan) =>
+			editRealmReport(scan, 0, (r) => {
+				delete o(o(o(r.arms).storm).reconnectInitialLate).maxNs;
+			}),
+		);
+		input.cell = { ...input.cell, id: "S2-40k", role: "characterization" };
+		const v = expectInvalidBy(input, "V-R");
+		expect(v.invalidReasons.join(" ")).toContain(
+			"outside the highest non-empty bucket",
+		);
+	});
+
+	test("V-R: a lateness maxNs outside the highest non-empty bucket is INVALID", () => {
+		for (const maxNs of [1_000, 900_000_000, Number.NaN, -1])
+			expectInvalidBy(
+				gradeInput("storm", (scan) =>
+					editRealmReport(scan, -1, (r) => {
+						o(o(o(r.arms).storm).reconnectInitialLate).maxNs = maxNs;
+					}),
+				),
+				"V-R",
+			);
+	});
+
+	test("S-C1 accounting: a numerator above survivor sent is INVALID", () => {
+		const v = expectInvalidBy(
+			gradeInput("storm", (scan) => {
+				const shard = (scan.shards as Row[])[0] as Row;
+				o(o(shard.windows).storm).rxSurvivors = 1_000_000_000;
+			}),
+			"S-C1 accounting",
+		);
+		expect(v.invalidReasons.join(" ")).toContain("> survivor sent");
 	});
 
 	test("V-R: without a frozen R a storm cell refuses to grade", () => {

@@ -211,4 +211,8 @@ export const HISTOGRAM_BUCKETS = BUCKETS;
 export function quantizationNs(valueNs: number): number {
 	return valueNs / (2 * SUB);
 }
+/** The bucket a value falls in (the producer's bucketing; read-only checks). */
+export function latencyBucketIndex(ns: number): number {
+	return bucketIndex(ns);
+}
 export const __testing = { bucketIndex, bucketValue };

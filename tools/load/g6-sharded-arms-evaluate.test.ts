@@ -112,6 +112,34 @@ describe("g6-sharded-arms stamp roll-up", () => {
 		);
 		expect(dry.authoritative).toBe(false);
 	});
+
+	test("a clause INCOMPLETE stops the roll-up like INVALID", () => {
+		expect(() =>
+			rollUpShardedArms(
+				[
+					cell("H5k", "PASS"),
+					cell("H40k", "INCOMPLETE"),
+					cell("S1-5k", "PASS"),
+				],
+				official,
+			),
+		).toThrow("after an INVALID or INCOMPLETE");
+		// A last-cell INCOMPLETE (even the characterization cell) is not COMPLETE.
+		const stamp = rollUpShardedArms(
+			[
+				cell("H5k", "PASS"),
+				cell("H40k", "PASS"),
+				cell("S1-5k", "PASS"),
+				cell("S2-5k", "PASS"),
+				cell("S1-40k", "PASS"),
+				cell("S2-40k", "INCOMPLETE"),
+			],
+			official,
+		);
+		expect(stamp.run).toBe("INCOMPLETE");
+		expect(stamp.arms.storm.verdict).toBe("PASS");
+		expect(stamp.sources).toEqual([]);
+	});
 });
 
 describe("V-R's R in the stamp", () => {
