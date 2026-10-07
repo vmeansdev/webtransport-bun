@@ -2031,7 +2031,7 @@ describe("G6 c32 atomic host-bound freeze", () => {
 		).toThrow(/not an ancestor of the current harness/);
 	}, 120_000);
 
-	test("historical replay accepts only the exact pre-fan-out and pre-arms input sets", async () => {
+	test("historical replay accepts only the exact pre-fan-out, pre-arms and arms run-01 input sets", async () => {
 		const fixture = await makeBindingFixture();
 		let tick = 1n;
 		const result = await bindHostFreeze(fixture.bindInput, {
@@ -2041,7 +2041,8 @@ describe("G6 c32 atomic host-bound freeze", () => {
 			},
 			randomId: () => "pre-fanout-set",
 		});
-		const arms = [...SHARDED_ARMS_CAMPAIGN_INPUT_PATHS];
+		const storm = [...SHARDED_ARMS_STORM_CAMPAIGN_INPUT_PATHS];
+		const arms = [...SHARDED_ARMS_CAMPAIGN_INPUT_PATHS, ...storm];
 		for (const [name, drop] of [
 			[
 				"earlier",
@@ -2052,8 +2053,11 @@ describe("G6 c32 atomic host-bound freeze", () => {
 				],
 			],
 			["pre-arms", arms],
+			// Sealed g6-sharded-arms-20261007-01: the arms inputs, no storm-rerun set.
+			["arms-run-01", storm],
 			["partial", ["tools/load/g6-client-merge.ts", ...arms]],
-			["partial-arms", ["tools/load/g6-sharded-arms-grade.ts"]],
+			["partial-arms", ["tools/load/g6-sharded-arms-grade.ts", ...storm]],
+			["partial-storm", ["tools/load/latency-stamp.ts"]],
 		] as const) {
 			const copy = join(fixture.provisioningRoot, `input-set-${name}`);
 			cpSync(result.root, copy, { recursive: true });
@@ -2073,7 +2077,11 @@ describe("G6 c32 atomic host-bound freeze", () => {
 			resealBoundFixture(copy);
 			const verify = () =>
 				verifyRetainedBoundFreeze(copy, { repositoryPath: fixture.root });
-			if (name === "partial" || name === "partial-arms")
+			if (
+				name === "partial" ||
+				name === "partial-arms" ||
+				name === "partial-storm"
+			)
 				expect(verify).toThrow(/complete fixed input set/);
 			else expect(verify).not.toThrow(/complete fixed input set/);
 		}
