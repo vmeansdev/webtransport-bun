@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { maximumLifecycleCost, validateBudgetPolicy } from "./g6-c32-budget.ts";
 import {
 	makeCapacityLadderWorkPlan,
+	makeShardedArmsStormWorkPlan,
 	makeShardedArmsWorkPlan,
 } from "./g6-c32-capacity-work.ts";
 import { workCellArguments } from "./g6-c32-work-cli.ts";
@@ -91,6 +92,71 @@ describe("sharded-arms campaign plan (g6-sharded-arms/1)", () => {
 		expect(policy.maximumLifecycleCostMicrousd).toBe(5_925_860);
 	});
 
+	test("storm-only rerun plan: the four storm cells, same maxima and stop rules", () => {
+		const full = makeShardedArmsWorkPlan();
+		const plan = makeShardedArmsStormWorkPlan();
+		expect(plan.id).toBe("g6-sharded-arms-storm");
+		expect(plan.entry).toBe("S1-5k");
+		expect(plan.nodes.map((n) => n.id)).toEqual([
+			"S1-5k",
+			"S2-5k",
+			"S1-40k",
+			"S2-40k",
+		]);
+		for (const node of plan.nodes) {
+			const same = full.nodes.find((n) => n.id === node.id);
+			// Identical storm cells (ids, sessions, maxima, edges) to the
+			// registered plan; only the hotspot prefix is absent.
+			expect(node).toEqual(same as never);
+		}
+		expect([
+			plan.setupMaximumSeconds,
+			plan.controlMaximumSeconds,
+			plan.teardownReserveSeconds,
+			plan.activeMaximumSeconds,
+		]).toEqual([2100, 60, 600, 4560]);
+		const branches = enumerateWorkPlanBranches(plan);
+		expect(Math.max(...branches.map((b) => b.totalSeconds))).toBe(5160);
+		// Liability as registered (§9 method): ceil(1,742,900 x 5,160 / 3,600) x 2.
+		const cost = maximumLifecycleCost({
+			hourlyMicrousdByRole: { server: ROLE_PRICE, generator: ROLE_PRICE },
+			executionSeconds: 4560,
+			teardownReserveSeconds: 600,
+		});
+		expect(cost).toBe(4_996_314);
+		const policy = validateBudgetPolicy({
+			schema: "g6-c32-budget-policy/2",
+			campaignId: "g6-sharded-arms",
+			runId: "g6-sharded-arms-storm-1",
+			currency: "USD",
+			lifecycle: "ladder-only",
+			totalBudgetMicrousd: 143_544_166,
+			spentBeforeMicrousd: 119_114_204,
+			maximumRoleHourlyMicrousd: { server: ROLE_PRICE, generator: ROLE_PRICE },
+			maximumLifecycleSeconds: 4560,
+			teardownReserveSeconds: 600,
+			maximumLifecycleCostMicrousd: cost,
+			cellMaximumSeconds: { storm: 600 },
+			allowedStages: ["storm"],
+			priorLedger: {
+				path: "prior.json",
+				sha256: "b".repeat(64),
+				sealedSpentMicrousd: 119_114_204,
+			},
+			workPlan: plan,
+			workProfiles: makeShardedArmsWorkProfiles(closed40k),
+		});
+		expect(policy.maximumLifecycleCostMicrousd).toBe(4_996_314);
+		expect(validateWorkProfiles(plan, { candidate: closed40k })).toEqual({
+			candidate: closed40k,
+		});
+		expect(() =>
+			validateWorkProfiles(plan, {
+				candidate: { ...closed40k, detailedProbe: true },
+			}),
+		).toThrow("closed 40k deployment");
+	});
+
 	test("only the closed 40k deployment profile is accepted", () => {
 		const plan = makeShardedArmsWorkPlan();
 		expect(validateWorkProfiles(plan, { candidate: closed40k })).toEqual({
@@ -149,12 +215,14 @@ describe("sharded-arms campaign plan (g6-sharded-arms/1)", () => {
 			cohort: 0,
 			raidTargetSlot: 0,
 			steadySeconds: 120,
+			drainToIdleMs: null,
 		});
 		expect(armsRawShape(node("S1-5k"))).toEqual({
 			arm: "storm",
 			cohort: 1000,
 			raidTargetSlot: 0,
 			steadySeconds: 60,
+			drainToIdleMs: 182_000,
 		});
 		expect(armsRawShape(makeCapacityLadderWorkPlan().nodes[0] as never)).toBe(
 			null,

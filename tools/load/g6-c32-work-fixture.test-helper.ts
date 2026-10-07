@@ -316,10 +316,43 @@ const phaseTimes = [
 	120_150_000_000n,
 	120_200_000_000n,
 ];
+/**
+ * One shard's native send-path evidence at the given phase instants
+ * (unarmed, connect, steady, drain, idle; monotonic ns). The default is the
+ * steady path's 120 s steady and 50 ms drain->idle; stop follows idle by
+ * 25 ms and the final snapshot by 50 ms.
+ */
+export function nativeShardFixture(
+	serverId: number,
+	pid: number,
+	batch: number,
+	times: readonly bigint[] = phaseTimes,
+): WorkGradeFixtureDiagnostic["sendPathDiagnostics"]["shards"][number] {
+	const idle = requireDefined(times[4]);
+	return {
+		serverId,
+		pid,
+		boundaries: Object.fromEntries([
+			...NATIVE_PHASES.map((phase, i) => [
+				phase,
+				nativeSnapshot(i, batch, false, times),
+			]),
+			[
+				"stop",
+				{
+					...nativeSnapshot(4, batch, false, times),
+					monoNs: String(idle + 25_000_000n),
+				},
+			],
+		]) as WorkGradeFixtureDiagnostic["sendPathDiagnostics"]["shards"][number]["boundaries"],
+		final: nativeSnapshot(4, batch, true, times),
+	};
+}
 function nativeSnapshot(
 	index: number,
 	batch: number,
 	finalized = false,
+	times: readonly bigint[] = phaseTimes,
 ): NativeSendPathSnapshot {
 	const phase = requireDefined(NATIVE_PHASES[index]);
 	return {
@@ -328,7 +361,7 @@ function nativeSnapshot(
 		finalized,
 		phase,
 		monoNs: String(
-			requireDefined(phaseTimes[index]) + (finalized ? 50_000_000n : 1n),
+			requireDefined(times[index]) + (finalized ? 50_000_000n : 1n),
 		),
 		phaseOrder: [...NATIVE_PHASES],
 		bucketUpperBoundsNs: Array.from({ length: 31 }, (_, i) => 1000 * 2 ** i),
@@ -341,12 +374,12 @@ function nativeSnapshot(
 							kind: kind as "reflector" | "udp-socket",
 							phase,
 							createdPhase: "connect",
-							createdNs: String(phaseTimes[1]),
+							createdNs: String(times[1]),
 							errors: 0,
 							cuts: NATIVE_PHASES.slice(2, index + 1).map((phase, i) => ({
 								phase,
-								beginNs: String(phaseTimes[i + 2]),
-								endNs: String(phaseTimes[i + 2]),
+								beginNs: String(times[i + 2]),
+								endNs: String(times[i + 2]),
 							})),
 							phases: NATIVE_PHASES.slice(1).map((phase) => ({
 								phase,
@@ -647,24 +680,7 @@ export function workGradeFixture(
 		producerSha256: "c".repeat(64),
 		shards: diagnostic.perShardLifecycle.map((row, i) => {
 			row.pid = i + 101;
-			return {
-				serverId: row.serverId,
-				pid: row.pid,
-				boundaries: Object.fromEntries([
-					...NATIVE_PHASES.map((phase, i) => [
-						phase,
-						nativeSnapshot(i, profile.udpSendBatch),
-					]),
-					[
-						"stop",
-						{
-							...nativeSnapshot(4, profile.udpSendBatch),
-							monoNs: "120225000000",
-						},
-					],
-				]) as WorkGradeFixtureDiagnostic["sendPathDiagnostics"]["shards"][number]["boundaries"],
-				final: nativeSnapshot(4, profile.udpSendBatch, true),
-			};
+			return nativeShardFixture(row.serverId, row.pid, profile.udpSendBatch);
 		}),
 	};
 	const operation = operationFixture(

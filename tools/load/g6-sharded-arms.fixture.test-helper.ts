@@ -208,8 +208,10 @@ export function armsScanFixture(
 			: {}),
 	});
 	const survivorsByShard = (shard: number) =>
-		// cohort sessions are each process's first local, placed on shard 1.
-		shard === 1 ? perShard - cohortPerProcess : perShard;
+		// cohort sessions are each process's first locals, filling shard 1
+		// first (a whole-realm S2 cohort spans every shard).
+		perShard -
+		Math.min(perShard, Math.max(0, cohortPerProcess - (shard - 1) * perShard));
 	const processReport = (i: number, total: number) => {
 		const windows = realmWindows(total);
 		if (arm === "storm")

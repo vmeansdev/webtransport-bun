@@ -41,6 +41,12 @@ export type ArmsRawShape = {
 	raidTargetSlot: number;
 	/** Registered steady window: hotspot 120 s, storm 60 s. */
 	steadySeconds: number;
+	/**
+	 * Registered native/probe drain->idle span. Storm: 1 s drain + 1,000 ms
+	 * reconnect delay + 120 s storm window + 60 s post-storm = 182,000 ms
+	 * (all inside the server's drain phase). Hotspot: null (unchanged).
+	 */
+	drainToIdleMs: number | null;
 };
 
 const STEADY_PHASES = ["connect", "steady", "drain", "idle", "stop"];

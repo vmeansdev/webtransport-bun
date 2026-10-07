@@ -8,6 +8,7 @@
 import { describe, expect, test } from "bun:test";
 import { makeShardedArmsWorkPlan } from "./g6-c32-capacity-work.ts";
 import {
+	nativeShardFixture,
 	workGradeFixture,
 	workProfileFixture,
 } from "./g6-c32-work-fixture.test-helper.ts";
@@ -19,7 +20,12 @@ import {
 	editRealmReport,
 	hist,
 } from "./g6-sharded-arms.fixture.test-helper.ts";
-import { SHARDED_ARMS_V_R_MS } from "./g6-sharded-arms-grade.ts";
+import {
+	SHARDED_ARMS_CELLS,
+	SHARDED_ARMS_REGISTERED,
+	SHARDED_ARMS_V_R_MS,
+	shardedArmsCell,
+} from "./g6-sharded-arms-grade.ts";
 
 type Row = Record<string, unknown>;
 const o = (v: unknown) => v as Row;
@@ -36,13 +42,40 @@ const profile: WorkProfile = {
 	fixedSourcePortBase: 20_000,
 };
 const REHEARSAL_VR = { ms: 250, source: "rehearsal" as const };
+const R = SHARDED_ARMS_REGISTERED;
+/** §3.3: the 1 s drain between steady and sever. */
+const DRAIN_MS = 1000;
 
-function armsWorkCell(nodeId: "H5k" | "S1-5k", mutate?: (scan: Row) => void) {
+/**
+ * The registered phase spans of a kind (pre-registration §3.3): hotspot 120 s
+ * steady and the 50 ms fixture drain; storm 60 s steady, then the 1 s drain,
+ * sever, 1,000 ms, the 120 s storm window and the 60 s post-storm, all inside
+ * the server's drain phase (182,000 ms drain->idle; sealed S1-5k: 181,997).
+ */
+function kindSpans(arm: "hotspot" | "storm") {
+	return arm === "storm"
+		? {
+				steadyMs: R.stormSteadySeconds * 1000,
+				drainToIdleMs:
+					DRAIN_MS +
+					R.stormReconnectDelayMs +
+					(R.stormWindowSeconds + R.postStormSeconds) * 1000,
+			}
+		: { steadyMs: R.hotspotSteadySeconds * 1000, drainToIdleMs: 50 };
+}
+
+type NativeShape = { steadyMs?: number; drainToIdleMs?: number };
+
+function armsWorkCell(
+	nodeId: string,
+	mutate?: (scan: Row) => void,
+	native: NativeShape = {},
+) {
 	const node = makeShardedArmsWorkPlan().nodes.find((n) => n.id === nodeId);
 	if (node === undefined) throw Error(nodeId);
 	const input = workGradeFixture({ node, profile });
 	const arm = node.kind as "hotspot" | "storm";
-	const cohort = nodeId === "S1-5k" ? 1000 : 0;
+	const cohort = arm === "storm" ? shardedArmsCell(nodeId).cohort : 0;
 	// The controller's arm env, exactly as the registered cell sets it.
 	const args = (input.operation as unknown as { action: { args: string[] } })
 		.action.args;
@@ -109,12 +142,21 @@ function armsWorkCell(nodeId: "H5k" | "S1-5k", mutate?: (scan: Row) => void) {
 		for (const key of Object.keys(o(ws[0]?.emitter)))
 			emitter[key] = ws.reduce((t, w) => t + Number(o(w.emitter)[key]), 0);
 	}
+	const spans = kindSpans(arm);
+	const diagnostic = o(input.diagnostic);
 	if (arm === "storm") {
-		// The storm's lifecycle: 60 s steady, then sever / storm / post-storm,
-		// all inside the scan operation's interval.
+		// The storm's lifecycle at the registered timings: 60 s steady, 1 s
+		// drain, sever, 1,000 ms, 120 s storm window, 60 s post-storm, then
+		// idle; all inside the scan operation's interval.
 		const startMs = Date.parse(String(scan.startedAt));
-		o(aggregate.steady).wallMsMax = 60_000;
-		const offsets = [0, 50, 60_050, 61_050, 62_050, 120_000, 120_100, 120_200];
+		o(aggregate.steady).wallMsMax = spans.steadyMs;
+		const steadyAt = 50,
+			drainAt = steadyAt + spans.steadyMs,
+			severAt = drainAt + DRAIN_MS,
+			stormAt = severAt + R.stormReconnectDelayMs,
+			postAt = stormAt + R.stormWindowSeconds * 1000,
+			idleAt = postAt + R.postStormSeconds * 1000;
+		const offsets = [0, steadyAt, drainAt, severAt, stormAt, postAt, idleAt];
 		const phases = [
 			"connect",
 			"steady",
@@ -125,16 +167,160 @@ function armsWorkCell(nodeId: "H5k" | "S1-5k", mutate?: (scan: Row) => void) {
 			"idle",
 			"stop",
 		];
-		for (const row of o(input.diagnostic).perShardLifecycle as Row[])
+		for (const row of diagnostic.perShardLifecycle as Row[]) {
 			row.boundaries = phases.map((phase, i) => ({
 				phase,
-				tsMs: startMs + (offsets[i] ?? 0),
+				tsMs: startMs + (offsets[i] ?? idleAt + 100),
 			}));
+			row.exits = [{ code: 0, signal: null, tsMs: startMs + idleAt + 200 }];
+		}
+		o(diagnostic.postRunSteering).capturedAtMs = startMs + idleAt + 500;
+		const operation = input.operation as unknown as Row;
+		const finishedAt = new Date(startMs + idleAt + 1000).toISOString();
+		operation.finishedAt = finishedAt;
+		operation.durationMonotonicNs = String(
+			BigInt(Date.parse(finishedAt) - Date.parse(String(operation.startedAt))) *
+				1_000_000n,
+		);
 	}
+	// Native send-path boundaries from the same per-kind spans as the
+	// lifecycle (the field the coverage check reads), unless a control
+	// overrides them.
+	const steadyNs = BigInt(native.steadyMs ?? spans.steadyMs) * 1_000_000n,
+		drainToIdleNs =
+			BigInt(native.drainToIdleMs ?? spans.drainToIdleMs) * 1_000_000n;
+	const times = [
+		1n,
+		100_000_000n,
+		150_000_000n,
+		150_000_000n + steadyNs,
+		150_000_000n + steadyNs + drainToIdleNs,
+	];
+	const sendPath = o(diagnostic.sendPathDiagnostics);
+	sendPath.shards = (sendPath.shards as Row[]).map((shard) =>
+		nativeShardFixture(
+			Number(shard.serverId),
+			Number(shard.pid),
+			profile.udpSendBatch,
+			times,
+		),
+	);
 	scan.arms = arms.arms;
 	mutate?.(scan);
 	return input;
 }
+
+/** Native (ms) and lifecycle (ms) spans of shard 0: steady->drain, drain->idle. */
+function spansOf(input: ReturnType<typeof armsWorkCell>) {
+	const d = o(input.diagnostic);
+	const shard = (o(d.sendPathDiagnostics).shards as Row[])[0] as Row;
+	const b = o(shard.boundaries);
+	const mono = (k: string) => Number(BigInt(String(o(b[k]).monoNs)) / 1000n);
+	const life = ((d.perShardLifecycle as Row[])[0] as Row).boundaries as {
+		phase: string;
+		tsMs: number;
+	}[];
+	const at = (k: string) =>
+		(life.find((x) => x.phase === k) as { tsMs: number }).tsMs;
+	return {
+		native: [
+			(mono("drain") - mono("steady")) / 1000,
+			(mono("idle") - mono("drain")) / 1000,
+		],
+		lifecycle: [at("drain") - at("steady"), at("idle") - at("drain")],
+	};
+}
+
+const COVERAGE_RED =
+	"g6-capacity-diagnostic-coverage: native steady phase does not span the rated window";
+
+describe("arms work-cell fixture: native boundaries consistent with the lifecycle", () => {
+	test.each(SHARDED_ARMS_CELLS.map((c) => c.id))("%s", (id) => {
+		const spans = spansOf(armsWorkCell(id));
+		expect(spans.native).toEqual(spans.lifecycle);
+		expect(spans.native).toEqual(
+			shardedArmsCell(id).arm === "storm" ? [60_000, 182_000] : [120_000, 50],
+		);
+	});
+});
+
+describe("gradeWorkCell: storm coverage windows (run 01's S1-5k INVALID)", () => {
+	test("storm raw cell: full gradeWorkCell path with storm-shaped native phases", () => {
+		// Red at 440632c7: the coverage check hard-coded a 120 s native steady,
+		// so this cell graded INVALID with exactly COVERAGE_RED, the sealed
+		// reason of run 01's S1-5k (g6-sharded-arms-20261007-01).
+		const grade = gradeWorkCell(armsWorkCell("S1-5k"));
+		expect(grade.reasons).not.toContain(COVERAGE_RED);
+		expect(grade).toEqual({
+			schema: "g6-c32-work-grade/1",
+			nodeId: "S1-5k",
+			outcome: "PASS",
+			reasons: [],
+		});
+	});
+
+	test.each(
+		SHARDED_ARMS_CELLS.map((c) => c.id),
+	)("%s grades through gradeWorkCell with kind-consistent native phases", (id) => {
+		const grade = gradeWorkCell(armsWorkCell(id));
+		// S2 cells sever the whole realm: S-C1 (not gated there) has no
+		// survivors to grade.
+		expect(grade.reasons).toEqual(
+			id.startsWith("S2-")
+				? ["S-C1 does not apply: the whole realm was severed"]
+				: [],
+		);
+		expect(grade.outcome).toBe("PASS");
+	});
+
+	test("negative control: a storm cell with a 120 s native steady is INVALID", () => {
+		const grade = gradeWorkCell(
+			armsWorkCell("S1-5k", undefined, { steadyMs: 120_000 }),
+		);
+		expect(grade).toMatchObject({
+			outcome: "INVALID",
+			reasons: [COVERAGE_RED],
+		});
+	});
+
+	test("negative control: a storm whose drain->idle is 100 s does not cover the storm", () => {
+		for (const drainToIdleMs of [100_000, 181_700, 182_300]) {
+			const grade = gradeWorkCell(
+				armsWorkCell("S1-40k", undefined, { drainToIdleMs }),
+			);
+			expect(grade).toMatchObject({
+				outcome: "INVALID",
+				reasons: [
+					"g6-capacity-diagnostic-coverage: native drain phase does not span the registered storm",
+				],
+			});
+		}
+		// Inside the registered tolerance (sealed S1-5k: 181,997 ms).
+		expect(
+			gradeWorkCell(
+				armsWorkCell("S1-40k", undefined, { drainToIdleMs: 181_997 }),
+			).outcome,
+		).toBe("PASS");
+	});
+
+	test("negative control: a hotspot cell with a 60 s native steady is INVALID", () => {
+		const grade = gradeWorkCell(
+			armsWorkCell("H40k", undefined, { steadyMs: 60_000 }),
+		);
+		expect(grade).toMatchObject({
+			outcome: "INVALID",
+			reasons: [COVERAGE_RED],
+		});
+	});
+
+	test("hotspot timing is unchanged: no drain-span requirement", () => {
+		// A hotspot drain->idle far from the storm span still grades PASS.
+		expect(
+			gradeWorkCell(armsWorkCell("H5k", undefined, { drainToIdleMs: 995 }))
+				.outcome,
+		).toBe("PASS");
+	});
+});
 
 describe("gradeWorkCell: sharded arms from a full raw work cell", () => {
 	test("hotspot PASS", () => {

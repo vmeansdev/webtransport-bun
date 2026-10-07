@@ -384,6 +384,14 @@ export function armsRawShape(node: WorkNode): ArmsRawShape | null {
 			cell.arm === "storm"
 				? SHARDED_ARMS_REGISTERED.stormSteadySeconds
 				: SHARDED_ARMS_REGISTERED.hotspotSteadySeconds,
+		drainToIdleMs:
+			cell.arm === "storm"
+				? SHARDED_ARMS_REGISTERED.drainSeconds * 1000 +
+					SHARDED_ARMS_REGISTERED.stormReconnectDelayMs +
+					(SHARDED_ARMS_REGISTERED.stormWindowSeconds +
+						SHARDED_ARMS_REGISTERED.postStormSeconds) *
+						1000
+				: null,
 	};
 }
 
@@ -550,6 +558,7 @@ export function validateCapacityRawCell(
 		probeProducerSha256: input.probeProducerSha256,
 		probeText: input.probe,
 		operation,
+		arms,
 	});
 	const binding = object(diagnostic.linuxProbe, "Linux probe binding"),
 		mode = object(binding.measurementMode, "Linux probe mode");

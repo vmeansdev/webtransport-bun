@@ -65,6 +65,7 @@ import { G6_SHARDED_CLAUSES } from "./g6-sharded-grade.ts";
 import {
 	LatencyHistogram,
 	type LatencyHistogramJson,
+	latencyBucketIndex,
 } from "./latency-histogram.ts";
 
 /* ------------------------------------------------------------------------ */
@@ -163,6 +164,8 @@ export const SHARDED_ARMS_REGISTERED = Object.freeze({
 	dcidLen: 20,
 	hotspotSteadySeconds: 120,
 	stormSteadySeconds: 60,
+	/** §3.3: the 1 s drain between steady and sever (both kinds). */
+	drainSeconds: 1,
 	stormReconnectDelayMs: 1000,
 	stormWindowSeconds: 120,
 	postStormSeconds: 60,
@@ -1266,6 +1269,34 @@ function vBarrier(ctx: Ctx): FalsifierResult {
 }
 
 /**
+ * The latest lateness sample (ms), or null when the producer's `maxNs` is
+ * missing, not finite, or outside the highest non-empty bucket — a raw
+ * integrity finding (it forces INVALID even where lateness is reported only).
+ * An empty histogram has no latest sample: 0.
+ */
+function lateMaxMs(
+	h: LatencyHistogramJson,
+	label: string,
+	reasons: string[],
+): number | null {
+	if (bucketSum(h) === 0) return 0;
+	const top = Math.max(...h.buckets.map((entry) => Number(entry[0])));
+	const maxNs = (h as { maxNs?: unknown }).maxNs;
+	if (
+		typeof maxNs !== "number" ||
+		!Number.isFinite(maxNs) ||
+		maxNs < 0 ||
+		latencyBucketIndex(maxNs) !== top
+	) {
+		reasons.push(
+			`${label}: lateness maxNs ${String(maxNs)} is missing or outside the highest non-empty bucket ${top}`,
+		);
+		return null;
+	}
+	return maxNs / 1e6;
+}
+
+/**
  * V-R: every cohort reconnect's first Initial within R ms of sever + 1,000 ms.
  * `late` holds the threshold findings (an Initial later than R); `reasons`
  * the raw-integrity ones. On a gate cell both force; on the characterization
@@ -1308,8 +1339,8 @@ function vReconnectIssue(ctx: Ctx): { reasons: string[]; late: string[] } {
 			reasons.push(
 				`V-R process ${i}: ${late.negative} Initial(s) issued before sever + 1,000 ms`,
 			);
-		const maxMs = (bucketSum(late) > 0 ? late.maxNs : 0) / 1e6;
-		if (maxMs > R.ms)
+		const maxMs = lateMaxMs(late, `V-R process ${i}`, reasons);
+		if (maxMs !== null && maxMs > R.ms)
 			lateReasons.push(
 				`V-R process ${i}: latest first Initial ${maxMs.toFixed(3)} ms > R ${R.ms} ms`,
 			);
@@ -1331,9 +1362,10 @@ function vReconnectIssue(ctx: Ctx): { reasons: string[]; late: string[] } {
 		)
 	)
 		reasons.push("V-R: merged lateness is not the bucket sum of the processes");
-	if ((bucketSum(merged) > 0 ? merged.maxNs : 0) / 1e6 > R.ms)
+	const mergedMaxMs = lateMaxMs(merged, "V-R merged", reasons);
+	if (mergedMaxMs !== null && mergedMaxMs > R.ms)
 		lateReasons.push(
-			`V-R merged: latest first Initial ${(merged.maxNs / 1e6).toFixed(3)} ms > R ${R.ms} ms`,
+			`V-R merged: latest first Initial ${mergedMaxMs.toFixed(3)} ms > R ${R.ms} ms`,
 		);
 	return { reasons, late: lateReasons };
 }
@@ -1954,6 +1986,18 @@ function gradeStorm(
 	);
 	const survivorAcksReflected = int(surv.rxAck, "survivor rxAck");
 	const survivorServerRx = survivorMovesJs + survivorAcksReflected;
+	// The lower bound can never exceed what the survivors sent: a numerator
+	// above survivor `sent` means double counting (raw integrity, INVALID).
+	guard("S-C1 accounting", () =>
+		run(
+			"S-C1 accounting",
+			survivorSessions > 0 && survivorServerRx > int(surv.sent, "survivor sent")
+				? [
+						`S-C1 numerator ${survivorServerRx} (rxSurvivors ${survivorMovesJs} + rxAck ${survivorAcksReflected}) > survivor sent ${int(surv.sent, "survivor sent")}`,
+					]
+				: [],
+		),
+	);
 	const atClose = maybeObj(at(st, "sessionsByShardAtStormEnd"))?.server;
 	const activeAtClose = Object.values(
 		obj(atClose, "server counts at storm end"),

@@ -5,6 +5,7 @@ import {
 	validateRfc3339Millis,
 } from "./g6-c32-freeze-model.ts";
 import type { WorkProfile } from "./g6-c32-work-profile.ts";
+import type { ArmsRawShape } from "./g6-capacity-raw-work.ts";
 import {
 	NATIVE_PHASES,
 	type NativeSendPathSnapshot,
@@ -66,11 +67,35 @@ function count(value: unknown, label: string, positive = false): number {
 function ms(value: unknown): number {
 	return Date.parse(validateRfc3339Millis(value, "adapter timestamp"));
 }
+/**
+ * The phase spans a cell kind registers. The steady path (and every sealed
+ * pre-arms freeze) is 120 s steady with no drain-span requirement. A
+ * sharded-arms cell brings its own steady window (hotspot 120 s, storm 60 s);
+ * a storm cell also runs sever, the reconnect delay, the storm window and the
+ * post-storm inside the native/probe `drain` phase, so its drain->idle span
+ * must cover exactly that (g6-sharded-arms/1 §3.3), at the same tolerance.
+ */
+export function coverageSpans(arms: ArmsRawShape | null): {
+	steadyMs: number;
+	drainToIdleMs: number | null;
+} {
+	return {
+		steadyMs: (arms?.steadySeconds ?? G6_SHARDED_VALIDITY.steadySeconds) * 1000,
+		drainToIdleMs: arms?.arm === "storm" ? arms.drainToIdleMs : null,
+	};
+}
+function within(spanMs: number, expectedMs: number): boolean {
+	return (
+		Math.abs(spanMs - expectedMs) <= G6_SHARDED_VALIDITY.steadyWallMsTolerance
+	);
+}
 export function validateNative(
 	diagnostic: RecordValue,
 	p: WorkProfile,
 	expectedProducer: string,
+	arms: ArmsRawShape | null = null,
 ): NativeSendPathSnapshot[] {
+	const spans = coverageSpans(arms);
 	const native = exact(
 		diagnostic.sendPathDiagnostics,
 		["enabled", "measurementMode", "producerSha256", "shards"],
@@ -128,10 +153,19 @@ export function validateNative(
 				required(phaseTimes.get("drain"), "native drain time") -
 					required(phaseTimes.get("steady"), "native steady time"),
 			) / 1e6;
-		if (
-			Math.abs(durationMs - 120000) > G6_SHARDED_VALIDITY.steadyWallMsTolerance
-		)
+		if (!within(durationMs, spans.steadyMs))
 			fail("native steady phase does not span the rated window");
+		if (
+			spans.drainToIdleMs !== null &&
+			!within(
+				Number(
+					required(phaseTimes.get("idle"), "native idle time") -
+						required(phaseTimes.get("drain"), "native drain time"),
+				) / 1e6,
+				spans.drainToIdleMs,
+			)
+		)
+			fail("native drain phase does not span the registered storm");
 		// Stop observes shutdown while still idle; it is not another phase bank.
 		const stop = parseNativeSendPath(boundaries.stop, {
 			enabled: true,
@@ -163,6 +197,8 @@ export function validateCapacityDiagnosticCoverage(input: {
 	probeProducerSha256: string;
 	probeText: string | null;
 	operation: unknown;
+	/** The sharded-arms kind's registered shape; null on the steady path. */
+	arms?: ArmsRawShape | null;
 }): { native: NativeSendPathSnapshot[]; probe: ParsedLinuxProbeJsonl | null } {
 	const diagnostic = object(input.diagnostic, "diagnostic"),
 		operation = validateOperationReceipt(input.operation);
@@ -173,10 +209,13 @@ export function validateCapacityDiagnosticCoverage(input: {
 		BigInt(operation.durationMonotonicNs) < 120_000_000_000n
 	)
 		fail("diagnostic scan lacks its complete successful operation");
+	const arms = input.arms ?? null,
+		spans = coverageSpans(arms);
 	const snapshots = validateNative(
 		diagnostic,
 		input.profile,
 		input.nativeProducerSha256,
+		arms,
 	);
 	const observed = { reflectQueueWait: 0, reflectSendCall: 0 };
 	for (const snapshot of snapshots)
@@ -230,12 +269,15 @@ export function validateCapacityDiagnosticCoverage(input: {
 	)
 		fail("Linux probe escaped this scan operation");
 	const steady = BigInt(parsed.phaseBoundaries.steady.monotonicNs),
-		drain = BigInt(parsed.phaseBoundaries.drain.monotonicNs);
-	if (
-		Math.abs(Number(drain - steady) / 1e6 - 120000) >
-		G6_SHARDED_VALIDITY.steadyWallMsTolerance
-	)
+		drain = BigInt(parsed.phaseBoundaries.drain.monotonicNs),
+		idle = BigInt(parsed.phaseBoundaries.idle.monotonicNs);
+	if (!within(Number(drain - steady) / 1e6, spans.steadyMs))
 		fail("Linux steady phase does not cover the rated workload");
+	if (
+		spans.drainToIdleMs !== null &&
+		!within(Number(idle - drain) / 1e6, spans.drainToIdleMs)
+	)
+		fail("Linux drain phase does not cover the registered storm");
 	for (const kind of ["queue", "sched"] as const) {
 		const cadenceMs = finite(
 			parsed.summary[`${kind}CadenceMs`],
@@ -250,6 +292,14 @@ export function validateCapacityDiagnosticCoverage(input: {
 			drain - BigInt(extent.lastNs) > cadence
 		)
 			fail("Linux probe samples do not span the steady phase");
+		if (spans.drainToIdleMs !== null) {
+			const stormExtent = parsed.phaseSampleExtents.drain[kind];
+			if (
+				BigInt(stormExtent.firstNs) - drain > cadence ||
+				idle - BigInt(stormExtent.lastNs) > cadence
+			)
+				fail("Linux probe samples do not span the storm drain phase");
+		}
 	}
 	return { native: snapshots, probe: parsed };
 }

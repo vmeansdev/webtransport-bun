@@ -3,16 +3,19 @@ import captured from "./fixtures/g6-native-boundaries-a0-1.json";
 import { requireDefined } from "./g6-c32-freeze-model.ts";
 import { validateNative as attributionNative } from "./g6-c32-send-path-evaluate.ts";
 import {
+	nativeShardFixture,
 	workGradeFixture,
 	workProbeFixture,
 	workProfileFixture,
 } from "./g6-c32-work-fixture.test-helper.ts";
 import type { WorkProfile } from "./g6-c32-work-profile.ts";
 import {
+	coverageSpans,
 	validateCapacityDiagnosticCoverage,
 	validateNative,
 } from "./g6-capacity-diagnostic-coverage.ts";
 import { validateCapacityDiagnosticCoverage as finalCoverage } from "./g6-capacity-goal-adapters.ts";
+import type { ArmsRawShape } from "./g6-capacity-raw-work.ts";
 import { linuxProbeFixtureText } from "./g6-linux-probe-fixture.ts";
 import { parseLinuxProbeJsonl } from "./g6-sharded-diagnostic.ts";
 
@@ -230,4 +233,81 @@ test("shared coverage needs a full successful operation even when probe is off",
 	const input = fixture(false);
 	input.operation.durationMonotonicNs = "50000000";
 	expect(() => validateCapacityDiagnosticCoverage(input)).toThrow(/operation/);
+});
+
+const HOTSPOT: ArmsRawShape = {
+	arm: "hotspot",
+	cohort: 0,
+	raidTargetSlot: 0,
+	steadySeconds: 120,
+	drainToIdleMs: null,
+};
+const STORM: ArmsRawShape = {
+	arm: "storm",
+	cohort: 1000,
+	raidTargetSlot: 0,
+	steadySeconds: 60,
+	drainToIdleMs: 182_000,
+};
+
+test("coverage spans per kind: steady path and hotspot unchanged, storm 60 s + 182 s", () => {
+	expect(coverageSpans(null)).toEqual({
+		steadyMs: 120_000,
+		drainToIdleMs: null,
+	});
+	expect(coverageSpans(HOTSPOT)).toEqual({
+		steadyMs: 120_000,
+		drainToIdleMs: null,
+	});
+	expect(coverageSpans(STORM)).toEqual({
+		steadyMs: 60_000,
+		drainToIdleMs: 182_000,
+	});
+});
+
+test("native coverage takes the kind's spans; the steady-path default is unchanged", () => {
+	const input = fixture(false);
+	const args = [input.diagnostic, input.profile, "c".repeat(64)] as const;
+	expect(validateNative(...args)).toHaveLength(1);
+	expect(validateNative(...args, HOTSPOT)).toHaveLength(1);
+	expect(() => validateNative(...args, STORM)).toThrow(
+		"native steady phase does not span the rated window",
+	);
+	// Storm-shaped native phases: 60 s steady, then the 182 s storm drain.
+	const shard = requireDefined(input.diagnostic.sendPathDiagnostics.shards[0]);
+	input.diagnostic.sendPathDiagnostics.shards[0] = nativeShardFixture(
+		shard.serverId,
+		shard.pid,
+		input.profile.udpSendBatch,
+		[1n, 100_000_000n, 150_000_000n, 60_150_000_000n, 242_150_000_000n],
+	);
+	expect(validateNative(...args, STORM)).toHaveLength(1);
+	expect(() => validateNative(...args)).toThrow(
+		"native steady phase does not span the rated window",
+	);
+	expect(() =>
+		validateNative(...args, { ...STORM, drainToIdleMs: 100_000 }),
+	).toThrow("native drain phase does not span the registered storm");
+});
+
+test("the Linux probe storm drain span is checked too (latent twin)", () => {
+	const input = fixture(true);
+	expect(
+		validateCapacityDiagnosticCoverage({ ...input, arms: HOTSPOT }).probe,
+	).not.toBeNull();
+	// Native steady 120 s and a 182 s storm drain, so the native check passes
+	// and the probe's short drain->idle is what fails.
+	const shard = requireDefined(input.diagnostic.sendPathDiagnostics.shards[0]);
+	input.diagnostic.sendPathDiagnostics.shards[0] = nativeShardFixture(
+		shard.serverId,
+		shard.pid,
+		input.profile.udpSendBatch,
+		[1n, 100_000_000n, 150_000_000n, 120_150_000_000n, 302_150_000_000n],
+	);
+	expect(() =>
+		validateCapacityDiagnosticCoverage({
+			...input,
+			arms: { ...STORM, steadySeconds: 120 },
+		}),
+	).toThrow("Linux drain phase does not cover the registered storm");
 });
