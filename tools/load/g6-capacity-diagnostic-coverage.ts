@@ -73,7 +73,8 @@ function ms(value: unknown): number {
  * sharded-arms cell brings its own steady window (hotspot 120 s, storm 60 s);
  * a storm cell also runs sever, the reconnect delay, the storm window and the
  * post-storm inside the native/probe `drain` phase, so its drain->idle span
- * must cover exactly that (g6-sharded-arms/1 §3.3), at the same tolerance.
+ * must cover that (g6-sharded-arms/1 §3.3): at least the registered span
+ * minus the same tolerance, with no upper bound.
  */
 export function coverageSpans(arms: ArmsRawShape | null): {
 	steadyMs: number;
@@ -88,6 +89,11 @@ function within(spanMs: number, expectedMs: number): boolean {
 	return (
 		Math.abs(spanMs - expectedMs) <= G6_SHARDED_VALIDITY.steadyWallMsTolerance
 	);
+}
+/** Coverage of the storm drain needs only a lower bound: an overrun past the
+ * registered span (sever barrier, sleeps, marker latency) still covers it. */
+function covers(spanMs: number, expectedMs: number): boolean {
+	return spanMs >= expectedMs - G6_SHARDED_VALIDITY.steadyWallMsTolerance;
 }
 export function validateNative(
 	diagnostic: RecordValue,
@@ -157,7 +163,7 @@ export function validateNative(
 			fail("native steady phase does not span the rated window");
 		if (
 			spans.drainToIdleMs !== null &&
-			!within(
+			!covers(
 				Number(
 					required(phaseTimes.get("idle"), "native idle time") -
 						required(phaseTimes.get("drain"), "native drain time"),
@@ -275,7 +281,7 @@ export function validateCapacityDiagnosticCoverage(input: {
 		fail("Linux steady phase does not cover the rated workload");
 	if (
 		spans.drainToIdleMs !== null &&
-		!within(Number(idle - drain) / 1e6, spans.drainToIdleMs)
+		!covers(Number(idle - drain) / 1e6, spans.drainToIdleMs)
 	)
 		fail("Linux drain phase does not cover the registered storm");
 	for (const kind of ["queue", "sched"] as const) {

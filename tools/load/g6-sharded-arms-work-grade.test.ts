@@ -283,8 +283,8 @@ describe("gradeWorkCell: storm coverage windows (run 01's S1-5k INVALID)", () =>
 		});
 	});
 
-	test("negative control: a storm whose drain->idle is 100 s does not cover the storm", () => {
-		for (const drainToIdleMs of [100_000, 181_700, 182_300]) {
+	test("negative control: a storm whose drain->idle is short does not cover the storm", () => {
+		for (const drainToIdleMs of [100_000, 181_700]) {
 			const grade = gradeWorkCell(
 				armsWorkCell("S1-40k", undefined, { drainToIdleMs }),
 			);
@@ -295,12 +295,36 @@ describe("gradeWorkCell: storm coverage windows (run 01's S1-5k INVALID)", () =>
 				],
 			});
 		}
-		// Inside the registered tolerance (sealed S1-5k: 181,997 ms).
-		expect(
-			gradeWorkCell(
-				armsWorkCell("S1-40k", undefined, { drainToIdleMs: 181_997 }),
-			).outcome,
-		).toBe("PASS");
+		// Covered: at or above the registered span minus 250 ms (sealed S1-5k:
+		// 181,997 ms). The bound is one-sided: an overrun still covers the storm.
+		for (const drainToIdleMs of [181_750, 181_997, 182_300, 190_000])
+			expect(
+				gradeWorkCell(armsWorkCell("S1-40k", undefined, { drainToIdleMs }))
+					.outcome,
+			).toBe("PASS");
+	});
+
+	test("S1-40k: an S-C1 numerator 200 datagrams above survivor sent (window misalignment) is not INVALID", () => {
+		const grade = gradeWorkCell(
+			armsWorkCell("S1-40k", (scan) => {
+				let sent = 0,
+					rxAck = 0;
+				editRealmReport(scan, -1, (r) => {
+					const w = o(o(r.windows).stormSurvivors);
+					sent = Number(w.sent);
+					rxAck = Number(w.rxAck);
+				});
+				const shards = scan.shards as Row[];
+				const storm = (i: number) => o(o((shards[i] as Row).windows).storm);
+				const others = shards
+					.slice(1)
+					.reduce((t, _, i) => t + Number(storm(i + 1).rxSurvivors), 0);
+				// Numerator = sum rxSurvivors + rxAck = sent + 200.
+				storm(0).rxSurvivors = sent + 200 - rxAck - others;
+			}),
+		);
+		expect(grade.outcome).toBe("PASS");
+		expect(grade.reasons).toEqual([]);
 	});
 
 	test("negative control: a hotspot cell with a 60 s native steady is INVALID", () => {

@@ -285,8 +285,16 @@ test("native coverage takes the kind's spans; the steady-path default is unchang
 	expect(() => validateNative(...args)).toThrow(
 		"native steady phase does not span the rated window",
 	);
+	// One-sided: 182,000 ms covers any registered span up to 182,250 ms, and
+	// an overrun past the registered span still covers it.
+	expect(
+		validateNative(...args, { ...STORM, drainToIdleMs: 182_250 }),
+	).toHaveLength(1);
+	expect(
+		validateNative(...args, { ...STORM, drainToIdleMs: 150_000 }),
+	).toHaveLength(1);
 	expect(() =>
-		validateNative(...args, { ...STORM, drainToIdleMs: 100_000 }),
+		validateNative(...args, { ...STORM, drainToIdleMs: 182_300 }),
 	).toThrow("native drain phase does not span the registered storm");
 });
 

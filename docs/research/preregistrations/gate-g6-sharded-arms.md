@@ -352,11 +352,15 @@ corrects §3.2 and §8 item 17 by reference.
 3. **The fix.** The coverage check now receives the cell kind's registered
    shape. Native (and Linux-probe) steady→drain must span the kind's steady
    window: 120 s for the steady path and hotspot cells, unchanged, and 60 s
-   for storm cells. For storm cells the drain→idle span must also equal
-   1 s drain + 1,000 ms + 120 s + 60 s = 182,000 ms. The Linux-probe drain
-   samples must cover that span at the probe cadence; the probe is off in
-   this gate's profile, so that branch is latent here. Every span uses the
-   registered ±250 ms tolerance (gate-g6-sharded `steadyWallMsTolerance`).
+   for storm cells. For storm cells the drain→idle span must also cover
+   1 s drain + 1,000 ms + 120 s + 60 s = 182,000 ms: it must be at least
+   182,000 − 250 ms, with no upper bound, because an overrun (sever
+   barrier, sleeps, marker latency) still covers the storm and is not a
+   coverage gap. The Linux-probe drain samples must cover that span at the
+   probe cadence; the probe is off in this gate's profile, so that branch is
+   latent here. Steady spans keep the registered two-sided ±250 ms tolerance
+   (gate-g6-sharded `steadyWallMsTolerance`; §6 RAW registers the steady
+   wall the same way).
    This is the validity check that the evidence covers the windows §3.3
    already registers, now applied per kind. No threshold or window moves:
    hotspot cells keep exactly their former check, and the steady path and
@@ -412,15 +416,22 @@ corrects §3.2 and §8 item 17 by reference.
    non-authoritative dry stamp. A clause INCOMPLETE stops the stamp roll-up
    like INVALID (§7; the roll-up previously let a last-cell INCOMPLETE read
    COMPLETE).
-9. **Two raw-integrity checks added (review findings; no threshold).** V-R
-   requires each lateness histogram's `maxNs` to be finite and inside its
-   highest non-empty bucket; otherwise it is raw-integrity INVALID, which
-   forces even on S2-40k, as V-R's other integrity checks do. S-C1's
-   registered numerator (§8 item 4) must not exceed survivor `sent`;
-   otherwise the cell is INVALID (`S-C1 accounting`) as double counting.
-   Both can only fire on malformed producer output. Run 01's S1-5k raw cell
-   satisfies both (maxNs in its top bucket on every process; numerator
-   1,917,497 ≤ sent 1,917,502).
+9. **One raw-integrity check and one disclosure added (review findings; no
+   threshold).** V-R requires each lateness histogram's `maxNs` to be
+   finite and inside its highest non-empty bucket; otherwise it is
+   raw-integrity INVALID, which forces even on S2-40k, as V-R's other
+   integrity checks do. It can only fire on malformed producer output (the
+   histogram is serialized after the storm, quiesced). S-C1's registered
+   numerator (§8 item 4) is compared with survivor `sent` and **reported
+   only** (`characterization["S-C1 accounting"]`: numerator, its parts,
+   survivor sent and the difference). It is not a validity check: the
+   numerator's server part is counted in the shard storm window and `sent`
+   in each client's own window (Disclosure 8), so a correct cell can
+   exceed `sent` by the window misalignment (ms-scale × the survivor rate;
+   hundreds of datagrams at 40k). A numerator above `sent` only means
+   delivery ≥ 1, so the gated delivery bar is never at risk from it. Run
+   01's S1-5k: maxNs in its top bucket on every process; numerator
+   1,917,497 vs sent 1,917,502.
 10. **Run 01's in-chain spend: 2,033,384 µUSD** (sealed chain total
     117,080,820 → 119,114,204 µUSD).
 11. **Freeze binding.** The rerun's semantic freeze binds this document,

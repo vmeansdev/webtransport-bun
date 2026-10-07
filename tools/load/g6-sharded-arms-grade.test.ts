@@ -150,7 +150,6 @@ describe("baseline fixtures grade PASS from raw fields", () => {
 			"V-G",
 			"V-P",
 			"V-B",
-			"S-C1 accounting",
 			"V-T",
 			"V-R",
 			"V-W",
@@ -527,15 +526,28 @@ describe("failing signatures: one per falsifier", () => {
 			);
 	});
 
-	test("S-C1 accounting: a numerator above survivor sent is INVALID", () => {
-		const v = expectInvalidBy(
-			gradeInput("storm", (scan) => {
-				const shard = (scan.shards as Row[])[0] as Row;
-				o(o(shard.windows).storm).rxSurvivors = 1_000_000_000;
-			}),
-			"S-C1 accounting",
+	test("S-C1 accounting: a numerator above survivor sent by window misalignment is reported, not INVALID", () => {
+		const baseline = o(
+			grade(gradeInput("storm")).characterization["S-C1 accounting"],
 		);
-		expect(v.invalidReasons.join(" ")).toContain("> survivor sent");
+		expect(baseline.verdictForce).toBe(false);
+		// 200 datagrams over sent: about 1.5 ms of window misalignment at the
+		// S1-40k survivor rate (about 130 datagrams/ms), on a correct cell.
+		const over = 200 - Number(baseline.numeratorMinusSent);
+		const v = grade(
+			gradeInput("storm", (scan) => {
+				const w = o(o(((scan.shards as Row[])[0] as Row).windows).storm);
+				w.rxSurvivors = Number(w.rxSurvivors) + over;
+			}),
+		);
+		expect(v.verdict).toBe("PASS");
+		expect(v.invalidReasons).toEqual([]);
+		expect(v.falsifiers.map((f) => f.id)).not.toContain("S-C1 accounting");
+		expect(o(v.characterization["S-C1 accounting"])).toMatchObject({
+			verdictForce: false,
+			numeratorMinusSent: 200,
+		});
+		expect(v.clauses.find((c) => c.id === "S-C1")?.verdict).toBe("PASS");
 	});
 
 	test("V-R: without a frozen R a storm cell refuses to grade", () => {
