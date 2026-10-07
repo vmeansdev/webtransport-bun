@@ -321,3 +321,112 @@ Disclosures:
   review → INCOMPLETE and exact-owned teardown.
 - The run is sealed before destruction, and absence is verified afterwards.
 - Stamp, then an independent audit.
+
+## 11. Addendum A — run 01, the coverage defect and the storm-only rerun (2026-10-07)
+
+Written after run 01 and before any rerun is frozen. It changes no
+threshold, window, tolerance, cell, cohort, maximum, R or stop rule in
+§1–§10. Original text above is left as registered; the erratum in item 7
+corrects §3.2 and §8 item 17 by reference.
+
+1. **Run 01.** `g6-sharded-arms-20261007-01` (candidate `440632c7`,
+   freeze authority `3f8bdaab…4ec9e`) ran H5k, H40k and S1-5k, then stopped
+   INCOMPLETE as §7 requires. It was sealed and destroyed (`RUN_STATUS`
+   DESTROYED, terminal `TEARDOWN_VERIFIED`). Sealed `gradeWorkCell`
+   outcomes: **H5k PASS, H40k PASS, S1-5k INVALID** with the single reason
+   `g6-capacity-diagnostic-coverage: native steady phase does not span the
+   rated window`.
+2. **The S1-5k INVALID is a harness defect, not a measurement.** The raw-cell
+   coverage check (`validateNative` in
+   `tools/load/g6-capacity-diagnostic-coverage.ts`, run inside
+   `validateCapacityRawCell` before the arms grader) hard-coded the steady
+   path's 120 s native steady→drain span. A storm cell registers 60 s
+   steady (§3.3) and runs the 1 s drain, sever, the 1,000 ms delay, the
+   120 s storm window and the 60 s post-storm inside the server's `drain`
+   phase. Sealed S1-5k shows steady→drain 60,006 ms on all 24 shards and
+   drain→idle 181,997 ms, exactly the registered shape. Every storm cell
+   would have failed identically. Every other raw-cell check already took
+   the per-kind shape; this one never received it, and the test fixture
+   left the native boundaries hotspot-shaped, so the test suite could not
+   see it. Run 01's S1-5k is not graded and no verdict is claimed from it.
+3. **The fix.** The coverage check now receives the cell kind's registered
+   shape. Native (and Linux-probe) steady→drain must span the kind's steady
+   window: 120 s for the steady path and hotspot cells, unchanged, and 60 s
+   for storm cells. For storm cells the drain→idle span must also equal
+   1 s drain + 1,000 ms + 120 s + 60 s = 182,000 ms. The Linux-probe drain
+   samples must cover that span at the probe cadence; the probe is off in
+   this gate's profile, so that branch is latent here. Every span uses the
+   registered ±250 ms tolerance (gate-g6-sharded `steadyWallMsTolerance`).
+   This is the validity check that the evidence covers the windows §3.3
+   already registers, now applied per kind. No threshold or window moves:
+   hotspot cells keep exactly their former check, and the steady path and
+   every older sealed freeze (B-12, P1, P2, run 01) replay unchanged. The
+   storm window is still required to be covered; it is not excluded.
+4. **The hotspot verdict stands from run 01.** H40k PASS (the hotspot gate)
+   and H5k PASS (bridge) are sealed and were graded by the paid path; the
+   corrected coverage code does not change them (re-graded read-only from
+   the sealed raw cells, `tools/load/g6-sharded-arms-run01-regrade.test.ts`).
+   §7's "a later storm INVALID never voids hotspot cells already stamped"
+   applies. No hotspot cell is rerun.
+5. **Storm-only rerun.** Run id `g6-sharded-arms-storm-20261007-02`, work
+   plan `g6-sharded-arms-storm` (`makeShardedArmsStormWorkPlan`): S1-5k,
+   S2-5k, S1-40k, S2-40k in that order. Same deployment and single profile
+   (§2), same cells, cohorts and roles (§4), storm maximum 600 s, R = 500 ms
+   with V-R reported only on S2-40k, and the same stop rules (§7). Budget,
+   computed as §9: active 2,100 s setup + 60 s control + 4 × 600 s = 4,560 s,
+   plus 600 s teardown = 5,160 s; maximum liability
+   ceil(1,742,900 × 5,160 / 3,600) × 2 = **4,996,314 µUSD**. The policy
+   chains to run 01's final ledger (sealed chain total **119,114,204 µUSD**).
+   Ceiling **143,544,166 µUSD** (unchanged). Remaining in chain 24,429,962
+   µUSD (19,433,648 after the liability). Out-of-chain spend (B-10, B-11,
+   network probes, ≈ 6.24 M µUSD) is unchanged, so true spend before the
+   rerun is ≈ 125.36 M µUSD, ≈ 18.19 M µUSD remains in truth, and the true
+   worst case after the rerun is ≈ 130.35 M µUSD, below the ceiling.
+6. **One gate stamp from two runs.** The `g6-sharded-arms/1` stamp combines
+   run 01's sealed H5k and H40k with the rerun's storm cells, in registered
+   order, and names both run ids (`sources`). Run 01's S1-5k is listed as
+   superseded by the rerun with its sealed outcome and reason. The storm
+   verdict is the worst of the rerun's S1-5k, S2-5k and S1-40k (§7).
+7. **Erratum: idle timeout.** §3.2 and §8 item 17 say "idle timeout 300 s".
+   The QUIC idle timeout is **60 s** (`mmo_client.rs` `MAX_IDLE`; QUIC uses
+   the minimum of the peers). The 300 s value is the client's
+   `connect_timeout` default, which does not wrap the storm reconnect path.
+   No threshold, window or code path reads that sentence. The true value is
+   the more favourable one: stalled reconnects resolve, and stale severed
+   sessions expire, well inside the storm window plus post-storm.
+8. **Run-01 stamp/grade disagreement found in audit.** Run 01's readout
+   stamp (`g6-sharded-arms-evaluate.ts` from scan files) reported S1-5k
+   **PASS** while the sealed grade is **INVALID**: the stamp tool ran the arms
+   grader only, never `validateCapacityRawCell`. Fixed before the rerun:
+   an authoritative stamp now takes sealed run roots, re-grades each cell
+   with the sealed path itself (`readWorkCellEvidence` + `gradeWorkCell`),
+   refuses any disagreement with the sealed `work-grade.json` or between the
+   arms verdict and that grade (a raw-cell INVALID forces the stamped cell
+   INVALID), and pins its argv: `--shards 24 --client-processes 4
+   --endpoints 128` and `--fixed-source-port-base` equal to the sealed
+   profile's, refusing when it is missing. A scan-file stamp is now always a
+   non-authoritative dry stamp. A clause INCOMPLETE stops the stamp roll-up
+   like INVALID (§7; the roll-up previously let a last-cell INCOMPLETE read
+   COMPLETE).
+9. **Two raw-integrity checks added (review findings; no threshold).** V-R
+   requires each lateness histogram's `maxNs` to be finite and inside its
+   highest non-empty bucket; otherwise it is raw-integrity INVALID, which
+   forces even on S2-40k, as V-R's other integrity checks do. S-C1's
+   registered numerator (§8 item 4) must not exceed survivor `sent`;
+   otherwise the cell is INVALID (`S-C1 accounting`) as double counting.
+   Both can only fire on malformed producer output. Run 01's S1-5k raw cell
+   satisfies both (maxNs in its top bucket on every process; numerator
+   1,917,497 ≤ sent 1,917,502).
+10. **Run 01's in-chain spend: 2,033,384 µUSD** (sealed chain total
+    117,080,820 → 119,114,204 µUSD).
+11. **Freeze binding.** The rerun's semantic freeze binds this document,
+    the corrected coverage path (`g6-capacity-diagnostic-coverage.ts`,
+    `g6-capacity-raw-cell.ts`, `g6-capacity-raw-work.ts`), the stamp
+    evaluator and grader, and adds `g6-server-core.ts`, `g6-artifact.ts`,
+    `latency-histogram.ts` and `latency-stamp.ts`, which run 01 bound only
+    through the candidate tree (`SHARDED_ARMS_STORM_CAMPAIGN_INPUT_PATHS`).
+12. **Authority.** The user chose "Fix + storm-only rerun (Recommended)" on
+    2026-10-07 after seeing run 01's results
+    (`.scratch/bare-metal-campaign/g6-40k-capacity-closure/authority/20261007-storm-rerun-authority.md`).
+    Sequential Architect → Critic approval of the exact freeze, the
+    exact-host review and every other gate in §10 apply unchanged.
