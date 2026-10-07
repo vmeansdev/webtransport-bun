@@ -32,6 +32,7 @@ import {
 	runQualificationCli,
 	type SemanticFreezeDependencies,
 	SHARDED_ARMS_CAMPAIGN_INPUT_PATHS,
+	SHARDED_ARMS_STORM_CAMPAIGN_INPUT_PATHS,
 	validateLockedExactPair,
 	verifyBoundFreeze,
 	verifyRetainedBoundFreeze,
@@ -1716,9 +1717,34 @@ describe("G6 c32 atomic host-bound freeze", () => {
 			expect(DEFAULT_CAMPAIGN_INPUT_PATHS).toContain(path);
 		expect(
 			DEFAULT_CAMPAIGN_INPUT_PATHS.slice(
-				-SHARDED_ARMS_CAMPAIGN_INPUT_PATHS.length,
+				-(
+					SHARDED_ARMS_CAMPAIGN_INPUT_PATHS.length +
+					SHARDED_ARMS_STORM_CAMPAIGN_INPUT_PATHS.length
+				),
 			),
-		).toEqual([...SHARDED_ARMS_CAMPAIGN_INPUT_PATHS]);
+		).toEqual([
+			...SHARDED_ARMS_CAMPAIGN_INPUT_PATHS,
+			...SHARDED_ARMS_STORM_CAMPAIGN_INPUT_PATHS,
+		]);
+	});
+
+	test("the storm-only rerun binds the coverage path and the reused server/histogram code", () => {
+		for (const path of [
+			"tools/load/g6-capacity-diagnostic-coverage.ts",
+			"tools/load/g6-capacity-raw-cell.ts",
+			"tools/load/g6-capacity-raw-work.ts",
+			"tools/load/g6-c32-work-grade.ts",
+			"tools/load/g6-server-core.ts",
+			"tools/load/g6-artifact.ts",
+			"tools/load/latency-histogram.ts",
+			"tools/load/latency-stamp.ts",
+		] as const)
+			expect(DEFAULT_CAMPAIGN_INPUT_PATHS).toContain(path);
+		expect(
+			DEFAULT_CAMPAIGN_INPUT_PATHS.slice(
+				-SHARDED_ARMS_STORM_CAMPAIGN_INPUT_PATHS.length,
+			),
+		).toEqual([...SHARDED_ARMS_STORM_CAMPAIGN_INPUT_PATHS]);
 	});
 
 	test("freezes the executable real Linux process-group proof input", () => {

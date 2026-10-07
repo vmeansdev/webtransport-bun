@@ -107,6 +107,19 @@ export const SHARDED_ARMS_CAMPAIGN_INPUT_PATHS = [
 	"examples/quic-lb/steer_by_cid.bpf.c",
 ] as const;
 
+/**
+ * Inputs bound since the g6-sharded-arms/1 run 01 freeze (storm-only rerun,
+ * pre-registration §11): the reused shard server core and artifact writer,
+ * and the histogram/stamp code the arms grader's percentiles rest on. They
+ * were bound only through the candidate tree before.
+ */
+export const SHARDED_ARMS_STORM_CAMPAIGN_INPUT_PATHS = [
+	"tools/load/g6-server-core.ts",
+	"tools/load/g6-artifact.ts",
+	"tools/load/latency-histogram.ts",
+	"tools/load/latency-stamp.ts",
+] as const;
+
 export const DEFAULT_CAMPAIGN_INPUT_PATHS = [
 	"crates/native/src/datagram_reflector.rs",
 	"crates/native/src/lib.rs",
@@ -190,6 +203,8 @@ export const DEFAULT_CAMPAIGN_INPUT_PATHS = [
 	"tools/load/g6-capacity-local-receipt.ts",
 	// g6-sharded-arms/1 (see SHARDED_ARMS_CAMPAIGN_INPUT_PATHS).
 	...SHARDED_ARMS_CAMPAIGN_INPUT_PATHS,
+	// g6-sharded-arms/1 storm-only rerun.
+	...SHARDED_ARMS_STORM_CAMPAIGN_INPUT_PATHS,
 ] as const;
 
 export type CreateSemanticFreezeInput = {
@@ -774,12 +789,20 @@ const LATER_CAMPAIGN_INPUT_PATHS = [
 	"tools/load/g6-generator-fanout.ts",
 	"tools/load/g6-client-merge.ts",
 ] as const;
-const PRE_ARMS_CAMPAIGN_INPUT_PATHS = DEFAULT_CAMPAIGN_INPUT_PATHS.filter(
+const ARMS_RUN_01_CAMPAIGN_INPUT_PATHS = DEFAULT_CAMPAIGN_INPUT_PATHS.filter(
+	(path) =>
+		!(SHARDED_ARMS_STORM_CAMPAIGN_INPUT_PATHS as readonly string[]).includes(
+			path,
+		),
+);
+const PRE_ARMS_CAMPAIGN_INPUT_PATHS = ARMS_RUN_01_CAMPAIGN_INPUT_PATHS.filter(
 	(path) =>
 		!(SHARDED_ARMS_CAMPAIGN_INPUT_PATHS as readonly string[]).includes(path),
 );
 const RETAINED_CAMPAIGN_INPUT_PATH_SETS: readonly (readonly string[])[] = [
 	DEFAULT_CAMPAIGN_INPUT_PATHS,
+	// Sealed g6-sharded-arms-20261007-01 (g6-sharded-arms/1 run 01).
+	ARMS_RUN_01_CAMPAIGN_INPUT_PATHS,
 	// Sealed before g6-sharded-arms/1 (B-12, the send-buffer pairs).
 	PRE_ARMS_CAMPAIGN_INPUT_PATHS,
 	PRE_ARMS_CAMPAIGN_INPUT_PATHS.filter(
