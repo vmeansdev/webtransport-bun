@@ -223,6 +223,10 @@ export function makeSendBufferAbWorkPlan(
 }
 
 export const SHARDED_ARMS_PLAN_ID = "g6-sharded-arms";
+/** Storm-only rerun of g6-sharded-arms/1 (pre-registration §11): the four
+ * storm cells after run 01's harness-INVALID S1-5k; the hotspot verdict
+ * stands from run 01. */
+export const SHARDED_ARMS_STORM_PLAN_ID = "g6-sharded-arms-storm";
 
 /** Sharded arms (pre-registration g6-sharded-arms/1, plan r6) on one pair:
  * H5k, H40k, S1-5k, S2-5k, S1-40k, S2-40k in that order, every cell on the
@@ -231,14 +235,32 @@ export const SHARDED_ARMS_PLAN_ID = "g6-sharded-arms";
  * continue; INVALID stops INCOMPLETE (stamped hotspot cells stand). Each
  * cell's arm, sessions and cohort come from SHARDED_ARMS_CELLS by node id. */
 export function makeShardedArmsWorkPlan(): WorkPlan {
-	const cells = SHARDED_ARMS_CELLS;
+	return shardedArmsWorkPlan(SHARDED_ARMS_PLAN_ID, SHARDED_ARMS_CELLS, 5520);
+}
+
+/** The storm-only rerun: S1-5k, S2-5k, S1-40k, S2-40k in registered order,
+ * the same deployment, maxima (storm 600 s), setup/control/teardown and stop
+ * rules; 2100 + 60 + 4 x 600 = 4,560 s active. */
+export function makeShardedArmsStormWorkPlan(): WorkPlan {
+	return shardedArmsWorkPlan(
+		SHARDED_ARMS_STORM_PLAN_ID,
+		SHARDED_ARMS_CELLS.filter((cell) => cell.arm === "storm"),
+		4560,
+	);
+}
+
+function shardedArmsWorkPlan(
+	id: string,
+	cells: readonly (typeof SHARDED_ARMS_CELLS)[number][],
+	activeMaximumSeconds: number,
+): WorkPlan {
 	return validateWorkPlan({
 		schema: "g6-c32-work-plan/1",
-		id: SHARDED_ARMS_PLAN_ID,
+		id,
 		setupMaximumSeconds: 2100,
 		controlMaximumSeconds: 60,
 		teardownReserveSeconds: 600,
-		activeMaximumSeconds: 5520,
+		activeMaximumSeconds,
 		profiles: ["candidate"],
 		entry: requireDefined(cells[0]).id,
 		nodes: cells.map(

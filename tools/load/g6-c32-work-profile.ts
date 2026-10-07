@@ -259,7 +259,10 @@ export function makeSendBufferWorkProfiles(
  * deployment exactly — the r5 probe-off ladder candidate (pump, stock send
  * path, probe off, default send buffer) with 24 shards and 4 generator
  * processes. Source-encoded so policy can bind nothing else. */
-export const SHARDED_ARMS_PLAN_IDS = ["g6-sharded-arms"] as const;
+export const SHARDED_ARMS_PLAN_IDS = [
+	"g6-sharded-arms",
+	"g6-sharded-arms-storm",
+] as const;
 export const SHARDED_ARMS_SHARDS = 24;
 export const SHARDED_ARMS_CLIENT_PROCESSES = 4;
 export function makeShardedArmsWorkProfiles(
