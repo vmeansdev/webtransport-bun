@@ -200,8 +200,11 @@ describe.skipIf(root === null)(
 		);
 		authority.runId = RERUN;
 		authority.policySha256 = budgetPolicyArtifactSha256(policy);
-		for (const role of ["server", "generator"])
+		// A second, fresh pair (pre-registration §11 item 5).
+		for (const role of ["server", "generator"]) {
 			authority.pair[role].envelope.runId = RERUN;
+			authority.pair[role].provider.id += 1_000_000;
+		}
 		writeFileSync(
 			join(campaign, "work-authority.json"),
 			JSON.stringify(authority),
@@ -304,6 +307,21 @@ describe.skipIf(root === null)(
 				},
 			]);
 			expect(stamp.notes.join(" ")).toContain(`${RUN} (H5k, H40k); ${RERUN}`);
+			// The arms come from different droplet pairs, and the stamp says so.
+			const [first, second] = stamp.sources;
+			expect(first?.pair).not.toEqual(second?.pair);
+			expect(second?.pair).toEqual({
+				server: Number(first?.pair.server) + 1_000_000,
+				generator: Number(first?.pair.generator) + 1_000_000,
+			});
+			const note = stamp.notes.find((n) =>
+				n.includes("different droplet pairs"),
+			);
+			expect(note).toContain(
+				`hotspot cells H5k, H40k on ${RUN}'s pair (server ${first?.pair.server}, generator ${first?.pair.generator})`,
+			);
+			expect(note).toContain(`storm cells S1-5k on ${RERUN}'s pair`);
+			expect(note).toContain("no clause compares cells across pairs");
 		}, 240_000);
 
 		test("a run must supply a prefix of its own plan", () => {
@@ -429,6 +447,17 @@ describe.skipIf(root === null)(
 				SEALED,
 			);
 			expect(SEALED - 117_080_820).toBe(2_033_384);
+		});
+
+		test("the run-01 chain is admitted for run g6-sharded-arms-storm-20261007-02 only", () => {
+			const storm = policy(makeShardedArmsStormWorkPlan(), { storm: 600 });
+			// A later storm-plan run must chain on the latest seal, not run 01's.
+			expect(() =>
+				validatePriorSpendLedger(
+					{ ...storm, runId: "g6-sharded-arms-storm-20261008-03" },
+					ledger,
+				),
+			).toThrow("campaign B requires A's versioned paid settlement");
 		});
 
 		test("only the storm-only arms plan may chain on a ladder-only seal", () => {

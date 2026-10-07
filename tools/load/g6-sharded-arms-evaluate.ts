@@ -101,6 +101,8 @@ export type StampSource = {
 	planId: string;
 	candidateSha: string;
 	registrationSha256: string;
+	/** The run's droplet pair (provider ids from the sealed work authority). */
+	pair: { server: number; generator: number };
 	cells: string[];
 	/** Sealed cells of this run replaced by another run's cell. */
 	superseded: {
@@ -187,6 +189,19 @@ export function rollUpShardedArms(
 						`Cells combined from ${sources.length} sealed runs: ${sources
 							.map((s) => `${s.runId} (${s.cells.join(", ")})`)
 							.join("; ")}.`,
+					]
+				: []),
+			...(new Set(sources.map((s) => `${s.pair.server}/${s.pair.generator}`))
+				.size > 1
+				? [
+						`The arms were measured on different droplet pairs (pre-registration §11 item 5, a user-authorised one-time exception to §7/§10): ${sources
+							.map(
+								(s) =>
+									`${[...new Set(s.cells.map((c) => shardedArmsCell(c).arm))].join("+")} cells ${s.cells.join(", ")} on ${s.runId}'s pair (server ${s.pair.server}, generator ${s.pair.generator})`,
+							)
+							.join(
+								"; ",
+							)}. Same size, region and source-encoded profile; no clause compares cells across pairs.`,
 					]
 				: []),
 			...sources.flatMap((s) =>
@@ -420,6 +435,10 @@ export function stampFromSealedRuns(
 			planId: run.policy.workPlan.id,
 			candidateSha: run.authority.candidateSha,
 			registrationSha256: run.authority.registrationSha256,
+			pair: {
+				server: run.authority.pair.server.provider.id,
+				generator: run.authority.pair.generator.provider.id,
+			},
 			cells: ids,
 			superseded,
 		});

@@ -326,7 +326,7 @@ Disclosures:
 
 Written after run 01 and before any rerun is frozen. It changes no
 threshold, window, tolerance, cell, cohort, maximum, R or stop rule in
-§1–§10. Original text above is left as registered; the erratum in item 7
+§1–§10 except the one user-authorised exception in item 5. Original text above is left as registered; the erratum in item 7
 corrects §3.2 and §8 item 17 by reference.
 
 1. **Run 01.** `g6-sharded-arms-20261007-01` (candidate `440632c7`,
@@ -391,9 +391,25 @@ corrects §3.2 and §8 item 17 by reference.
    network probes, ≈ 6.24 M µUSD) is unchanged, so true spend before the
    rerun is ≈ 125.36 M µUSD, ≈ 18.19 M µUSD remains in truth, and the true
    worst case after the rerun is ≈ 130.35 M µUSD, below the ceiling.
+   This is a one-time exception, by the user's authority (item 12), to §7
+   ("no retries … or second pair") and §10 ("exactly one pair"). The storm
+   cells run on a second, fresh pair of the same size
+   (g5-48vcpu-96gb-80gb), region (ric1) and source-encoded profile. §7 and
+   §10 apply unchanged within run 02. The hotspot arm comes wholly from run
+   01's pair and the storm arm wholly from run 02's pair. No clause compares
+   cells across the two pairs. The measurement path (crates/,
+   g6-sharded-scan.ts, g6-shard-server.ts, BPF) is identical at 440632c7 and
+   ed5706b2. The budget code admits the run-01 chain for this run id
+   (`g6-sharded-arms-storm-20261007-02`) only, so no later run can skip
+   run 02's spend. S2-40k still carries no verdict force: an INVALID there
+   (for example the storm RAW wall check, never exercised at a whole-realm
+   40k cohort) is a characterization risk only. It ends the run INCOMPLETE
+   after the three gate cells and leaves the storm verdict to S1-5k, S2-5k
+   and S1-40k.
 6. **One gate stamp from two runs.** The `g6-sharded-arms/1` stamp combines
    run 01's sealed H5k and H40k with the rerun's storm cells, in registered
-   order, and names both run ids (`sources`). Run 01's S1-5k is listed as
+   order, and names both run ids and each run's droplet pair (`sources`);
+   its notes state that the arms were measured on different pairs. Run 01's S1-5k is listed as
    superseded by the rerun with its sealed outcome and reason. The storm
    verdict is the worst of the rerun's S1-5k, S2-5k and S1-40k (§7).
 7. **Erratum: idle timeout.** §3.2 and §8 item 17 say "idle timeout 300 s".
