@@ -4,6 +4,7 @@
  */
 import {
 	requireDefined,
+	rigSkuForRun,
 	validateOperationReceipt,
 	validateRfc3339Millis,
 } from "./g6-c32-freeze-model.ts";
@@ -118,6 +119,7 @@ function ms(value: unknown): number {
 
 function validatePair(input: CapacityRawCellInput): void {
 	const pair = exact(input.pair, ["server", "generator"], "bound host pair");
+	const sku = rigSkuForRun(input.runId);
 	for (const role of ["server", "generator"] as const) {
 		const host = validateHostIdentityPacket(pair[role]);
 		if (
@@ -131,9 +133,9 @@ function validatePair(input: CapacityRawCellInput): void {
 			fail(`${role} source/provenance differs from this frozen run`);
 		if (
 			host.provider.region !== "ric1" ||
-			host.provider.size !== "g5-48vcpu-96gb-80gb" ||
-			host.provider.vcpus !== 48 ||
-			host.provider.memoryMiB !== 98304
+			host.provider.size !== sku.size ||
+			host.provider.vcpus !== sku.expectedVcpus ||
+			host.provider.memoryMiB !== sku.expectedMemoryMiB
 		)
 			fail(`${role} differs from approved exact host shape`);
 	}

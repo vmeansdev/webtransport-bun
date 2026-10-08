@@ -102,7 +102,7 @@ export type StampSource = {
 	candidateSha: string;
 	registrationSha256: string;
 	/** The run's droplet pair (provider ids from the sealed work authority). */
-	pair: { server: number; generator: number };
+	pair: { server: number; generator: number; size: string };
 	cells: string[];
 	/** Sealed cells of this run replaced by another run's cell. */
 	superseded: {
@@ -197,11 +197,13 @@ export function rollUpShardedArms(
 						`The arms were measured on different droplet pairs (pre-registration §11 item 5, a user-authorised one-time exception to §7/§10): ${sources
 							.map(
 								(s) =>
-									`${[...new Set(s.cells.map((c) => shardedArmsCell(c).arm))].join("+")} cells ${s.cells.join(", ")} on ${s.runId}'s pair (server ${s.pair.server}, generator ${s.pair.generator})`,
+									`${[...new Set(s.cells.map((c) => shardedArmsCell(c).arm))].join("+")} cells ${s.cells.join(", ")} on ${s.runId}'s pair (server ${s.pair.server}, generator ${s.pair.generator}, size ${s.pair.size})`,
 							)
-							.join(
-								"; ",
-							)}. Same size, region and source-encoded profile; no clause compares cells across pairs.`,
+							.join("; ")}. ${
+							new Set(sources.map((s) => s.pair.size)).size > 1
+								? "Droplet sizes differ in memory only (pre-registration §11 item 13): same g5 generation, 48 vCPUs, region, VPC and source-encoded profile"
+								: "Same size, region and source-encoded profile"
+						}; no clause compares cells across pairs.`,
 					]
 				: []),
 			...sources.flatMap((s) =>
@@ -438,6 +440,7 @@ export function stampFromSealedRuns(
 			pair: {
 				server: run.authority.pair.server.provider.id,
 				generator: run.authority.pair.generator.provider.id,
+				size: run.authority.pair.server.provider.size,
 			},
 			cells: ids,
 			superseded,

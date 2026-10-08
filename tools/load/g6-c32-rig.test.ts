@@ -218,6 +218,31 @@ describe("G6 c32 rig command", () => {
 		expect(production).toContain("for lock_attempt in 1 2 3 4 5");
 		expect(production).toContain("flock -n /tmp/bench.lock true && break");
 	}, 15_000);
+	test("the storm-rerun run alone binds the 192 GB g5 (pre-registration §11 item 13)", () => {
+		const profile = (runId: string) =>
+			makeDesiredRig({
+				runId,
+				recordedAt: "2026-08-30T12:00:00.000Z",
+				deadline: DEADLINE,
+				freezeAuthoritySha256: "1".repeat(64),
+				freezeArtifactSha256: "2".repeat(64),
+				approvalAuthoritySha256: "3".repeat(64),
+				approvalArtifactSha256: "4".repeat(64),
+				budget,
+			}).profile;
+		expect(profile("g6-sharded-arms-storm-20261007-02")).toMatchObject({
+			region: "ric1",
+			size: "g5-48vcpu-192gb-80gb",
+			vpcUuid: "02276475-d3ca-451f-9ea2-30db481509e1",
+			expectedVcpus: 48,
+			expectedMemoryMiB: 196_608,
+		});
+		expect(profile("g6-sharded-arms-20261007-01")).toMatchObject({
+			size: "g5-48vcpu-96gb-80gb",
+			expectedVcpus: 48,
+			expectedMemoryMiB: 98_304,
+		});
+	});
 	test("binds the exact timestamped two-Droplet specification", () => {
 		const desired = makeDesiredRig({
 			runId: "g6-c32-rig-test",

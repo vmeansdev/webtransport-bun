@@ -1,6 +1,7 @@
 import { lstatSync, realpathSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import {
+	rigSkuForRun,
 	validateDeadline,
 	validateEnvelope,
 	validateRfc3339Millis,
@@ -100,6 +101,7 @@ export type MakeDesiredRigInput = Readonly<{
 export function makeDesiredRig(input: MakeDesiredRigInput): DesiredRig {
 	const recordedAt = validateRfc3339Millis(input.recordedAt, "recordedAt");
 	const deadline = validateDeadline(recordedAt, input.deadline);
+	const sku = rigSkuForRun(input.runId);
 	return validateDesiredRig({
 		recordedAt,
 		requestedAt: recordedAt,
@@ -113,14 +115,14 @@ export function makeDesiredRig(input: MakeDesiredRigInput): DesiredRig {
 		},
 		profile: {
 			region: "ric1",
-			size: "g5-48vcpu-96gb-80gb",
+			size: sku.size,
 			image: "ubuntu-24-04-x64",
 			vpcUuid: "02276475-d3ca-451f-9ea2-30db481509e1",
 			projectMode: "none",
 			projectId: null,
 			sshKeyId: input.sshKeyId ?? 34466793,
-			expectedVcpus: 48,
-			expectedMemoryMiB: 98_304,
+			expectedVcpus: sku.expectedVcpus,
+			expectedMemoryMiB: sku.expectedMemoryMiB,
 		},
 		semantic: {
 			freezeAuthoritySha256: input.freezeAuthoritySha256,

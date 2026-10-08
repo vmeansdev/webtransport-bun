@@ -6,6 +6,7 @@ import {
 	makeShardedArmsStormWorkPlan,
 	makeShardedArmsWorkPlan,
 } from "./g6-c32-capacity-work.ts";
+import { rigSkuForRun } from "./g6-c32-freeze-model.ts";
 import { workCellArguments } from "./g6-c32-work-cli.ts";
 import {
 	workGradeFixture,
@@ -28,6 +29,8 @@ const closed40k: WorkProfile = {
 	clientProcesses: 4,
 };
 const ROLE_PRICE = 1_742_900;
+/** g5-48vcpu-192gb-80gb in ric1 (storm rerun, §11 item 13). */
+const STORM_ROLE_PRICE = 2_130_850;
 
 describe("sharded-arms campaign plan (g6-sharded-arms/1)", () => {
 	test("cells, order, maxima and continuation edges are registered", () => {
@@ -117,13 +120,17 @@ describe("sharded-arms campaign plan (g6-sharded-arms/1)", () => {
 		]).toEqual([2100, 60, 600, 4560]);
 		const branches = enumerateWorkPlanBranches(plan);
 		expect(Math.max(...branches.map((b) => b.totalSeconds))).toBe(5160);
-		// Liability as registered (§9 method): ceil(1,742,900 x 5,160 / 3,600) x 2.
+		// Liability as registered (§9 method) at the rerun SKU price
+		// (§11 item 13): ceil(2,130,850 x 5,160 / 3,600) x 2.
 		const cost = maximumLifecycleCost({
-			hourlyMicrousdByRole: { server: ROLE_PRICE, generator: ROLE_PRICE },
+			hourlyMicrousdByRole: {
+				server: STORM_ROLE_PRICE,
+				generator: STORM_ROLE_PRICE,
+			},
 			executionSeconds: 4560,
 			teardownReserveSeconds: 600,
 		});
-		expect(cost).toBe(4_996_314);
+		expect(cost).toBe(6_108_438);
 		const policy = validateBudgetPolicy({
 			schema: "g6-c32-budget-policy/2",
 			campaignId: "g6-sharded-arms",
@@ -132,7 +139,10 @@ describe("sharded-arms campaign plan (g6-sharded-arms/1)", () => {
 			lifecycle: "ladder-only",
 			totalBudgetMicrousd: 143_544_166,
 			spentBeforeMicrousd: 119_114_204,
-			maximumRoleHourlyMicrousd: { server: ROLE_PRICE, generator: ROLE_PRICE },
+			maximumRoleHourlyMicrousd: {
+				server: STORM_ROLE_PRICE,
+				generator: STORM_ROLE_PRICE,
+			},
 			maximumLifecycleSeconds: 4560,
 			teardownReserveSeconds: 600,
 			maximumLifecycleCostMicrousd: cost,
@@ -146,7 +156,7 @@ describe("sharded-arms campaign plan (g6-sharded-arms/1)", () => {
 			workPlan: plan,
 			workProfiles: makeShardedArmsWorkProfiles(closed40k),
 		});
-		expect(policy.maximumLifecycleCostMicrousd).toBe(4_996_314);
+		expect(policy.maximumLifecycleCostMicrousd).toBe(6_108_438);
 		expect(validateWorkProfiles(plan, { candidate: closed40k })).toEqual({
 			candidate: closed40k,
 		});
@@ -266,5 +276,90 @@ describe("sharded-arms campaign plan (g6-sharded-arms/1)", () => {
 		const smuggled = gradeWorkCell(input);
 		expect(smuggled.outcome).toBe("INVALID");
 		expect(smuggled.reasons.join(" ")).toContain("unregistered workload");
+	});
+});
+
+describe("storm rerun droplet size (pre-registration §11 item 13)", () => {
+	test("only storm-rerun run ids get the 192 GB g5; every other run keeps the 96 GB g5", () => {
+		expect(rigSkuForRun("g6-sharded-arms-storm-20261007-02")).toEqual({
+			size: "g5-48vcpu-192gb-80gb",
+			expectedVcpus: 48,
+			expectedMemoryMiB: 196_608,
+		});
+		for (const run of [
+			"g6-sharded-arms-20261007-01",
+			"g6-capacity-b-20261004-12",
+			"g6-sndbuf-50k-p2-20261005-02",
+		])
+			expect(rigSkuForRun(run)).toEqual({
+				size: "g5-48vcpu-96gb-80gb",
+				expectedVcpus: 48,
+				expectedMemoryMiB: 98_304,
+			});
+	});
+
+	test("the storm-rerun run id and the storm plan bind each other in the budget policy", () => {
+		const base = {
+			schema: "g6-c32-budget-policy/2",
+			campaignId: "g6-sharded-arms",
+			currency: "USD",
+			lifecycle: "ladder-only",
+			totalBudgetMicrousd: 143_544_166,
+			spentBeforeMicrousd: 119_114_204,
+			maximumRoleHourlyMicrousd: {
+				server: STORM_ROLE_PRICE,
+				generator: STORM_ROLE_PRICE,
+			},
+			maximumLifecycleSeconds: 4560,
+			teardownReserveSeconds: 600,
+			maximumLifecycleCostMicrousd: 6_108_438,
+			cellMaximumSeconds: { storm: 600 },
+			allowedStages: ["storm"],
+			priorLedger: {
+				path: "prior.json",
+				sha256: "b".repeat(64),
+				sealedSpentMicrousd: 119_114_204,
+			},
+			workPlan: makeShardedArmsStormWorkPlan(),
+			workProfiles: makeShardedArmsWorkProfiles(closed40k),
+		};
+		expect(
+			validateBudgetPolicy({ ...base, runId: "g6-sharded-arms-storm-1" }).runId,
+		).toBe("g6-sharded-arms-storm-1");
+		expect(() =>
+			validateBudgetPolicy({ ...base, runId: "g6-sharded-arms-2" }),
+		).toThrow(
+			"storm-rerun run ids and the g6-sharded-arms-storm plan go together",
+		);
+	});
+
+	test("no harness tuning derives from memory: the controller's host settings are literal constants", () => {
+		// The 192 GB SKU must not change tuning. Every sysctl the controller
+		// writes and the nofile limit are literals, identical for every plan.
+		const controller = readFileSync(
+			"tools/load/g6-c32-rca-controller.sh",
+			"utf8",
+		);
+		const lines = controller
+			.split("\n")
+			.filter((line) => line.includes("sysctl -w"));
+		expect(lines.length).toBeGreaterThan(0);
+		for (const line of lines) {
+			const settings = [...line.matchAll(/sysctl -w ([^>;"]+)/g)].flatMap((m) =>
+				[...(m[1] as string).matchAll(/([\w.$']+)=([^\s'">;]+)/g)].map(
+					(kv) => kv[2] as string,
+				),
+			);
+			// Literal byte counts, the frozen profile's send buffer, or a
+			// restore of the host's own snapshot; never a memory-derived value.
+			for (const value of settings)
+				expect(value).toMatch(/^(\d+|\$server_udp_sndbuf_bytes|\$value)$/);
+		}
+		expect(controller).toContain("net.core.rmem_max=26214400");
+		expect(controller).toContain("root soft nofile 1048576");
+		expect(controller).toContain("root hard nofile 1048576");
+		// MemAvailable is only printed, never used to size anything.
+		expect(controller).not.toMatch(/MemTotal/);
+		expect(controller).not.toMatch(/\$\(\(.*mem/i);
 	});
 });

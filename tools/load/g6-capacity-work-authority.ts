@@ -23,6 +23,7 @@ import type {
 import {
 	type ArtifactIdentity,
 	canonicalArtifactSha256,
+	rigSkuForRun,
 } from "./g6-c32-freeze-model.ts";
 import { validateHostIdentityPacket } from "./g6-c32-host.ts";
 import type { RawPairIdentity } from "./g6-capacity-raw-work.ts";
@@ -103,6 +104,7 @@ export function validateWorkAuthority(value: unknown): WorkAuthority {
 	)
 		fail("invalid capsule identity or digest");
 	const pairRaw = object(raw.pair, ["server", "generator"]);
+	const sku = rigSkuForRun(raw.runId);
 	const pair = {
 		server: validateHostIdentityPacket(pairRaw.server),
 		generator: validateHostIdentityPacket(pairRaw.generator),
@@ -118,9 +120,9 @@ export function validateWorkAuthority(value: unknown): WorkAuthority {
 			host.binary.kind !==
 				(role === "server" ? "native-addon" : "mmo-client") ||
 			host.provider.region !== "ric1" ||
-			host.provider.size !== "g5-48vcpu-96gb-80gb" ||
-			host.provider.vcpus !== 48 ||
-			host.provider.memoryMiB !== 98304
+			host.provider.size !== sku.size ||
+			host.provider.vcpus !== sku.expectedVcpus ||
+			host.provider.memoryMiB !== sku.expectedMemoryMiB
 		)
 			fail(`${role} differs from exact approved run/source/host shape`);
 	}

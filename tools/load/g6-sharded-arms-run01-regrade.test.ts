@@ -33,7 +33,10 @@ import {
 import { canonicalArtifactSha256 } from "./g6-c32-freeze-model.ts";
 import { readWorkCellEvidence } from "./g6-c32-work-execution.ts";
 import { gradeWorkCell } from "./g6-c32-work-grade.ts";
-import { readWorkAuthority } from "./g6-capacity-work-authority.ts";
+import {
+	readWorkAuthority,
+	validateWorkAuthority,
+} from "./g6-capacity-work-authority.ts";
 import { stampFromSealedRuns } from "./g6-sharded-arms-evaluate.ts";
 
 const RUN = "g6-sharded-arms-20261007-01";
@@ -204,6 +207,9 @@ describe.skipIf(root === null)(
 		for (const role of ["server", "generator"]) {
 			authority.pair[role].envelope.runId = RERUN;
 			authority.pair[role].provider.id += 1_000_000;
+			// The storm rerun's SKU (pre-registration §11 item 13).
+			authority.pair[role].provider.size = "g5-48vcpu-192gb-80gb";
+			authority.pair[role].provider.memoryMiB = 196_608;
 		}
 		writeFileSync(
 			join(campaign, "work-authority.json"),
@@ -275,6 +281,23 @@ describe.skipIf(root === null)(
 			}
 		}, 240_000);
 
+		test("a storm-rerun authority on run 01's 96 GB size is refused, and run 01's stays valid", () => {
+			const original = JSON.parse(
+				readFileSync(
+					join(run, `campaign-${RUN}`, "work-authority.json"),
+					"utf8",
+				),
+			);
+			expect(validateWorkAuthority(original).runId).toBe(RUN);
+			const moved = structuredClone(original);
+			moved.runId = RERUN;
+			for (const role of ["server", "generator"])
+				moved.pair[role].envelope.runId = RERUN;
+			expect(() => validateWorkAuthority(moved)).toThrow(
+				"differs from exact approved run/source/host shape",
+			);
+		});
+
 		test("hotspot from run 01, storm from the rerun, both run ids disclosed", () => {
 			const stamp = stampFromSealedRuns(
 				[
@@ -313,14 +336,19 @@ describe.skipIf(root === null)(
 			expect(second?.pair).toEqual({
 				server: Number(first?.pair.server) + 1_000_000,
 				generator: Number(first?.pair.generator) + 1_000_000,
+				size: "g5-48vcpu-192gb-80gb",
 			});
+			expect(first?.pair.size).toBe("g5-48vcpu-96gb-80gb");
 			const note = stamp.notes.find((n) =>
 				n.includes("different droplet pairs"),
 			);
 			expect(note).toContain(
-				`hotspot cells H5k, H40k on ${RUN}'s pair (server ${first?.pair.server}, generator ${first?.pair.generator})`,
+				`hotspot cells H5k, H40k on ${RUN}'s pair (server ${first?.pair.server}, generator ${first?.pair.generator}, size g5-48vcpu-96gb-80gb)`,
 			);
 			expect(note).toContain(`storm cells S1-5k on ${RERUN}'s pair`);
+			expect(note).toContain(`storm cells S1-5k on ${RERUN}'s pair`);
+			expect(note).toContain("size g5-48vcpu-192gb-80gb");
+			expect(note).toContain("Droplet sizes differ in memory only");
 			expect(note).toContain("no clause compares cells across pairs");
 		}, 240_000);
 
@@ -414,21 +442,25 @@ describe.skipIf(root === null)(
 			),
 		);
 		const SEALED = 119_114_204;
+		// The storm rerun's SKU price (g5-48vcpu-192gb-80gb, ric1, 2026-10-08).
+		const STORM_PRICE = { server: 2_130_850, generator: 2_130_850 };
 		const policy = (
 			workPlan: ReturnType<typeof makeShardedArmsWorkPlan>,
 			stages: Record<string, number>,
+			runId = "g6-sharded-arms-storm-20261007-02",
 		) => {
 			const active = workPlan.activeMaximumSeconds;
 			return validateBudgetPolicy({
 				...base,
-				runId: "g6-sharded-arms-storm-20261007-02",
+				runId,
+				maximumRoleHourlyMicrousd: STORM_PRICE,
 				spentBeforeMicrousd: SEALED,
 				workPlan,
 				allowedStages: Object.keys(stages),
 				cellMaximumSeconds: stages,
 				maximumLifecycleSeconds: active,
 				maximumLifecycleCostMicrousd: maximumLifecycleCost({
-					hourlyMicrousdByRole: base.maximumRoleHourlyMicrousd,
+					hourlyMicrousdByRole: STORM_PRICE,
 					executionSeconds: active,
 					teardownReserveSeconds: base.teardownReserveSeconds,
 				}),
@@ -442,7 +474,8 @@ describe.skipIf(root === null)(
 
 		test("run 01's sealed total is 119,114,204 (in-chain spend 2,033,384)", () => {
 			const storm = policy(makeShardedArmsStormWorkPlan(), { storm: 600 });
-			expect(storm.maximumLifecycleCostMicrousd).toBe(4_996_314);
+			// ceil(2,130,850 x 5,160 / 3,600) x 2.
+			expect(storm.maximumLifecycleCostMicrousd).toBe(6_108_438);
 			expect(validatePriorSpendLedger(storm, ledger).sealedTotalMicrousd).toBe(
 				SEALED,
 			);
@@ -462,10 +495,18 @@ describe.skipIf(root === null)(
 
 		test("only the storm-only arms plan may chain on a ladder-only seal", () => {
 			// The full six-cell arms plan (a second full run) may not.
-			const full = policy(makeShardedArmsWorkPlan(), {
-				hotspot: 480,
-				storm: 600,
-			});
+			const full = policy(
+				makeShardedArmsWorkPlan(),
+				{ hotspot: 480, storm: 600 },
+				"g6-sharded-arms-20261008-03",
+			);
+			// A storm-rerun run id never carries the full plan (it selects the
+			// rerun's droplet size).
+			expect(() =>
+				policy(makeShardedArmsWorkPlan(), { hotspot: 480, storm: 600 }),
+			).toThrow(
+				"storm-rerun run ids and the g6-sharded-arms-storm plan go together",
+			);
 			expect(() => validatePriorSpendLedger(full, ledger)).toThrow(
 				"campaign B requires A's versioned paid settlement",
 			);

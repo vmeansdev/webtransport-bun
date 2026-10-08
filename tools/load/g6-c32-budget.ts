@@ -1,5 +1,8 @@
 import { createHash } from "node:crypto";
-import { canonicalArtifactSha256 } from "./g6-c32-freeze-model.ts";
+import {
+	canonicalArtifactSha256,
+	SHARDED_ARMS_STORM_RUN_PREFIX,
+} from "./g6-c32-freeze-model.ts";
 import {
 	evaluateWorkPlanTimeAdmission,
 	validateWorkPlan,
@@ -584,7 +587,13 @@ export function validateBudgetPolicy(value: unknown): BudgetPolicy {
 		allowedStages,
 		priorLedger,
 	};
-	if (!hasWorkPlan) return { ...common, schema: G6_C32_BUDGET_POLICY_SCHEMA };
+	if (!hasWorkPlan) {
+		if (common.runId.startsWith(SHARDED_ARMS_STORM_RUN_PREFIX))
+			fail(
+				"storm-rerun run ids and the g6-sharded-arms-storm plan go together",
+			);
+		return { ...common, schema: G6_C32_BUDGET_POLICY_SCHEMA };
+	}
 	const workPlan = validateWorkPlan(value.workPlan);
 	if (
 		workPlan.activeMaximumSeconds !== maximumLifecycleSeconds ||
@@ -611,6 +620,13 @@ export function validateBudgetPolicy(value: unknown): BudgetPolicy {
 			: kinds.includes("attribution") || kinds.includes("attribution-r4")
 	)
 		fail("work-plan kinds disagree with lifecycle");
+	// The storm-rerun run-id prefix selects its droplet size (rigSkuForRun),
+	// so it is bound to the storm-only plan both ways.
+	if (
+		common.runId.startsWith(SHARDED_ARMS_STORM_RUN_PREFIX) !==
+		(workPlan.id === "g6-sharded-arms-storm")
+	)
+		fail("storm-rerun run ids and the g6-sharded-arms-storm plan go together");
 	return {
 		...common,
 		schema: G6_C32_WORK_BUDGET_POLICY_SCHEMA,

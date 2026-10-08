@@ -383,18 +383,21 @@ corrects §3.2 and §8 item 17 by reference.
    `g6-sharded-arms` settlement of the same campaign whose run id is
    pinned to `g6-sharded-arms-20261007-01`. Budget,
    computed as §9: active 2,100 s setup + 60 s control + 4 × 600 s = 4,560 s,
-   plus 600 s teardown = 5,160 s; maximum liability
-   ceil(1,742,900 × 5,160 / 3,600) × 2 = **4,996,314 µUSD**. The policy
+   plus 600 s teardown = 5,160 s; maximum liability at the rerun's droplet
+   price (item 13) ceil(2,130,850 × 5,160 / 3,600) × 2 = **6,108,438 µUSD**.
+   The policy
    chains to run 01's final ledger (sealed chain total **119,114,204 µUSD**).
    Ceiling **143,544,166 µUSD** (unchanged). Remaining in chain 24,429,962
-   µUSD (19,433,648 after the liability). Out-of-chain spend (B-10, B-11,
+   µUSD (18,321,524 after the liability). Out-of-chain spend (B-10, B-11,
    network probes, ≈ 6.24 M µUSD) is unchanged, so true spend before the
-   rerun is ≈ 125.36 M µUSD, ≈ 18.19 M µUSD remains in truth, and the true
-   worst case after the rerun is ≈ 130.35 M µUSD, below the ceiling.
+   rerun is ≈ 125.36 M µUSD, ≈ 18.19 M µUSD remains in truth (≈ 12.08 M
+   after the liability), and the true worst case after the rerun is
+   ≈ 131.47 M µUSD, below the ceiling.
    This is a one-time exception, by the user's authority (item 12), to §7
    ("no retries … or second pair") and §10 ("exactly one pair"). The storm
-   cells run on a second, fresh pair of the same size
-   (g5-48vcpu-96gb-80gb), region (ric1) and source-encoded profile. §7 and
+   cells run on a second, fresh pair of the same g5 generation and vCPU
+   count (48), region (ric1) and source-encoded profile; its droplet size
+   differs from run 01's in memory only (item 13). §7 and
    §10 apply unchanged within run 02. The hotspot arm comes wholly from run
    01's pair and the storm arm wholly from run 02's pair. No clause compares
    cells across the two pairs. The measurement path (crates/,
@@ -464,3 +467,32 @@ corrects §3.2 and §8 item 17 by reference.
     (`.scratch/bare-metal-campaign/g6-40k-capacity-closure/authority/20261007-storm-rerun-authority.md`).
     Sequential Architect → Critic approval of the exact freeze, the
     exact-host review and every other gate in §10 apply unchanged.
+13. **Droplet size deviation for the storm rerun (2026-10-08).** DigitalOcean
+    withdrew `g5-48vcpu-96gb-80gb` from ric1 (as of 2026-10-08 18:10 UTC it
+    is offered only in mkc1); nothing had been created. The user chose
+    "ric1, g5-48vcpu-192gb (Recommended)" after the ric1 capacity outage.
+    The storm rerun's pair is `g5-48vcpu-192gb-80gb` in ric1: the same g5
+    generation, 48 vCPUs, region, VPC, image and SSH key as run 01; only the
+    memory differs (196,608 MiB instead of 98,304 MiB). Price ceiling
+    2,130,850 µUSD/h per role (live `doctl compute size list`). The size is
+    selected for storm-rerun run ids only (`rigSkuForRun`; the budget policy
+    binds that run-id prefix and the `g6-sharded-arms-storm` plan to each
+    other), and both the creation check and the raw-cell/work-authority
+    host-shape checks accept exactly this size for that run; every other run,
+    including run 01, keeps the 96 GB size, and all sealed freezes replay
+    unchanged. The measurement code and all harness tuning are unchanged:
+    every setting the harness applies is a literal constant (receive buffers
+    26,214,400 bytes, `nofile` 1,048,576, the profile's send buffer), none is
+    derived from memory, and a test enforces that. Kernel defaults that the
+    kernel itself sizes from memory at boot (`net.ipv4.udp_mem`,
+    `net.ipv4.tcp_mem`, `fs.file-max`, `vm.min_free_kbytes`) are not set by
+    the harness on either run and were not recorded in run 01, so they
+    cannot be pinned to run 01's values; they roughly double with memory.
+    They are pressure ceilings, not tuning: by the kernel's formula UDP
+    memory pressure starts at the middle `udp_mem` value, roughly 12 GB at
+    96 GB, above the worst-case receive-buffer reservation on either host
+    (the generator's 128 endpoints × 26,214,400 bytes, doubled for kernel
+    accounting, about 6.7 GB; the server's shard sockets less), so on
+    current evidence they do not bind on either size. This is a disclosed
+    difference, not a pinned equality.
+    The stamp's pair disclosure names each run's droplet size.

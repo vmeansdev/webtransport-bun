@@ -1693,3 +1693,35 @@ export function renderExactIdentitySheet(input: GeneratedViewContext): string {
 		"",
 	].join("\n");
 }
+
+/** A DigitalOcean droplet size the campaign may create and accept. */
+export type RigSku = Readonly<{
+	size: string;
+	expectedVcpus: number;
+	expectedMemoryMiB: number;
+}>;
+/** Every campaign since A': the v5 g5 48 vCPU / 96 GB size. */
+export const DEFAULT_RIG_SKU: RigSku = Object.freeze({
+	size: "g5-48vcpu-96gb-80gb",
+	expectedVcpus: 48,
+	expectedMemoryMiB: 98_304,
+});
+/**
+ * The g6-sharded-arms/1 storm-only rerun only (pre-registration §11 item 13):
+ * DigitalOcean withdrew the 96 GB g5 from ric1 on 2026-10-08, and the user
+ * chose the 192 GB g5 in ric1 (same generation, 48 vCPUs, region and VPC;
+ * only memory differs). No tuning is derived from memory.
+ */
+export const SHARDED_ARMS_STORM_RIG_SKU: RigSku = Object.freeze({
+	size: "g5-48vcpu-192gb-80gb",
+	expectedVcpus: 48,
+	expectedMemoryMiB: 196_608,
+});
+/** Run ids of the storm-only rerun plan; the budget policy binds the prefix
+ * to plan `g6-sharded-arms-storm` both ways. */
+export const SHARDED_ARMS_STORM_RUN_PREFIX = "g6-sharded-arms-storm-";
+export function rigSkuForRun(runId: string): RigSku {
+	return runId.startsWith(SHARDED_ARMS_STORM_RUN_PREFIX)
+		? SHARDED_ARMS_STORM_RIG_SKU
+		: DEFAULT_RIG_SKU;
+}
