@@ -1,0 +1,563 @@
+import { describe, expect, test } from "bun:test";
+import { DEFAULT_CAMPAIGN_INPUT_PATHS } from "./g6-c32-freeze.ts";
+import {
+	canonicalArtifactSha256,
+	canonicalAuthoritySha256,
+	type OperationReceipt,
+} from "./g6-c32-freeze-model.ts";
+import {
+	G6_C32_GATE_CATALOG,
+	G6_C32_GATE_CATALOG_SCHEMA,
+	gateDefinitionSha256,
+	runGatePhase,
+	validateGateCatalog,
+	validateGateReceipt,
+} from "./g6-c32-gates.ts";
+import { capacityLocalProofArgv } from "./g6-capacity-proof-catalog.ts";
+
+test("connect probe proof is a required prepared gate with frozen local proof coverage", () => {
+	expect(
+		G6_C32_GATE_CATALOG.gates.find(
+			(g) => g.id === "prepared-server-connect-probe-proof",
+		),
+	).toMatchObject({
+		phase: "PREPARED_HOST",
+		command: "bun",
+		args: ["tools/load/g6-linux-probe-proof.ts"],
+		timeoutMs: 60000,
+		requiredHost: "server",
+	});
+	expect([...DEFAULT_CAMPAIGN_INPUT_PATHS]).toContain(
+		"tools/load/g6-linux-probe-proof.ts",
+	);
+	expect(
+		G6_C32_GATE_CATALOG.gates.find((g) => g.id === "local-bun-campaign-suite")
+			?.args,
+	).toContain("tools/load/g6-linux-probe-proof.test.ts");
+});
+
+test("cell admission is frozen, linted and tested by actual LOCAL argv", () => {
+	expect([...DEFAULT_CAMPAIGN_INPUT_PATHS]).toContain(
+		"tools/load/g6-c32-cell-admission.ts",
+	);
+	expect(
+		G6_C32_GATE_CATALOG.gates.find((g) => g.id === "local-bun-campaign-suite")
+			?.args,
+	).toContain("tools/load/g6-c32-cell-admission.test.ts");
+	const lint = G6_C32_GATE_CATALOG.gates.find(
+		(g) => g.id === "local-biome-changed-files",
+	);
+	expect(lint?.args).toContain("tools/load/g6-c32-cell-admission.ts");
+	expect(lint?.args).toContain("tools/load/g6-c32-cell-admission.test.ts");
+});
+
+test("shared clock is frozen, linted and tested by the executable LOCAL catalog", () => {
+	expect([...DEFAULT_CAMPAIGN_INPUT_PATHS]).toContain(
+		"tools/load/g6-c32-system-clock.ts",
+	);
+	const suite = G6_C32_GATE_CATALOG.gates.find(
+		(g) => g.id === "local-bun-campaign-suite",
+	);
+	expect(suite?.args).toContain("tools/load/g6-c32-system-clock.test.ts");
+	const lint = G6_C32_GATE_CATALOG.gates.find(
+		(g) => g.id === "local-biome-changed-files",
+	);
+	expect(lint?.args).toContain("tools/load/g6-c32-system-clock.ts");
+	expect(lint?.args).toContain("tools/load/g6-c32-system-clock.test.ts");
+});
+
+const REQUIRED_BUN_TESTS = [
+	"tools/load/g6-sharded-scan-source.test.ts",
+	"tools/load/g6-shard-server-source.test.ts",
+	"tools/load/g6-sharded-diagnostic.test.ts",
+	"tools/load/g6-sharded-grade.test.ts",
+	"tools/load/g6-c32-capacity-evaluate.test.ts",
+	"tools/load/g6-c32-rca-evaluate.test.ts",
+	"tools/load/g6-c32-successor-grade.test.ts",
+	"tools/load/g6-offbox.test.ts",
+	"tools/load/g6-offbox-provenance.test.ts",
+	"tools/load/g6-linux-probe.test.ts",
+	"tools/load/g6-bpf-map.test.ts",
+	"tools/load/g6-manifest.test.ts",
+	"tools/load/g6-bundle.test.ts",
+	"tools/offbox/linux-generator-entry-g6.test.ts",
+	"tools/offbox/generator-report.test.ts",
+	"tools/load/g6-c32-freeze-model.test.ts",
+	"tools/load/g6-c32-gates.test.ts",
+	"tools/load/g6-c32-freeze.test.ts",
+	"tools/load/g6-c32-operation.test.ts",
+	"tools/load/g6-c32-budget.test.ts",
+	"tools/load/g6-c32-budget-cli.test.ts",
+	"tools/load/g6-c32-rig-model.test.ts",
+	"tools/load/g6-c32-rig-journal.test.ts",
+	"tools/load/g6-c32-digitalocean.test.ts",
+	"tools/load/g6-c32-host.test.ts",
+	"tools/load/g6-c32-rca-controller.test.ts",
+	"tools/load/g6-c32-rig.test.ts",
+	"tools/load/g6-c32-rca-closure-source.test.ts",
+	"packages/webtransport/test/server-udp-send-buffer.test.ts",
+	"packages/webtransport/test/server-udp-send-batch.test.ts",
+] as const;
+
+const EXPECTED_IDS = [
+	"local-candidate-inputs-clean",
+	"local-native-build",
+	"local-bun-campaign-suite",
+	"local-reference-mmo-client-tests",
+	"local-reference-integration-tests",
+	"local-native-unit-tests",
+	"local-vendored-wtransport-tests",
+	"local-biome-changed-files",
+	"local-rust-format",
+	"local-typescript-typecheck",
+	"local-reference-clippy",
+	"local-native-clippy",
+	"prepared-server-bundle-verify",
+	"prepared-generator-bundle-verify",
+	"prepared-server-native-unit-tests",
+	"prepared-server-vendored-wtransport-tests",
+	"prepared-server-owned-process-proof",
+	"prepared-server-connect-probe-proof",
+	"prepared-server-native-platform",
+	"prepared-server-native-source",
+	"prepared-server-linux-smoke",
+	"prepared-generator-linux-smoke",
+	"prepared-server-rollback-proof",
+	"locked-exact-pair-qualification",
+	"final-candidate-bundle-verify",
+	"final-manifest-verify",
+] as const;
+
+function operationReceipt(
+	sequence: number,
+	gateId: string,
+	outcome: OperationReceipt["status"]["outcome"] = "SUCCEEDED",
+): OperationReceipt {
+	const exitCode = outcome === "SUCCEEDED" ? 0 : 1;
+	return {
+		schema: "g6-c32-operation-receipt/1",
+		envelope: {
+			recordedAt: `2026-08-30T12:00:${String(sequence).padStart(2, "0")}.000Z`,
+			sequence,
+			runId: "gate-test",
+			phase: "LOCAL",
+			operationId: `gate-${gateId}`,
+			clockSource: "offrunner",
+		},
+		startedAt: `2026-08-30T12:00:${String(sequence).padStart(2, "0")}.000Z`,
+		finishedAt: `2026-08-30T12:00:${String(sequence).padStart(2, "0")}.000Z`,
+		durationMonotonicNs: "1",
+		attempt: 1,
+		action: {
+			command: "fixture",
+			args: [gateId],
+			cwd: ".",
+			environmentKeys: [],
+		},
+		status: { outcome, exitCode, signal: null },
+		stdoutPath: `operations/${gateId}/operation.stdout`,
+		stderrPath: `operations/${gateId}/operation.stderr`,
+		remoteTiming: null,
+	};
+}
+
+describe("G6 c32 immutable gate catalog", () => {
+	test.each([
+		"diagnostic-coverage",
+		"raw-cell",
+		"work-authority",
+	])("binds shared %s to local and final harness proof", (name) => {
+		const source = `tools/load/g6-capacity-${name}.ts`;
+		const regression = `tools/load/g6-capacity-${name}.test.ts`;
+		const catalog = validateGateCatalog(G6_C32_GATE_CATALOG);
+		expect(
+			catalog.gates.find(({ id }) => id === "local-bun-campaign-suite")?.args,
+		).toContain(regression);
+		expect(capacityLocalProofArgv("harness-lifecycle")[0]).toContain(
+			regression,
+		);
+		for (const path of [source, regression])
+			expect(
+				catalog.gates.find(({ id }) => id === "local-biome-changed-files")
+					?.args,
+			).toContain(path);
+	});
+
+	test("binds the complete exact plan-required suite as semantic bytes", () => {
+		const catalog = validateGateCatalog(G6_C32_GATE_CATALOG);
+		expect(catalog.schema).toBe(G6_C32_GATE_CATALOG_SCHEMA);
+		expect(catalog.gates.map(({ id }) => id)).toEqual([...EXPECTED_IDS]);
+		expect(new Set(catalog.gates.map(({ id }) => id)).size).toBe(
+			catalog.gates.length,
+		);
+
+		expect(catalog.gates[0]).toMatchObject({
+			id: "local-candidate-inputs-clean",
+			command: "git",
+		});
+		for (const value of [
+			"diff",
+			"--quiet",
+			"HEAD",
+			".",
+			":(exclude)AGENTS.md",
+		]) {
+			expect(catalog.gates[0]?.args).toContain(value);
+		}
+		const bunGate = catalog.gates.find(
+			({ id }) => id === "local-bun-campaign-suite",
+		);
+		expect(bunGate).toMatchObject({
+			phase: "LOCAL",
+			command: "bun",
+			cwd: ".",
+			requiredHost: "offrunner",
+		});
+		expect(bunGate?.args.slice(0, 1)).toEqual(["test"]);
+		for (const path of REQUIRED_BUN_TESTS) {
+			expect(bunGate?.args).toContain(path);
+		}
+		expect(
+			catalog.gates.find(({ id }) => id === "local-native-build"),
+		).toMatchObject({
+			phase: "LOCAL",
+			command: "bun",
+			args: ["run", "build:native"],
+			requiredHost: "offrunner",
+		});
+		const biomeGate = catalog.gates.find(
+			({ id }) => id === "local-biome-changed-files",
+		);
+		for (const path of [
+			"tools/load/g6-c32-budget.ts",
+			"tools/load/g6-c32-budget.test.ts",
+			"tools/load/g6-c32-budget-cli.ts",
+			"tools/load/g6-c32-budget-cli.test.ts",
+			"tools/load/g6-c32-rig-production.ts",
+			"tools/load/g6-c32-rca-evaluate.ts",
+			"tools/load/g6-c32-rca-evaluate.test.ts",
+		]) {
+			expect(biomeGate?.args).toContain(path);
+		}
+
+		expect(catalog.gates).toContainEqual(
+			expect.objectContaining({
+				id: "local-native-unit-tests",
+				command: "cargo",
+				args: [
+					"test",
+					"-p",
+					"native",
+					"--locked",
+					"--features",
+					"webtransport_test_seams",
+					"--",
+					"--test-threads=1",
+				],
+			}),
+		);
+		expect(catalog.gates).toContainEqual(
+			expect.objectContaining({
+				id: "local-reference-mmo-client-tests",
+				command: "cargo",
+				args: ["test", "-p", "reference", "--bin", "mmo-client"],
+			}),
+		);
+		expect(catalog.gates).toContainEqual(
+			expect.objectContaining({
+				id: "local-native-clippy",
+				command: "cargo",
+				args: [
+					"clippy",
+					"-p",
+					"native",
+					"--all-targets",
+					"--",
+					"-D",
+					"warnings",
+				],
+			}),
+		);
+		expect(catalog.gates).toContainEqual(
+			expect.objectContaining({
+				id: "local-rust-format",
+				command: "cargo",
+				args: ["fmt", "--check", "--all"],
+			}),
+		);
+		expect(catalog.gates).toContainEqual(
+			expect.objectContaining({
+				id: "local-typescript-typecheck",
+				command: "bun",
+				args: ["run", "typecheck"],
+			}),
+		);
+		expect(catalog.gates).toContainEqual(
+			expect.objectContaining({
+				id: "local-reference-clippy",
+				command: "cargo",
+				args: [
+					"clippy",
+					"-p",
+					"reference",
+					"--bin",
+					"mmo-client",
+					"--all-targets",
+					"--",
+					"-D",
+					"warnings",
+				],
+			}),
+		);
+		expect(
+			catalog.gates.filter(({ phase }) => phase === "PREPARED_HOST"),
+		).toHaveLength(11);
+		expect(
+			catalog.gates.find((g) => g.id === "prepared-server-native-unit-tests"),
+		).toMatchObject({
+			phase: "PREPARED_HOST",
+			requiredHost: "server",
+			command: "cargo",
+			args: [
+				"test",
+				"-p",
+				"native",
+				"--release",
+				"--locked",
+				"--features",
+				"webtransport_test_seams",
+				"--",
+				"--test-threads=1",
+			],
+			timeoutMs: 180000,
+		});
+		const dispatch = catalog.gates.find(
+			(g) => g.id === "locked-exact-pair-qualification",
+		);
+		if (!dispatch) throw Error("missing exact-pair dispatch gate");
+		expect(dispatch.args.slice(-2)).toEqual([
+			"--deadline",
+			"$" + "{G6_C32_DEADLINE}",
+		]);
+		expect(dispatch.requiredInputs).toContain("G6_C32_DEADLINE");
+		for (const role of ["server", "generator"] as const) {
+			const evidenceInput = `G6_C32_REMOTE_SMOKE_${role.toUpperCase()}_EVIDENCE`;
+			expect(catalog.gates).toContainEqual(
+				expect.objectContaining({
+					id: `prepared-${role}-linux-smoke`,
+					phase: "PREPARED_HOST",
+					command: "bash",
+					args: [
+						"$" + "{G6_C32_REMOTE_SMOKE_SCRIPT}",
+						role,
+						`\${${evidenceInput}}`,
+						"$" + "{G6_C32_SHARDS}",
+					],
+					requiredHost: role,
+					requiredInputs: [
+						"G6_C32_REMOTE_SMOKE_SCRIPT",
+						evidenceInput,
+						"G6_C32_SHARDS",
+					],
+				}),
+			);
+		}
+		expect(catalog.gates.some(({ id }) => id.includes("rollback"))).toBeTrue();
+		expect(catalog.gates.some(({ id }) => id.includes("bundle"))).toBeTrue();
+		expect(catalog.gates.some(({ id }) => id.includes("manifest"))).toBeTrue();
+		expect(catalog.gates).toContainEqual(
+			expect.objectContaining({
+				id: "locked-exact-pair-qualification",
+				phase: "LOCKED_PAIR",
+				command: "bun",
+				args: [
+					"tools/load/g6-c32-freeze.ts",
+					"dispatch",
+					"--root",
+					"$" + "{G6_C32_BOUND_ROOT}",
+					"--repository",
+					"$" + "{G6_C32_REPOSITORY_PATH}",
+					"--deadline",
+					"$" + "{G6_C32_DEADLINE}",
+				],
+				requiredHost: "pair",
+			}),
+		);
+		expect(Object.isFrozen(G6_C32_GATE_CATALOG)).toBeTrue();
+		expect(Object.isFrozen(G6_C32_GATE_CATALOG.gates)).toBeTrue();
+		for (const gate of G6_C32_GATE_CATALOG.gates) {
+			expect(Object.isFrozen(gate)).toBeTrue();
+			expect(Object.isFrozen(gate.args)).toBeTrue();
+			expect(Object.isFrozen(gate.requiredInputs)).toBeTrue();
+			expect(gateDefinitionSha256(gate)).toMatch(/^[0-9a-f]{64}$/);
+		}
+		expect(canonicalAuthoritySha256(catalog)).toMatch(/^[0-9a-f]{64}$/);
+	}, 15_000);
+
+	test("runs a phase serially and emits one timestamped PASS receipt per gate", async () => {
+		const calls: string[] = [];
+		let clockIndex = 40;
+		const result = await runGatePhase({
+			runId: "gate-test",
+			phase: "LOCAL",
+			catalog: G6_C32_GATE_CATALOG,
+			sequenceStart: 1,
+			inputs: {},
+			clock: {
+				wallNow: () =>
+					`2026-08-30T12:00:${String(clockIndex++).padStart(2, "0")}.000Z`,
+			},
+			runner: {
+				execute: async (request) => {
+					calls.push(request.gate.id);
+					const receipt = operationReceipt(request.sequence, request.gate.id);
+					return {
+						receipt,
+						receiptPath: `operations/${request.gate.id}/operation.receipt.json`,
+					};
+				},
+			},
+		});
+
+		const expected = G6_C32_GATE_CATALOG.gates
+			.filter(({ phase }) => phase === "LOCAL")
+			.map(({ id }) => id);
+		expect(calls).toEqual(expected);
+		expect(result.complete).toBeTrue();
+		expect(result.receipts.map(({ result }) => result.verdict)).toEqual(
+			expected.map(() => "PASS"),
+		);
+		for (const receipt of result.receipts) {
+			expect(validateGateReceipt(receipt)).toEqual(receipt);
+			expect(receipt.envelope.recordedAt).toMatch(/\.\d{3}Z$/);
+			expect(receipt.result.operationReceiptArtifactSha256).toMatch(
+				/^[0-9a-f]{64}$/,
+			);
+		}
+	}, 15_000);
+
+	test("records a failed gate and every unrun remainder as INCOMPLETE without fallback", async () => {
+		const calls: string[] = [];
+		let clockIndex = 40;
+		const result = await runGatePhase({
+			runId: "gate-test",
+			phase: "LOCAL",
+			catalog: G6_C32_GATE_CATALOG,
+			sequenceStart: 20,
+			inputs: {},
+			clock: {
+				wallNow: () =>
+					`2026-08-30T12:00:${String(clockIndex++).padStart(2, "0")}.000Z`,
+			},
+			runner: {
+				execute: async (request) => {
+					calls.push(request.gate.id);
+					const outcome = calls.length === 2 ? "FAILED" : "SUCCEEDED";
+					const receipt = operationReceipt(
+						request.sequence,
+						request.gate.id,
+						outcome,
+					);
+					return {
+						receipt,
+						receiptPath: `operations/${request.gate.id}/operation.receipt.json`,
+					};
+				},
+			},
+		});
+
+		expect(result.complete).toBeFalse();
+		expect(calls).toHaveLength(2);
+		expect(result.receipts).toHaveLength(
+			G6_C32_GATE_CATALOG.gates.filter(({ phase }) => phase === "LOCAL").length,
+		);
+		expect(result.receipts[0]?.result.verdict).toBe("PASS");
+		expect(result.receipts[1]?.result).toMatchObject({
+			verdict: "INCOMPLETE",
+			reason: "NONZERO",
+		});
+		for (const receipt of result.receipts.slice(2)) {
+			expect(receipt.result).toEqual({
+				verdict: "INCOMPLETE",
+				reason: "SKIPPED_AFTER_INCOMPLETE",
+				operationReceiptPath: null,
+				operationReceiptArtifactSha256: null,
+			});
+			expect(validateGateReceipt(receipt)).toEqual(receipt);
+		}
+	}, 15_000);
+
+	test("records an unavailable runner before skipping the exact remainder", async () => {
+		const run = await runGatePhase({
+			runId: "gate-test",
+			phase: "LOCAL",
+			catalog: G6_C32_GATE_CATALOG,
+			sequenceStart: 1,
+			inputs: {},
+			clock: { wallNow: () => "2026-08-30T12:02:00.000Z" },
+			runner: {
+				execute: async () => {
+					throw new Error("binary unavailable");
+				},
+			},
+		});
+		expect(run.complete).toBeFalse();
+		expect(run.receipts[0]?.result).toEqual({
+			verdict: "INCOMPLETE",
+			reason: "UNAVAILABLE",
+			operationReceiptPath: null,
+			operationReceiptArtifactSha256: null,
+		});
+		expect(
+			run.receipts
+				.slice(1)
+				.every(({ result }) => result.reason === "SKIPPED_AFTER_INCOMPLETE"),
+		).toBeTrue();
+	}, 15_000);
+
+	test("rejects catalog, definition, timestamp, status, and operation-digest drift", async () => {
+		const catalog = structuredClone(G6_C32_GATE_CATALOG) as unknown as {
+			schema: string;
+			gates: Array<Record<string, unknown> & { args: string[] }>;
+		};
+		const firstGate = catalog.gates[0];
+		expect(firstGate).toBeDefined();
+		if (!firstGate) throw new Error("fixture gate is missing");
+		firstGate.args = ["test"];
+		expect(() => validateGateCatalog(catalog)).toThrow(/catalog|gate|args/i);
+
+		const run = await runGatePhase({
+			runId: "gate-test",
+			phase: "LOCAL",
+			catalog: G6_C32_GATE_CATALOG,
+			sequenceStart: 1,
+			inputs: {},
+			clock: { wallNow: () => "2026-08-30T12:01:00.000Z" },
+			runner: {
+				execute: async (request) => {
+					const receipt = operationReceipt(request.sequence, request.gate.id);
+					return {
+						receipt,
+						receiptPath: `operations/${request.gate.id}/operation.receipt.json`,
+					};
+				},
+			},
+		});
+		const valid = run.receipts[0];
+		expect(valid).toBeDefined();
+		if (!valid) throw new Error("fixture receipt is missing");
+		expect(valid.result.operationReceiptArtifactSha256).toBe(
+			canonicalArtifactSha256(operationReceipt(1, valid.gate.id)),
+		);
+		for (const invalid of [
+			{ ...valid, envelope: { ...valid.envelope, recordedAt: "untimed" } },
+			{ ...valid, gate: { ...valid.gate, definitionSha256: "0".repeat(64) } },
+			{
+				...valid,
+				result: { ...valid.result, verdict: "INCOMPLETE", reason: null },
+			},
+		]) {
+			expect(() => validateGateReceipt(invalid)).toThrow();
+		}
+	}, 15_000);
+});

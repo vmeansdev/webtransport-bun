@@ -39,6 +39,7 @@ const packageJson = JSON.parse(
 type Assert<T extends true> = T;
 type Not<T extends boolean> = T extends true ? false : true;
 type Extends<A, B> = A extends B ? true : false;
+type HasKey<T, K extends PropertyKey> = K extends keyof T ? true : false;
 
 // Both adapters must satisfy the common session contract structurally.
 type _AssertWasmSessionIsPortable = Assert<
@@ -82,6 +83,26 @@ type _AssertSendDatagramBatchOnNative = Assert<
 >;
 type _AssertNoGetStatsOnPortable = Assert<
 	Not<Extends<PortableServerSession, { getStats(): unknown }>>
+>;
+
+// Raw attribution stages are available only through the explicitly internal
+// native connection snapshot. They must not silently become W3C getStats()
+// fields, whose supported contract remains unchanged.
+type RawDatagramStageKeys =
+	| "datagramFramesSent"
+	| "datagramFramesReceived"
+	| "udpDatagramsSent"
+	| "udpDatagramsReceived";
+type _AssertRawStagesOnInternalSnapshot = Assert<
+	HasKey<rootSurface.QuicConnectionStats, RawDatagramStageKeys>
+>;
+type _AssertRawStagesOffPublicGetStats = Assert<
+	Not<
+		HasKey<
+			Awaited<ReturnType<rootSurface.WebTransport["getStats"]>>,
+			RawDatagramStageKeys
+		>
+	>
 >;
 
 // The portable server exposes no native-only lifecycle knobs (cert rotation,
@@ -152,6 +173,15 @@ type _AssertPacedMirrorOnNative = Assert<
 			): unknown;
 			readMirrorReports(max?: number): unknown;
 		}
+	>
+>;
+type _AssertNoReflectorOnPortable = Assert<
+	Not<Extends<PortableServer, { setDatagramReflector(rule: unknown): unknown }>>
+>;
+type _AssertReflectorOnNative = Assert<
+	Extends<
+		rootSurface.WebTransportServer,
+		{ setDatagramReflector(rule: unknown): void }
 	>
 >;
 
@@ -286,6 +316,7 @@ function assertServerContract(server: PortableServer): void {
 	expect(bag.sendDatagramMirrorPaced).toBeUndefined();
 	expect(bag.readMirrorReports).toBeUndefined();
 	expect(bag.updateCert).toBeUndefined();
+	expect(bag.setDatagramReflector).toBeUndefined();
 }
 
 function assertSessionContract(session: PortableServerSession): void {

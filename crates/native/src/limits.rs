@@ -335,9 +335,11 @@ mod tests {
         assert_eq!(lim.idle_timeout_ms, 1000, "parse floor applies");
         assert_eq!(lim.effective_keep_alive_interval_ms(), Some(100));
 
-        let mut lim = Limits::default();
-        lim.idle_timeout_ms = 2;
-        lim.keep_alive_interval_ms = Some(100);
+        let lim = Limits {
+            idle_timeout_ms: 2,
+            keep_alive_interval_ms: Some(100),
+            ..Limits::default()
+        };
         assert_eq!(lim.effective_keep_alive_interval_ms(), Some(1));
     }
 }

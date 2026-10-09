@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
-import { writeFileSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 export type GeneratedCert = {
 	certPem: string;
@@ -78,7 +78,14 @@ export function generateCertForNames(
 
 		const leafKeyArgs =
 			leafKeyType === "ec"
-				? ["-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1"]
+				? [
+						"-newkey",
+						"ec",
+						"-pkeyopt",
+						"ec_paramgen_curve:prime256v1",
+						"-pkeyopt",
+						"ec_param_enc:named_curve",
+					]
 				: ["-newkey", "rsa:2048"];
 		execFileSync("openssl", [
 			"req",
@@ -116,7 +123,15 @@ export function generateCertForNames(
 		// separate file so the input is never truncated under the reader.
 		const sec1Path = join(dir, "key-sec1.pem");
 		if (keyFormat === "sec1") {
-			execFileSync("openssl", ["ec", "-in", keyPath, "-out", sec1Path]);
+			execFileSync("openssl", [
+				"ec",
+				"-in",
+				keyPath,
+				"-param_enc",
+				"named_curve",
+				"-out",
+				sec1Path,
+			]);
 		}
 		return {
 			certPem:

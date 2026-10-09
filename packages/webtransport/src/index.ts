@@ -42,10 +42,6 @@
 
 import type { Duplex, Readable, Writable } from "node:stream";
 
-export type { Resettable, StopSendable } from "./streams.js";
-// Re-export stream symbols and helpers
-export { WT_RESET, WT_STOP_SENDING } from "./streams.js";
-
 export type { QuicLbOptions } from "./quic-lb.js";
 // The QUIC-LB decoders are the balancer's half of the `quicLb` server option
 // and belong on the native surface with it. They are pure and load no addon, so
@@ -59,6 +55,9 @@ export {
 	decodeQuicLbServerId,
 	quicLbCidLength,
 } from "./quic-lb.js";
+export type { Resettable, StopSendable } from "./streams.js";
+// Re-export stream symbols and helpers
+export { WT_RESET, WT_STOP_SENDING } from "./streams.js";
 
 import {
 	type QuicLbOptions,
@@ -169,6 +168,10 @@ import {
 	sendDatagramMirrorChecked,
 	sendDatagramMirrorPacedChecked,
 } from "./datagram-mirror.js";
+import {
+	type DatagramReflectorRule,
+	datagramReflectorRuleChecked,
+} from "./datagram-reflector.js";
 import { createMonotonicDeadline, sleep, withDeadline } from "./deadline.js";
 import {
 	E_BACKPRESSURE_TIMEOUT,
@@ -683,6 +686,35 @@ export type ServerOptions = {
 	 */
 	quicLb?: QuicLbOptions;
 
+	/**
+	 * Wire this instance's bind socket into a CID-steered `SO_REUSEPORT` group:
+	 * insert the socket at `key` in a pinned BPF `REUSEPORT_SOCKARRAY`
+	 * (`sockArrayPinPath`), and — when `attachProgPinPath` is set — attach the
+	 * pinned `sk_reuseport` steering program to the group (exactly one instance
+	 * per group passes it; the program lives on the group afterwards and covers
+	 * later joiners). By convention `key` equals this instance's numeric QUIC-LB
+	 * server id, matching what the steering program's `slot_by_server_id` map
+	 * resolves. See examples/quic-lb for the program and the load recipe.
+	 *
+	 * Requires `reusePort: true` (there is no group to steer otherwise) and
+	 * `quicLb` (without QUIC-LB CIDs every packet takes the hash fallback while
+	 * the group looks steered) — both rejected with `E_INVALID_ARGUMENT`.
+	 * Linux only (`E_UNSUPPORTED_ARGUMENT` elsewhere); typically needs
+	 * `CAP_BPF` to open the pins. Fail-closed: any steering failure fails
+	 * `createServer` rather than silently degrading to 4-tuple hashing. The
+	 * kernel drops the sockarray entry when the socket closes; a fast
+	 * close-and-rebind can transiently see the slot still occupied, which is
+	 * retryable exactly like `AddrInUse`.
+	 */
+	reusePortSteering?: {
+		/** Absolute bpffs path of the pinned `REUSEPORT_SOCKARRAY`. */
+		sockArrayPinPath: string;
+		/** This instance's slot in the sockarray (its QUIC-LB server id). */
+		key: number;
+		/** Absolute bpffs path of the pinned `sk_reuseport` program to attach. */
+		attachProgPinPath?: string;
+	};
+
 	/** Called on each accepted session (must not block; long work should be async) */
 	onSession: (session: ServerSession) => void | Promise<void>;
 
@@ -704,6 +736,8 @@ export interface WebTransportServer {
 	 */
 	__pacerStatsSnapshot?(): number;
 	__pacerStatsJson?(token?: number): string;
+	/** Diagnostic-only process-wide phase banks; absent on older addons. */
+	__sendPathDiagnostics?(phase?: string): string;
 	/** Effective congestion-control mode applied to all server connections. */
 	readonly congestionControl: "default" | "throughput" | "low-latency";
 	/** Rotate only the default server TLS certificate/key at runtime. Existing sessions stay alive. */
@@ -792,6 +826,36 @@ export interface WebTransportServer {
 	 * Omitting `max` drains everything pending. Native-only.
 	 */
 	readMirrorReports(max?: number): readonly MirrorReport[];
+	/**
+	 * Install, replace, or clear (`null`) this server's datagram reflector: a
+	 * matched datagram is answered in native with a rewritten copy of its
+	 * first bytes and never reaches `incomingDatagrams()`. Native-only.
+	 */
+	setDatagramReflector(rule: DatagramReflectorRule | null): void;
+	/**
+	 * Effective Tokio worker count of the native server runtime in this
+	 * process. 2 unless `WEBTRANSPORT_NATIVE_SERVER_WORKERS` overrode it before
+	 * the addon built its runtime; that override exists for measurement-campaign
+	 * A/B runs, so a load harness can read this back and refuse a shard that did
+	 * not get the count it asked for.
+	 */
+	serverWorkerThreads(): number;
+	/** Endpoint-driver placement the addon resolved: "shared" | "dedicated". */
+	serverRecvRuntime(): string;
+	/** ACK cadence requested of the client the addon resolved: "default" | "relaxed". */
+	serverAckCadence(): string;
+	/** Requested UDP server send buffer bytes the addon resolved; 0 = default bind path. */
+	serverUdpSendBufferBytes(): number;
+	/** Cross-connection UDP send batch size the addon resolved
+	 * (`WEBTRANSPORT_NATIVE_UDP_SEND_BATCH`); 0 = off, one sendmsg per transmit. */
+	serverUdpSendBatch(): number;
+	/** wtransport driver datagram read path in this process: "pump" (default,
+	 * dedicated per-connection task) | "legacy" (`WTRANSPORT_DATAGRAM_PUMP=0`). */
+	serverDatagramDriver(): string;
+	/** Linux sendmmsg EAGAIN policy: "wait" | "drop". */
+	serverUdpSendEagainMode(): string;
+	/** Native reflector direct-lane mode: "off" | "on". */
+	serverReflectRingBypass(): string;
 	close(): Promise<void>;
 	metricsSnapshot(): MetricsSnapshot;
 }
@@ -802,6 +866,12 @@ export type {
 	DatagramMirrorResult,
 	MirrorReport,
 } from "./datagram-mirror.js";
+
+export type {
+	DatagramReflectorRule,
+	ReflectorMatch,
+	ReflectorOp,
+} from "./datagram-reflector.js";
 
 // ---------------------------------------------------------------------------
 // Browser-style facade types (RFC_CLIENT_FACADE, PARITY_MATRIX)
@@ -1122,6 +1192,68 @@ export type MetricsSnapshot = {
 	 * number. Absent entirely on an addon built without the pacer.
 	 */
 	mirrorReportsDropped?: number;
+	/** Native only. Datagrams the per-server reflector matched. */
+	datagramReflectHits?: number;
+	/** Native only. Reflected replies the transport accepted. */
+	datagramReflectSent?: number;
+	/** Native only. Reflected replies dropped because the sender queue was full. */
+	datagramReflectQueueFull?: number;
+	/** Native only. Reflected replies the transport refused; dropped, never retried. */
+	datagramReflectSendErrors?: number;
+	datagramReflectRingBypassMarked?: number;
+	datagramReflectRingBypassRefreshed?: number;
+	datagramReflectRingBypassRefused?: number;
+	datagramReflectRingBypassExpired?: number;
+	datagramReflectRingBypassed?: number;
+	datagramReflectRingDirectBlocked?: number;
+	datagramReflectRingDirectErrors?: number;
+	datagramReflectRingGsoFallback?: number;
+	/** Native only, process-wide. Cross-connection UDP send batching
+	 * (`WEBTRANSPORT_NATIVE_UDP_SEND_BATCH`): sendmmsg calls, datagrams sent
+	 * through them, datagrams sent one at a time instead, WouldBlocks handed
+	 * to a driver because the ring was full, datagrams dropped because the
+	 * flusher was gone or a fallback WouldBlocked, congestion drops admitted
+	 * by EAGAIN drop mode, send errors, largest batch flushed. All zero while
+	 * batching is off. */
+	udpSendBatchCalls?: number;
+	udpSendBatchMessages?: number;
+	udpSendBatchFallback?: number;
+	udpSendBatchBlocked?: number;
+	udpSendBatchDropped?: number;
+	udpSendBatchCongestionDropped?: number;
+	udpSendBatchErrors?: number;
+	datagramPumpsSpawned?: number;
+	datagramPumpsLive?: number;
+	udpSendBatchMaxBatch?: number;
+	datagramReflectSendErrorsByReason?: {
+		notConnected: number;
+		unsupportedByPeer: number;
+		tooLarge: number;
+	};
+	/** Native only. Receive-to-reflection duration. Present when any observation. */
+	datagramReflectHold?: HistogramSnapshot | null;
+	/**
+	 * Native only. Connections that were live when this snapshot was taken and
+	 * therefore contributed to the `quic*` sums below.
+	 */
+	quicSessions?: number;
+	/**
+	 * Native only. quinn transport counters summed over those live connections.
+	 * A boundary sample, not a lifetime total — a closed session's counters go
+	 * with it — so two snapshots may only be differenced across a window whose
+	 * session set is stable. Beside the application's own receive tally these
+	 * separate socket-to-quinn loss ({@link quicUdpDatagramsReceived} short of
+	 * what the peer sent) from quinn-to-application loss
+	 * ({@link quicDatagramFramesReceived} short of what the app counted). One
+	 * UDP datagram can carry several DATAGRAM frames, so the two are not
+	 * expected to be equal.
+	 */
+	quicUdpDatagramsReceived?: number;
+	quicUdpDatagramsSent?: number;
+	quicDatagramFramesReceived?: number;
+	quicDatagramFramesSent?: number;
+	quicPacketsSent?: number;
+	quicPacketsLost?: number;
 
 	rateLimitedCount: number;
 	limitExceededCount: number;
@@ -1555,7 +1687,26 @@ interface NativeServerHandle {
 	/** Drain-on-poll reader for deferred paced failures. Absent on addons
 	 * without the pacer, where the facade answers with an empty batch. */
 	readMirrorReports?(max?: number): NativeMirrorReport[];
+	/** Absent on addons built without the reflector; feature detection is
+	 * method presence (spec §3), as for `sendDatagramMirrorPaced`. */
+	setDatagramReflector?(rule: unknown): void;
+	/** Effective server-runtime worker count; version-bound with the prebuild. */
+	serverWorkerThreads(): number;
+	/** Endpoint-driver placement ("shared" | "dedicated"); version-bound with the prebuild. */
+	serverRecvRuntime(): string;
+	/** ACK cadence requested of the client ("default" | "relaxed"); version-bound with the prebuild. */
+	serverAckCadence(): string;
+	/** UDP server send buffer bytes (0 = upstream default bind path); version-bound with the prebuild. */
+	serverUdpSendBufferBytes(): number;
+	/** UDP send batch size (0 = off); version-bound with the prebuild. */
+	serverUdpSendBatch(): number;
+	/** Datagram driver read path; version-bound with the prebuild. */
+	serverDatagramDriver(): string;
+	/** Linux sendmmsg EAGAIN policy; version-bound with the prebuild. */
+	serverUdpSendEagainMode(): string;
+	serverReflectRingBypass(): string;
 	metricsSnapshot(): MetricsSnapshot;
+	__sendPathDiagnostics?(phase?: string): string;
 }
 interface NativeAddon {
 	ServerHandle: new (
@@ -2252,6 +2403,14 @@ class NativeServerSession implements ServerSession {
 	metricsSnapshot(): SessionMetricsSnapshot {
 		return this.#nativeHandle.metricsSnapshot();
 	}
+
+	/** Wire-level QUIC stats from the native layer, or null when unavailable. */
+	/** @internal */
+	_connectionStats(): QuicConnectionStats | null {
+		return typeof this.#nativeHandle.connectionStats === "function"
+			? (this.#nativeHandle.connectionStats() ?? null)
+			: null;
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -2383,6 +2542,52 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		}
 	}
 
+	if (opts.reusePortSteering !== undefined && opts.reusePortSteering !== null) {
+		const steering = opts.reusePortSteering;
+		const steeringError = (() => {
+			if (typeof steering !== "object") {
+				return "reusePortSteering must be an object";
+			}
+			if (
+				typeof steering.sockArrayPinPath !== "string" ||
+				!steering.sockArrayPinPath.startsWith("/")
+			) {
+				return "reusePortSteering.sockArrayPinPath must be an absolute bpffs path";
+			}
+			if (
+				!Number.isInteger(steering.key) ||
+				steering.key < 0 ||
+				steering.key > 0xffffffff
+			) {
+				return "reusePortSteering.key must be a non-negative 32-bit integer";
+			}
+			if (
+				steering.attachProgPinPath !== undefined &&
+				(typeof steering.attachProgPinPath !== "string" ||
+					!steering.attachProgPinPath.startsWith("/"))
+			) {
+				return "reusePortSteering.attachProgPinPath must be an absolute bpffs path";
+			}
+			if (opts.reusePort !== true) {
+				return "reusePortSteering requires reusePort: true";
+			}
+			if (opts.quicLb === undefined || opts.quicLb === null) {
+				return (
+					"reusePortSteering requires quicLb — without QUIC-LB CIDs every " +
+					"packet falls back to the kernel hash and the steering program " +
+					"steers nothing"
+				);
+			}
+			return null;
+		})();
+		if (steeringError !== null) {
+			throw createMappedError(
+				E_INVALID_ARGUMENT as ErrorCode,
+				`E_INVALID_ARGUMENT: ${steeringError}`,
+			);
+		}
+	}
+
 	const mergedLimits = { ...DEFAULT_LIMITS, ...opts.limits };
 	const limitsJson = JSON.stringify(mergedLimits);
 	const serverOptsJson = JSON.stringify({
@@ -2393,6 +2598,9 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		...(opts.quicLb === undefined || opts.quicLb === null
 			? {}
 			: { quicLb: quicLbOptionsToJson(opts.quicLb) }),
+		...(opts.reusePortSteering === undefined || opts.reusePortSteering === null
+			? {}
+			: { reusePortSteering: opts.reusePortSteering }),
 		...(opts.qpackMaxTableCapacity === undefined
 			? {}
 			: { qpackMaxTableCapacity: opts.qpackMaxTableCapacity }),
@@ -2596,6 +2804,17 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 			),
 		readMirrorReports: (max) =>
 			decodeMirrorReports(handle.readMirrorReports?.(max) ?? []),
+		setDatagramReflector: (rule) =>
+			datagramReflectorRuleChecked((native) => {
+				const install = handle.setDatagramReflector;
+				if (typeof install !== "function") {
+					throw new WebTransportError(
+						E_UNSUPPORTED_ARGUMENT,
+						"E_UNSUPPORTED_ARGUMENT: this addon was built without the datagram reflector, so setDatagramReflector has nothing to install",
+					);
+				}
+				install.call(handle, native as never);
+			}, rule),
 		close: createServerCloseContract({
 			closeNative: () => handle.close(),
 			resolveOwnedSessions: (info) => {
@@ -2610,6 +2829,20 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 					onSessionDrainResolve = resolve;
 				}),
 		}),
+		serverWorkerThreads: () => handle.serverWorkerThreads(),
+		serverRecvRuntime: () => handle.serverRecvRuntime(),
+		serverAckCadence: () => handle.serverAckCadence(),
+		serverUdpSendBufferBytes: () => handle.serverUdpSendBufferBytes(),
+		serverUdpSendBatch: () => handle.serverUdpSendBatch(),
+		serverDatagramDriver: () => handle.serverDatagramDriver(),
+		serverUdpSendEagainMode: () => handle.serverUdpSendEagainMode(),
+		serverReflectRingBypass: () => handle.serverReflectRingBypass(),
+		...(typeof handle.__sendPathDiagnostics === "function"
+			? {
+					__sendPathDiagnostics: (phase?: string) =>
+						handle.__sendPathDiagnostics!(phase),
+				}
+			: {}),
 		metricsSnapshot: () => handle.metricsSnapshot(),
 	};
 }
@@ -2849,7 +3082,14 @@ class NativeClientSession implements ClientSession {
 	}
 }
 
-/** Wire-level QUIC connection stats reported by the native layer. */
+/**
+ * Wire-level QUIC connection stats reported by the native layer.
+ *
+ * @internal Unstable diagnostic surface for source-bound evidence. It is not
+ * part of the supported W3C or Node client contract. `packetsReceived` is a
+ * legacy alias of `udpDatagramsReceived` because the pinned Quinn version does
+ * not expose a distinct received QUIC-packet total.
+ */
 export interface QuicConnectionStats {
 	rttMs: number;
 	bytesSent: number;
@@ -2857,6 +3097,14 @@ export interface QuicConnectionStats {
 	packetsSent: number;
 	packetsReceived: number;
 	packetsLost: number;
+	/** @internal Application DATAGRAM frames emitted/consumed by QUIC. */
+	datagramFramesSent?: number | null;
+	/** @internal Application DATAGRAM frames emitted/consumed by QUIC. */
+	datagramFramesReceived?: number | null;
+	/** @internal UDP datagrams emitted/consumed by QUIC. */
+	udpDatagramsSent?: number | null;
+	/** @internal UDP datagrams emitted/consumed by QUIC. */
+	udpDatagramsReceived?: number | null;
 	maxDatagramSize?: number | null;
 }
 

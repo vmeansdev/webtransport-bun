@@ -1,9 +1,10 @@
 /**
  * Sink latency gate check (RFC_STREAM_SINK §9.4), run by the bench-bandwidth
- * workflow's sink_gate mode. Reads the saturated bench-sink JSON and holds
- * the sink path to the RFC envelope: app-observed p99 at or under 5 ms at
- * the dispatched saturation level. The facade numbers are printed for the
- * comparison record but are not gated — the facade is EXPECTED to degrade.
+ * workflow's sink-gate mode (mode=sink-gate; knobs in the sink_params
+ * input). Reads the saturated bench-sink JSON and holds the sink path to
+ * the RFC envelope: app-observed p99 at or under 5 ms at the dispatched
+ * saturation level. The facade numbers are printed for the comparison
+ * record but are not gated — the facade is EXPECTED to degrade.
  */
 
 const idlePath = process.env.IDLE_JSON;

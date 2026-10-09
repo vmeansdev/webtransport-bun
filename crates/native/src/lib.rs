@@ -80,12 +80,15 @@ use std::sync::Arc;
 use tokio::runtime::Runtime;
 use tokio::sync::watch;
 
+pub mod ack_cadence;
 pub mod async_ops;
 pub mod client;
 pub mod client_pool;
 pub mod client_stream;
 pub mod datagram_batch;
+mod datagram_driver;
 pub mod datagram_mirror;
+pub mod datagram_reflector;
 pub mod egress_pacer;
 pub mod error;
 pub mod histogram;
@@ -95,8 +98,11 @@ pub mod native_memory;
 pub mod panic_guard;
 pub mod payload_buffer;
 pub mod quic_lb;
+pub mod quic_runtime;
 pub mod rate_limit;
 pub(crate) mod read_ownership;
+pub mod reuseport_steering;
+mod send_path_diagnostics;
 // R1 secure comparison filesystem boundary: Rust-public only so the
 // comparison-supervisor binary can link it; no #[napi] symbols.
 pub mod secure_fs;
@@ -113,11 +119,90 @@ pub mod session_registry;
 pub mod spawn_tracked;
 pub mod stream_sink;
 pub mod transport_memory;
+pub mod udp_send_batch;
 pub mod zero_rtt;
 
 // ---------------------------------------------------------------------------
 // Global Tokio runtime singleton
 // ---------------------------------------------------------------------------
+
+/// Default server worker count. Every measured alternative was worse (macOS:
+/// 89k/s at two, 82k/s at four, 48k/s at ten), so two remains the default and
+/// nothing derives it from `available_parallelism()`.
+pub(crate) const DEFAULT_SERVER_WORKER_THREADS: usize = 2;
+
+/// Parse `WEBTRANSPORT_NATIVE_SERVER_WORKERS`. Unset is the measured default;
+/// a plain decimal integer in 1..=8 is honoured; everything else is an error
+/// the caller turns into a fail-closed abort.
+fn parse_server_worker_threads(raw: Option<&str>) -> Result<usize, ()> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_SERVER_WORKER_THREADS);
+    };
+    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(());
+    }
+    match raw.parse::<usize>() {
+        Ok(n) if (1..=8).contains(&n) => Ok(n),
+        _ => Err(()),
+    }
+}
+
+fn parse_server_udp_send_buffer_bytes(raw: Option<&str>) -> Result<Option<usize>, String> {
+    const NAME: &str = "WEBTRANSPORT_NATIVE_SERVER_UDP_SNDBUF_BYTES";
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    if raw.is_empty() || raw == "0" {
+        return Ok(None);
+    }
+    if !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "{NAME} must be unset, empty, 0, or an integer 65536..=67108864, got '{}'",
+            raw
+        ));
+    }
+    match raw.parse::<usize>() {
+        Ok(value) if (65_536..=67_108_864).contains(&value) => Ok(Some(value)),
+        _ => Err(format!(
+            "{NAME} must be unset, empty, 0, or an integer 65536..=67108864, got '{}'",
+            raw
+        )),
+    }
+}
+
+pub(crate) fn server_udp_send_buffer_bytes() -> Result<Option<usize>, String> {
+    static RESOLVED: std::sync::OnceLock<Result<Option<usize>, String>> =
+        std::sync::OnceLock::new();
+    RESOLVED
+        .get_or_init(|| {
+            let raw = std::env::var("WEBTRANSPORT_NATIVE_SERVER_UDP_SNDBUF_BYTES").ok();
+            parse_server_udp_send_buffer_bytes(raw.as_deref())
+        })
+        .clone()
+}
+
+/// Effective server worker count, resolved once per process.
+///
+/// The default is 2 for the reasons documented on [`RUNTIME`]; the environment
+/// knob exists only so a measurement campaign can run an A/B at another value
+/// without shipping a different binary. Resolution is memoised so the runtime
+/// and the `serverWorkerThreads` getter can never disagree.
+pub(crate) fn server_worker_threads() -> usize {
+    static RESOLVED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        let raw = std::env::var("WEBTRANSPORT_NATIVE_SERVER_WORKERS").ok();
+        match parse_server_worker_threads(raw.as_deref()) {
+            Ok(n) => n,
+            Err(()) => {
+                eprintln!(
+                    "webtransport-native: FATAL E_INTERNAL: WEBTRANSPORT_NATIVE_SERVER_WORKERS must be an integer 1..=8, got '{}'",
+                    raw.unwrap_or_default()
+                );
+                std::process::abort();
+            }
+        }
+    })
+}
 
 /// Server runtime: drives the WebTransport server and all server-side stream bridges.
 ///
@@ -132,12 +217,18 @@ pub mod zero_rtt;
 /// not pinned near 5,300/s, and datagram rate-limit is not the binder.
 /// Ingest drop reasons are counted separately so a later artifact can name
 /// session queue vs global queue vs size. Higher worker counts measured worse
-/// (macOS: 89k/s at two, 82k/s at four, 48k/s at ten), so this is a fixed
-/// constant rather than `available_parallelism()`, and
-/// `scripts/check-doc-truth.ts` pins it.
+/// (macOS: 89k/s at two, 82k/s at four, 48k/s at ten), so the default stays
+/// two and is never derived from `available_parallelism()`.
+///
+/// The count comes from [`server_worker_threads`], which is
+/// `DEFAULT_SERVER_WORKER_THREADS` (2) unless
+/// `WEBTRANSPORT_NATIVE_SERVER_WORKERS` names another value in 1..=8. That
+/// knob exists for campaign A/B measurement only — it does not restate the
+/// measurements above, and an out-of-range value aborts rather than falling
+/// back. `scripts/check-doc-truth.ts` pins the default and the resolver.
 pub(crate) static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
     tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(server_worker_threads())
         .enable_all()
         .thread_name("wt-server")
         .build()
@@ -221,6 +312,37 @@ static TSFN_DELIVERY_FAILURE_COUNT: std::sync::atomic::AtomicUsize =
 static CHANNEL_DELIVERY_FAILURE_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// `WEBTRANSPORT_NATIVE_STDERR_WARNINGS=1`, resolved once per process.
+fn stderr_warnings_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        parse_stderr_warnings(
+            std::env::var("WEBTRANSPORT_NATIVE_STDERR_WARNINGS")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+fn parse_stderr_warnings(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), Some("1"))
+}
+
+#[cfg(test)]
+mod stderr_warnings_tests {
+    use super::parse_stderr_warnings;
+
+    #[test]
+    fn only_the_literal_one_enables_it() {
+        assert!(parse_stderr_warnings(Some("1")));
+        assert!(parse_stderr_warnings(Some(" 1 ")));
+        assert!(!parse_stderr_warnings(None));
+        assert!(!parse_stderr_warnings(Some("")));
+        assert!(!parse_stderr_warnings(Some("true")));
+        assert!(!parse_stderr_warnings(Some("0")));
+    }
+}
+
 fn emit_log(
     tx: &Option<tokio::sync::mpsc::Sender<LogEvent>>,
     redact: bool,
@@ -232,7 +354,22 @@ fn emit_log(
 ) {
     // Keep stderr quiet by default to avoid log floods during load/soak runs.
     // Full structured details still go through the optional JS log callback.
-    if matches!(level, "error") {
+    // WEBTRANSPORT_NATIVE_STDERR_WARNINGS=1 (diagnostic runs) writes warn and
+    // error events verbatim to stderr from this thread, bypassing the bounded
+    // channel, the N-API batcher and the JS loop, so the one warning a run
+    // exists to capture can neither be dropped under a connect storm nor
+    // perturb the server the way a JS log hook would.
+    if matches!(level, "warn" | "error") && stderr_warnings_enabled() {
+        eprintln!(
+            "webtransport-native: [{level}] {msg}{}{}",
+            session_id
+                .map(|id| format!(" session={id}"))
+                .unwrap_or_default(),
+            peer_ip
+                .map(|ip| format!(" peer={ip}:{}", peer_port.unwrap_or(0)))
+                .unwrap_or_default()
+        );
+    } else if matches!(level, "error") {
         eprintln!("webtransport-native: [{}]", level);
     }
     // Without a JS listener nothing below is observable; build nothing.
@@ -748,11 +885,39 @@ pub(crate) fn spawn_wtransport_server(
             memory_policy.apply_flow_control(&mut transport);
             memory_policy.apply_datagram_buffers(&mut transport);
             client::apply_congestion_controller(&mut transport, congestion_control);
+            // ACK cadence is a registered campaign knob
+            // (`WEBTRANSPORT_NATIVE_ACK_CADENCE`); `default` is quinn's stock
+            // cadence, `relaxed` widens `max_ack_delay` and requests
+            // ACK_FREQUENCY from the client. See `ack_cadence` for why this
+            // is active against any quinn peer.
+            ack_cadence::apply(&mut transport, ack_cadence::server_ack_cadence_mode());
             // reusePort takes over the socket build so SO_REUSEPORT can be set
             // before bind(); with_bind_socket hands it to quinn untouched.
+            // Steering wiring happens in the gap between bind and handoff —
+            // the only moment the fd is visible to us — and any failure aborts
+            // startup: a steering misconfiguration must never degrade to
+            // silent 4-tuple hashing.
             let bound = if bind.reuse_port {
-                match server_spawn::bind_reuse_port_socket(bind_addr) {
-                    Ok(socket) => ServerConfig::builder().with_bind_socket(socket),
+                let bind_socket = if let Some(send_buffer_bytes) = bind.udp_send_buffer_bytes {
+                    server_spawn::bind_socket_with_options(
+                        bind_addr,
+                        true,
+                        Some(send_buffer_bytes),
+                    )
+                } else {
+                    server_spawn::bind_reuse_port_socket(bind_addr)
+                };
+                match bind_socket {
+                    Ok(socket) => {
+                        if let Some(steering) = &bind.steering {
+                            if let Err(msg) = reuseport_steering::install(&socket, steering) {
+                                emit_log(&log_tx, !debug_logs, "error", format_args!("{}", msg), None, None, None);
+                                report_startup(Err(msg));
+                                return;
+                            }
+                        }
+                        ServerConfig::builder().with_bind_socket(socket)
+                    }
                     Err(e) => {
                         let msg = format!("failed to bind reusePort socket: {}", e);
                         emit_log(&log_tx, !debug_logs, "error", format_args!("{}", msg), None, None, None);
@@ -761,7 +926,24 @@ pub(crate) fn spawn_wtransport_server(
                     }
                 }
             } else {
-                ServerConfig::builder().with_bind_address(bind_addr)
+                match bind.udp_send_buffer_bytes {
+                    Some(send_buffer_bytes) => {
+                        match server_spawn::bind_socket_with_options(
+                            bind_addr,
+                            false,
+                            Some(send_buffer_bytes),
+                        ) {
+                            Ok(socket) => ServerConfig::builder().with_bind_socket(socket),
+                            Err(e) => {
+                                let msg = format!("failed to bind socket: {}", e);
+                                emit_log(&log_tx, !debug_logs, "error", format_args!("{}", msg), None, None, None);
+                                report_startup(Err(msg));
+                                return;
+                            }
+                        }
+                    }
+                    None => ServerConfig::builder().with_bind_address(bind_addr),
+                }
             };
             let config_builder =
                 bound.with_custom_tls_and_transport(tls_config, transport);
@@ -804,9 +986,51 @@ pub(crate) fn spawn_wtransport_server(
                     .quic_endpoint_config_mut()
                     .cid_generator(quic_lb::QuicLbCidGenerator::factory(quic_lb));
             }
-            let server = match Endpoint::server(config) {
+            // Endpoint-driver placement is a registered campaign knob
+            // (`WEBTRANSPORT_NATIVE_SERVER_RECV_RUNTIME`); `shared` is today's
+            // `TokioRuntime`, `dedicated` moves quinn's single socket reader to
+            // its own thread. See `quic_runtime` for why the first spawn is
+            // the driver.
+            let recv_mode = quic_runtime::server_recv_runtime_mode();
+            let split_runtime = match recv_mode {
+                quic_runtime::RecvRuntimeMode::Dedicated => {
+                    match quic_runtime::SplitRuntime::new(owner_server_id) {
+                        Ok(rt) => Some(rt),
+                        Err(e) => {
+                            let msg = format!("failed to create the dedicated QUIC receive runtime: {e}");
+                            emit_log(&log_tx, !debug_logs, "error", format_args!("{}", msg), None, None, None);
+                            report_startup(Err(msg));
+                            return;
+                        }
+                    }
+                }
+                quic_runtime::RecvRuntimeMode::Shared => None,
+            };
+            // Cross-connection send batching (`WEBTRANSPORT_NATIVE_UDP_SEND_BATCH`)
+            // wraps the socket either runtime hands quinn; the split runtime
+            // does it in its own `wrap_udp_socket`, the shared Tokio runtime
+            // through `BatchedRuntime`. Off, both are today's sockets.
+            let quinn_runtime: Arc<dyn wtransport::quinn::Runtime> = match &split_runtime {
+                Some(rt) => Arc::clone(rt) as Arc<dyn wtransport::quinn::Runtime>,
+                None => Arc::new(udp_send_batch::BatchedRuntime::new(wtransport::quinn::TokioRuntime)),
+            };
+            let server = match Endpoint::server_with_runtime(config, quinn_runtime) {
                 Ok(s) => match s.local_addr() {
                     Ok(addr) => {
+                        if let Some(rt) = &split_runtime {
+                            // quinn spawns exactly the endpoint driver while
+                            // building the endpoint; anything else means the
+                            // routing assumption no longer holds.
+                            let spawns = rt.spawn_count();
+                            if spawns != 1 {
+                                let msg = format!(
+                                    "dedicated QUIC receive runtime saw {spawns} spawns during endpoint construction, expected 1"
+                                );
+                                emit_log(&log_tx, !debug_logs, "error", format_args!("{}", msg), None, None, None);
+                                report_startup(Err(msg));
+                                return;
+                            }
+                        }
                         let bound_port = addr.port();
                         emit_log(
                             &log_tx,
@@ -871,6 +1095,13 @@ pub(crate) fn spawn_wtransport_server(
                                     panic_guard::PanicScope::Server(owner_server_id),
                                     async move {
                                 let _handshake_admission = handshake_admission;
+                                // Taken before the await: a handshake that fails or
+                                // stalls is logged with the peer's ip:port, which is
+                                // the generator's endpoint address and the only key
+                                // that pairs the line with the client's own record.
+                                let incoming_peer = incoming_session.remote_address();
+                                let incoming_peer_ip = incoming_peer.ip().to_string();
+                                let incoming_peer_port = u32::from(incoming_peer.port());
                                 let session_request = match incoming_session.await {
                                     Ok(r) => {
                                         emit_log(&ltx, !debug_logs, "debug", format_args!("CONNECT received authority={:?}", r.authority()), None, None, None);
@@ -885,7 +1116,7 @@ pub(crate) fn spawn_wtransport_server(
                                             chain.push_str(&s.to_string());
                                             src = s;
                                         }
-                                        emit_log(&ltx, !debug_logs, "warn", format_args!("handshake failed (incoming_session): {}", chain), None, None, None);
+                                        emit_log(&ltx, !debug_logs, "warn", format_args!("handshake failed (incoming_session): {}", chain), None, Some(&incoming_peer_ip), Some(incoming_peer_port));
                                         return;
                                     }
                                 };
@@ -983,7 +1214,7 @@ pub(crate) fn spawn_wtransport_server(
                                     Err(_elapsed) => {
                                         metrics.sessions_active.fetch_sub(1, Ordering::SeqCst);
                                         rate_limit::release_per_ip_session(owner_server_id, peer_ip_addr);
-                                        emit_log(&ltx, !debug_logs, "warn", format_args!("handshake timed out authority={:?}", authority), None, None, None);
+                                        emit_log(&ltx, !debug_logs, "warn", format_args!("handshake timed out authority={:?}", authority), None, Some(&incoming_peer_ip), Some(incoming_peer_port));
                                         return;
                                     }
                                 };
@@ -1568,6 +1799,7 @@ pub(crate) fn spawn_wtransport_server(
                                                                     return;
                                                                 }
                                                             };
+                                                            let received_at = std::time::Instant::now();
                                                             m_dgram.datagrams_in.fetch_add(1, Ordering::Relaxed);
                                                             sm_dgram.datagrams_in.fetch_add(1, Ordering::Relaxed);
                                                             if !rate_limit::try_acquire_datagram_ingress(owner_server_id, peer_ip_for_release, rl_dgram.datagrams_per_sec, rl_dgram.datagrams_burst) {
@@ -1577,6 +1809,61 @@ pub(crate) fn spawn_wtransport_server(
                                                             if dgram.len() > lim_dgram.max_datagram_size {
                                                                 m_dgram.record_datagram_drop(crate::server_metrics::DatagramDropReason::TooLarge);
                                                                 continue;
+                                                            }
+                                                            // One relaxed load when no server has a rule, so the
+                                                            // no-reflector path keeps its existing cost.
+                                                            if crate::datagram_reflector::any_installed() {
+                                                            if let Some(rule) = crate::datagram_reflector::rule_for(owner_server_id) {
+                                                                if rule.matches(&dgram) {
+                                                                    m_dgram.datagram_reflect_hits.fetch_add(1, Ordering::Relaxed);
+                                                                    let now_ns = crate::datagram_reflector::monotonic_ns();
+                                                                    // The hold is read before the reply is built, so it
+                                                                    // measures receive -> buffer build (a few hundred ns
+                                                                    // short of receive -> send) and needs no rewrite pass.
+                                                                    let hold = received_at.elapsed();
+                                                                    // TODO(reflector): reuse a per-task reply buffer if profiling shows the Vec per hit
+                                                                    let reply = rule.apply(&dgram, now_ns, hold.as_nanos().min(u64::MAX as u128) as u64);
+                                                                    // The send runs on the reflect sender thread, not here:
+                                                                    // a slow send must not lengthen this read task. Reflected
+                                                                    // sends are counted in datagrams_out but deliberately
+                                                                    // bypass try_reserve_queued_bytes_with_session. They use a
+                                                                    // separate bounded sender queue; JS outbound byte accounting
+                                                                    // excludes that queue, which has its own diagnostic ownership.
+                                                                    let send_conn = conn_dgram.clone();
+                                                                    let send_m = std::sync::Arc::clone(&m_dgram);
+                                                                    let send_sm = std::sync::Arc::clone(&sm_dgram);
+                                                                    // TODO(reflector): the boxed job allocates per hit; pool if profiling shows it
+                                                                    let queued = crate::datagram_reflector::enqueue(Box::new(move || {
+                                                                        crate::datagram_reflector::mark_ring_bypass(peer_addr);
+                                                                        let send_interval = crate::datagram_reflector::send_call_interval();
+                                                                        let send_result = send_conn.send_datagram(&reply);
+                                                                        if let Some(interval) = send_interval { interval.finish(); }
+                                                                        match send_result {
+                                                                            Ok(()) => {
+                                                                                send_m.datagrams_out.fetch_add(1, Ordering::Relaxed);
+                                                                                send_sm.datagrams_out.fetch_add(1, Ordering::Relaxed);
+                                                                                send_m.datagram_reflect_sent.fetch_add(1, Ordering::Relaxed);
+                                                                            }
+                                                                            Err(error) => {
+                                                                                crate::datagram_reflector::cancel_ring_bypass(peer_addr);
+                                                                                send_m.record_reflect_send_error(
+                                                                                    crate::datagram_reflector::reason_for(&error),
+                                                                                );
+                                                                            }
+                                                                        }
+                                                                    }));
+                                                                    // Both refusals mean the reply never left this process, so
+                                                                    // neither is a transport error. Disconnected is counted here
+                                                                    // too rather than growing ReflectSendErrorReason (which would
+                                                                    // add a by-reason field across the N-API and TS surfaces) for
+                                                                    // a case the process-global queue makes unreachable.
+                                                                    if queued.is_err() {
+                                                                        m_dgram.datagram_reflect_queue_full.fetch_add(1, Ordering::Relaxed);
+                                                                    }
+                                                                    m_dgram.datagram_reflect_hold.observe(hold);
+                                                                    continue;
+                                                                }
+                                                            }
                                                             }
                                                             let sz = dgram.len() as u64;
                                                             match m_dgram.try_reserve_queued_bytes_with_session(
@@ -1845,5 +2132,77 @@ mod tests {
 
         assert_eq!(discard.completed(), 0);
         assert_eq!(discard.error().as_deref(), Some("E_STREAM_RESET"));
+    }
+}
+
+#[cfg(test)]
+mod server_worker_threads_tests {
+    use super::{parse_server_worker_threads, DEFAULT_SERVER_WORKER_THREADS};
+
+    #[test]
+    fn unset_is_the_measured_default() {
+        assert_eq!(
+            parse_server_worker_threads(None),
+            Ok(DEFAULT_SERVER_WORKER_THREADS)
+        );
+        assert_eq!(DEFAULT_SERVER_WORKER_THREADS, 2);
+    }
+
+    #[test]
+    fn in_range_values_are_accepted() {
+        assert_eq!(parse_server_worker_threads(Some("1")), Ok(1));
+        assert_eq!(parse_server_worker_threads(Some("3")), Ok(3));
+        assert_eq!(parse_server_worker_threads(Some("8")), Ok(8));
+    }
+
+    #[test]
+    fn out_of_range_values_are_refused() {
+        assert!(parse_server_worker_threads(Some("0")).is_err());
+        assert!(parse_server_worker_threads(Some("9")).is_err());
+    }
+
+    #[test]
+    fn non_decimal_values_are_refused() {
+        assert!(parse_server_worker_threads(Some("abc")).is_err());
+        assert!(parse_server_worker_threads(Some("")).is_err());
+        assert!(parse_server_worker_threads(Some(" 3")).is_err());
+        assert!(parse_server_worker_threads(Some("+3")).is_err());
+        assert!(parse_server_worker_threads(Some("3.0")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod server_udp_send_buffer_bytes_tests {
+    use super::parse_server_udp_send_buffer_bytes;
+
+    #[test]
+    fn unset_empty_and_zero_leave_the_socket_unchanged() {
+        assert_eq!(parse_server_udp_send_buffer_bytes(None), Ok(None));
+        assert_eq!(parse_server_udp_send_buffer_bytes(Some("")), Ok(None));
+        assert_eq!(parse_server_udp_send_buffer_bytes(Some("0")), Ok(None));
+    }
+
+    #[test]
+    fn accepts_in_range_values() {
+        assert_eq!(
+            parse_server_udp_send_buffer_bytes(Some("65536")),
+            Ok(Some(65_536))
+        );
+        assert_eq!(
+            parse_server_udp_send_buffer_bytes(Some("67108864")),
+            Ok(Some(67_108_864))
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_or_non_decimal_values() {
+        for raw in [
+            "1", "65535", "67108865", "abc", " 65536", "+65536", "65536.0",
+        ] {
+            let err = parse_server_udp_send_buffer_bytes(Some(raw))
+                .expect_err("invalid send-buffer knob must fail closed");
+            assert!(err.contains("WEBTRANSPORT_NATIVE_SERVER_UDP_SNDBUF_BYTES"));
+            assert!(err.contains(raw));
+        }
     }
 }

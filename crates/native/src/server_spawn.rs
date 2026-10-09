@@ -22,6 +22,14 @@ pub(crate) struct BindOptions {
     /// L4 balancer can route by CID instead of by 4-tuple. `None` leaves
     /// quinn's default random 8-octet CIDs in place.
     pub quic_lb: Option<crate::quic_lb::QuicLbConfig>,
+    /// Wire the bound socket into a pinned BPF reuseport sockarray (and
+    /// optionally attach the pinned steering program) so the kernel routes by
+    /// QUIC-LB CID instead of 4-tuple hash. Requires `reuse_port` and
+    /// `quic_lb`; Linux only. Fail-closed at bind.
+    pub steering: Option<crate::reuseport_steering::ReusePortSteering>,
+    /// Requested UDP send buffer bytes. `None` preserves the upstream bind
+    /// path; `Some` is applied before bind and read back after bind.
+    pub udp_send_buffer_bytes: Option<usize>,
 }
 
 /// Builds the server's UDP socket with `SO_REUSEPORT` set before `bind()`.
@@ -33,9 +41,10 @@ pub(crate) struct BindOptions {
 ///
 /// Nonblocking mode and GSO/GRO are deliberately not touched here: quinn-udp's
 /// `UdpSocketState::new` configures both when the endpoint wraps the socket.
-#[cfg(unix)]
-pub(crate) fn bind_reuse_port_socket(
+pub(crate) fn bind_socket_with_options(
     addr: std::net::SocketAddr,
+    reuse_port: bool,
+    udp_send_buffer_bytes: Option<usize>,
 ) -> std::io::Result<std::net::UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
 
@@ -44,19 +53,41 @@ pub(crate) fn bind_reuse_port_socket(
         std::net::SocketAddr::V6(_) => Domain::IPV6,
     };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-    socket.set_reuse_port(true)?;
+    #[cfg(unix)]
+    if reuse_port {
+        socket.set_reuse_port(true)?;
+    }
+    #[cfg(not(unix))]
+    if reuse_port {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            REUSE_PORT_UNSUPPORTED,
+        ));
+    }
+    if let Some(requested) = udp_send_buffer_bytes {
+        socket.set_send_buffer_size(requested)?;
+    }
     socket.bind(&addr.into())?;
+    if let Some(requested) = udp_send_buffer_bytes {
+        validate_effective_send_buffer_floor(requested, socket.send_buffer_size()?)?;
+    }
     Ok(std::net::UdpSocket::from(socket))
 }
 
-#[cfg(not(unix))]
+fn validate_effective_send_buffer_floor(requested: usize, effective: usize) -> std::io::Result<()> {
+    if effective < requested {
+        return Err(std::io::Error::other(format!(
+            "effective UDP send buffer size {} is below requested {}",
+            effective, requested
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn bind_reuse_port_socket(
-    _addr: std::net::SocketAddr,
+    addr: std::net::SocketAddr,
 ) -> std::io::Result<std::net::UdpSocket> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        REUSE_PORT_UNSUPPORTED,
-    ))
+    bind_socket_with_options(addr, true, None)
 }
 
 /// Rejection message for `reusePort` on platforms without `SO_REUSEPORT`.
@@ -111,6 +142,7 @@ pub(crate) fn spawn_server_instance(
 ) -> std::result::Result<(watch::Sender<()>, u16), String> {
     const RETRY_DELAY: Duration = Duration::from_millis(100);
 
+    crate::udp_send_batch::validate_configured_output_mode()?;
     let mut last_err: Option<String> = None;
 
     for attempt in 0..max_retries {
@@ -251,6 +283,35 @@ mod tests {
             },
         ));
         assert!(drain.is_none(), "unexpected drain diagnostic: {drain:?}");
+    }
+
+    #[test]
+    fn bind_socket_with_requested_send_buffer_sets_a_floor() {
+        let socket = super::bind_socket_with_options(
+            "127.0.0.1:0".parse().expect("addr"),
+            false,
+            Some(65_536),
+        )
+        .expect("send-buffer bind");
+        let effective = socket2::Socket::from(socket)
+            .send_buffer_size()
+            .expect("send buffer size");
+        assert!(
+            effective >= 65_536,
+            "effective send buffer {effective} below requested floor"
+        );
+    }
+
+    #[test]
+    fn requested_send_buffer_rejects_an_undersized_effective_readback() {
+        let err = super::validate_effective_send_buffer_floor(26_214_400, 8_388_608)
+            .expect_err("undersized effective send buffer must fail closed");
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(
+            err.to_string()
+                .contains("effective UDP send buffer size 8388608 is below requested 26214400"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -477,6 +538,8 @@ mod tests {
         let bind = BindOptions {
             reuse_port: false,
             quic_lb: Some(QuicLbConfig::new(server_id.clone(), 8, 2).expect("valid config")),
+            steering: None,
+            udp_send_buffer_bytes: None,
         };
         let (session_tx, mut session_rx) = tokio::sync::mpsc::channel(4);
         let (shutdown_tx, port) = spawn_server_instance(

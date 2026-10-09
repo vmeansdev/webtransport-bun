@@ -12,7 +12,7 @@ Production-focused WebTransport for Bun, Node, and Deno with in-process server/c
 
 - API contract: [`SPEC.md`](SPEC.md)
 - Architecture: [`ARCHITECTURE.md`](ARCHITECTURE.md)
-- Operations and runbooks: [`OPERATIONS.md`](OPERATIONS.md)
+- Operations and runbooks: [`OPERATIONS.md`](OPERATIONS.md), [`DO_DROPLET_RUNBOOK.md`](research/DO_DROPLET_RUNBOOK.md)
 - Routing by connection ID: [`quic-lb.md`](quic-lb.md)
 - Testing and gates: [`TESTPLAN.md`](TESTPLAN.md)
 - CI/release: [`CI.md`](CI.md)

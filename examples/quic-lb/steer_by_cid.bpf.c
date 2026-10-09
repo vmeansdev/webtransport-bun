@@ -97,8 +97,12 @@
 
 #define CID_LEN (1 + SERVER_ID_LEN + NONCE_LEN)
 
-// Slots in the sockarray. One per instance sharing the port.
+// Slots in the sockarray. One per instance sharing the port. Overridable at
+// build time (-DMAX_INSTANCES=N) for boxes with more cores than the default
+// assumes.
+#ifndef MAX_INSTANCES
 #define MAX_INSTANCES 8
+#endif
 
 // Fixed-width map key so the hash key has no uninitialised padding. Only the
 // first SERVER_ID_LEN octets are ever meaningful; the rest stay zero.
@@ -177,6 +181,54 @@ struct {
 	__type(value, __u64);
 } steer_stats SEC(".maps");
 
+// Per-slot packet counters, so a reader can put the number of packets this
+// program dispatched to a slot next to that instance's own received-datagram
+// count and see whether the two agree. Split by header form: a short header is
+// steady-state traffic routed by the decoded server ID, a long header is a
+// handshake packet (routed by server ID once the server's CID is in use, or
+// placed by client-DCID hash before that).
+//
+// Deliberately a SEPARATE map from `steer_stats` rather than more keys in it:
+// `steer_stats` keys 0/1 are a frozen contract that readers reject other keys
+// from. This map is keyed by sockarray slot, so it needs its own dimension.
+//
+// PER-CPU for the same reason `steer_stats` is, and with the same consequence
+// for the reader: `bpftool map dump` returns one value per CPU per key, and
+// the total is their sum.
+//
+// Only packets this program actually SELECTED a socket for are counted here.
+// The fail-open path (SK_PASS without a selection) has no slot to attribute
+// to and stays counted by `steer_stats` key 1; this program never returns
+// SK_DROP, so there is no drop counter.
+struct slot_packet_counts {
+	__u64 short_header;
+	__u64 long_header;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, MAX_INSTANCES);
+	__type(key, __u32);
+	__type(value, struct slot_packet_counts);
+} slot_packets SEC(".maps");
+
+static __always_inline void bump_slot(__u32 slot, __u8 is_long)
+{
+	struct slot_packet_counts *counts =
+		bpf_map_lookup_elem(&slot_packets, &slot);
+
+	// Per-CPU value: this CPU is the only writer, so plain increments are
+	// correct and no atomic is needed. An out-of-range slot cannot happen
+	// here (bpf_sk_select_reuseport already accepted it) but the lookup is
+	// null-checked anyway, which is what the verifier requires.
+	if (!counts)
+		return;
+	if (is_long)
+		counts->long_header += 1;
+	else
+		counts->short_header += 1;
+}
+
 static __always_inline void bump(__u32 slot)
 {
 	__u64 *count = bpf_map_lookup_elem(&steer_stats, &slot);
@@ -209,6 +261,69 @@ static __always_inline int fallback(void)
 	return SK_PASS;
 }
 
+// PLACEMENT POLICY FOR CLIENT-CHOSEN DCIDs (long header, QUIC v1 only).
+//
+// A client's opening Initial carries a DCID the client invented (RFC 9000
+// §7.2, at least 8 octets, required random). The CID map cannot route it, and
+// the previous policy handed it to the kernel's 4-tuple reuseport hash. That
+// hash decides which instance ACCEPTS the connection — the accepting instance
+// mints the server CID that pins the session to itself — so session placement
+// was 4-tuple-hash luck for the connection's whole lifetime.
+//
+// Measured on the G6 c-32 rig (r74, 20,000 sessions over 16 instances,
+// fixed-source-port generator): the kernel hash concentrated 2,345 sessions on
+// one instance against an ideal of 1,250 (uniform placement predicts a maximum
+// near 1,350), and that 1.88x-hot instance saturated its two-worker runtime at
+// 96% while the host idled at 63% — the sole cause of the ack-p99 cliff
+// between 10k and 20k sessions.
+//
+// So place deliberately instead: FNV-1a over the first 8 octets of the
+// client's random DCID, modulo the instance count. Random octets give a
+// uniform placement, and the same DCID always lands on the same instance, so
+// a retransmitted Initial — or the whole first flight, even across a client
+// address change — stays on the instance that will answer it. That is
+// strictly more stable than the 4-tuple hash this replaces.
+//
+// Anything that cannot be placed this way (a DCID shorter than the §7.2
+// minimum, a read past the end of a truncated datagram, an empty target slot)
+// takes the ordinary fallback: a pass, never a drop, for the reasons above.
+static __always_inline int place_by_client_dcid(struct sk_reuseport_md *reuse,
+						__u8 dcid_len)
+{
+	__u8 dcid[8];
+	__u32 hash = 0x811c9dc5; // FNV-1a offset basis
+	__u32 slot;
+	int i;
+
+	// RFC 9000 §7.2: an opening Initial's DCID is at least 8 octets. A
+	// shorter DCID is not a v1 opening Initial; leave it to the kernel
+	// hash rather than guess a placement from too little entropy.
+	if (dcid_len < 8)
+		return fallback();
+	if (bpf_skb_load_bytes(reuse, UDP_HDR_LEN + 6, dcid, sizeof(dcid)) < 0)
+		return fallback();
+#pragma unroll
+	for (i = 0; i < 8; i++) {
+		hash ^= dcid[i];
+		hash *= 0x01000193; // FNV-1a prime
+	}
+	slot = hash % MAX_INSTANCES;
+	if (bpf_sk_select_reuseport(reuse, &socks, &slot, 0) != 0)
+		// The hashed slot is empty (that instance is down or not yet
+		// registered). Fall back rather than drop.
+		return fallback();
+
+	// Counted as steered: this is the program deliberately selecting a
+	// socket, not the kernel hash. The steered/fallback counters keep
+	// their documented meaning of "this program placed it" versus
+	// "the kernel decided".
+	bump(0);
+	// Long header by construction: this path is only reached from the long
+	// header branch below.
+	bump_slot(slot, 1);
+	return SK_PASS;
+}
+
 SEC("sk_reuseport")
 int steer_by_cid(struct sk_reuseport_md *reuse)
 {
@@ -218,6 +333,7 @@ int steer_by_cid(struct sk_reuseport_md *reuse)
 	__u32 cid_off;
 	__u32 *slot;
 	__u8 first_octet;
+	__u8 is_long;
 	__u32 version;
 	int i;
 
@@ -241,7 +357,9 @@ int steer_by_cid(struct sk_reuseport_md *reuse)
 
 	first_octet = prefix[UDP_HDR_LEN];
 
-	if (first_octet & QUIC_HEADER_FORM_LONG) {
+	is_long = (first_octet & QUIC_HEADER_FORM_LONG) ? 1 : 0;
+
+	if (is_long) {
 		// RFC 9000 §17.2 long header:
 		//   +0 first octet, +1..+4 version, +5 DCID length, +6 DCID.
 		version = ((__u32)prefix[UDP_HDR_LEN + 1] << 24) |
@@ -302,11 +420,13 @@ int steer_by_cid(struct sk_reuseport_md *reuse)
 			break;
 		}
 
-		// The DCID is routable only if it is the length this
-		// configuration issues. Anything else is another endpoint's
-		// connection ID (or a client-chosen one).
+		// The DCID is routable by server ID only if it is the length
+		// this configuration issues. Any other length is a client-chosen
+		// DCID (the opening Initial) or another endpoint's connection
+		// ID; place it deliberately by hashing the client's random
+		// octets instead of leaving placement to the kernel hash.
 		if (prefix[UDP_HDR_LEN + 5] != CID_LEN)
-			return fallback();
+			return place_by_client_dcid(reuse, prefix[UDP_HDR_LEN + 5]);
 
 		cid_off = UDP_HDR_LEN + 6;
 	} else {
@@ -373,6 +493,7 @@ int steer_by_cid(struct sk_reuseport_md *reuse)
 		return fallback();
 
 	bump(0);
+	bump_slot(*slot, is_long);
 	return SK_PASS;
 }
 

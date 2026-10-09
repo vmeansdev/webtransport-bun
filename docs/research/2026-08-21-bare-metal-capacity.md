@@ -8,8 +8,12 @@ in, and where a number does not exist, this document says so rather than
 estimating one.
 
 G9 is a final **PASS at 600 sessions/s**. The remaining terminal exceptions are
-G2's **hardware-scoped INCOMPLETE, FINAL**, G6's
-**registered-never-dispatched / NO-VERDICT, FINAL** disposition, and G11-T's
+G2's **hardware-scoped INCOMPLETE, FINAL**, G6's **valid MISS, FINAL**
+(G6-04 under `g6-mmo-closeout/1`, single-instance home rig, all three arms;
+see the G6 status update below — the steady realm arm has since passed at
+40,000 sessions on the sharded DigitalOcean deployment, and on 2026-10-09 the
+raid-hotspot and reconnect-storm arms passed there under `g6-sharded-arms/1`;
+see the G6 sharded arms result below), and G11-T's
 dual reading **C6-app MISS (final) · C6-wire PASS**. These are reported with
 the same weight as the passes: the campaign's bar was *"every gate reaches a
 terminally accounted disposition"*, not *"every gate passes."*
@@ -65,10 +69,221 @@ cleanup/lock/process proof is unretained and unproven. Parser repair
 **UNCONSUMED**, not a G6 candidate or rerun authority. No rerun or dispatch is
 authorized without new explicit maintainer authority.
 
+**G6 status update (2026-10-06; supersedes the "no run" summary above for G6
+as a whole — the g6-mmo-02 page itself stays closed as written):**
+
+- **G6-03** (run 32666697490) was stamped MISS and later **superseded to
+  INVALID** (`.scratch/bare-metal-campaign/corrections/g6-mmo-03-invalid-grading-20260824.md`;
+  among others, hotspot H1 was bound to the wrong field).
+- **G6-04** (run 32852265326, candidate `6935e597`, 2026-08-25) is a **valid
+  MISS, terminal under `g6-mmo-closeout/1`**
+  (`.scratch/bare-metal-campaign/stamps/g6-04.md`): the single-instance server
+  passed every steady clause at 500, reached its knee at 2,500 and collapsed at
+  5,000; hotspot missed H1/H2/H3; storm missed S-C1/S-C2 at 1,000 and S-C2 at
+  5,000. The closeout authority licenses no rerun.
+- **Sharded steady realm:** `g6-sharded/1` valid MISS ×3 on S3 duty only;
+  `g6-sharded/2` **PASS at 5,000 and 15,000**, 20,000 refused-final on connect
+  errors (`.scratch/bare-metal-campaign/stamps/g6-sharded-02.md`).
+- **40k capacity closure (2026-10-04):** the unchanged steady workload passed
+  S1–S5 at **40,000 sessions in two independent cells** (S4 ACK p99 3.71 /
+  3.59 ms) on a v5 `g5-48vcpu-96gb-80gb` pair in ric1 — 24 SO_REUSEPORT shards,
+  C-PUMP receive path, stock send path, 4 owned generator processes; source
+  `e43c667f` on `probe/g6-sharded-diagnostic-01`; source-bound goal evaluator
+  PASS and independent audit PASS
+  (`.scratch/bare-metal-campaign/g6-40k-capacity-closure/final-r5-b12/`). 50,000
+  missed S4 (ACK p99 43.97 ms) and is the measured ceiling; a later
+  send-buffer A/B (`.scratch/bare-metal-campaign/g6-50k-sndbuf/`) showed a
+  4 MiB server send buffer removes SndbufErrors without improving the 50k tail
+  (server packet-processing limited, host-dependent). The maintainer set
+  **40,000 sessions as the current capacity bar**. This is a diagnostic-worktree
+  result, not a release or promotion.
+- **Open** (closed 2026-10-09 by the G6 sharded arms result below)**:** the
+  raid-hotspot and reconnect-storm arms have never been measured
+  on the sharded deployment. Raid fan-out is per shard today (no cross-shard
+  path), so a sharded hotspot needs registered raid co-location or a relay and
+  a new pre-registration; `g6-mmo-closeout/1` does not license reruns.
+
 G9's stamped F-1 finding concerns admission refusals under concurrent ramps;
 see [OPERATIONS.md §Admission control: refusal is load-shaping, not rejection](../OPERATIONS.md#admission-control-refusal-is-load-shaping-not-rejection)
 for the existing refusal/retry policy. This document does not duplicate that
 policy.
+
+**G6-sharded diagnostic (historical evidence retracted for causal use):** the
+`g6-sharded-02` 20k refused-final (3 connect errors, 11,767
+`kernelMarks.connect.NoPorts`) was re-investigated on a fresh DO
+`c-32-intel` rig with the producer/grader **byte-identical** to
+`c9586585` and a non-graded conductor diagnostic surface
+(`g6-sharded-diagnostic/1`, branch `probe/g6-sharded-diagnostic-01` @
+`ff9e25be`). Three rungs (5k/15k/20k) on a same-VPC, Linux-generator,
+16-instance BPF rig reported 0 shard exits in its recorded connect-phase
+window and `steer_stats` fallback = 0, while
+`kernelMarks.connect.{InErrors,RcvbufErrors}` step **0 → 3,117 →
+12,920** and `SndbufErrors` steps **0 → 10 → 2,329** with rung size.
+Those aggregate counters remain historical observations, but the diagnostic
+producer parsed the per-shard UDP socket table incorrectly and sampled T1 near
+launch rather than at the actual connect midpoint. Its structured error sample
+was also `null`; **null is not zero** and cannot establish an error count.
+Consequently **D1/D2/D3 remain unresolved** for this artifact. It cannot rule
+out D1 or D2, discriminate among the three hypotheses, or attribute the
+parent's `NoPorts` signal to an OS.
+Any causal discrimination requires a new source-bound rerun with the corrected
+producer. The historical stamp remains at:
+`.scratch/bare-metal-campaign/stamps/g6-sharded-diagnostic-01.md` (on
+`probe/g6-sharded-20k-01`).
+
+**G6-sharded-03 (buffer-tuning intervention, evidence only — no S1–S5 re-stamp):**
+`g6-sharded-02` was re-dispatched at 20k on a fresh DO `c-32-intel`
+rig with the same candidate and producer/grader, and the only change
+being kernel UDP socket buffer tuning on both droplets
+(`net.core.{r,w}mem_{max,default}=26214400`,
+`net.ipv4.udp_{rmem_min,wmem_min,mem}="26214400 26214400 26214400"`).
+The historical registration recorded all five intervention criteria at 20k:
+sessionsAtSteady **20,000 / 20,000 (100.00%)**, `connectErrorsSample`
+**null** (no structured error sample), `connectWallSec` **3.00s** (was
+300.76s in the diagnostic), `kernelMarks.connect.NoPorts` **5** (was 16 / 11,767 in
+the parent), `InErrors` **0** (was 12,920 in the diagnostic),
+`RcvbufErrors` **0** (was 12,920), `SndbufErrors` **0** (was 2,329),
+`InDatagrams` **448** (was 22,410,076 — the diagnostic was retransmitting
+~50,000× per datagram). 0 of 16 shard exits were recorded in the connect
+window. This before/after association supports testing buffer pressure as a
+hypothesis, but it does not retroactively validate the broken diagnostic-01
+instrument or establish a kernel-only root cause. No server code change or
+`SO_RCVBUFFORCE` was present in that historical intervention. A separate
+**g6-sharded-04** registration was
+licensed to re-stamp the S1–S5 clauses on the same rig to issue a
+terminal verdict on g6-sharded-3. Stamp:
+`.scratch/bare-metal-campaign/stamps/g6-sharded-03.md` (on
+`probe/g6-sharded-20k-01`).
+
+**G6-sharded-04 (50k buffer-tuning observation, evidence only — no S1–S5 re-stamp):**
+the kernel-tuning fix was re-tested at **50,000 sessions** on a fresh
+DO `c-32-intel` rig, with the same candidate and producer/grader.
+The historical registration recorded all five intervention criteria at 50k:
+sessionsAtSteady **49,999 / 50,000 (99.998%)**, `connectErrorsSample`
+**null** (no structured error sample), `connectWallSec` **7.08s** (2.36× the
+20k value, ~100× < the 300s cap, scaling linearly with the 2.5× session count
+under the connect-concurrency=500 cap), `kernelMarks.connect.NoPorts`
+**2**, `InErrors` **0**, `RcvbufErrors` **0**, `SndbufErrors` **0**,
+`InDatagrams` **432** (clean, every datagram landed first time). 0 of
+16 shard exits were recorded in the connect window. The observed aggregate
+kernel counters were clean under a 25 MiB UDP buffer ceiling × 16 shards, but
+that observation is not a causal proof or a per-shard occupancy measurement.
+A separate **g6-sharded-05** was licensed to re-stamp the S1–S5
+clauses on the same rig at 50k to issue a terminal verdict on
+g6-sharded-3's clauses. Stamp:
+`.scratch/bare-metal-campaign/stamps/g6-sharded-04.md` (on
+`probe/g6-sharded-20k-01`).
+
+**G6-sharded-05 (200k scale rung, evidence — ladder stopped at rung 1
+of 5):** the scale-ladder question was tested at **200,000 sessions**
+on a fresh DO `c-32-intel` rig with full rig-side tuning
+(`fs.file-max=8388608`, `ulimit -n 8388608`, `ip_local_port_range=1024
+65535`, plus the g6-sharded-03/04 UDP buffer tuning) and an env-var
+forwarded `MMO_CLIENT_RSS_LIMIT_MB=32768` to lift the mmo-client's
+12 GB RSS guard. **PARTIAL at 200k** — three of five registration
+criteria met, two failed:
+sessionsAtSteady **199,976 / 200,000 (99.988%)**, `connectErrorsSample`
+**null** (no structured error sample), 0 of 16 shard exits in the recorded connect
+window, and **0 / 0 / 0 InErrors / RcvbufErrors / SndbufErrors** at
+200k). But `connectWallSec` **301.72s** (just over the 300s
+mmo-client cap; the conductor's `SCAN_CONNECT_TIMEOUT_SECONDS=600`
+was not forwarded to the mmo-client's `--connect-timeout-secs` in that
+historical source), and
+`kernelMarks.connect.NoPorts` **376,563** (a new signal — orders of
+magnitude above the diagnostic's 16, g6-sharded-03's 5, g6-sharded-04's
+2, and the parent's 11,767). The 500k / 1m / 1.5m / 2m rungs are
+**not dispatched**;
+they were licensed for a successor registration that forwards
+`--connect-timeout-secs` and re-establishes a clean NoPorts floor. The zero
+aggregate UDP error counters apply only to that run; they do not close D3 or
+prove a kernel-only or SO_REUSEPORT-only cause. The current candidate forwards the registered timeout
+to both layers, but that source repair does not retroactively repair the
+historical run and requires a new source-bound rerun for current evidence.
+Stamp: `.scratch/bare-metal-campaign/stamps/g6-sharded-05.md`
+(on `probe/g6-sharded-20k-01`).
+
+**G6-sharded-06 (200k clean re-dispatch, evidence — aggregate UDP errors
+return):** the `SCAN_CONNECT_TIMEOUT_SECONDS` plumbing was added
+(commit `f4cac670`) and 200k was re-dispatched cleanly on a fresh
+rig. The clean re-dispatch reduced `kernelMarks.connect.NoPorts` from
+376,563 in g6-sharded-05 to **5** at 200k, but it also surfaced large
+aggregate UDP error counters: `InErrors = 13,815,588`
+/ `RcvbufErrors = 13,815,588` / `SndbufErrors = 415,819` /
+`InDatagrams = 36,856,427` (37% loss rate at 200k steady state). The
+g6-sharded-03/04 buffer setting was 25 MiB per socket × 16 shards = 400 MiB.
+The historical note attributed the counters to uneven SO_REUSEPORT hashing,
+but the invalid per-shard diagnostic cannot substantiate that distribution or
+its per-shard rate. The 500k
+/ 1m / 1.5m / 2m rungs are **not dispatched**. Three of five
+registration criteria met at 200k (sessionsAtSteady **199,982 / 200,000
+(99.991%)**, `connectErrorsSample` **null** with no structured error sample,
+0 of 16 shard exits), and `connectWallSec` **301.76s** (the 300s cap is gone via
+plumbing but the 200k connect rate is ~666/s, so 300s of connect ≈
+200k sessions). The aggregate counter shape is consistent with UDP receive
+buffer pressure at scale, but the broken diagnostic-01 artifact cannot make
+that a proved D3 attribution or exclude another contributor. A successor
+registration was licensed to test rig-side `rmem_max=wmem_max=100+ MiB` (or
+`SO_RCVBUFFORCE` on
+the QUIC socket, which is a server-side patch) before resuming the
+ladder. Stamp: `.scratch/bare-metal-campaign/stamps/g6-sharded-06.md`
+(on `probe/g6-sharded-20k-01`).
+
+**G6 sharded arms result (2026-10-09) — `g6-sharded-arms/1`, both arms PASS:**
+this is the **sharded-deployment verdict** for the two G6 arms that had never
+been measured on the sharded deployment (raid hotspot and reconnect storm),
+under pre-registration `g6-sharded-arms/1`
+(`docs/research/preregistrations/gate-g6-sharded-arms.md`, incl. §11
+Addendum A). **G6-04's valid MISS remains the single-instance G6 verdict**;
+no G6 PASS is promoted from this gate and no comparison claim is made against
+G6-04. Raid co-location (prereg §3.1, §8 item 18) makes H1–H3 structurally
+easier than G6-04's single-instance hotspot.
+
+- **Stamp:** `g6-sharded-arms-stamp/1`, authoritative (sealed run roots, no
+  rehearsal override), run COMPLETE, every cell re-graded by the sealed path
+  and equal to its sealed `work-grade.json`:
+  `.scratch/bare-metal-campaign/g6-sharded-arms/readout-r3/stamp.json`
+  (sha256 `2b7a314b…6d728c`).
+- **Two runs, two pairs (prereg §11 items 5, 6, 13; a user-authorised
+  one-time exception to §7/§10):** hotspot cells from
+  `g6-sharded-arms-20261007-01` (candidate `440632c7`; server 606913366,
+  generator 606913367, `g5-48vcpu-96gb-80gb`); storm cells from the
+  storm-only rerun `g6-sharded-arms-storm-20261009-03` (candidate `15c26752`;
+  server 607635072, generator 607635073, `g5-48vcpu-192gb-80gb`). Same g5
+  generation, 48 vCPUs, ric1, VPC and source-encoded profile (24 shards,
+  4 client processes, 128 endpoints, source-port base 20000); memory differs
+  only. No clause compares cells across pairs. Run 01's S1-5k (sealed
+  INVALID, a coverage-check harness defect, §11 items 1–3) is superseded by
+  the rerun. Both runs sealed and DESTROYED with empty managed inventory.
+
+| Cell (role) | Verdict | Gated clauses | Key numbers |
+|---|---|---|---|
+| H5k (bridge) | PASS | H1, H2, H3 | H1 one-way p99 1.25 ms; H2 1.0004; H3 S4 ACK p99 0.30 ms |
+| **H40k (hotspot gate)** | **PASS** | H1, H2, H3 | H1 one-way p99 **8.50 ms** (≤ 25); H2 **1.0004**; H3 S4 ACK p99 realm 11.29 / shard K 11.52 ms (≤ 25) |
+| S1-5k (storm gate) | PASS | S-C1, S-C2 | survivor ACK p99 **0.29 ms**; delivery 0.999997; 1,000/1,000 re-accepted by +1.05 s |
+| S2-5k (storm gate) | PASS | S-C2 (S-C1 n/a) | 5,000/5,000 re-accepted by +1.22 s |
+| **S1-40k (storm gate)** | **PASS** | S-C1, S-C2 | survivor ACK p99 **7.82 ms** (≤ 25; G6 50 ms PASS); delivery **0.99977**; 8,000/8,000 re-accepted by +2.41 s |
+| S2-40k (characterization) | PASS | none (S-C2 reported) | 40,000/40,000 re-accepted by +4.55 s; worst first Initial 175.7 ms vs R = 500 ms (reported) |
+
+Storm verdict = worst of S1-5k, S2-5k, S1-40k = **PASS**; hotspot verdict =
+H40k = **PASS**. No falsifier fired in any cell (V-T sever skew ≤ 21 ms vs
+100 ms; V-W storm fallback ≤ 3.7×10⁻⁶ vs 0.01; V-P client = server per shard
+at steady entry and storm end; V-F floor p99 ≤ 2.03 ms; V-F′ worst process
+p99 ≤ 4.12 ms vs 10 ms; storm cell walls 360–504 s vs the 600 s maximum).
+S-C1 delivery uses the registered survivor numerator (JS-classified moves +
+reflected ACKs, a lower bound); the uncorrected moves-only ratio (0.8748 at
+both rungs) is disclosed beside it and its accounting gap to survivor `sent`
+is −5 (5k) and −3,578 (40k) datagrams, reported only (§11 item 9).
+
+- **Spend:** the rerun's sealed lifecycle cost is 3,409,360 µUSD (liability
+  6,108,438); the sealed chain total is **122,523,564 µUSD** against the
+  143,544,166 ceiling (21,020,602 remaining in chain). With disclosed
+  out-of-chain spend (B-10 1,394,320; B-11 3,718,188; network probes
+  ≈ 1.13 M; retired attempt -02 ≤ 260,438) the true total is
+  **≈ 129.03 M µUSD**, ≈ 14.52 M remaining.
+- **Readout and audit inputs:**
+  `.scratch/bare-metal-campaign/g6-sharded-arms/readout-r3/` (README lists
+  artefacts and hashes). An independent audit is pending at the time of
+  writing.
 
 **G10 itself is not in this table.** Its VM-era MISS was ruled final for that
 rig, and the paced-broadcast gate supersedes its scenario on this one — the

@@ -175,6 +175,34 @@ impl ServerHandle {
             // quinn's default CIDs (docs/OPERATIONS.md).
             let quic_lb = crate::quic_lb::parse_quic_lb_options(&server_opts)
                 .map_err(|msg| napi::Error::from_reason(format!("E_INVALID_ARGUMENT: {}", msg)))?;
+            // CID steering for the reuseport group. Steering without reusePort
+            // has no group to steer, and steering without quicLb is 100%
+            // hash-fallback while looking configured — both are refused rather
+            // than half-honored.
+            let steering = crate::reuseport_steering::parse_steering_options(&server_opts)
+                .map_err(|msg| napi::Error::from_reason(format!("E_INVALID_ARGUMENT: {}", msg)))?;
+            if steering.is_some() {
+                if !crate::reuseport_steering::steering_supported() {
+                    return Err(napi::Error::from_reason(format!(
+                        "E_UNSUPPORTED_ARGUMENT: {}",
+                        crate::reuseport_steering::STEERING_UNSUPPORTED
+                    )));
+                }
+                if !reuse_port {
+                    return Err(napi::Error::from_reason(
+                        "E_INVALID_ARGUMENT: reusePortSteering requires reusePort: true"
+                            .to_string(),
+                    ));
+                }
+                if quic_lb.is_none() {
+                    return Err(napi::Error::from_reason(
+                        "E_INVALID_ARGUMENT: reusePortSteering requires quicLb — \
+                         without QUIC-LB CIDs every packet falls back to the \
+                         kernel hash and the steering program steers nothing"
+                            .to_string(),
+                    ));
+                }
+            }
             let limits = crate::limits::Limits::from_json(&_limits_json);
             let rate_limits = crate::rate_limit::RateLimits::from_json(&_rate_limits_json);
             crate::panic_guard::set_panic_log_verbose(debug);
@@ -187,6 +215,9 @@ impl ServerHandle {
                         .to_string(),
                 ));
             }
+            let udp_send_buffer_bytes = crate::server_udp_send_buffer_bytes().map_err(|msg| {
+                napi::Error::from_reason(format!("E_INTERNAL: server startup failed: {}", msg))
+            })?;
 
             let server_id = SERVER_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
             let tls_config = parse_tls_resolver_config(&tls_config_json)
@@ -217,6 +248,8 @@ impl ServerHandle {
                 crate::server_spawn::BindOptions {
                     reuse_port,
                     quic_lb,
+                    steering,
+                    udp_send_buffer_bytes,
                 },
                 1,
             )
@@ -245,6 +278,17 @@ impl ServerHandle {
     #[napi(getter)]
     pub fn port(&self) -> u32 {
         panic_guard::catch_panic(|| Ok(self.port)).unwrap_or(0)
+    }
+
+    #[napi]
+    pub fn server_udp_send_buffer_bytes(&self) -> u32 {
+        panic_guard::catch_panic(|| {
+            Ok(crate::server_udp_send_buffer_bytes()
+                .ok()
+                .flatten()
+                .unwrap_or(0) as u32)
+        })
+        .unwrap_or(0)
     }
 
     #[napi]
@@ -342,6 +386,7 @@ impl ServerHandle {
                 let _ = tx.send(());
             }
             crate::rate_limit::cleanup_server_entries(self.server_id);
+            crate::datagram_reflector::clear_owner(self.server_id);
             crate::session_registry::close_all_for_owner(
                 self.server_id,
                 crate::SERVER_CLOSING_CLOSE_CODE,
@@ -404,6 +449,40 @@ impl ServerHandle {
             &self.metrics,
         )
         .into_napi()
+    }
+
+    /// Install, replace, or clear (`null`) this server's datagram reflector.
+    ///
+    /// The rule is validated here again even though the TypeScript wrapper
+    /// already checked it: a raw-addon caller must not be able to hand the
+    /// hot path an unchecked offset. Shape errors are `TypeError`, bound
+    /// errors `RangeError`, both raised before any state changes. Takes
+    /// effect on the next datagram of every session this server owns.
+    #[napi(js_name = "setDatagramReflector")]
+    pub fn set_datagram_reflector(
+        &self,
+        rule: Option<crate::datagram_reflector::DatagramReflectorRuleInput>,
+    ) -> Result<()> {
+        let compiled = match rule {
+            None => None,
+            Some(input) => match crate::datagram_reflector::compile(&input) {
+                Ok(rule) => Some(std::sync::Arc::new(rule)),
+                Err(crate::datagram_reflector::RuleError::Shape(message)) => {
+                    return Err(napi::Error::new(
+                        napi::Status::InvalidArg,
+                        format!("TypeError: {message}"),
+                    ));
+                }
+                Err(crate::datagram_reflector::RuleError::Range(message)) => {
+                    return Err(napi::Error::new(
+                        napi::Status::InvalidArg,
+                        format!("RangeError: {message}"),
+                    ));
+                }
+            },
+        };
+        crate::datagram_reflector::set_rule(self.server_id, compiled);
+        Ok(())
     }
 
     /// Hand one payload and many targets to the egress pacer's schedule.
@@ -493,9 +572,101 @@ impl ServerHandle {
     /// without one, `window` is `null`. Process-global by construction — the
     /// pacer is one schedule per process, not one per server — so a second
     /// `Server` in the same process reads the same counters.
+    /// Effective Tokio worker count of the server runtime for this process.
+    /// Default 2; overridden only by `WEBTRANSPORT_NATIVE_SERVER_WORKERS` for
+    /// campaign A/B measurement. Exposed so a load harness can prove the shard
+    /// it started is running the worker count it asked for.
+    #[napi]
+    pub fn server_worker_threads(&self) -> u32 {
+        panic_guard::catch_panic(|| Ok(crate::server_worker_threads() as u32)).unwrap_or(0)
+    }
+
+    /// Where quinn's endpoint driver runs for servers in this process:
+    /// `"shared"` (the server runtime) or `"dedicated"` (its own thread).
+    /// Memoised with the runtime choice so a shard can attest the mode it
+    /// actually started with.
+    #[napi]
+    pub fn server_recv_runtime(&self) -> String {
+        panic_guard::catch_panic(|| {
+            Ok(crate::quic_runtime::server_recv_runtime_mode()
+                .as_str()
+                .to_string())
+        })
+        .unwrap_or_default()
+    }
+
+    /// Server-side ACK cadence requested of the client for servers in this
+    /// process: `"default"` (quinn's stock cadence) or `"relaxed"`
+    /// (`max_ack_delay` 100 ms + ACK_FREQUENCY, threshold 10). Memoised with
+    /// the transport-config choice so a shard can attest the mode it
+    /// actually started with.
+    #[napi]
+    pub fn server_ack_cadence(&self) -> String {
+        panic_guard::catch_panic(|| {
+            Ok(crate::ack_cadence::server_ack_cadence_mode()
+                .as_str()
+                .to_string())
+        })
+        .unwrap_or_default()
+    }
+
+    /// Datagram read path the wtransport driver uses in this process:
+    /// `"pump"` (dedicated per-connection task, the default) or `"legacy"`
+    /// (inline in the driver select loop, `WTRANSPORT_DATAGRAM_PUMP=0`).
+    #[napi]
+    pub fn server_datagram_driver(&self) -> String {
+        crate::datagram_driver::effective_mode().to_string()
+    }
+
+    /// Cross-connection UDP send batch size the addon actually resolved
+    /// (`WEBTRANSPORT_NATIVE_UDP_SEND_BATCH`); 0 = off, one sendmsg per
+    /// transmit as before.
+    #[napi]
+    pub fn server_udp_send_batch(&self) -> u32 {
+        panic_guard::catch_panic(|| {
+            Ok(crate::udp_send_batch::configured_batch().unwrap_or(0) as u32)
+        })
+        .unwrap_or_default()
+    }
+
+    /// Action taken when Linux `sendmmsg` reports EAGAIN: `"wait"` keeps
+    /// the unsent suffix and waits for writability; `"drop"` discards that
+    /// suffix so shard drivers are not parked behind the flusher.
+    #[napi]
+    pub fn server_udp_send_eagain_mode(&self) -> String {
+        panic_guard::catch_panic(|| {
+            Ok(crate::udp_send_batch::configured_eagain_mode()
+                .as_str()
+                .to_string())
+        })
+        .unwrap_or_default()
+    }
+
+    #[napi]
+    pub fn server_reflect_ring_bypass(&self) -> String {
+        panic_guard::catch_panic(|| {
+            Ok(crate::datagram_reflector::configured_ring_bypass_mode()
+                .as_str()
+                .to_string())
+        })
+        .unwrap_or_default()
+    }
+
     #[napi(js_name = "__pacerStatsJson")]
     pub fn pacer_stats_json(&self, since: Option<u32>) -> String {
         crate::egress_pacer::stats_json(since)
+    }
+
+    /// Campaign-only, process-wide phase/readout seam. Off unless explicitly
+    /// armed; snapshots before `closed` are provisional, not resettable deltas.
+    #[napi(js_name = "__sendPathDiagnostics")]
+    // Keep Result visible to the napi macro: an opaque type alias serializes
+    // Err as a returned JS Error value instead of throwing at this boundary.
+    pub fn send_path_diagnostics(&self, phase: Option<String>) -> napi::Result<String> {
+        panic_guard::catch_panic(|| {
+            crate::send_path_diagnostics::control(phase.as_deref())
+                .map_err(|message| wt_from_reason(format!("E_INTERNAL: {message}")))
+        })
     }
 
     #[napi]
@@ -527,6 +698,14 @@ impl ServerHandle {
                 crate::stream_sink::SINK_DROPPED_RECORDS_TOTAL
                     .load(std::sync::atomic::Ordering::Relaxed) as f64,
             );
+            let quic = crate::session_registry::owner_quic_aggregate(self.server_id);
+            snapshot.quic_sessions = Some(quic.sessions as f64);
+            snapshot.quic_udp_datagrams_received = Some(quic.udp_datagrams_received as f64);
+            snapshot.quic_udp_datagrams_sent = Some(quic.udp_datagrams_sent as f64);
+            snapshot.quic_datagram_frames_received = Some(quic.datagram_frames_received as f64);
+            snapshot.quic_datagram_frames_sent = Some(quic.datagram_frames_sent as f64);
+            snapshot.quic_packets_sent = Some(quic.packets_sent as f64);
+            snapshot.quic_packets_lost = Some(quic.packets_lost as f64);
             Ok(snapshot)
         })
         .map_err(wt_from_reason)
@@ -603,6 +782,12 @@ mod tests {
         let snap = handle.tls_snapshot().expect("tls snap");
         assert!(snap.sni_server_names.contains(&"x.example".to_string()));
         assert_eq!(snap.unknown_sni_policy, "default");
+        assert_eq!(
+            handle.server_udp_send_buffer_bytes(),
+            crate::server_udp_send_buffer_bytes()
+                .expect("resolved knob")
+                .unwrap_or(0) as u32
+        );
         handle
             .remove_sni_cert("x.example".into())
             .await

@@ -415,6 +415,23 @@ pub fn owner_of(session_id: &str) -> Option<u64> {
     REGISTRY.get(session_id).map(|entry| entry.owner_server_id)
 }
 
+/// Sum quinn transport counters over the sessions this server currently owns.
+///
+/// One registry pass, `conn.stats()` per entry (a cheap copy of quinn's own
+/// counter struct). LIVE sessions only — see [`crate::metrics::QuicAggregate`]
+/// for why the result is a boundary sample rather than a lifetime total.
+pub fn owner_quic_aggregate(owner_server_id: u64) -> crate::metrics::QuicAggregate {
+    let mut agg = crate::metrics::QuicAggregate::default();
+    for entry in REGISTRY.iter() {
+        let state = entry.value();
+        if state.owner_server_id != owner_server_id {
+            continue;
+        }
+        agg.accumulate(&state.conn.quic_connection().stats());
+    }
+    agg
+}
+
 pub fn owner_entry_count(owner_server_id: u64) -> usize {
     REGISTRY
         .iter()
@@ -881,7 +898,9 @@ mod tests {
     // reserved budget; a laxer value silently reopens the accounting hole.
     #[test]
     fn zero_copy_threshold_bounds_backing_overhead_to_two_x() {
-        assert!(TRANSPORT_ZERO_COPY_MIN_PAYLOAD * 2 >= TRANSPORT_DATAGRAM_BACKING_ESTIMATE);
+        const {
+            assert!(TRANSPORT_ZERO_COPY_MIN_PAYLOAD * 2 >= TRANSPORT_DATAGRAM_BACKING_ESTIMATE);
+        }
     }
 
     // `into_transport_slot` cannot be exercised directly (`Datagram` has no
@@ -1160,7 +1179,7 @@ mod tests {
 
         metrics.release_datagram_capacity(&sm.queued_bytes, &session_notify, SESSION_MAX);
 
-        let _ = timeout(Duration::from_millis(100), second_send)
+        timeout(Duration::from_millis(100), second_send)
             .await
             .expect("the first outbound send's direct release must wake the second")
             .expect("second send task must not panic")

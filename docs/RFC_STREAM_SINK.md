@@ -421,7 +421,8 @@ production. **Shape parity, not latency parity.**
   on a saturated loop.
 
   **AUTHORITATIVE GATE: PASS (2026-08-26, Linux heavy runner, run 32960345591 @ 6a0d9b81).**
-  Dispatched through bench-bandwidth's `sink_gate` mode; 8 streams × 100 msg/s × 1 KiB, 30 s
+  Dispatched through bench-bandwidth's `sink_gate` input (since the G6 merge: `mode=sink-gate`,
+  knobs in the `sink_params` JSON input, same defaults); 8 streams × 100 msg/s × 1 KiB, 30 s
   cells, ~24.9k samples each:
 
   | cell | facade p50 / p99 | sink p50 / p99 |

@@ -2085,10 +2085,12 @@ mod tests {
 
         // Client-side registry insert exercises read/create error + datagram dequeue.
         let client_id = format!("{id}-client");
-        let mut tight = Limits::default();
-        tight.max_queued_bytes_global = 1;
-        tight.max_queued_bytes_per_session = 1;
-        tight.backpressure_timeout_ms = 1;
+        let tight = Limits {
+            max_queued_bytes_global: 1,
+            max_queued_bytes_per_session: 1,
+            backpressure_timeout_ms: 1,
+            ..Limits::default()
+        };
         let (
             dgram_tx,
             _bidi_accept_tx,
@@ -2193,13 +2195,10 @@ mod tests {
             .send(discard_slot)
             .await
             .expect("enqueue discard datagram");
-        assert_eq!(
-            discard_datagram_for_session(&client_id, None)
-                .await
-                .expect("discard")
-                .expect("discard result"),
-            true
-        );
+        assert!(discard_datagram_for_session(&client_id, None)
+            .await
+            .expect("discard")
+            .expect("discard result"));
         assert_eq!(sm.queued_bytes.load(Ordering::Relaxed), 0);
 
         for data in [b"batch-a".to_vec(), b"batch-b".to_vec()] {

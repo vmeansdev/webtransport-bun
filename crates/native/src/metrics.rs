@@ -14,6 +14,13 @@ pub struct HistogramSnapshot {
 }
 
 #[napi(object)]
+pub struct ReflectSendErrorsSnapshot {
+    pub not_connected: f64,
+    pub unsupported_by_peer: f64,
+    pub too_large: f64,
+}
+
+#[napi(object)]
 pub struct ServerMetricsSnapshot {
     pub now_ms: f64,
     pub sessions_active: u32,
@@ -52,6 +59,45 @@ pub struct ServerMetricsSnapshot {
     /// Native only. Deferred mirror reports lost to ring overflow. Process-wide,
     /// like the pacer's schedule: `drained + this == deferredFailures`.
     pub mirror_reports_dropped: Option<f64>,
+    /// Native only. Datagrams the per-server reflector matched.
+    pub datagram_reflect_hits: Option<f64>,
+    /// Native only. Reflected replies the transport accepted.
+    pub datagram_reflect_sent: Option<f64>,
+    /// Native only. Reflected replies dropped because the sender queue was full.
+    pub datagram_reflect_queue_full: Option<f64>,
+    /// Native only. Reflected replies the transport refused (dropped, never retried).
+    pub datagram_reflect_send_errors: Option<f64>,
+    pub datagram_reflect_ring_bypass_marked: Option<f64>,
+    pub datagram_reflect_ring_bypass_refreshed: Option<f64>,
+    pub datagram_reflect_ring_bypass_refused: Option<f64>,
+    pub datagram_reflect_ring_bypass_expired: Option<f64>,
+    pub datagram_reflect_ring_bypassed: Option<f64>,
+    pub datagram_reflect_ring_direct_blocked: Option<f64>,
+    pub datagram_reflect_ring_direct_errors: Option<f64>,
+    pub datagram_reflect_ring_gso_fallback: Option<f64>,
+    /// Native only, process-wide. Cross-connection UDP send batching
+    /// (`WEBTRANSPORT_NATIVE_UDP_SEND_BATCH`): sendmmsg calls, datagrams sent
+    /// through them, datagrams sent one at a time instead (unsupported shape
+    /// or platform), `WouldBlock`s handed to a driver because the ring was
+    /// full, datagrams dropped because the flusher was gone or a fallback
+    /// WouldBlock, congestion drops admitted by the EAGAIN drop mode, send
+    /// errors, and the largest batch flushed. All zero while batching is off.
+    pub udp_send_batch_calls: Option<f64>,
+    pub udp_send_batch_messages: Option<f64>,
+    pub udp_send_batch_fallback: Option<f64>,
+    pub udp_send_batch_blocked: Option<f64>,
+    pub udp_send_batch_dropped: Option<f64>,
+    pub udp_send_batch_congestion_dropped: Option<f64>,
+    pub udp_send_batch_errors: Option<f64>,
+    pub udp_send_batch_max_batch: Option<f64>,
+    /// Datagram read tasks the wtransport driver spawned in this process
+    /// (0 when `WTRANSPORT_DATAGRAM_PUMP=0` selects the inline path), and how
+    /// many are alive now. Process-wide, like the batch counters above.
+    pub datagram_pumps_spawned: Option<f64>,
+    pub datagram_pumps_live: Option<f64>,
+    pub datagram_reflect_send_errors_by_reason: Option<ReflectSendErrorsSnapshot>,
+    /// Native only. Receive-to-reflection duration. Present when any observation.
+    pub datagram_reflect_hold: Option<HistogramSnapshot>,
     pub rate_limited_count: f64,
     pub limit_exceeded_count: f64,
     /// Native only. Sessions the QUIC idle timeout ended.
@@ -89,6 +135,22 @@ pub struct ServerMetricsSnapshot {
     pub datagram_enqueue_latency: Option<HistogramSnapshot>,
     /// Stream open latency (create_bidi/create_uni). Present when any observation.
     pub stream_open_latency: Option<HistogramSnapshot>,
+    /// Native only. Connections that were live when this snapshot was taken and
+    /// therefore contributed to the `quic_*` sums below.
+    pub quic_sessions: Option<f64>,
+    /// Native only. quinn transport counters summed over those live connections.
+    /// A boundary sample, not a lifetime total: a closed session's counters are
+    /// gone with it, so two boundaries may only be differenced across a window
+    /// whose session set is stable. Together with the application's own receive
+    /// tally these discriminate NIC-to-quinn loss (`quic_udp_datagrams_received`
+    /// short of what the peer sent) from quinn-to-application loss
+    /// (`quic_datagram_frames_received` short of what the app counted).
+    pub quic_udp_datagrams_received: Option<f64>,
+    pub quic_udp_datagrams_sent: Option<f64>,
+    pub quic_datagram_frames_received: Option<f64>,
+    pub quic_datagram_frames_sent: Option<f64>,
+    pub quic_packets_sent: Option<f64>,
+    pub quic_packets_lost: Option<f64>,
 }
 
 /// Process-wide native stream-handle counts used by post-close residency
@@ -118,16 +180,28 @@ pub struct QuicConnectionStats {
     /// UDP payload bytes sent/received on the connection (wire bytes).
     pub bytes_sent: f64,
     pub bytes_received: f64,
-    /// QUIC packets sent/received/lost.
+    /// QUIC packets sent/lost. `packets_received` is the legacy receive field:
+    /// the pinned quinn release exposes received UDP datagrams, not a separate
+    /// received QUIC-packet total, so it aliases `udp_datagrams_received`.
     pub packets_sent: f64,
     pub packets_received: f64,
     pub packets_lost: f64,
+    /// Application DATAGRAM frames emitted/consumed by QUIC.
+    pub datagram_frames_sent: f64,
+    pub datagram_frames_received: f64,
+    /// UDP datagrams emitted/consumed by QUIC. These remain distinct from
+    /// application DATAGRAM frames because one UDP datagram can carry other
+    /// frame classes and transport batching can change their relationship.
+    pub udp_datagrams_sent: f64,
+    pub udp_datagrams_received: f64,
     /// Current max datagram payload size for this path (None until known).
     pub max_datagram_size: Option<u32>,
 }
 
-pub fn quic_stats_from_conn(conn: &wtransport::Connection) -> QuicConnectionStats {
-    let stats = conn.quic_connection().stats();
+fn quic_stats_from_snapshot(
+    stats: &wtransport::quinn::ConnectionStats,
+    max_datagram_size: Option<usize>,
+) -> QuicConnectionStats {
     QuicConnectionStats {
         rtt_ms: stats.path.rtt.as_secs_f64() * 1000.0,
         bytes_sent: stats.udp_tx.bytes as f64,
@@ -135,8 +209,58 @@ pub fn quic_stats_from_conn(conn: &wtransport::Connection) -> QuicConnectionStat
         packets_sent: stats.path.sent_packets as f64,
         packets_received: stats.udp_rx.datagrams as f64,
         packets_lost: stats.path.lost_packets as f64,
-        max_datagram_size: conn.max_datagram_size().map(|n| n as u32),
+        datagram_frames_sent: stats.frame_tx.datagram as f64,
+        datagram_frames_received: stats.frame_rx.datagram as f64,
+        udp_datagrams_sent: stats.udp_tx.datagrams as f64,
+        udp_datagrams_received: stats.udp_rx.datagrams as f64,
+        max_datagram_size: max_datagram_size.map(|n| n as u32),
     }
+}
+
+/// Per-server sums of quinn transport counters over the connections that were
+/// live when the snapshot was taken.
+///
+/// Semantics: LIVE connections only. quinn owns its stats per connection, so a
+/// session that has already closed takes its counters with it — this is a
+/// boundary sample, not a lifetime counter. Differencing two boundaries is only
+/// valid while the session set is stable (a steady measurement window); across
+/// a window where sessions churn, the delta undercounts by whatever the
+/// departed connections carried.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct QuicAggregate {
+    pub sessions: u64,
+    pub udp_datagrams_received: u64,
+    pub udp_datagrams_sent: u64,
+    pub datagram_frames_received: u64,
+    pub datagram_frames_sent: u64,
+    pub packets_sent: u64,
+    pub packets_lost: u64,
+}
+
+impl QuicAggregate {
+    /// Fold one connection's raw quinn stats into the running sums.
+    pub fn accumulate(&mut self, stats: &wtransport::quinn::ConnectionStats) {
+        self.sessions = self.sessions.saturating_add(1);
+        self.udp_datagrams_received = self
+            .udp_datagrams_received
+            .saturating_add(stats.udp_rx.datagrams);
+        self.udp_datagrams_sent = self
+            .udp_datagrams_sent
+            .saturating_add(stats.udp_tx.datagrams);
+        self.datagram_frames_received = self
+            .datagram_frames_received
+            .saturating_add(stats.frame_rx.datagram);
+        self.datagram_frames_sent = self
+            .datagram_frames_sent
+            .saturating_add(stats.frame_tx.datagram);
+        self.packets_sent = self.packets_sent.saturating_add(stats.path.sent_packets);
+        self.packets_lost = self.packets_lost.saturating_add(stats.path.lost_packets);
+    }
+}
+
+pub fn quic_stats_from_conn(conn: &wtransport::Connection) -> QuicConnectionStats {
+    let stats = conn.quic_connection().stats();
+    quic_stats_from_snapshot(&stats, conn.max_datagram_size())
 }
 
 #[napi(object)]
@@ -160,4 +284,67 @@ pub struct ClientPoolMetricsSnapshot {
     pub misses: u32,
     pub evict_idle: u32,
     pub evict_broken: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quic_stats_from_snapshot;
+
+    #[test]
+    fn quic_stats_snapshot_maps_raw_datagram_stages_exactly() {
+        let mut raw = wtransport::quinn::ConnectionStats::default();
+        raw.path.rtt = std::time::Duration::from_micros(2_500);
+        raw.frame_tx.datagram = 17;
+        raw.frame_rx.datagram = 19;
+        raw.udp_tx.datagrams = 23;
+        raw.udp_rx.datagrams = 29;
+        raw.udp_tx.bytes = 31;
+        raw.udp_rx.bytes = 37;
+        raw.path.sent_packets = 41;
+        raw.path.lost_packets = 43;
+
+        let mapped = quic_stats_from_snapshot(&raw, Some(1_200));
+
+        assert_eq!(mapped.datagram_frames_sent, 17.0);
+        assert_eq!(mapped.datagram_frames_received, 19.0);
+        assert_eq!(mapped.udp_datagrams_sent, 23.0);
+        assert_eq!(mapped.udp_datagrams_received, 29.0);
+        assert_eq!(mapped.bytes_sent, 31.0);
+        assert_eq!(mapped.bytes_received, 37.0);
+        assert_eq!(mapped.packets_sent, 41.0);
+        assert_eq!(mapped.packets_lost, 43.0);
+        assert_eq!(mapped.max_datagram_size, Some(1_200));
+        assert_eq!(mapped.rtt_ms, 2.5);
+    }
+
+    #[test]
+    fn quic_aggregate_sums_every_stage_over_two_sessions() {
+        let mut a = wtransport::quinn::ConnectionStats::default();
+        a.udp_rx.datagrams = 100;
+        a.udp_tx.datagrams = 90;
+        a.frame_rx.datagram = 80;
+        a.frame_tx.datagram = 70;
+        a.path.sent_packets = 60;
+        a.path.lost_packets = 5;
+        let mut b = wtransport::quinn::ConnectionStats::default();
+        b.udp_rx.datagrams = 1;
+        b.udp_tx.datagrams = 2;
+        b.frame_rx.datagram = 3;
+        b.frame_tx.datagram = 4;
+        b.path.sent_packets = 6;
+        b.path.lost_packets = 7;
+
+        let mut agg = super::QuicAggregate::default();
+        assert_eq!(agg, super::QuicAggregate::default());
+        agg.accumulate(&a);
+        agg.accumulate(&b);
+
+        assert_eq!(agg.sessions, 2);
+        assert_eq!(agg.udp_datagrams_received, 101);
+        assert_eq!(agg.udp_datagrams_sent, 92);
+        assert_eq!(agg.datagram_frames_received, 83);
+        assert_eq!(agg.datagram_frames_sent, 74);
+        assert_eq!(agg.packets_sent, 66);
+        assert_eq!(agg.packets_lost, 12);
+    }
 }

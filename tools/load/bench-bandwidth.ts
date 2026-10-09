@@ -392,4 +392,10 @@ async function main(): Promise<void> {
 	}
 }
 
-await main();
+try {
+	await main();
+	process.exit(0);
+} catch (err) {
+	console.error(err instanceof Error ? (err.stack ?? err.message) : err);
+	process.exit(1);
+}
