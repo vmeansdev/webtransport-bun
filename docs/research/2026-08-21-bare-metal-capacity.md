@@ -11,8 +11,9 @@ G9 is a final **PASS at 600 sessions/s**. The remaining terminal exceptions are
 G2's **hardware-scoped INCOMPLETE, FINAL**, G6's **valid MISS, FINAL**
 (G6-04 under `g6-mmo-closeout/1`, single-instance home rig, all three arms;
 see the G6 status update below — the steady realm arm has since passed at
-40,000 sessions on the sharded DigitalOcean deployment, while the raid-hotspot
-and reconnect-storm arms remain unmeasured there), and G11-T's
+40,000 sessions on the sharded DigitalOcean deployment, and on 2026-10-09 the
+raid-hotspot and reconnect-storm arms passed there under `g6-sharded-arms/1`;
+see the G6 sharded arms result below), and G11-T's
 dual reading **C6-app MISS (final) · C6-wire PASS**. These are reported with
 the same weight as the passes: the campaign's bar was *"every gate reaches a
 terminally accounted disposition"*, not *"every gate passes."*
@@ -96,7 +97,8 @@ as a whole — the g6-mmo-02 page itself stays closed as written):**
   (server packet-processing limited, host-dependent). The maintainer set
   **40,000 sessions as the current capacity bar**. This is a diagnostic-worktree
   result, not a release or promotion.
-- **Open:** the raid-hotspot and reconnect-storm arms have never been measured
+- **Open** (closed 2026-10-09 by the G6 sharded arms result below)**:** the
+  raid-hotspot and reconnect-storm arms have never been measured
   on the sharded deployment. Raid fan-out is per shard today (no cross-shard
   path), so a sharded hotspot needs registered raid co-location or a relay and
   a new pre-registration; `g6-mmo-closeout/1` does not license reruns.
@@ -225,6 +227,63 @@ registration was licensed to test rig-side `rmem_max=wmem_max=100+ MiB` (or
 the QUIC socket, which is a server-side patch) before resuming the
 ladder. Stamp: `.scratch/bare-metal-campaign/stamps/g6-sharded-06.md`
 (on `probe/g6-sharded-20k-01`).
+
+**G6 sharded arms result (2026-10-09) — `g6-sharded-arms/1`, both arms PASS:**
+this is the **sharded-deployment verdict** for the two G6 arms that had never
+been measured on the sharded deployment (raid hotspot and reconnect storm),
+under pre-registration `g6-sharded-arms/1`
+(`docs/research/preregistrations/gate-g6-sharded-arms.md`, incl. §11
+Addendum A). **G6-04's valid MISS remains the single-instance G6 verdict**;
+no G6 PASS is promoted from this gate and no comparison claim is made against
+G6-04. Raid co-location (prereg §3.1, §8 item 18) makes H1–H3 structurally
+easier than G6-04's single-instance hotspot.
+
+- **Stamp:** `g6-sharded-arms-stamp/1`, authoritative (sealed run roots, no
+  rehearsal override), run COMPLETE, every cell re-graded by the sealed path
+  and equal to its sealed `work-grade.json`:
+  `.scratch/bare-metal-campaign/g6-sharded-arms/readout-r3/stamp.json`
+  (sha256 `2b7a314b…6d728c`).
+- **Two runs, two pairs (prereg §11 items 5, 6, 13; a user-authorised
+  one-time exception to §7/§10):** hotspot cells from
+  `g6-sharded-arms-20261007-01` (candidate `440632c7`; server 606913366,
+  generator 606913367, `g5-48vcpu-96gb-80gb`); storm cells from the
+  storm-only rerun `g6-sharded-arms-storm-20261009-03` (candidate `15c26752`;
+  server 607635072, generator 607635073, `g5-48vcpu-192gb-80gb`). Same g5
+  generation, 48 vCPUs, ric1, VPC and source-encoded profile (24 shards,
+  4 client processes, 128 endpoints, source-port base 20000); memory differs
+  only. No clause compares cells across pairs. Run 01's S1-5k (sealed
+  INVALID, a coverage-check harness defect, §11 items 1–3) is superseded by
+  the rerun. Both runs sealed and DESTROYED with empty managed inventory.
+
+| Cell (role) | Verdict | Gated clauses | Key numbers |
+|---|---|---|---|
+| H5k (bridge) | PASS | H1, H2, H3 | H1 one-way p99 1.25 ms; H2 1.0004; H3 S4 ACK p99 0.30 ms |
+| **H40k (hotspot gate)** | **PASS** | H1, H2, H3 | H1 one-way p99 **8.50 ms** (≤ 25); H2 **1.0004**; H3 S4 ACK p99 realm 11.29 / shard K 11.52 ms (≤ 25) |
+| S1-5k (storm gate) | PASS | S-C1, S-C2 | survivor ACK p99 **0.29 ms**; delivery 0.999997; 1,000/1,000 re-accepted by +1.05 s |
+| S2-5k (storm gate) | PASS | S-C2 (S-C1 n/a) | 5,000/5,000 re-accepted by +1.22 s |
+| **S1-40k (storm gate)** | **PASS** | S-C1, S-C2 | survivor ACK p99 **7.82 ms** (≤ 25; G6 50 ms PASS); delivery **0.99977**; 8,000/8,000 re-accepted by +2.41 s |
+| S2-40k (characterization) | PASS | none (S-C2 reported) | 40,000/40,000 re-accepted by +4.55 s; worst first Initial 175.7 ms vs R = 500 ms (reported) |
+
+Storm verdict = worst of S1-5k, S2-5k, S1-40k = **PASS**; hotspot verdict =
+H40k = **PASS**. No falsifier fired in any cell (V-T sever skew ≤ 21 ms vs
+100 ms; V-W storm fallback ≤ 3.7×10⁻⁶ vs 0.01; V-P client = server per shard
+at steady entry and storm end; V-F floor p99 ≤ 2.03 ms; V-F′ worst process
+p99 ≤ 4.12 ms vs 10 ms; storm cell walls 360–504 s vs the 600 s maximum).
+S-C1 delivery uses the registered survivor numerator (JS-classified moves +
+reflected ACKs, a lower bound); the uncorrected moves-only ratio (0.8748 at
+both rungs) is disclosed beside it and its accounting gap to survivor `sent`
+is −5 (5k) and −3,578 (40k) datagrams, reported only (§11 item 9).
+
+- **Spend:** the rerun's sealed lifecycle cost is 3,409,360 µUSD (liability
+  6,108,438); the sealed chain total is **122,523,564 µUSD** against the
+  143,544,166 ceiling (21,020,602 remaining in chain). With disclosed
+  out-of-chain spend (B-10 1,394,320; B-11 3,718,188; network probes
+  ≈ 1.13 M; retired attempt -02 ≤ 260,438) the true total is
+  **≈ 129.03 M µUSD**, ≈ 14.52 M remaining.
+- **Readout and audit inputs:**
+  `.scratch/bare-metal-campaign/g6-sharded-arms/readout-r3/` (README lists
+  artefacts and hashes). An independent audit is pending at the time of
+  writing.
 
 **G10 itself is not in this table.** Its VM-era MISS was ruled final for that
 rig, and the paced-broadcast gate supersedes its scenario on this one — the
