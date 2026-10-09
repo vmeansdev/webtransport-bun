@@ -1100,7 +1100,19 @@ export async function inventoryDigitalOcean(
 	};
 }
 
-type DigitalOceanIdentityInventory = Omit<
+/**
+ * Inventory of droplet identities only (account, management/run tags, exact
+ * owned IDs), without the size/region/image/VPC/key catalogue. Use it for
+ * every read once droplets may exist: owned droplets are judged by their own
+ * records against the bound identity, never by catalogue availability.
+ */
+export async function inventoryDigitalOceanOwned(
+	input: InventoryDigitalOceanInput,
+): Promise<DigitalOceanIdentityInventory> {
+	return inventoryDigitalOceanForTeardown(input);
+}
+
+export type DigitalOceanIdentityInventory = Omit<
 	DigitalOceanInventory,
 	"region" | "size" | "image" | "vpc" | "sshKey"
 >;
@@ -1925,16 +1937,23 @@ export async function ensureDigitalOceanRig(
 	for (;;) {
 		// Read-only reconciliation and exact-owned cleanup must remain available
 		// after the campaign deadline. The create mutation is deadline-gated below.
-		let inventory: DigitalOceanInventory;
+		// Reconciliation reads identities only: owned droplets are validated by
+		// their own provider records against the bound identity (name, tags,
+		// region, size slug, vCPUs, memory, image, VPC, key), never by the size
+		// catalogue, which can flicker after create (run
+		// g6-sharded-arms-storm-20261007-02). The catalogue is a pre-create
+		// admission check only (below).
+		const inventoryInput = {
+			desired: state.desired,
+			provider: input.provider,
+			attempt: Math.max(1, state.creationAttempt),
+			exactIds: state.ownedResources.map(({ id }) => id),
+			allowMissingExact: singleAttemptCapacity,
+			strictExactAbsence: singleAttemptCapacity,
+		};
+		let inventory: DigitalOceanIdentityInventory;
 		try {
-			inventory = await inventoryDigitalOcean({
-				desired: state.desired,
-				provider: input.provider,
-				attempt: Math.max(1, state.creationAttempt),
-				exactIds: state.ownedResources.map(({ id }) => id),
-				allowMissingExact: singleAttemptCapacity,
-				strictExactAbsence: singleAttemptCapacity,
-			});
+			inventory = await inventoryDigitalOceanForTeardown(inventoryInput);
 		} catch (error) {
 			// Networks-pending is retryable in every lifecycle state: the cleanup
 			// and inventory reads must not fail closed on an unpopulated
@@ -2176,12 +2195,54 @@ export async function ensureDigitalOceanRig(
 			);
 			return { kind: "FAILED", state };
 		}
+		// Pre-create admission: the size, region, image, VPC and key catalogue,
+		// re-read with the identities so the empty-inventory decision is fresh.
+		// Nothing is owned here and no intent is open, so a catalogue refusal
+		// fails the attempt cleanly instead of marking inventory ambiguous.
+		let admission: DigitalOceanInventory;
+		try {
+			admission = await inventoryDigitalOcean(inventoryInput);
+		} catch (error) {
+			if (
+				(error instanceof PendingDropletNetworksError ||
+					error instanceof PendingDropletStatusError) &&
+				activationPolls < deps.maxAbsencePolls
+			) {
+				activationPolls += 1;
+				await deps.waitBetweenPolls();
+				continue;
+			}
+			state = validateRigState({
+				...state,
+				lifecycle: "FAILED",
+				evidence: {
+					...state.evidence,
+					offrunnerEvidenceSealed: true,
+					inventoryAmbiguous: false,
+				},
+			});
+			appendState(
+				input,
+				state,
+				"RESULT",
+				"pre-create-admission-refused",
+				{ reason: error instanceof Error ? error.message : String(error) },
+				deps.randomId,
+			);
+			return { kind: "FAILED", state };
+		}
+		if (
+			reconcileInventory(state, admission.managementInventory).kind !==
+			decision.kind
+		)
+			continue;
+		inventory = admission;
 		const priceAuthority = {
 			recordedAt: inventory.observedAt,
 			clockSource: "provider" as const,
 			runId: state.desired.runId,
-			serverHourlyMicrousd: inventory.size.priceHourlyMicrousd,
-			generatorHourlyMicrousd: inventory.size.priceHourlyMicrousd,
+			serverHourlyMicrousd: admission.size.priceHourlyMicrousd,
+			generatorHourlyMicrousd: admission.size.priceHourlyMicrousd,
 		};
 		const absenceAuthority = {
 			recordedAt: inventory.observedAt,
@@ -2798,9 +2859,9 @@ async function destroyDigitalOceanRigOnce(
 ): Promise<{ state: RigState; receipt: G6DestructionReceipt }> {
 	const deps = lifecycleDependencies(input);
 	deps.fundedTeardown = fundedTeardown;
-	const readDestructionInventory = fundedTeardown
-		? inventoryDigitalOceanForTeardown
-		: inventoryDigitalOcean;
+	// Destruction judges droplets by their own records, never by whether the
+	// size/region catalogue would still admit a new create (it can flicker).
+	const readDestructionInventory = inventoryDigitalOceanForTeardown;
 	let state = loadRigStateFromJournal(input.journalPath);
 	if (state.lifecycle === "DESTROYED") {
 		const finalSnapshot = readRigJournal(input.journalPath);

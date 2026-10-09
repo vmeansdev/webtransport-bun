@@ -1725,3 +1725,16 @@ export function rigSkuForRun(runId: string): RigSku {
 		? SHARDED_ARMS_STORM_RIG_SKU
 		: DEFAULT_RIG_SKU;
 }
+
+/**
+ * Run ids that may never create droplets again. g6-sharded-arms-storm-20261007-02
+ * sealed INCOMPLETE before any cell (pre-registration §11 item 14); its sealed
+ * evidence stays readable, but no lifecycle may run under its id.
+ */
+export const RETIRED_RUN_IDS: readonly string[] = Object.freeze([
+	"g6-sharded-arms-storm-20261007-02",
+]);
+export function assertRunIdNotRetired(runId: string): void {
+	if (RETIRED_RUN_IDS.includes(runId))
+		throw Error(`g6-c32: run id ${runId} is retired and cannot be reused`);
+}

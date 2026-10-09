@@ -230,7 +230,7 @@ describe("G6 c32 rig command", () => {
 				approvalArtifactSha256: "4".repeat(64),
 				budget,
 			}).profile;
-		expect(profile("g6-sharded-arms-storm-20261007-02")).toMatchObject({
+		expect(profile("g6-sharded-arms-storm-20261009-03")).toMatchObject({
 			region: "ric1",
 			size: "g5-48vcpu-192gb-80gb",
 			vpcUuid: "02276475-d3ca-451f-9ea2-30db481509e1",
@@ -242,6 +242,20 @@ describe("G6 c32 rig command", () => {
 			expectedVcpus: 48,
 			expectedMemoryMiB: 98_304,
 		});
+	});
+	test("the retired storm run id -02 can never create droplets again", () => {
+		expect(() =>
+			makeDesiredRig({
+				runId: "g6-sharded-arms-storm-20261007-02",
+				recordedAt: "2026-08-30T12:00:00.000Z",
+				deadline: DEADLINE,
+				freezeAuthoritySha256: "1".repeat(64),
+				freezeArtifactSha256: "2".repeat(64),
+				approvalAuthoritySha256: "3".repeat(64),
+				approvalArtifactSha256: "4".repeat(64),
+				budget,
+			}),
+		).toThrow("run id g6-sharded-arms-storm-20261007-02 is retired");
 	});
 	test("binds the exact timestamped two-Droplet specification", () => {
 		const desired = makeDesiredRig({

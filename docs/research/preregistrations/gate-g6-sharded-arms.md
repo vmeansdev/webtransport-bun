@@ -372,7 +372,9 @@ corrects §3.2 and §8 item 17 by reference.
    the sealed raw cells, `tools/load/g6-sharded-arms-run01-regrade.test.ts`).
    §7's "a later storm INVALID never voids hotspot cells already stamped"
    applies. No hotspot cell is rerun.
-5. **Storm-only rerun.** Run id `g6-sharded-arms-storm-20261007-02`, work
+5. **Storm-only rerun.** Run id `g6-sharded-arms-storm-20261009-03` (the
+   first attempt, `g6-sharded-arms-storm-20261007-02`, is retired; item
+   14), work
    plan `g6-sharded-arms-storm` (`makeShardedArmsStormWorkPlan`): S1-5k,
    S2-5k, S1-40k, S2-40k in that order. Same deployment and single profile
    (§2), same cells, cohorts and roles (§4), storm maximum 600 s, R = 500 ms
@@ -389,22 +391,24 @@ corrects §3.2 and §8 item 17 by reference.
    chains to run 01's final ledger (sealed chain total **119,114,204 µUSD**).
    Ceiling **143,544,166 µUSD** (unchanged). Remaining in chain 24,429,962
    µUSD (18,321,524 after the liability). Out-of-chain spend (B-10, B-11,
-   network probes, ≈ 6.24 M µUSD) is unchanged, so true spend before the
-   rerun is ≈ 125.36 M µUSD, ≈ 18.19 M µUSD remains in truth (≈ 12.08 M
-   after the liability), and the true worst case after the rerun is
-   ≈ 131.47 M µUSD, below the ceiling.
+   network probes, ≈ 6.24 M µUSD) plus the retired attempt's ≈ 0.26 M µUSD
+   (item 14) is disclosed, so true spend before the rerun is ≈ 125.62 M
+   µUSD, ≈ 17.93 M µUSD remains in truth (≈ 11.82 M after the liability),
+   and the true worst case after the rerun is ≈ 131.73 M µUSD, below the
+   ceiling.
    This is a one-time exception, by the user's authority (item 12), to §7
    ("no retries … or second pair") and §10 ("exactly one pair"). The storm
    cells run on a second, fresh pair of the same g5 generation and vCPU
    count (48), region (ric1) and source-encoded profile; its droplet size
    differs from run 01's in memory only (item 13). §7 and
-   §10 apply unchanged within run 02. The hotspot arm comes wholly from run
-   01's pair and the storm arm wholly from run 02's pair. No clause compares
+   §10 apply unchanged within the rerun. The hotspot arm comes wholly from
+   run 01's pair and the storm arm wholly from the rerun's pair. No clause compares
    cells across the two pairs. The measurement path (crates/,
    g6-sharded-scan.ts, g6-shard-server.ts, BPF) is identical at 440632c7 and
-   ed5706b2. The budget code admits the run-01 chain for this run id
-   (`g6-sharded-arms-storm-20261007-02`) only, so no later run can skip
-   run 02's spend. S2-40k still carries no verdict force: an INVALID there
+   ed5706b2, and at the current candidate (item 14's fix is provisioning
+   code only). The budget code admits the run-01 chain for this run id
+   (`g6-sharded-arms-storm-20261009-03`) only, so no later run can skip
+   the rerun's spend. S2-40k still carries no verdict force: an INVALID there
    (for example the storm RAW wall check, never exercised at a whole-realm
    40k cohort) is a characterization risk only. It ends the run INCOMPLETE
    after the three gate cells and leaves the storm verdict to S1-5k, S2-5k
@@ -496,3 +500,34 @@ corrects §3.2 and §8 item 17 by reference.
     current evidence they do not bind on either size. This is a disclosed
     difference, not a pinned equality.
     The stamp's pair disclosure names each run's droplet size.
+14. **Retired attempt `g6-sharded-arms-storm-20261007-02` (2026-10-08).**
+    Launched on freeze `a3ecf9e4…` after semantic approval. Local gates and
+    the pre-create inventory passed; at 21:13:10Z DigitalOcean created both
+    `g5-48vcpu-192gb-80gb` droplets in ric1 (607409281 server, 607409282
+    generator). The rig's post-create reconciliation re-read the whole
+    provisioning catalogue, the size listing flickered between ric1 and mkc1,
+    and `normalizeSize` raised "size g5-48vcpu-192gb-80gb is not available in
+    ric1". That marked the journal's inventory ambiguous (21:14:46Z), so the
+    rig's own cleanup refused ("destroy refused: journal marks inventory
+    ambiguous"), and the run sealed INCOMPLETE with no cell run, no work
+    authority and no SEAL entry in its spend ledger (it ends at
+    CREATE_OBSERVED). The main session deleted exactly those two IDs with
+    `doctl compute droplet delete 607409281 607409282 --force` at about
+    21:16:4xZ and verified the managed inventory empty at 21:17:06Z; no other
+    resource was touched. **Spend:** created 21:13:10Z, deleted by 21:16:50Z,
+    ≤ 220 s × 2 droplets × 2,130,850 µUSD/h = **260,438 µUSD** (per-role
+    ceiling), out of chain: the attempt has no sealed ledger to chain, so the
+    rerun still chains on run 01's ledger and this amount is disclosed in the
+    true total (item 5). The invoice is authoritative if it differs.
+    **Root cause and fix (provisioning code only; no threshold, window or
+    measurement change):** the size catalogue is now a pre-create admission
+    check only. Once droplets may exist, ensure/reconcile, the fresh-pair
+    check and every destroy path read droplet identities only and validate
+    owned droplets by their own provider records against the bound identity
+    (exact name, tags, region, size slug, vCPUs, memory, image, VPC, key). A
+    catalogue refusal before create fails the attempt cleanly without
+    ambiguity. Unknown or foreign droplets still make inventory ambiguous and
+    still refuse destroy. **Run id:** -02 is retired (the rig refuses to
+    create droplets under it); the rerun runs as
+    `g6-sharded-arms-storm-20261009-03` under the same plan, cells, SKU
+    (item 13), thresholds and stop rules. The user approved "Fix rig + retry".

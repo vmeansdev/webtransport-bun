@@ -281,7 +281,7 @@ describe("sharded-arms campaign plan (g6-sharded-arms/1)", () => {
 
 describe("storm rerun droplet size (pre-registration §11 item 13)", () => {
 	test("only storm-rerun run ids get the 192 GB g5; every other run keeps the 96 GB g5", () => {
-		expect(rigSkuForRun("g6-sharded-arms-storm-20261007-02")).toEqual({
+		expect(rigSkuForRun("g6-sharded-arms-storm-20261009-03")).toEqual({
 			size: "g5-48vcpu-192gb-80gb",
 			expectedVcpus: 48,
 			expectedMemoryMiB: 196_608,

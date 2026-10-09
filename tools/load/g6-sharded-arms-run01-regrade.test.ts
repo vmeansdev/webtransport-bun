@@ -447,7 +447,7 @@ describe.skipIf(root === null)(
 		const policy = (
 			workPlan: ReturnType<typeof makeShardedArmsWorkPlan>,
 			stages: Record<string, number>,
-			runId = "g6-sharded-arms-storm-20261007-02",
+			runId = "g6-sharded-arms-storm-20261009-03",
 		) => {
 			const active = workPlan.activeMaximumSeconds;
 			return validateBudgetPolicy({
@@ -482,7 +482,7 @@ describe.skipIf(root === null)(
 			expect(SEALED - 117_080_820).toBe(2_033_384);
 		});
 
-		test("the run-01 chain is admitted for run g6-sharded-arms-storm-20261007-02 only", () => {
+		test("the run-01 chain is admitted for run g6-sharded-arms-storm-20261009-03 only", () => {
 			const storm = policy(makeShardedArmsStormWorkPlan(), { storm: 600 });
 			// A later storm-plan run must chain on the latest seal, not run 01's.
 			expect(() =>

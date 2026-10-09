@@ -42,6 +42,7 @@ import {
 	destructionReceiptFromFinalJournal,
 	ensureDigitalOceanRig,
 	inventoryDigitalOcean,
+	inventoryDigitalOceanOwned,
 	loadRigStateFromJournal,
 	type ProviderMutationRecord,
 	RecordedDigitalOceanProvider,
@@ -60,6 +61,7 @@ import {
 } from "./g6-c32-freeze.ts";
 import {
 	type ArtifactManifestEntry,
+	assertRunIdNotRetired,
 	canonicalArtifactSha256,
 	canonicalJson,
 	makeArtifactManifestRecord,
@@ -831,6 +833,7 @@ export class ProductionRigBackend implements RigBackend {
 		if (policy.runId !== context.runId) {
 			fail("budget policy runId differs from semantic runId");
 		}
+		assertRunIdNotRetired(context.runId);
 		const desired = makeDesiredRig({
 			runId: context.runId,
 			recordedAt,
@@ -2133,7 +2136,8 @@ export class ProductionRigBackend implements RigBackend {
 	): Promise<[DropletIdentity, DropletIdentity]> {
 		const state = validateRigState(stateValue);
 		const recorded = this.#ownedPair(state);
-		const inventory = await inventoryDigitalOcean({
+		// Owned droplets are judged by their own records, not the size catalogue.
+		const inventory = await inventoryDigitalOceanOwned({
 			desired: state.desired,
 			provider: this.#provider(context, signal),
 			attempt: Math.max(1, state.creationAttempt),

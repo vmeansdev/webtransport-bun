@@ -1,6 +1,7 @@
 import { lstatSync, realpathSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import {
+	assertRunIdNotRetired,
 	rigSkuForRun,
 	validateDeadline,
 	validateEnvelope,
@@ -101,6 +102,7 @@ export type MakeDesiredRigInput = Readonly<{
 export function makeDesiredRig(input: MakeDesiredRigInput): DesiredRig {
 	const recordedAt = validateRfc3339Millis(input.recordedAt, "recordedAt");
 	const deadline = validateDeadline(recordedAt, input.deadline);
+	assertRunIdNotRetired(input.runId);
 	const sku = rigSkuForRun(input.runId);
 	return validateDesiredRig({
 		recordedAt,

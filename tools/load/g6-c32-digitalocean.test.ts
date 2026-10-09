@@ -40,7 +40,7 @@ import {
 	readRigCreateIntentRecord,
 	readRigJournal,
 } from "./g6-c32-rig-journal.ts";
-import type { DesiredRig } from "./g6-c32-rig-model.ts";
+import type { DesiredRig, RigState } from "./g6-c32-rig-model.ts";
 
 const temporaryRoots: string[] = [];
 
@@ -589,6 +589,9 @@ class FakeCloudProvider implements DigitalOceanProvider {
 	intentPrecededEveryCreation = true;
 	crashAfterNextDelete = false;
 	ignoreDeleteCount = 0;
+	/** Size-catalogue response once any create has run (a catalogue flicker). */
+	sizeAfterCreate: string | null = null;
+	#created = false;
 
 	constructor(options: {
 		plans: CreatePlan[];
@@ -629,7 +632,11 @@ class FakeCloudProvider implements DigitalOceanProvider {
 		let stdout: string;
 		if (joined.startsWith("account get ")) stdout = accountFixture;
 		else if (joined.startsWith("compute region list ")) stdout = regionFixture;
-		else if (joined.startsWith("compute size list ")) stdout = sizeFixture;
+		else if (joined.startsWith("compute size list "))
+			stdout =
+				this.#created && this.sizeAfterCreate !== null
+					? this.sizeAfterCreate
+					: sizeFixture;
 		else if (joined.startsWith("compute image list-distribution ")) {
 			stdout = imageFixture;
 		} else if (joined.startsWith("vpcs list ")) stdout = vpcFixture;
@@ -676,6 +683,7 @@ class FakeCloudProvider implements DigitalOceanProvider {
 			if (!this.createSawOpenIntent) {
 				throw new Error("create executed without a durable OPEN intent");
 			}
+			this.#created = true;
 			const plan = this.#plans.shift() ?? "full";
 			this.#createBase += 1;
 			const serverId = this.#createBase;
@@ -1439,7 +1447,7 @@ describe("absolute funded DigitalOcean teardown", () => {
 	test.each([
 		true,
 		false,
-	])("funded=%s teardown keeps provisioning catalogs out of the funded delete path only", async (funded) => {
+	])("funded=%s teardown keeps provisioning catalogs out of every delete path", async (funded) => {
 		const fixture = await fundedDestroyFixture();
 		const original = fixture.provider.execute.bind(fixture.provider);
 		const requests: DigitalOceanOperationRequest[] = [];
@@ -1460,12 +1468,8 @@ describe("absolute funded DigitalOcean teardown", () => {
 			maxEmergencyPolls: 1,
 			emergencyWaitBetweenPolls: async () => undefined,
 		});
-		if (!funded) {
-			await expect(cleanup).rejects.toThrow(/provisioning catalog outage/);
-			expect(requests.some(isCatalog)).toBe(true);
-			expect(requests.some(({ args }) => args[2] === "delete")).toBe(false);
-			return;
-		}
+		// A catalogue outage or flicker never blocks deleting owned droplets
+		// (run g6-sharded-arms-storm-20261007-02), funded or not.
 		const result = await cleanup;
 		expect(result.receipt.deletedIds).toEqual([101, 102]);
 		expect(fixture.provider.resources.size).toBe(0);
@@ -2254,6 +2258,115 @@ describe("G6 c32 DigitalOcean lifecycle", () => {
 				drift,
 			).toBe(before);
 		}
+	}, 15_000);
+
+	// Run g6-sharded-arms-storm-20261007-02: the size catalogue stopped listing
+	// the region right after create, and reconcile marked the owned pair
+	// ambiguous, so cleanup refused. The catalogue is pre-create admission only.
+	const sizeElsewhere = JSON.stringify([
+		{ ...JSON.parse(sizeFixture)[0], regions: ["mkc1"] },
+	]);
+	const terminalize = (
+		fixture: ReturnType<typeof makeLifecycleFixture>,
+		state: RigState,
+	) =>
+		appendRigJournalEvent(
+			fixture.journalPath,
+			{
+				state: "TERMINAL",
+				kind: "TRANSITION",
+				operationId: "test-terminal",
+				details: {
+					rigState: {
+						...state,
+						lifecycle: "TERMINAL",
+						evidence: {
+							...state.evidence,
+							offrunnerEvidenceSealed: true,
+							controllerExited: true,
+							cleanupDisposition: "NEVER_DISPATCHED",
+						},
+					},
+				},
+			},
+			{ clock: fixture.clock, randomId: () => "terminal" },
+		);
+
+	test("a size-catalogue flicker after create neither blocks the owned pair nor its cleanup", async () => {
+		const fixture = makeLifecycleFixture(["full"]);
+		fixture.provider.sizeAfterCreate = sizeElsewhere;
+		const result = await ensureDigitalOceanRig(lifecycleInput(fixture));
+		expect(result.kind).toBe("PROVISIONED");
+		expect(result.state.evidence.inventoryAmbiguous).toBeFalse();
+		expect(result.state.ownedResources.map(({ id }) => id)).toEqual([101, 102]);
+		// Re-reconciling the owned pair (resume) still uses it.
+		const again = await ensureDigitalOceanRig(lifecycleInput(fixture));
+		expect(again.kind).toBe("REUSED");
+		terminalize(fixture, again.state);
+		const destroyed = await destroyDigitalOceanRig({
+			...lifecycleInput(fixture),
+			destructionReceiptPath: fixture.destructionReceiptPath,
+		});
+		expect(destroyed.receipt.deletedIds).toEqual([101, 102]);
+		expect(fixture.provider.resources.size).toBe(0);
+	}, 15_000);
+
+	test("a partial create under a catalogue flicker deletes exactly the owned ID and refuses a second create cleanly", async () => {
+		const fixture = makeLifecycleFixture(["partial", "full"]);
+		fixture.provider.sizeAfterCreate = sizeElsewhere;
+		const unrelated = rawDroplet("server", {
+			id: 478884125,
+			name: "ubuntu-s-1vcpu-1gb-ams3-01",
+			tags: [],
+		});
+		fixture.provider.resources.set(478884125, unrelated);
+		const result = await ensureDigitalOceanRig(lifecycleInput(fixture));
+		expect(result.kind).toBe("FAILED");
+		expect(result.state.evidence.inventoryAmbiguous).toBeFalse();
+		expect(result.state.ownedResources).toEqual([]);
+		const deletes = fixture.provider.calls.filter(({ args }) =>
+			args.join(" ").startsWith("compute droplet delete "),
+		);
+		expect(deletes.map(({ args }) => args)).toEqual([
+			["compute", "droplet", "delete", "101", "--force"],
+		]);
+		expect(
+			fixture.provider.calls.filter(({ args }) =>
+				args.join(" ").startsWith("compute droplet create "),
+			),
+		).toHaveLength(1);
+		expect([...fixture.provider.resources.keys()]).toEqual([478884125]);
+		const events = readFileSync(fixture.journalPath, "utf8");
+		expect(events).toContain("pre-create-admission-refused");
+	}, 15_000);
+
+	test("a foreign tagged droplet still makes inventory ambiguous and refuses destroy", async () => {
+		const fixture = makeLifecycleFixture(["full"]);
+		fixture.provider.sizeAfterCreate = sizeElsewhere;
+		const first = await ensureDigitalOceanRig(lifecycleInput(fixture));
+		expect(first.kind).toBe("PROVISIONED");
+		fixture.provider.resources.set(
+			999,
+			rawDroplet("server", {
+				id: 999,
+				tags: [desired.managementTag, desired.runTag],
+			}),
+		);
+		const second = await ensureDigitalOceanRig(lifecycleInput(fixture));
+		expect(second.kind).toBe("INVENTORY_AMBIGUOUS");
+		expect(second.state.evidence.inventoryAmbiguous).toBeTrue();
+		await expect(
+			destroyDigitalOceanRig({
+				...lifecycleInput(fixture),
+				destructionReceiptPath: fixture.destructionReceiptPath,
+			}),
+		).rejects.toThrow(/ambiguous|duplicate server role/);
+		expect(
+			fixture.provider.calls.some(({ args }) =>
+				args.join(" ").startsWith("compute droplet delete "),
+			),
+		).toBeFalse();
+		expect(fixture.provider.resources.has(999)).toBeTrue();
 	}, 15_000);
 
 	test("deletes a journal-owned partial ID literally and performs one retry", async () => {
