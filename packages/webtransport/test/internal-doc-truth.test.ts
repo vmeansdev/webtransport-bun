@@ -149,6 +149,7 @@ function runPolicy(mutate?: (fixture: Fixture, root: string) => void) {
 		join(root, "docs", "ARCHITECTURE.md"),
 		[
 			"The server runtime uses `Builder::new_multi_thread().worker_threads(2)`.",
+			"WEBTRANSPORT_NATIVE_SERVER_WORKERS overrides the server count with 1..=8 for campaign A/B only.",
 			"The client runtime uses `Builder::new_multi_thread().worker_threads(1)`.",
 			"readDatagram, readDatagramBatch, sendDatagram, and discardDatagram run on the N-API runtime and must not be wrapped in `RUNTIME.spawn`.",
 		].join("\n"),
@@ -228,9 +229,26 @@ function runPolicy(mutate?: (fixture: Fixture, root: string) => void) {
 	);
 	writeFileSync(
 		join(root, "crates", "native", "src", "lib.rs"),
-		`pub(crate) static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
+		`pub(crate) const DEFAULT_SERVER_WORKER_THREADS: usize = 2;
+fn parse_server_worker_threads(raw: Option<&str>) -> Result<usize, ()> {
+  let Some(raw) = raw else {
+    return Ok(DEFAULT_SERVER_WORKER_THREADS);
+  };
+  match raw.parse::<usize>() {
+    Ok(n) if (1..=8).contains(&n) => Ok(n),
+    _ => Err(()),
+  }
+}
+pub(crate) fn server_worker_threads() -> usize {
+  let raw = std::env::var("WEBTRANSPORT_NATIVE_SERVER_WORKERS").ok();
+  match parse_server_worker_threads(raw.as_deref()) {
+    Ok(n) => n,
+    Err(()) => std::process::abort(),
+  }
+}
+pub(crate) static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
   tokio::runtime::Builder::new_multi_thread()
-    .worker_threads(2)
+    .worker_threads(server_worker_threads())
     .thread_name("wt-server")
     .build().unwrap()
 });
@@ -334,7 +352,7 @@ describe("documentation truth policy", () => {
 		});
 		expect(result.status).toBe(1);
 		expect(result.stderr).toContain(
-			"RUNTIME contradicts Builder::new_multi_thread().worker_threads(2)",
+			"RUNTIME must build its runtime as Builder::new_multi_thread().worker_threads(server_worker_threads())",
 		);
 	});
 
@@ -347,14 +365,31 @@ describe("documentation truth policy", () => {
 			writeFileSync(
 				path,
 				readFileSync(path, "utf8").replace(
-					".worker_threads(2)",
+					".worker_threads(server_worker_threads())",
 					".worker_threads(1)",
 				),
 			);
 		});
 		expect(result.status).toBe(1);
 		expect(result.stderr).toContain(
-			"RUNTIME contradicts Builder::new_multi_thread().worker_threads(2)",
+			"RUNTIME must build its runtime as Builder::new_multi_thread().worker_threads(server_worker_threads())",
+		);
+	});
+
+	it("rejects a server resolver whose default reverts to a single worker", () => {
+		const result = runPolicy((_fixture, root) => {
+			const path = join(root, "crates", "native", "src", "lib.rs");
+			writeFileSync(
+				path,
+				readFileSync(path, "utf8").replace(
+					"DEFAULT_SERVER_WORKER_THREADS: usize = 2;",
+					"DEFAULT_SERVER_WORKER_THREADS: usize = 1;",
+				),
+			);
+		});
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain(
+			"server_worker_threads() must contain pub(crate) const DEFAULT_SERVER_WORKER_THREADS: usize = 2;",
 		);
 	});
 
@@ -469,14 +504,34 @@ describe("documentation truth policy", () => {
 			writeFileSync(
 				path,
 				readFileSync(path, "utf8").replace(
-					".worker_threads(2)",
-					".worker_threads(2)\n    .max_blocking_threads(std::thread::available_parallelism().unwrap().get())",
+					".worker_threads(server_worker_threads())",
+					".worker_threads(server_worker_threads())\n    .max_blocking_threads(std::thread::available_parallelism().unwrap().get())",
 				),
 			);
 		});
 		expect(result.status).toBe(1);
 		expect(result.stderr).toContain(
-			"RUNTIME must hardcode its worker count, not derive it at runtime",
+			"RUNTIME must not derive its worker count from the host",
+		);
+	});
+
+	it("rejects a server resolver that derives its unset default from the host", () => {
+		const result = runPolicy((_fixture, root) => {
+			const path = join(root, "crates", "native", "src", "lib.rs");
+			writeFileSync(
+				path,
+				readFileSync(path, "utf8").replace(
+					"return Ok(DEFAULT_SERVER_WORKER_THREADS);",
+					"return Ok(std::thread::available_parallelism().unwrap().get());",
+				),
+			);
+		});
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain(
+			"server_worker_threads() must not derive its worker count from the host",
+		);
+		expect(result.stderr).toContain(
+			"server_worker_threads() must return DEFAULT_SERVER_WORKER_THREADS when the override is unset",
 		);
 	});
 
