@@ -13,8 +13,12 @@ the steady realm passed S1–S5 at 40,000 sessions, and the raid-hotspot and
 reconnect-storm arms passed there under `g6-sharded-arms/1`. G6-04's
 single-instance **valid MISS** (`g6-mmo-closeout/1`, home rig, all three
 arms) stays on record as history; see the G6 headline verdict below. The
-remaining terminal exceptions are G2's **hardware-scoped INCOMPLETE, FINAL**
-and G11-T's dual reading **C6-app MISS (final) · C6-wire PASS**. These are reported with
+**G2 is a PASS under `g2-do/1` (2026-08-26)** on a DigitalOcean
+`c-32-intel` pair in ams3: gate RTT p99 1.0168 ms against 10.0 ms, floor
+0.397 ms against the unchanged 4.0 ms quiet bar. The home rig's
+**hardware-scoped INCOMPLETE, FINAL** stays on record as history; see the
+G2 note below. The remaining terminal exception is G11-T's dual reading
+**C6-app MISS (final) · C6-wire PASS**. These are reported with
 the same weight as the passes: the campaign's bar was *"every gate reaches a
 terminally accounted disposition"*, not *"every gate passes."*
 
@@ -44,7 +48,7 @@ corroboration.
 | Gate | Verdict, in one line | Stamp |
 |---|---|---|
 | **G1 — GPS session scale** | **PASS**, all five clauses: 10,000 sessions, ingest p99 **2.576 ms**, delivery **1.000000**, memory **~126.5 KB/session** linear | `stamps/g1.md` §9.6 |
-| **G2 — FPS/MOBA tail latency** | **hardware-scoped INCOMPLETE, FINAL** after the two licensed valid attempts: F-off raw RTT p99 medians **12.632064 ms** (attempt 1) and **9.289728 ms** (attempt 2), each above the fixed 4.0 ms `path-not-quiet` bar. No gate PASS/MISS statistic exists because the gate had no evaluable cells; no third attempt or lower bar is authorized | `stamps/g2.md` §9.10.3, §9.10.6 |
+| **G2 — FPS/MOBA tail latency** | **PASS under `g2-do/1`** (2026-08-26, DigitalOcean `c-32-intel` pair in ams3, VPC; conductor+server and generator on separate droplets): gate statistic (median censored RTT p99, 9 evaluable G-off replicates) **1.0168 ms** against **10.0 ms**; off-box floor RTT p99 **0.397 ms** against the unchanged 4.0 ms `path-not-quiet` bar; no integrity or honesty failure; thresholds byte-identical to the home registration; independent re-grade byte-identical. History: on the home rig, **hardware-scoped INCOMPLETE, FINAL** after the two licensed valid attempts: F-off raw RTT p99 medians **12.632064 ms** (attempt 1) and **9.289728 ms** (attempt 2), each above the fixed 4.0 ms `path-not-quiet` bar. No gate PASS/MISS statistic exists because the gate had no evaluable cells; no third attempt or lower bar is authorized | `stamps/g2-do.md`; history `stamps/g2.md` §9.10.3, §9.10.6 |
 | **G3 — camera / bursty egress** | **PASS, with C3 = `CEILING-MOVED`**: egress one-way p99 **1.491 ms** (median of 5 blocks) against a 33.3 ms bar; GSO **and** GRO active at 64 segments, `sndbufErrors` 0 on all 30 steps. C3 states no lever value in milliseconds — for the third time across three registrations | `stamps/g3.md` §9.6, C2/C4 |
 | **G4 — SFU fan-out** | **PASS**: **16,509/s** forward egress inside a 30 Hz frame gate, p99 **10.879 ms**, delivery **1.0000**. Stated as a *rate* bound — "the 50 is incidental to that number, not causal" | `stamps/g4.md` §9.6 |
 | **G5 — bulk / VOD** | **PASS**, all six clauses, graded on the knob-**on** `P-batch` cell: **1.2505 Gbps** delivered against a 1.000 Gbps bar, sourcing 100.037% of its registered 1.25 Gbps offer. Separately — disclosed, not gating — the knob-**off** `P-control` cell delivered **1.1473 Gbps**, falsifying the registered prediction that knob-off would fall short of 1.000 Gbps. The unpaced `A6` window probe is **force-stripped** and licenses nothing | `stamps/g5.md` §9.6 clause 2, §6 P5 |
@@ -1033,7 +1037,29 @@ registration predicted this outcome in advance and called it a legitimate
 campaign result. The final stamp records a hardware-scoped INCOMPLETE with no
 gate statistic, because the path was not quiet and no gate cells were
 evaluable. **The Mac vantage cannot witness a single-digit-millisecond
-tail-latency claim**, and no such claim appears in this document.
+tail-latency claim**, and no such claim rests on it in this document.
+
+**G2 on DigitalOcean — `g2-do/1`, PASS (2026-08-26).** G2's registered
+question was asked again under a new rig authority, pre-registration
+`docs/research/preregistrations/gate-g2-do.md` (`g2-do/1`). Its rig was
+chosen because it removes the measured cause, generator wake lateness. The
+pair was DigitalOcean `c-32-intel` droplets in ams3 over VPC: server
+595150697 ran the conductor and server, and generator 595150696 ran the
+Linux entry twin. The schedule, clauses, decision rows, falsifiers and the
+4.0 ms quiet bar are byte-identical to the home registration. Stamp
+`stamps/g2-do.md`, attempt 1 (after one retained infrastructure refusal):
+
+- gate statistic, the median censored RTT p99 over 9 evaluable G-off
+  replicates: **1.0168 ms** (interval 0.996–1.037) against **10.0 ms**;
+- off-box floor RTT p99 **0.397 ms** (median of three F-off arms) against
+  the 4.0 ms `path-not-quiet` bar, with floor scheduleLag p99 1.399 ms;
+- no integrity failure (O1–O5) or honesty failure (H1–H5) in any cell;
+- the independent re-grade from raw fragments was byte-identical.
+
+The claim is that the FPS/MOBA tail shape (100 sessions × 150/s × 1,150 B
+echo) holds a sub-1.1 ms RTT p99 on that rentable pair over VPC. It is a
+claim about that rig class only. **The home rig's hardware-scoped
+INCOMPLETE stands unmodified as history**, and no stamp was rewritten.
 
 ## 3. The cable and its preflight
 
