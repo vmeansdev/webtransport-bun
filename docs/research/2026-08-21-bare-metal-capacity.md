@@ -7,14 +7,14 @@ Nothing here is a forecast. Every number carries the stamp it was recomputed
 in, and where a number does not exist, this document says so rather than
 estimating one.
 
-G9 is a final **PASS at 600 sessions/s**. The remaining terminal exceptions are
-G2's **hardware-scoped INCOMPLETE, FINAL**, G6's **valid MISS, FINAL**
-(G6-04 under `g6-mmo-closeout/1`, single-instance home rig, all three arms;
-see the G6 status update below — the steady realm arm has since passed at
-40,000 sessions on the sharded DigitalOcean deployment, and on 2026-10-09 the
-raid-hotspot and reconnect-storm arms passed there under `g6-sharded-arms/1`;
-see the G6 sharded arms result below), and G11-T's
-dual reading **C6-app MISS (final) · C6-wire PASS**. These are reported with
+G9 is a final **PASS at 600 sessions/s**. **G6 is a PASS by user
+reclassification D33 (2026-10-16)**, on the sharded DigitalOcean deployment:
+the steady realm passed S1–S5 at 40,000 sessions, and the raid-hotspot and
+reconnect-storm arms passed there under `g6-sharded-arms/1`. G6-04's
+single-instance **valid MISS** (`g6-mmo-closeout/1`, home rig, all three
+arms) stays on record as history; see the G6 headline verdict below. The
+remaining terminal exceptions are G2's **hardware-scoped INCOMPLETE, FINAL**
+and G11-T's dual reading **C6-app MISS (final) · C6-wire PASS**. These are reported with
 the same weight as the passes: the campaign's bar was *"every gate reaches a
 terminally accounted disposition"*, not *"every gate passes."*
 
@@ -48,6 +48,7 @@ corroboration.
 | **G3 — camera / bursty egress** | **PASS, with C3 = `CEILING-MOVED`**: egress one-way p99 **1.491 ms** (median of 5 blocks) against a 33.3 ms bar; GSO **and** GRO active at 64 segments, `sndbufErrors` 0 on all 30 steps. C3 states no lever value in milliseconds — for the third time across three registrations | `stamps/g3.md` §9.6, C2/C4 |
 | **G4 — SFU fan-out** | **PASS**: **16,509/s** forward egress inside a 30 Hz frame gate, p99 **10.879 ms**, delivery **1.0000**. Stated as a *rate* bound — "the 50 is incidental to that number, not causal" | `stamps/g4.md` §9.6 |
 | **G5 — bulk / VOD** | **PASS**, all six clauses, graded on the knob-**on** `P-batch` cell: **1.2505 Gbps** delivered against a 1.000 Gbps bar, sourcing 100.037% of its registered 1.25 Gbps offer. Separately — disclosed, not gating — the knob-**off** `P-control` cell delivered **1.1473 Gbps**, falsifying the registered prediction that knob-off would fall short of 1.000 Gbps. The unpaced `A6` window probe is **force-stripped** and licenses nothing | `stamps/g5.md` §9.6 clause 2, §6 P5 |
+| **G6 — MMO realm** | **PASS by user reclassification D33 (2026-10-16)**, sharded DigitalOcean deployment (`g5-48vcpu` pairs, ric1, 24 shards): steady realm S1–S5 at **40,000** sessions in two cells (S4 ACK p99 **3.71 / 3.59 ms**); hotspot H40k **PASS** (H1 one-way p99 **8.50 ms**, H2 1.0004, H3 11.29 / 11.52 ms); storm **PASS** (S1-40k survivor ACK p99 **7.82 ms**, 8,000/8,000 re-accepted). Raid co-location makes the hotspot arm structurally easier than single-instance (prereg §3.1, §8 item 18). History: G6-04's single-instance **valid MISS** under `g6-mmo-closeout/1` | `g6-40k-capacity-closure/final-r5-b12/`; `g6-sharded-arms/readout-r3/stamp.json`; history `stamps/g6-04.md` |
 | **G7 — stream egress** | **PASS, unnarrowed** (the C4-closure redispatch upgraded G7-01's "PASS — narrowed by C4 NOT-EVALUATED"): **1.2498 Gbps** at 16 streams × 64 KiB, byte- and stream-ledgers exact, and client receive-socket drops a *measured* **0** in all 14 cell-repeats | `stamps/g7-02.md`; run-1 record at `stamps/g7.md` |
 | **G8 — many-rooms fan-out** | **PASS, narrowed to one cell of nine**: **2** concurrent 10-subscriber video rooms at 330/s per publisher, p99 **3.740 ms**, forward delivery **0.99995**. Eight of nine cells INVALID; the voice and mutual arms produced no room count at all | `stamps/g8.md` §9.6 |
 | **G9 — sustained churn** | **PASS at 600 sessions/s, FINAL** (`licensedRung(600)`): L-600 achieved **595.75 / 596.01 sessions/s** against the **594/s** bar, base RTT p99 **7.09 / 12.60 ms** against 40 ms, delivery **0.99952**, zero leaked sessions/handles, and LIM PASS | `stamps/g9-02.md` §2, §4, §7 |
@@ -227,6 +228,32 @@ registration was licensed to test rig-side `rmem_max=wmem_max=100+ MiB` (or
 the QUIC socket, which is a server-side patch) before resuming the
 ladder. Stamp: `.scratch/bare-metal-campaign/stamps/g6-sharded-06.md`
 (on `probe/g6-sharded-20k-01`).
+
+**G6 headline verdict — PASS by user reclassification D33 (2026-10-16):**
+the user decided (D33, verbatim): *"by new rules, the ones that passed are
+way more informative and important that single instance, so consider it as
+PASS from now on."* From 2026-10-16 the G6 headline verdict is therefore
+**PASS**, resting on the sharded DigitalOcean deployment: the 40k steady
+realm closure (S1–S5 at 40,000 sessions in two independent cells) and the
+`g6-sharded-arms/1` hotspot and storm PASS below. What this does and does
+not change:
+
+- It is a **reclassification of the headline**, recorded as a user decision,
+  not a new measurement and not a re-grade. No stamp is rewritten: G6-04's
+  stamp (`stamps/g6-04.md`) still reads valid MISS, and the
+  `g6-sharded-arms/1` stamp still reads its own two-arm PASS.
+- **G6-04's single-instance valid MISS stays on record as history**: the
+  single-instance server reached its knee at 2,500 and collapsed at 5,000,
+  and missed the hotspot and storm arms. The PASS is a claim about the
+  sharded deployment only, not about one instance.
+- **Disclosed:** raid co-location makes the hotspot arm structurally easier
+  than G6-04's single-instance hotspot (prereg `gate-g6-sharded-arms.md`
+  §3.1, §8 item 18): the raid's publisher and its 40 subscribers are placed
+  on one shard (K = 0) by their opening DCIDs, so the raid fan-out never
+  crosses shards, unlike the single-instance hotspot.
+- The two sentences below that say no G6 PASS is promoted from
+  `g6-sharded-arms/1` were true when written (2026-10-09) and are kept as
+  written. D33 supersedes them for the headline only.
 
 **G6 sharded arms result (2026-10-09) — `g6-sharded-arms/1`, both arms PASS:**
 this is the **sharded-deployment verdict** for the two G6 arms that had never
