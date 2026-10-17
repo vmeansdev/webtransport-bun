@@ -66,11 +66,27 @@ import {
 } from "./quic-lb.js";
 
 import {
+	createNativeByteReadable,
+	type NativeReadableOwner,
+} from "./native-readable.js";
+import {
+	configureReadGroup,
+	createIncomingReadable,
+	type GroupFeedableHandle,
+	type NativeReadGroup,
+	ReadGroupPump,
+	readGroupConfig,
+	readGroupDiagnosticsSnapshot,
+	resetReadGroupDiagnostics,
+} from "./read-group.js";
+import {
 	BidiStream,
+	type DirectReadable,
 	RecvStream,
 	type Resettable,
 	SendStream,
 	type StopSendable,
+	WT_DIRECT_READ_OWNER,
 	WT_RESET,
 	WT_STOP_SENDING,
 } from "./streams.js";
@@ -1562,6 +1578,8 @@ type NativeBidiStreamHandle = {
 	/** Coalescing read (see stream-chunk-batch.ts). Optional so an override
 	 * addon without it degrades to `read` instead of throwing. */
 	readBatch?: (maxBytes: number) => Promise<Uint8Array | string | null>;
+	/** Cross-stream delivery feeder (read-group.ts); optional like readBatch. */
+	feedReadGroup?: GroupFeedableHandle["feedReadGroup"];
 	write(chunk: Buffer | Uint8Array): Promise<string | null>;
 	finish(): Promise<string | null> | void;
 	finishWait?: () => Promise<string | null> | void;
@@ -1582,6 +1600,7 @@ type NativeRecvStreamHandle = {
 	readonly id: number;
 	read(): Promise<Uint8Array | string | null>;
 	readBatch?: (maxBytes: number) => Promise<Uint8Array | string | null>;
+	feedReadGroup?: GroupFeedableHandle["feedReadGroup"];
 	reset?: (code?: number) => void;
 	stopSending?: (code?: number) => void;
 	dispose?: () => void;
@@ -1854,6 +1873,14 @@ const nativeLoad = tryLoadNativeAddon(
 );
 const native = nativeLoad.addon as NativeAddon | undefined;
 const nativeLoadFailures = nativeLoad.failures;
+{
+	// Opt-in cross-stream delivery (read-group.ts); an addon without the
+	// class leaves every readable on the direct pull.
+	const ReadGroup = (
+		native as { StreamReadGroup?: new () => NativeReadGroup } | undefined
+	)?.StreamReadGroup;
+	configureReadGroup(ReadGroup ? () => new ReadGroup() : null);
+}
 
 function getNativeOrThrow(): NativeAddon {
 	if (native) return native;
@@ -4316,7 +4343,8 @@ class ServerIncomingBidiResource implements ServerIncomingStreamResource {
 	disposed = false;
 	readableDone = false;
 	writableDone = false;
-	/** True once the W3C readable pulled — a sink cannot open after that. */
+	/** True once the W3C readable began reading the handle (its first direct
+	 * pull, or its read-group feeder starting) — a sink cannot open after that. */
 	didRead = false;
 	private writableStream: WritableStream<Uint8Array> | null = null;
 	readonly onDisposed: (resource: ServerIncomingStreamResource) => void;
@@ -4376,30 +4404,23 @@ class ServerIncomingBidiResource implements ServerIncomingStreamResource {
 		}
 	}
 
-	async pull(controller: ReadableStreamDefaultController<Uint8Array>) {
-		const current = this.handle;
-		if (!current || this.disposed) {
-			controller.close();
-			return;
-		}
-		this.didRead = true;
-		try {
-			const chunk = unwrapNativeValue(await readStreamChunk(current));
-			if (this.disposed || this.handle !== current) return;
-			if (chunk === null) {
-				this.readableDone = true;
-				this.maybeRelease();
-				controller.close();
-				return;
-			}
-			controller.enqueue(chunk);
-		} catch (err) {
-			if (this.disposed) return;
+	/** The readable half's view of this resource (see native-readable.ts). */
+	readonly readOwner: NativeReadableOwner = {
+		current: () => (this.disposed ? null : this.handle),
+		onRead: () => {
+			this.didRead = true;
+		},
+		onEnd: () => {
+			this.readableDone = true;
+			this.maybeRelease();
+		},
+		onError: (err) => {
 			this.readableDone = true;
 			this.release(true);
-			controller.error(toWebTransportError(err));
-		}
-	}
+			return toWebTransportError(err);
+		},
+		onCancel: (reason) => this.cancel(reason),
+	};
 
 	/** See BidiStream.openReadSink — same contract on the W3C wrapper. */
 	openReadSink(opts?: StreamSinkOptionsType): StreamSinkHandleType {
@@ -4493,9 +4514,7 @@ function createServerIncomingBidiWebStreams(
 	stream: WebTransportBidirectionalStream;
 } {
 	const resource = new ServerIncomingBidiResource(nativeStream, onDisposed);
-	const readable = new ReadableStream<Uint8Array>(resource, {
-		highWaterMark: 0,
-	});
+	const readable = createIncomingReadable(nativeStream, resource.readOwner);
 	const stream = {
 		readable,
 		get writable(): WritableStream<Uint8Array> {
@@ -4530,7 +4549,8 @@ function attachServerBidiResourceControls(
 class ServerIncomingUniResource implements ServerIncomingStreamResource {
 	handle: NativeRecvStreamHandle | null;
 	disposed = false;
-	/** True once the W3C readable pulled — a sink cannot open after that. */
+	/** True once the W3C readable began reading the handle (its first direct
+	 * pull, or its read-group feeder starting) — a sink cannot open after that. */
 	didRead = false;
 	readonly onDisposed: (resource: ServerIncomingStreamResource) => void;
 
@@ -4580,28 +4600,19 @@ class ServerIncomingUniResource implements ServerIncomingStreamResource {
 		}
 	}
 
-	async pull(controller: ReadableStreamDefaultController<Uint8Array>) {
-		const current = this.handle;
-		if (!current || this.disposed) {
-			controller.close();
-			return;
-		}
-		this.didRead = true;
-		try {
-			const chunk = unwrapNativeValue(await readStreamChunk(current));
-			if (this.disposed || this.handle !== current) return;
-			if (chunk === null) {
-				this.release(false);
-				controller.close();
-				return;
-			}
-			controller.enqueue(chunk);
-		} catch (err) {
-			if (this.disposed) return;
+	/** The readable's view of this resource (see native-readable.ts). */
+	readonly readOwner: NativeReadableOwner = {
+		current: () => (this.disposed ? null : this.handle),
+		onRead: () => {
+			this.didRead = true;
+		},
+		onEnd: () => this.release(false),
+		onError: (err) => {
 			this.release(true);
-			controller.error(toWebTransportError(err));
-		}
-	}
+			return toWebTransportError(err);
+		},
+		onCancel: (reason) => this.cancel(reason),
+	};
 
 	cancel(reason: unknown): void {
 		this.release(true, extractStreamErrorCode(reason));
@@ -4627,9 +4638,7 @@ function createServerIncomingUniWebReadable(
 	readable: WebTransportReceiveStream;
 } {
 	const resource = new ServerIncomingUniResource(nativeStream, onDisposed);
-	const readable = new ReadableStream<Uint8Array>(resource, {
-		highWaterMark: 0,
-	});
+	const readable = createIncomingReadable(nativeStream, resource.readOwner);
 	const withControls = readable as WebTransportReceiveStream;
 	withControls[WT_STOP_SENDING] = (code?: number) => resource.stopSending(code);
 	(
@@ -4853,12 +4862,36 @@ function nodeDuplexToWebBidi(
 	return Promise.resolve({ readable, writable });
 }
 
+/**
+ * The native-backed client streams' readable: a byte stream pulling the addon
+ * directly, with the Node stream kept only as the owner of the handle's
+ * lifecycle (see `directReadOwner` in streams.ts). Null for anything without
+ * a native handle, which keeps the Node adapter below.
+ */
+function directNativeReadable(
+	r: Readable,
+	onReadBytes: ((bytes: number) => void) | undefined,
+	strictW3CErrors: boolean,
+): ReadableStream<Uint8Array> | null {
+	const owner = (r as unknown as Partial<DirectReadable>)[WT_DIRECT_READ_OWNER];
+	if (typeof owner !== "function") return null;
+	const direct = owner.call(r, {
+		toError: (err: unknown) => toWebTransportError(err, strictW3CErrors),
+		cancelCode: extractStreamErrorCode,
+	});
+	if (!direct) return null;
+	if (onReadBytes) direct.onBytes = onReadBytes;
+	return createNativeByteReadable(direct);
+}
+
 function nodeReadableToWebReadable(
 	r: Readable,
 	onReadBytes?: (bytes: number) => void,
 	strictW3CErrors = false,
 	destroyOnCancel = true,
 ): ReadableStream<Uint8Array> {
+	const direct = directNativeReadable(r, onReadBytes, strictW3CErrors);
+	if (direct) return direct;
 	const stopSendable = r as unknown as Partial<StopSendable>;
 	// Pull-based so the web stream's highWaterMark actually bounds buffering:
 	// a slow consumer stops pulls, which stops draining the native channel,
@@ -5002,6 +5035,20 @@ export const __TESTING__ = {
 	resetStreamBatchDiagnosticsForTests: resetStreamBatchDiagnostics,
 	/** The exact receive-side crossing both incoming-stream readables run. */
 	readStreamChunkForTests: readStreamChunk,
+	/** The direct byte-stream readable every native incoming stream uses. */
+	createNativeByteReadableForTests: createNativeByteReadable,
+	/** The cross-stream delivery pump (read-group.ts), driven by a fake group. */
+	ReadGroupPumpForTests: ReadGroupPump,
+	readGroupConfigForTests: readGroupConfig,
+	readGroupDiagnosticsSnapshotForTests: readGroupDiagnosticsSnapshot,
+	resetReadGroupDiagnosticsForTests: resetReadGroupDiagnostics,
+	/** The addon's group constructor, when this addon has one. */
+	createNativeReadGroupForTests: (): NativeReadGroup | null => {
+		const ReadGroup = (
+			native as { StreamReadGroup?: new () => NativeReadGroup } | undefined
+		)?.StreamReadGroup;
+		return ReadGroup ? new ReadGroup() : null;
+	},
 	nativePayloadDeliveryModeForTests: () =>
 		native?.nativePayloadDeliveryMode?.(),
 	nativePayloadEngineOwnedMaxBytesForTests: () =>

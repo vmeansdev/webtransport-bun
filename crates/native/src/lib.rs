@@ -100,6 +100,7 @@ pub mod payload_buffer;
 pub mod quic_lb;
 pub mod quic_runtime;
 pub mod rate_limit;
+pub mod read_group;
 pub(crate) mod read_ownership;
 pub mod reuseport_steering;
 mod send_path_diagnostics;

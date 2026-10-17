@@ -14,6 +14,7 @@ import type {
 	WritableOptions,
 } from "node:stream";
 import { Duplex, Readable, Writable } from "node:stream";
+import type { NativeReadableOwner } from "./native-readable.js";
 import {
 	openReadSinkOnNativeHandle,
 	type StreamSinkHandle,
@@ -31,6 +32,30 @@ export const WT_RESET: unique symbol = Symbol("WT_RESET");
  * @example `(stream as StopSendable)[WT_STOP_SENDING](code)`
  */
 export const WT_STOP_SENDING: unique symbol = Symbol("WT_STOP_SENDING");
+
+/**
+ * Internal: hands the native receive handle to a direct web readable (see
+ * native-readable.ts) while the Node stream keeps owning its lifecycle. Once
+ * taken, the Node readable side is never read; a second call returns null.
+ */
+export const WT_DIRECT_READ_OWNER: unique symbol = Symbol(
+	"WT_DIRECT_READ_OWNER",
+);
+
+/** What the web layer supplies so this module needs no error mapping. */
+export type DirectReadMapping = {
+	/** The error a failed read puts on the web stream. */
+	toError(err: unknown): unknown;
+	/** The STOP_SENDING code a cancel reason carries. */
+	cancelCode(reason: unknown): number;
+};
+
+/** A Node stream whose receive half a direct web readable can take over. */
+export type DirectReadable = {
+	[WT_DIRECT_READ_OWNER](
+		mapping: DirectReadMapping,
+	): NativeReadableOwner | null;
+};
 
 /** Stream that supports reset via WT_RESET. */
 export type Resettable = { [WT_RESET](code?: number): void };
@@ -67,6 +92,9 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
 	#readableEnded = false;
 	#writableFinished = false;
 	#nativeTerminationRequested = false;
+	#directRead = false;
+	/** A direct web readable began reading the handle (sink exclusivity). */
+	#directReadStarted = false;
 	#strictStreamErrors = DEFAULT_STRICT_STREAM_ERRORS;
 
 	constructor(opts: BidiStreamOptions) {
@@ -90,23 +118,13 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
 		// autoDestroy:false, a bidi stream whose readable reaches EOF and whose
 		// writable finishes never runs _destroy() on its own, stranding the
 		// native handle until GC. Destroy once BOTH halves are done (half-open
-		// lifetimes are preserved because we wait for both events).
-		let readableEnded = false;
-		let writableFinished = false;
-		const freeWhenBothDone = () => {
-			if (readableEnded && writableFinished && !this.#destroyed) {
-				this.destroy();
-			}
-		};
-		this.once("end", () => {
-			readableEnded = true;
-			this.#readableEnded = true;
-			freeWhenBothDone();
-		});
+		// lifetimes are preserved because we wait for both events). A direct
+		// web readable reports its EOF through the same path (see
+		// WT_DIRECT_READ_OWNER), since Node's "end" never fires for it.
+		this.once("end", () => this.#markReadableEnded());
 		this.once("finish", () => {
-			writableFinished = true;
 			this.#writableFinished = true;
-			freeWhenBothDone();
+			this.#freeWhenBothDone();
 		});
 		this.on("error", (err) => {
 			if (this.listenerCount("error") > 1) return;
@@ -123,9 +141,54 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
 		});
 	}
 
+	#markReadableEnded(): void {
+		this.#readableEnded = true;
+		this.#freeWhenBothDone();
+	}
+
+	#freeWhenBothDone(): void {
+		if (this.#readableEnded && this.#writableFinished && !this.#destroyed) {
+			this.destroy();
+		}
+	}
+
+	/**
+	 * Hand the receive half to a direct web readable. Each hook does what the
+	 * Node adapter's path did for the same event — EOF frees the handle once
+	 * the writable has finished too, a failed read or a cancel destroys the
+	 * stream and so aborts both halves — except that a read error is not
+	 * re-emitted as a Node "error" event: the web stream carries it, as the
+	 * async iterator's listener used to absorb it.
+	 */
+	[WT_DIRECT_READ_OWNER](
+		mapping: DirectReadMapping,
+	): NativeReadableOwner | null {
+		if (this.#directRead || !this.#nativeHandle || this.#destroyed) return null;
+		this.#directRead = true;
+		return {
+			current: () => (this.#destroyed ? null : this.#nativeHandle),
+			onRead: () => {
+				this.#directReadStarted = true;
+			},
+			onEnd: () => this.#markReadableEnded(),
+			onError: (err) => {
+				const mapped = mapping.toError(err);
+				this.destroy();
+				return mapped;
+			},
+			onCancel: (reason) => {
+				this[WT_STOP_SENDING](mapping.cancelCode(reason));
+				if (!this.destroyed) this.destroy();
+			},
+		};
+	}
+
 	// -- Node stream overrides -----------------------
 
 	override _read(_size: number): void {
+		// The web readable owns the receive half; the Node side stays silent
+		// rather than pushing an EOF that would free the handle under it.
+		if (this.#directRead) return;
 		const h = this.#nativeHandle;
 		if (!h || this.#destroyed) {
 			this.push(null);
@@ -258,7 +321,11 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
 	openReadSink(opts?: StreamSinkOptions): StreamSinkHandle {
 		const h = this.#nativeHandle;
 		if (!h || this.#destroyed) throw new Error("E_STREAM_RESET");
-		if (this.readableDidRead || this.readableFlowing !== null) {
+		if (
+			this.readableDidRead ||
+			this.readableFlowing !== null ||
+			this.#directReadStarted
+		) {
 			throw new Error("E_SINK_READ_ACTIVE");
 		}
 		return openReadSinkOnNativeHandle(h, opts);
@@ -397,6 +464,9 @@ export class RecvStream extends Readable implements StopSendable {
 	private readonly _handleId: StreamHandleId;
 	#nativeHandle: any;
 	#destroyed = false;
+	#directRead = false;
+	/** A direct web readable began reading the handle (sink exclusivity). */
+	#directReadStarted = false;
 	#strictStreamErrors = DEFAULT_STRICT_STREAM_ERRORS;
 
 	constructor(opts: RecvStreamOptions) {
@@ -424,7 +494,46 @@ export class RecvStream extends Readable implements StopSendable {
 		});
 	}
 
+	/**
+	 * Hand the stream to a direct web readable. EOF destroys cleanly (what
+	 * autoDestroy did after "end"); a failed read sends STOP_SENDING(0) and
+	 * destroys (what `destroy(err)` did, without a Node "error" event the web
+	 * stream already carries); a cancel stops sending with the reason's code
+	 * and destroys.
+	 */
+	[WT_DIRECT_READ_OWNER](
+		mapping: DirectReadMapping,
+	): NativeReadableOwner | null {
+		if (this.#directRead || !this.#nativeHandle || this.#destroyed) return null;
+		this.#directRead = true;
+		return {
+			current: () => (this.#destroyed ? null : this.#nativeHandle),
+			onRead: () => {
+				this.#directReadStarted = true;
+			},
+			onEnd: () => {
+				if (!this.destroyed) this.destroy();
+			},
+			onError: (err) => {
+				const mapped = mapping.toError(err);
+				try {
+					this.#nativeHandle?.stopSending?.(0);
+				} catch {
+					// Session teardown may already have closed the native stream.
+				}
+				if (!this.destroyed) this.destroy();
+				return mapped;
+			},
+			onCancel: (reason) => {
+				this[WT_STOP_SENDING](mapping.cancelCode(reason));
+				if (!this.destroyed) this.destroy();
+			},
+		};
+	}
+
 	override _read(_size: number): void {
+		// The web readable owns the stream; see BidiStream._read.
+		if (this.#directRead) return;
 		const h = this.#nativeHandle;
 		if (!h || this.#destroyed) {
 			this.push(null);
@@ -488,7 +597,11 @@ export class RecvStream extends Readable implements StopSendable {
 	openReadSink(opts?: StreamSinkOptions): StreamSinkHandle {
 		const h = this.#nativeHandle;
 		if (!h || this.#destroyed) throw new Error("E_STREAM_RESET");
-		if (this.readableDidRead || this.readableFlowing !== null) {
+		if (
+			this.readableDidRead ||
+			this.readableFlowing !== null ||
+			this.#directReadStarted
+		) {
 			throw new Error("E_SINK_READ_ACTIVE");
 		}
 		return openReadSinkOnNativeHandle(h, opts);

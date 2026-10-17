@@ -546,6 +546,16 @@ pub struct CoalescedChunks {
 }
 
 impl CoalescedChunks {
+    /// Total payload bytes across the chunks.
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests(bytes: Vec<u8>) -> Self {
+        Self::new(vec![StreamChunk::new(bytes, None, 0)])
+    }
+
     fn new(chunks: Vec<StreamChunk>) -> Self {
         let len = chunks.iter().map(|chunk| chunk.as_bytes().len()).sum();
         Self { chunks, len }
@@ -1786,6 +1796,37 @@ impl ClientBidiStreamHandle {
         }
     }
 
+    /// Feed this stream's receive half into a read group (`read_group.rs`):
+    /// loop `readBatch(max_bytes)` — or `read()` when `max_bytes` is 0, the
+    /// batch knob's off state — under the group's per-stream credit,
+    /// queueing each chunk, the EOF, or the error code under `key`. Resolves
+    /// when the stream ends, its key is cancelled, or the group closes. Never
+    /// rejects; an unknown group or a bad window resolves as an error string.
+    #[napi]
+    pub async fn feed_read_group(
+        &self,
+        group_id: u32,
+        key: u32,
+        max_bytes: u32,
+        window: u32,
+    ) -> Option<String> {
+        let Some(group) = crate::read_group::lookup_group(group_id) else {
+            return Some("E_INVALID_ARGUMENT: unknown read group".to_string());
+        };
+        crate::read_group::run_feeder(group, key, window, || async move {
+            use crate::read_group::FeedChunk;
+            if max_bytes == 0 {
+                Ok(self.read_inner().await?.map(FeedChunk::Single))
+            } else {
+                Ok(self
+                    .read_batch_inner(max_bytes)
+                    .await?
+                    .map(FeedChunk::Batch))
+            }
+        })
+        .await
+    }
+
     async fn read_batch_inner(&self, max_bytes: u32) -> Result<Option<CoalescedChunks>> {
         let _probe_method = await_probe::enter(&await_probe::READ_METHOD);
         if let Some(result) = read_deferred_direct_batch(
@@ -2692,6 +2733,37 @@ impl ClientUniRecvHandle {
             Ok(None) => Either3::B(Null),
             Err(error) => Either3::C(error.reason.clone()),
         }
+    }
+
+    /// Feed this stream's receive half into a read group (`read_group.rs`):
+    /// loop `readBatch(max_bytes)` — or `read()` when `max_bytes` is 0, the
+    /// batch knob's off state — under the group's per-stream credit,
+    /// queueing each chunk, the EOF, or the error code under `key`. Resolves
+    /// when the stream ends, its key is cancelled, or the group closes. Never
+    /// rejects; an unknown group or a bad window resolves as an error string.
+    #[napi]
+    pub async fn feed_read_group(
+        &self,
+        group_id: u32,
+        key: u32,
+        max_bytes: u32,
+        window: u32,
+    ) -> Option<String> {
+        let Some(group) = crate::read_group::lookup_group(group_id) else {
+            return Some("E_INVALID_ARGUMENT: unknown read group".to_string());
+        };
+        crate::read_group::run_feeder(group, key, window, || async move {
+            use crate::read_group::FeedChunk;
+            if max_bytes == 0 {
+                Ok(self.read_inner().await?.map(FeedChunk::Single))
+            } else {
+                Ok(self
+                    .read_batch_inner(max_bytes)
+                    .await?
+                    .map(FeedChunk::Batch))
+            }
+        })
+        .await
     }
 
     async fn read_batch_inner(&self, max_bytes: u32) -> Result<Option<CoalescedChunks>> {
