@@ -211,6 +211,10 @@ export class ReadGroupPump {
 	#running = false;
 	/** Sinks whose feeder has started; the pump runs only while > 0. */
 	#active = 0;
+	/** Released keys to cancel once the current batch is dispatched. */
+	readonly #pendingCancels = new Set<number>();
+	/** Keys whose terminal entry the current batch carried. */
+	readonly #terminalInBatch = new Set<number>();
 
 	constructor(group: NativeReadGroup, window = DEFAULT_READ_GROUP_WINDOW) {
 		this.#group = group;
@@ -339,8 +343,15 @@ export class ReadGroupPump {
 		return sink;
 	}
 
-	#fail(key: number, err: unknown): void {
+	/**
+	 * Error one stream's readable. `stopFeeder` is set when the failure did
+	 * not come from the feeder's own last entry (a delivery that threw), so a
+	 * still-running feeder is cancelled instead of parking on credit forever
+	 * and pinning its handle.
+	 */
+	#fail(key: number, err: unknown, stopFeeder = false): void {
 		const sink = this.#detach(key);
+		if (stopFeeder && sink?.started) this.#group.cancel(key);
 		if (!sink || sink.owner.current() === null) return;
 		try {
 			sink.controller?.error(sink.owner.onError(err));
@@ -367,6 +378,12 @@ export class ReadGroupPump {
 					if (entries > diag.maxEntriesPerCrossing)
 						diag.maxEntriesPerCrossing = entries;
 				}
+				this.#pendingCancels.clear();
+				this.#terminalInBatch.clear();
+				for (let i = 0; i + 1 < batch.length; i += 2) {
+					if (!((batch[i + 1] ?? null) instanceof Uint8Array))
+						this.#terminalInBatch.add(batch[i] as number);
+				}
 				for (let i = 0; i + 1 < batch.length; i += 2) {
 					const value = batch[i + 1] ?? null;
 					if (value instanceof Uint8Array) {
@@ -381,8 +398,11 @@ export class ReadGroupPump {
 					try {
 						this.#dispatch(key, value);
 					} catch (err) {
-						this.#fail(key, err);
+						this.#fail(key, err, value instanceof Uint8Array);
 					}
+				}
+				for (const key of this.#pendingCancels) {
+					if (!this.#terminalInBatch.has(key)) this.#group.cancel(key);
 				}
 			}
 		} finally {
@@ -401,9 +421,11 @@ export class ReadGroupPump {
 		// and its feeder is told to stop.
 		if (sink.owner.current() === null) {
 			this.#detach(key);
-			// Data means the feeder is still running; a terminal entry means it
-			// already ended and there is nothing to cancel.
-			if (value instanceof Uint8Array) this.#group.cancel(key);
+			// Data means the feeder may still be running; a terminal entry means
+			// it already ended. The cancel waits for the end of this batch and is
+			// dropped if the same batch also carried the key's terminal entry, so
+			// a feeder that already unregistered is never cancelled.
+			if (value instanceof Uint8Array) this.#pendingCancels.add(key);
 			closeQuietly(sink.controller);
 			return;
 		}

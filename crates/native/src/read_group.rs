@@ -110,7 +110,16 @@ struct GroupQueue {
 struct Credits {
     live: HashMap<u32, Arc<Credit>>,
     cancelled_early: HashSet<u32>,
+    /// Insertion order of `cancelled_early`, for its bound.
+    cancelled_order: VecDeque<u32>,
 }
+
+/// `cancelled_early` only has to bridge the microseconds between a feeder's
+/// start and its registration. A cancel that lands after a feeder already
+/// unregistered (its last entry still in flight to JavaScript) also lands
+/// here and is never consumed, so the set is bounded: the oldest key is
+/// forgotten first, and no real early cancel is that old.
+const CANCELLED_EARLY_CAP: usize = 1024;
 
 /// What a feeder's registration found.
 enum Registration {
@@ -168,6 +177,7 @@ impl GroupShared {
             return Registration::Duplicate;
         };
         if credits.cancelled_early.remove(&key) {
+            credits.cancelled_order.retain(|k| *k != key);
             return Registration::CancelledEarly;
         }
         if credits.live.contains_key(&key) {
@@ -207,7 +217,14 @@ impl GroupShared {
                 credit.notify.notify_one();
             }
             None => {
-                credits.cancelled_early.insert(key);
+                if credits.cancelled_early.insert(key) {
+                    credits.cancelled_order.push_back(key);
+                }
+                while credits.cancelled_order.len() > CANCELLED_EARLY_CAP {
+                    if let Some(old) = credits.cancelled_order.pop_front() {
+                        credits.cancelled_early.remove(&old);
+                    }
+                }
             }
         }
     }
@@ -597,7 +614,22 @@ mod tests {
         assert!(out.is_none());
         assert_eq!(reads, 0, "a pre-cancelled feeder reads nothing");
         assert!(drain(&shared).is_empty());
-        assert!(shared.credits.lock().unwrap().cancelled_early.is_empty());
+        let credits = shared.credits.lock().unwrap();
+        assert!(credits.cancelled_early.is_empty());
+        assert!(credits.cancelled_order.is_empty());
+    }
+
+    #[test]
+    fn late_cancels_of_finished_feeders_stay_bounded() {
+        let shared = GroupShared::new();
+        for key in 0..5000 {
+            shared.cancel(key);
+        }
+        let credits = shared.credits.lock().unwrap();
+        assert_eq!(credits.cancelled_early.len(), CANCELLED_EARLY_CAP);
+        assert_eq!(credits.cancelled_order.len(), CANCELLED_EARLY_CAP);
+        assert!(credits.cancelled_early.contains(&4999));
+        assert!(!credits.cancelled_early.contains(&0));
     }
 
     #[tokio::test]

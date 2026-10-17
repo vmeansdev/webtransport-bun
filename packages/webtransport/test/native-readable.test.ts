@@ -485,6 +485,8 @@ describe("read group pump (fix A)", () => {
 		await expect(pa).rejects.toThrow("mapped:app hook threw");
 		// The rest of the batch still landed on the other stream.
 		expect(Array.from((await pb).value ?? [])).toEqual([2]);
+		// The failed stream's still-running feeder is told to stop (r2 N7b).
+		expect(g.cancels).toEqual([ka]);
 	});
 
 	it("cancels a started feeder and drops its late entries", async () => {
@@ -533,6 +535,24 @@ describe("read group pump (fix A)", () => {
 		expect(g.cancels).toEqual([key]);
 		expect(o.events).toEqual([]);
 		expect(pump.size).toBe(0);
+	});
+
+	it("does not cancel a released feeder whose terminal entry rides the same batch", async () => {
+		const g = fakeGroup();
+		const pump = new __TESTING__.ReadGroupPumpForTests(g.group, WINDOW);
+		const f = feedable();
+		const o = ownerFor({ read: async () => null });
+		const r = pump.attach(f.handle, o.owner).getReader();
+		const pending = r.read();
+		await tick();
+		const key = f.feeds[0]?.[1] as number;
+		o.release();
+		g.push(key, new Uint8Array([1]), key, null);
+		expect((await pending).done).toBe(true);
+		await tick();
+		// The feeder already ended and unregistered: a cancel would only park
+		// a key natively (r2 N7a).
+		expect(g.cancels).toEqual([]);
 	});
 
 	it("settles a waiting read when the owner is released mid-read (the read aborts)", async () => {
