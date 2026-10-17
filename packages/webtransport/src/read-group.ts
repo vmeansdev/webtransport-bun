@@ -22,6 +22,7 @@
 import {
 	type ByteController,
 	closeByteStream,
+	closeQuietly,
 	createNativeByteReadable,
 	type NativeReadableOwner,
 } from "./native-readable.js";
@@ -65,6 +66,8 @@ export type NativeReadGroup = {
 	close(): void;
 	/** Monotonic count of data entries the batched read produced. */
 	readonly batchedEntries?: number;
+	/** Monotonic count of every data entry the feeders produced. */
+	readonly dataEntries?: number;
 };
 
 /** A receive handle that can feed a group. */
@@ -94,6 +97,9 @@ export type ReadGroupDiagnostics = {
 	bytes: number;
 	/** Data entries the native feeders produced with the batched read. */
 	batchedEntries: number;
+	/** Every data entry the native feeders produced, counted on the same
+	 * (native) side and in the same window as `batchedEntries`. */
+	nativeDataEntries: number;
 	/** The largest single data entry: V-K's bound on a knob-off cell. */
 	maxEntryBytes: number;
 	maxEntriesPerCrossing: number;
@@ -101,10 +107,15 @@ export type ReadGroupDiagnostics = {
 };
 
 let batchedBaseline = 0;
+let nativeDataBaseline = 0;
 let since = 0;
 
 function nativeBatchedEntries(): number {
 	return processPump?.nativeBatchedEntries() ?? 0;
+}
+
+function nativeDataEntries(): number {
+	return processPump?.nativeDataEntries() ?? 0;
 }
 
 const diag = {
@@ -121,6 +132,7 @@ export function readGroupDiagnosticsSnapshot(): ReadGroupDiagnostics {
 	return {
 		...diag,
 		batchedEntries: nativeBatchedEntries() - batchedBaseline,
+		nativeDataEntries: nativeDataEntries() - nativeDataBaseline,
 		meanEntriesPerCrossing:
 			diag.crossings > 0 ? diag.entries / diag.crossings : 0,
 	};
@@ -133,14 +145,28 @@ export function readGroupDiagnosticsSnapshot(): ReadGroupDiagnostics {
  * stream-level chunk — exactly what one `readStreamChunk` data crossing is on
  * the direct path; only the JS-thread crossing that carries it differs, and
  * that is `crossings` in {@link readGroupDiagnosticsSnapshot}.
+ *
+ * `batchedCrossings` is decided on one side, in one window: the native
+ * feeders count both their batched entries and all their data entries, and
+ * only if the two agree exactly (every entry fed in the window was batched)
+ * does the shape report every delivered entry as batched; otherwise it
+ * reports the native batched count, which a knob-off cell needs to be 0 and
+ * a knob-on cell cannot then pass. Comparing the native count with the
+ * JS-side dispatch count instead would mix two windows offset by whatever was
+ * fed before the reset and dispatched after it.
  */
 export function readGroupAsStreamBatchDiagnostics(): StreamBatchDiagnostics {
 	const snap = readGroupDiagnosticsSnapshot();
 	const elapsedMs = since > 0 ? Math.max(0, performance.now() - since) : 0;
+	const everyFedEntryBatched =
+		snap.nativeDataEntries > 0 &&
+		snap.batchedEntries === snap.nativeDataEntries;
 	return {
 		dataCrossings: snap.dataEntries,
 		terminalCrossings: snap.terminalEntries,
-		batchedCrossings: snap.batchedEntries,
+		batchedCrossings: everyFedEntryBatched
+			? snap.dataEntries
+			: snap.batchedEntries,
 		bytes: snap.bytes,
 		meanBytesPerCrossing:
 			snap.dataEntries > 0 ? snap.bytes / snap.dataEntries : 0,
@@ -156,6 +182,7 @@ export function readGroupAsStreamBatchDiagnostics(): StreamBatchDiagnostics {
 /** Start a fresh measurement window (a probe calls this at phase start). */
 export function resetReadGroupDiagnostics(): void {
 	batchedBaseline = nativeBatchedEntries();
+	nativeDataBaseline = nativeDataEntries();
 	since = performance.now();
 	diag.crossings = 0;
 	diag.entries = 0;
@@ -169,6 +196,8 @@ export function resetReadGroupDiagnostics(): void {
 type Sink = {
 	owner: NativeReadableOwner;
 	controller: ByteController | null;
+	/** The feeder starts on the first pull, never at attach. */
+	started: boolean;
 	/** Bytes the feeder has been allowed in total, and has delivered. */
 	granted: number;
 	delivered: number;
@@ -180,6 +209,8 @@ export class ReadGroupPump {
 	readonly #sinks = new Map<number, Sink>();
 	#nextKey = 1;
 	#running = false;
+	/** Sinks whose feeder has started; the pump runs only while > 0. */
+	#active = 0;
 
 	constructor(group: NativeReadGroup, window = DEFAULT_READ_GROUP_WINDOW) {
 		this.#group = group;
@@ -190,6 +221,10 @@ export class ReadGroupPump {
 		return this.#group.batchedEntries ?? 0;
 	}
 
+	nativeDataEntries(): number {
+		return this.#group.dataEntries ?? 0;
+	}
+
 	/** Streams currently attached (tests and diagnostics). */
 	get size(): number {
 		return this.#sinks.size;
@@ -198,6 +233,17 @@ export class ReadGroupPump {
 	/**
 	 * Build the readable for one stream. The owner's hooks keep the lifecycle
 	 * exactly as the direct readable's (native-readable.ts).
+	 *
+	 * **Lazy.** Nothing is read at attach: the feeder starts on the readable's
+	 * first pull — the first `read()` that finds the queue empty — so a stream
+	 * the application never reads holds no read-ahead, exactly as the direct
+	 * pull holds none, and a native stream sink (`openReadSink`) can still
+	 * claim the handle; starting the feeder marks the stream as read (the
+	 * owner's `onRead`), after which a sink is refused with
+	 * E_SINK_READ_ACTIVE. Once started, a stream holds at
+	 * most one window plus one batch ahead of its consumer: the native part is
+	 * also inside the stream's own `maxQueuedBytesPerStream` reservation until
+	 * it crosses; the crossed part sits in the byte stream's JS queue.
 	 */
 	attach(
 		handle: GroupFeedableHandle,
@@ -210,21 +256,55 @@ export class ReadGroupPump {
 		const sink: Sink = {
 			owner,
 			controller: null,
+			started: false,
 			granted: this.#window,
 			delivered: 0,
 		};
 		this.#sinks.set(key, sink);
-		const readable = new ReadableStream<Uint8Array>(
+		const startFeeder = () => {
+			sink.started = true;
+			owner.onRead?.();
+			this.#active++;
+			void feed
+				.call(
+					handle,
+					this.#group.id,
+					key,
+					// The batch knob carries: 0 (off) makes the feeder loop
+					// `read()`, a budget makes it loop `readBatch(budget)` — the
+					// same chunks the direct readable's `readStreamChunk` would
+					// cross.
+					streamBatchConfig().batchBytes,
+					this.#window,
+				)
+				.then((code) => {
+					// A feeder that could not start is a stream that cannot read.
+					if (typeof code === "string") this.#fail(key, new Error(code));
+				});
+			this.#start();
+		};
+		return new ReadableStream<Uint8Array>(
 			{
 				type: "bytes",
 				start: (controller: ByteController) => {
 					sink.controller = controller;
 				},
 				// A pull means the consumer is waiting on an empty queue:
-				// everything delivered so far has been read. Top the feeder's
-				// allowance back up to a full window once half is spent, so a
-				// grant crosses once per half window rather than once per read.
+				// everything delivered so far has been read. The first one starts
+				// the feeder with a full window; later ones top the allowance back
+				// up to a full window once half is spent, so a grant crosses once
+				// per half window rather than once per read.
 				pull: () => {
+					if (!this.#sinks.has(key)) return;
+					if (!sink.started) {
+						if (sink.owner.current() === null) {
+							this.#detach(key);
+							if (sink.controller) closeQuietly(sink.controller);
+							return;
+						}
+						startFeeder();
+						return;
+					}
 					const allowed = sink.granted - sink.delivered;
 					if (allowed < this.#window / 2) {
 						const add = this.#window - allowed;
@@ -233,47 +313,40 @@ export class ReadGroupPump {
 					}
 				},
 				cancel: (reason: unknown) => {
+					const wasStarted = sink.started;
 					this.#detach(key);
-					this.#group.cancel(key);
+					// A key whose feeder has not registered yet is remembered as
+					// cancelled natively (read_group.rs), so the cancel is never
+					// lost to a registration race.
+					if (wasStarted) this.#group.cancel(key);
 					owner.onCancel(reason);
 				},
 			} as unknown as object,
 			{ highWaterMark: 0 },
 		);
-		owner.onRead?.();
-		void feed
-			.call(
-				handle,
-				this.#group.id,
-				key,
-				// The batch knob carries: 0 (off) makes the feeder loop `read()`,
-				// a budget makes it loop `readBatch(budget)` — the same chunks
-				// the direct readable's `readStreamChunk` would cross.
-				streamBatchConfig().batchBytes,
-				this.#window,
-			)
-			.then((code) => {
-				// A feeder that could not start is a stream that cannot read.
-				if (typeof code === "string") this.#fail(key, new Error(code));
-			});
-		this.#start();
-		return readable;
 	}
 
 	#detach(key: number): Sink | undefined {
 		const sink = this.#sinks.get(key);
 		if (!sink) return undefined;
 		this.#sinks.delete(key);
-		// Let a pending `next()` resolve so a pump with no streams left stops
-		// and does not hold the event loop open.
-		if (this.#sinks.size === 0) this.#group.wake();
+		if (sink.started) {
+			this.#active--;
+			// Let a pending `next()` resolve so a pump with no feeders left
+			// stops and does not hold the event loop open.
+			if (this.#active === 0) this.#group.wake();
+		}
 		return sink;
 	}
 
 	#fail(key: number, err: unknown): void {
 		const sink = this.#detach(key);
 		if (!sink || sink.owner.current() === null) return;
-		sink.controller?.error(sink.owner.onError(err));
+		try {
+			sink.controller?.error(sink.owner.onError(err));
+		} catch {
+			// The stream already settled by another path.
+		}
 	}
 
 	#start(): void {
@@ -284,7 +357,7 @@ export class ReadGroupPump {
 
 	async #run(): Promise<void> {
 		try {
-			while (this.#sinks.size > 0) {
+			while (this.#active > 0) {
 				const batch = await this.#group.next(READ_GROUP_MAX_ENTRIES);
 				if (batch === null) break;
 				const entries = batch.length >> 1;
@@ -302,24 +375,36 @@ export class ReadGroupPump {
 						if (value.byteLength > diag.maxEntryBytes)
 							diag.maxEntryBytes = value.byteLength;
 					} else diag.terminalEntries++;
-					this.#dispatch(batch[i] as number, value);
+					const key = batch[i] as number;
+					// Contain a throwing delivery to its own stream: the rest of
+					// the batch belongs to other streams and must still land.
+					try {
+						this.#dispatch(key, value);
+					} catch (err) {
+						this.#fail(key, err);
+					}
 				}
 			}
 		} finally {
 			this.#running = false;
-			// A stream attached while the last `next()` was resolving.
-			if (this.#sinks.size > 0) this.#start();
+			// A feeder started while the last `next()` was resolving.
+			if (this.#active > 0) this.#start();
 		}
 	}
 
 	#dispatch(key: number, value: number | Uint8Array | string | null): void {
 		const sink = this.#sinks.get(key);
-		// A cancelled stream's late entries are dropped, and so are a released
-		// one's, as a direct read completing after release always was; the
-		// released stream's terminal entry stops tracking it.
-		if (!sink) return;
-		if (sink.owner.current() === null || !sink.controller) {
-			if (!(value instanceof Uint8Array)) this.#detach(key);
+		// A cancelled stream's late entries are dropped.
+		if (!sink || !sink.controller) return;
+		// A released stream (the owner disposed or reset it) settles a waiting
+		// reader the way the direct readable's next pull would — it closes —
+		// and its feeder is told to stop.
+		if (sink.owner.current() === null) {
+			this.#detach(key);
+			// Data means the feeder is still running; a terminal entry means it
+			// already ended and there is nothing to cancel.
+			if (value instanceof Uint8Array) this.#group.cancel(key);
+			closeQuietly(sink.controller);
 			return;
 		}
 		if (typeof value === "string") {

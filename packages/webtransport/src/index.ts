@@ -4872,12 +4872,14 @@ function directNativeReadable(
 	r: Readable,
 	onReadBytes: ((bytes: number) => void) | undefined,
 	strictW3CErrors: boolean,
+	destroyOnCancel: boolean,
 ): ReadableStream<Uint8Array> | null {
 	const owner = (r as unknown as Partial<DirectReadable>)[WT_DIRECT_READ_OWNER];
 	if (typeof owner !== "function") return null;
 	const direct = owner.call(r, {
 		toError: (err: unknown) => toWebTransportError(err, strictW3CErrors),
 		cancelCode: extractStreamErrorCode,
+		destroyOnCancel,
 	});
 	if (!direct) return null;
 	if (onReadBytes) direct.onBytes = onReadBytes;
@@ -4890,7 +4892,12 @@ function nodeReadableToWebReadable(
 	strictW3CErrors = false,
 	destroyOnCancel = true,
 ): ReadableStream<Uint8Array> {
-	const direct = directNativeReadable(r, onReadBytes, strictW3CErrors);
+	const direct = directNativeReadable(
+		r,
+		onReadBytes,
+		strictW3CErrors,
+		destroyOnCancel,
+	);
 	if (direct) return direct;
 	const stopSendable = r as unknown as Partial<StopSendable>;
 	// Pull-based so the web stream's highWaterMark actually bounds buffering:

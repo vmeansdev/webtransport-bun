@@ -38,7 +38,7 @@ use napi::bindgen_prelude::{Null, ToNapiValue, TypeName};
 use napi::Result;
 use napi_derive::napi;
 use once_cell::sync::Lazy;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::Notify;
@@ -103,15 +103,34 @@ struct GroupQueue {
     woken: bool,
 }
 
+/// Live feeders' credits, and keys cancelled before their feeder registered.
+/// One lock covers both, so a cancel and a registration can never miss each
+/// other: whichever comes second sees the first.
+#[derive(Default)]
+struct Credits {
+    live: HashMap<u32, Arc<Credit>>,
+    cancelled_early: HashSet<u32>,
+}
+
+/// What a feeder's registration found.
+enum Registration {
+    Fed(Arc<Credit>),
+    Duplicate,
+    CancelledEarly,
+}
+
 pub(crate) struct GroupShared {
     queue: Mutex<GroupQueue>,
     ready: Notify,
     closed: AtomicBool,
-    credits: Mutex<HashMap<u32, Arc<Credit>>>,
+    credits: Mutex<Credits>,
     /// Data entries a feeder produced with `read_batch_inner` (the batch knob
     /// on) — measured here, where the read happened, so the harness's knob
     /// provenance check grades what ran rather than what was configured.
     batched_entries: AtomicU64,
+    /// Every data entry a feeder produced, counted beside `batched_entries`
+    /// so the two are compared on one side in one window.
+    data_entries: AtomicU64,
 }
 
 impl GroupShared {
@@ -120,8 +139,9 @@ impl GroupShared {
             queue: Mutex::new(GroupQueue::default()),
             ready: Notify::new(),
             closed: AtomicBool::new(false),
-            credits: Mutex::new(HashMap::new()),
+            credits: Mutex::new(Credits::default()),
             batched_entries: AtomicU64::new(0),
+            data_entries: AtomicU64::new(0),
         }
     }
 
@@ -143,26 +163,53 @@ impl GroupShared {
         self.ready.notify_one();
     }
 
-    fn register(&self, key: u32, window: i64) -> Option<Arc<Credit>> {
-        let credit = Arc::new(Credit::new(window));
-        let mut credits = self.credits.lock().ok()?;
-        if credits.contains_key(&key) {
-            return None;
+    fn register(&self, key: u32, window: i64) -> Registration {
+        let Ok(mut credits) = self.credits.lock() else {
+            return Registration::Duplicate;
+        };
+        if credits.cancelled_early.remove(&key) {
+            return Registration::CancelledEarly;
         }
-        credits.insert(key, credit.clone());
-        Some(credit)
+        if credits.live.contains_key(&key) {
+            return Registration::Duplicate;
+        }
+        let credit = Arc::new(Credit::new(window));
+        credits.live.insert(key, credit.clone());
+        Registration::Fed(credit)
     }
 
     fn unregister(&self, key: u32, credit: &Arc<Credit>) {
         if let Ok(mut credits) = self.credits.lock() {
-            if credits.get(&key).is_some_and(|c| Arc::ptr_eq(c, credit)) {
-                credits.remove(&key);
+            if credits
+                .live
+                .get(&key)
+                .is_some_and(|c| Arc::ptr_eq(c, credit))
+            {
+                credits.live.remove(&key);
             }
         }
     }
 
     fn credit(&self, key: u32) -> Option<Arc<Credit>> {
-        self.credits.lock().ok()?.get(&key).cloned()
+        self.credits.lock().ok()?.live.get(&key).cloned()
+    }
+
+    /// Stop `key`'s feeder at its next credit check; a key whose feeder has
+    /// not registered yet is remembered, and its registration then ends the
+    /// feeder before it reads anything.
+    fn cancel(&self, key: u32) {
+        let Ok(mut credits) = self.credits.lock() else {
+            return;
+        };
+        match credits.live.get(&key) {
+            Some(credit) => {
+                credit.cancelled.store(true, Ordering::Release);
+                credit.notify.notify_one();
+            }
+            None => {
+                credits.cancelled_early.insert(key);
+            }
+        }
     }
 
     fn has_ready(&self) -> bool {
@@ -179,7 +226,7 @@ impl GroupShared {
         }
         self.ready.notify_one();
         if let Ok(credits) = self.credits.lock() {
-            for credit in credits.values() {
+            for credit in credits.live.values() {
                 credit.notify.notify_one();
             }
         }
@@ -213,8 +260,12 @@ where
     if window == 0 {
         return Some("E_INVALID_ARGUMENT: read group window must be positive".to_string());
     }
-    let Some(credit) = group.register(key, i64::from(window)) else {
-        return Some("E_INVALID_ARGUMENT: read group key already fed".to_string());
+    let credit = match group.register(key, i64::from(window)) {
+        Registration::Fed(credit) => credit,
+        Registration::CancelledEarly => return None,
+        Registration::Duplicate => {
+            return Some("E_INVALID_ARGUMENT: read group key already fed".to_string())
+        }
     };
     loop {
         // Park until JavaScript grants credit, the stream is cancelled, or
@@ -235,6 +286,7 @@ where
                 credit
                     .available
                     .fetch_sub(chunk.len() as i64, Ordering::AcqRel);
+                group.data_entries.fetch_add(1, Ordering::Relaxed);
                 if matches!(chunk, FeedChunk::Batch(_)) {
                     group.batched_entries.fetch_add(1, Ordering::Relaxed);
                 }
@@ -374,12 +426,21 @@ impl StreamReadGroup {
     /// Stop stream `key`'s feeder at its next credit check. A read already in
     /// flight completes (the owner's stop/reset/dispose aborts it), and what it
     /// returns is still queued; the JS side drops entries for a cancelled key.
+    /// A cancel that lands before the feeder registered is remembered and ends
+    /// that feeder at registration, before it reads anything. (The JS pump
+    /// cancels only feeders it has not seen a terminal entry from, so a
+    /// remembered key is not left behind by streams that already ended,
+    /// except for a cancel racing the feeder's own last entry — one key.)
     #[napi]
     pub fn cancel(&self, key: u32) {
-        if let Some(credit) = self.shared.credit(key) {
-            credit.cancelled.store(true, Ordering::Release);
-            credit.notify.notify_one();
-        }
+        self.shared.cancel(key);
+    }
+
+    /// Every data entry the feeders produced since the group was made
+    /// (monotonic; compared with `batchedEntries` on the same side).
+    #[napi(getter)]
+    pub fn data_entries(&self) -> f64 {
+        self.shared.data_entries.load(Ordering::Relaxed) as f64
     }
 
     /// Resolve the pending `next` even if nothing is queued.
@@ -514,11 +575,47 @@ mod tests {
     #[tokio::test]
     async fn a_key_cannot_be_fed_twice_and_window_must_be_positive() {
         let shared = Arc::new(GroupShared::new());
-        let _held = shared.register(5, 10).unwrap();
+        let Registration::Fed(_held) = shared.register(5, 10) else {
+            panic!("first registration must feed");
+        };
         let dup = run_feeder(shared.clone(), 5, 10, || async { data(1) }).await;
         assert!(dup.unwrap().contains("already fed"));
         let zero = run_feeder(shared.clone(), 6, 0, || async { data(1) }).await;
         assert!(zero.unwrap().contains("window"));
+    }
+
+    #[tokio::test]
+    async fn a_cancel_before_registration_ends_the_feeder_unread() {
+        let shared = Arc::new(GroupShared::new());
+        shared.cancel(4);
+        let mut reads = 0;
+        let out = run_feeder(shared.clone(), 4, 100, || {
+            reads += 1;
+            async { data(1) }
+        })
+        .await;
+        assert!(out.is_none());
+        assert_eq!(reads, 0, "a pre-cancelled feeder reads nothing");
+        assert!(drain(&shared).is_empty());
+        assert!(shared.credits.lock().unwrap().cancelled_early.is_empty());
+    }
+
+    #[tokio::test]
+    async fn data_and_batched_counts_are_kept_side_by_side() {
+        let shared = Arc::new(GroupShared::new());
+        let mut script = vec![
+            Ok(Some(FeedChunk::Single(PayloadBuffer::from(vec![1u8; 3])))),
+            data(4),
+            Ok(None),
+        ]
+        .into_iter();
+        run_feeder(shared.clone(), 8, 1 << 20, || {
+            let next = script.next().unwrap();
+            async move { next }
+        })
+        .await;
+        assert_eq!(shared.data_entries.load(Ordering::Relaxed), 2);
+        assert_eq!(shared.batched_entries.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

@@ -157,23 +157,36 @@ describe("direct native readable (fix B)", () => {
 		await expect(pending).rejects.toThrow("mapped:boom");
 	});
 
-	it("drops a read that completes after the owner released the handle", async () => {
+	it("settles a waiting read with a close when the owner releases mid-read", async () => {
 		const h = scriptedHandle();
 		const o = ownerFor(h.handle);
 		const reader = __TESTING__
 			.createNativeByteReadableForTests(o.owner)
 			.getReader();
-		let settled = false;
-		void reader.read().then(() => {
-			settled = true;
-		});
+		const pending = reader.read();
 		await tick();
 		o.release();
 		h.settle(new Uint8Array([1]));
-		await tick();
-		await tick();
-		expect(settled).toBe(false);
+		// What the next pull would have done: the reader is answered, with
+		// no bytes from the released handle and no owner event.
+		expect((await pending).done).toBe(true);
 		expect(o.events).toEqual([]);
+	});
+
+	it("drops a read that completes after a cancel", async () => {
+		const h = scriptedHandle();
+		const o = ownerFor(h.handle);
+		const reader = __TESTING__
+			.createNativeByteReadableForTests(o.owner)
+			.getReader();
+		const pending = reader.read();
+		await tick();
+		await reader.cancel("bye");
+		expect((await pending).done).toBe(true);
+		h.settle(new Uint8Array([1]));
+		await tick();
+		await tick();
+		expect(o.events).toEqual(["cancel:bye"]);
 	});
 
 	it("closes at once when the owner has no handle", async () => {
@@ -302,6 +315,25 @@ function feedable() {
 describe("read group pump (fix A)", () => {
 	const WINDOW = 1000;
 
+	it("starts no feeder and reads nothing ahead until the first read", async () => {
+		const g = fakeGroup();
+		const pump = new __TESTING__.ReadGroupPumpForTests(g.group, WINDOW);
+		const f = feedable();
+		const r = pump
+			.attach(f.handle, ownerFor({ read: async () => null }).owner)
+			.getReader();
+		await tick();
+		await tick();
+		expect(f.feeds).toEqual([]);
+		expect(g.parked).toBe(false);
+		const pending = r.read();
+		await tick();
+		expect(f.feeds).toEqual([[7, f.feeds[0]?.[1] as number, 0, WINDOW]]);
+		expect(g.parked).toBe(true);
+		g.push(f.feeds[0]?.[1] as number, null);
+		expect((await pending).done).toBe(true);
+	});
+
 	it("demultiplexes one crossing's entries into each stream, in order", async () => {
 		const g = fakeGroup();
 		const pump = new __TESTING__.ReadGroupPumpForTests(g.group, WINDOW);
@@ -311,13 +343,15 @@ describe("read group pump (fix A)", () => {
 		const ob = ownerFor({ read: async () => null });
 		const ra = pump.attach(a.handle, oa.owner).getReader();
 		const rb = pump.attach(b.handle, ob.owner).getReader();
+		const pa = ra.read();
+		await tick();
+		const pb = rb.read();
+		await tick();
 		expect(a.feeds[0]?.[0]).toBe(7);
 		expect(a.feeds[0]?.[3]).toBe(WINDOW);
 		const ka = a.feeds[0]?.[1] as number;
 		const kb = b.feeds[0]?.[1] as number;
 		expect(ka).not.toBe(kb);
-		const pa = ra.read();
-		const pb = rb.read();
 		g.push(
 			ka,
 			new Uint8Array([1]),
@@ -351,11 +385,15 @@ describe("read group pump (fix A)", () => {
 		const rb = pump
 			.attach(b.handle, ownerFor({ read: async () => null }).owner)
 			.getReader();
+		const pa = ra.read();
+		await tick();
+		const pb = rb.read();
+		await tick();
 		const ka = a.feeds[0]?.[1] as number;
 		const kb = b.feeds[0]?.[1] as number;
 		g.push(ka, new Uint8Array(3), kb, new Uint8Array(5), ka, null);
-		await ra.read();
-		await rb.read();
+		await pa;
+		await pb;
 		g.push(kb, null);
 		await ra.read();
 		await rb.read();
@@ -366,6 +404,7 @@ describe("read group pump (fix A)", () => {
 			terminalEntries: 2,
 			bytes: 8,
 			batchedEntries: 0,
+			nativeDataEntries: 0,
 			maxEntryBytes: 5,
 			maxEntriesPerCrossing: 3,
 			meanEntriesPerCrossing: 2,
@@ -378,14 +417,17 @@ describe("read group pump (fix A)", () => {
 		const f = feedable();
 		const o = ownerFor({ read: async () => null });
 		const r = pump.attach(f.handle, o.owner).getReader();
+		const first = r.read();
+		await tick();
 		const key = f.feeds[0]?.[1] as number;
-		// Delivered but unread bytes never trigger a grant.
+		// The first pull starts the feeder with its window; delivered but
+		// unread bytes never trigger a grant.
 		g.push(key, new Uint8Array(400), key, new Uint8Array(400));
+		await first;
 		await tick();
 		expect(g.grants).toEqual([]);
 		// Reading drains the stream; the pull on the empty queue tops the
 		// feeder back up to a full window (800 spent -> grant 800).
-		await r.read();
 		await r.read();
 		const waiting = r.read();
 		await tick();
@@ -409,23 +451,53 @@ describe("read group pump (fix A)", () => {
 		const ob = ownerFor({ read: async () => null });
 		const ra = pump.attach(a.handle, oa.owner).getReader();
 		const rb = pump.attach(b.handle, ob.owner).getReader();
+		const pa = ra.read();
+		await tick();
+		const pb = rb.read();
+		await tick();
 		const ka = a.feeds[0]?.[1] as number;
 		const kb = b.feeds[0]?.[1] as number;
-		const pa = ra.read();
 		g.push(ka, "E_STREAM_RESET", kb, new Uint8Array([5]));
 		await expect(pa).rejects.toThrow("mapped:E_STREAM_RESET");
-		expect(Array.from((await rb.read()).value ?? [])).toEqual([5]);
+		expect(Array.from((await pb).value ?? [])).toEqual([5]);
 		expect(oa.events).toEqual(["error:E_STREAM_RESET"]);
 	});
 
-	it("cancels the feeder and drops late entries on cancel", async () => {
+	it("contains a delivery that throws to its own stream", async () => {
+		const g = fakeGroup();
+		const pump = new __TESTING__.ReadGroupPumpForTests(g.group, WINDOW);
+		const a = feedable();
+		const b = feedable();
+		const oa = ownerFor({ read: async () => null });
+		oa.owner.onBytes = () => {
+			throw new Error("app hook threw");
+		};
+		const ob = ownerFor({ read: async () => null });
+		const ra = pump.attach(a.handle, oa.owner).getReader();
+		const rb = pump.attach(b.handle, ob.owner).getReader();
+		const pa = ra.read();
+		await tick();
+		const pb = rb.read();
+		await tick();
+		const ka = a.feeds[0]?.[1] as number;
+		const kb = b.feeds[0]?.[1] as number;
+		g.push(ka, new Uint8Array([1]), kb, new Uint8Array([2]));
+		await expect(pa).rejects.toThrow("mapped:app hook threw");
+		// The rest of the batch still landed on the other stream.
+		expect(Array.from((await pb).value ?? [])).toEqual([2]);
+	});
+
+	it("cancels a started feeder and drops its late entries", async () => {
 		const g = fakeGroup();
 		const pump = new __TESTING__.ReadGroupPumpForTests(g.group, WINDOW);
 		const f = feedable();
 		const o = ownerFor({ read: async () => null });
-		const readable = pump.attach(f.handle, o.owner);
+		const r = pump.attach(f.handle, o.owner).getReader();
+		const pending = r.read();
+		await tick();
 		const key = f.feeds[0]?.[1] as number;
-		await readable.cancel("stop");
+		await r.cancel("stop");
+		expect((await pending).done).toBe(true);
 		expect(g.cancels).toEqual([key]);
 		expect(o.events).toEqual(["cancel:stop"]);
 		g.push(key, new Uint8Array([1]));
@@ -433,24 +505,62 @@ describe("read group pump (fix A)", () => {
 		expect(o.events).toEqual(["cancel:stop"]);
 	});
 
-	it("drops a released stream's late data", async () => {
+	it("cancels an unread stream without ever starting a feeder", async () => {
+		const g = fakeGroup();
+		const pump = new __TESTING__.ReadGroupPumpForTests(g.group, WINDOW);
+		const f = feedable();
+		const o = ownerFor({ read: async () => null });
+		await pump.attach(f.handle, o.owner).cancel("stop");
+		expect(f.feeds).toEqual([]);
+		expect(g.cancels).toEqual([]);
+		expect(o.events).toEqual(["cancel:stop"]);
+		expect(pump.size).toBe(0);
+	});
+
+	it("settles a waiting read when the owner is released mid-read (data arrives)", async () => {
 		const g = fakeGroup();
 		const pump = new __TESTING__.ReadGroupPumpForTests(g.group, WINDOW);
 		const f = feedable();
 		const o = ownerFor({ read: async () => null });
 		const r = pump.attach(f.handle, o.owner).getReader();
+		const pending = r.read();
+		await tick();
 		const key = f.feeds[0]?.[1] as number;
-		let settled = false;
-		void r.read().then(() => {
-			settled = true;
-		});
 		o.release();
 		g.push(key, new Uint8Array([1]));
-		await tick();
-		expect(settled).toBe(false);
-		g.push(key, "E_STREAM_RESET");
-		await tick();
+		expect((await pending).done).toBe(true);
+		// The feeder was still running, so it is told to stop.
+		expect(g.cancels).toEqual([key]);
+		expect(o.events).toEqual([]);
 		expect(pump.size).toBe(0);
+	});
+
+	it("settles a waiting read when the owner is released mid-read (the read aborts)", async () => {
+		const g = fakeGroup();
+		const pump = new __TESTING__.ReadGroupPumpForTests(g.group, WINDOW);
+		const f = feedable();
+		const o = ownerFor({ read: async () => null });
+		const r = pump.attach(f.handle, o.owner).getReader();
+		const pending = r.read();
+		await tick();
+		const key = f.feeds[0]?.[1] as number;
+		o.release();
+		// Disposal aborts the native read: the feeder's last entry.
+		g.push(key, "E_STREAM_RESET");
+		expect((await pending).done).toBe(true);
+		expect(g.cancels).toEqual([]);
+		expect(pump.size).toBe(0);
+	});
+
+	it("closes at the first read when the owner was released before it", async () => {
+		const g = fakeGroup();
+		const pump = new __TESTING__.ReadGroupPumpForTests(g.group, WINDOW);
+		const f = feedable();
+		const o = ownerFor({ read: async () => null });
+		const r = pump.attach(f.handle, o.owner).getReader();
+		o.release();
+		expect((await r.read()).done).toBe(true);
+		expect(f.feeds).toEqual([]);
 	});
 
 	it("surfaces a feeder that could not start as a stream error", async () => {
@@ -460,21 +570,23 @@ describe("read group pump (fix A)", () => {
 		const o = ownerFor({ read: async () => null });
 		const r = pump.attach(f.handle, o.owner).getReader();
 		const pending = r.read();
+		await tick();
 		f.finish("E_INVALID_ARGUMENT: unknown read group");
 		await expect(pending).rejects.toThrow("mapped:E_INVALID_ARGUMENT");
 	});
 
-	it("stops pumping (wakes the pending next) when its last stream ends", async () => {
+	it("stops pumping (wakes the pending next) when its last feeder ends", async () => {
 		const g = fakeGroup();
 		const pump = new __TESTING__.ReadGroupPumpForTests(g.group, WINDOW);
 		const f = feedable();
 		const o = ownerFor({ read: async () => null });
 		const r = pump.attach(f.handle, o.owner).getReader();
-		const key = f.feeds[0]?.[1] as number;
+		const pending = r.read();
 		await tick();
+		const key = f.feeds[0]?.[1] as number;
 		expect(g.parked).toBe(true);
 		g.push(key, null);
-		expect((await r.read()).done).toBe(true);
+		expect((await pending).done).toBe(true);
 		await tick();
 		await tick();
 		expect(g.wakes).toBe(1);
@@ -681,4 +793,63 @@ describe("real transfers (fixes A and B)", () => {
 			expect(res.echo).toEqual(new Array(8).fill(132_000));
 		}, 120_000);
 	}
+});
+
+// B4 (g11t-do r1): cancelling a client bidi stream's readable is a W3C
+// half-close — STOP_SENDING for the peer's half, the writable keeps working.
+// The Node adapter fix B replaced intended this (`destroyOnReadableCancel =
+// false`) but its async iterator's `return()` destroyed the duplex anyway.
+const halfCloseBody = `
+	const { createServer, WebTransport } = await import(PUBLIC_MODULE);
+	const port = Number(process.env.WT_TEST_PORT);
+	let resolveGot;
+	const got = new Promise((r) => { resolveGot = r; });
+	const server = createServer({
+		port,
+		host: "127.0.0.1",
+		tls: { certPem: "", keyPem: "" },
+		onSession: async (session) => {
+			const r = session.incomingBidirectionalStreams.getReader();
+			const { value: stream } = await r.read();
+			const w = stream.writable.getWriter();
+			await w.write(new Uint8Array([1]));
+			const rd = stream.readable.getReader();
+			let n = 0, error = null;
+			try {
+				for (;;) { const x = await rd.read(); if (x.done) break; n += x.value.byteLength; }
+			} catch (e) { error = String(e); }
+			resolveGot({ n, error });
+		},
+	});
+	const wt = new WebTransport("https://127.0.0.1:" + port, { tls: { insecureSkipVerify: true } });
+	await wt.ready;
+	const { readable, writable } = await wt.createBidirectionalStream();
+	const w = writable.getWriter();
+	await w.write(new Uint8Array(10));
+	const rr = readable.getReader();
+	await rr.read();
+	await rr.cancel("done reading");
+	await Bun.sleep(100);
+	let writeError = null;
+	try { await w.write(new Uint8Array(20)); await w.close(); } catch (e) { writeError = String(e); }
+	const server_ = await Promise.race([got, Bun.sleep(5000).then(() => ({ n: -1, error: "timeout" }))]);
+	report({ writeError, server: server_ });
+	wt.close();
+	server.close();
+	process.exit(0);
+`;
+
+describe("client bidi readable cancel (fix B, B4)", () => {
+	it("stops only the receive half: the writable still delivers and FINs", async () => {
+		const res = childResult(
+			await runChild(halfCloseBody, {
+				WT_TEST_PORT: String(nextPort(28800, 100)),
+			}),
+		) as {
+			writeError: string | null;
+			server: { n: number; error: string | null };
+		};
+		expect(res.writeError).toBeNull();
+		expect(res.server).toEqual({ n: 30, error: null });
+	}, 60_000);
 });

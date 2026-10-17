@@ -48,6 +48,13 @@ export type DirectReadMapping = {
 	toError(err: unknown): unknown;
 	/** The STOP_SENDING code a cancel reason carries. */
 	cancelCode(reason: unknown): number;
+	/**
+	 * Whether cancelling the readable destroys the whole Node stream. A bidi
+	 * stream's web pair passes `false` (W3C half-close: cancelling the readable
+	 * stops only the peer's sending half, and the writable stays usable — the
+	 * server-accepted streams' rule); an incoming uni stream passes `true`.
+	 */
+	destroyOnCancel: boolean;
 };
 
 /** A Node stream whose receive half a direct web readable can take over. */
@@ -153,12 +160,16 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
 	}
 
 	/**
-	 * Hand the receive half to a direct web readable. Each hook does what the
-	 * Node adapter's path did for the same event — EOF frees the handle once
-	 * the writable has finished too, a failed read or a cancel destroys the
-	 * stream and so aborts both halves — except that a read error is not
-	 * re-emitted as a Node "error" event: the web stream carries it, as the
-	 * async iterator's listener used to absorb it.
+	 * Hand the receive half to a direct web readable. EOF frees the handle
+	 * once the writable has finished too; a failed read destroys the stream
+	 * and so aborts both halves (a read error is not re-emitted as a Node
+	 * "error" event: the web stream carries it, as the async iterator's
+	 * listener used to absorb it). A cancel sends STOP_SENDING and, unless the
+	 * mapping asks for a full destroy, ends only the receive half: the handle
+	 * is freed when the writable finishes. The Node adapter this replaces meant
+	 * the same (`destroyOnReadableCancel = false`) but did not deliver it —
+	 * its async iterator's `return()` destroyed the duplex anyway, so a
+	 * cancelled readable took the writable with it.
 	 */
 	[WT_DIRECT_READ_OWNER](
 		mapping: DirectReadMapping,
@@ -178,7 +189,11 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
 			},
 			onCancel: (reason) => {
 				this[WT_STOP_SENDING](mapping.cancelCode(reason));
-				if (!this.destroyed) this.destroy();
+				if (mapping.destroyOnCancel) {
+					if (!this.destroyed) this.destroy();
+					return;
+				}
+				this.#markReadableEnded();
 			},
 		};
 	}

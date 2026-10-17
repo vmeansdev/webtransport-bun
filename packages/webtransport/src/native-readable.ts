@@ -24,8 +24,10 @@ import {
 
 export type NativeReadableOwner = {
 	/** The live handle, or null once the owner released it. A read that
-	 * completes after its handle was swapped out or released is dropped, as the
-	 * Node adapters and the server resources always did. */
+	 * completes after the owner released the handle closes the stream — what
+	 * the next pull would have done — so a reader already waiting settles
+	 * instead of hanging; a read that completes after a cancel, or after the
+	 * handle was swapped for another, is dropped. */
 	current(): BatchableRecvHandle | null;
 	/** A read is about to cross the handle: the first one marks the stream as
 	 * read, so a native sink can no longer claim it (`openReadSink` throws
@@ -60,9 +62,21 @@ export function closeByteStream(controller: ByteController): void {
 	controller.byobRequest?.respond(0);
 }
 
+/** Close unless the stream already settled by another path. */
+export function closeQuietly(controller: ByteController): void {
+	try {
+		closeByteStream(controller);
+	} catch {
+		// Already closed or errored: the reader has its answer.
+	}
+}
+
+type PullState = { cancelled: boolean };
+
 function pullOnce(
 	owner: NativeReadableOwner,
 	controller: ByteController,
+	state: PullState,
 ): Promise<void> | undefined {
 	const handle = owner.current();
 	if (!handle) {
@@ -72,7 +86,14 @@ function pullOnce(
 	owner.onRead?.();
 	return readStreamChunk(handle).then(
 		(value): Promise<void> | undefined => {
-			if (owner.current() !== handle) return undefined;
+			if (state.cancelled) return undefined;
+			const live = owner.current();
+			if (live !== handle) {
+				// Released while the read was in flight: settle the waiting
+				// reader the way the next pull would. Swapped: not ours.
+				if (live === null) closeQuietly(controller);
+				return undefined;
+			}
 			// Never-reject sentinel: a string result IS an error code (see
 			// unwrapNativeValue) and is never deliverable as payload.
 			if (typeof value === "string") {
@@ -86,13 +107,18 @@ function pullOnce(
 			}
 			// A byte stream refuses an empty chunk, and a pull that enqueues
 			// nothing is not re-run while the reader waits: read again instead.
-			if (value.byteLength === 0) return pullOnce(owner, controller);
+			if (value.byteLength === 0) return pullOnce(owner, controller, state);
 			owner.onBytes?.(value.byteLength);
 			controller.enqueue(value);
 			return undefined;
 		},
 		(err: unknown) => {
-			if (owner.current() !== handle) return;
+			if (state.cancelled) return;
+			const live = owner.current();
+			if (live !== handle) {
+				if (live === null) closeQuietly(controller);
+				return;
+			}
 			controller.error(owner.onError(err));
 		},
 	);
@@ -105,11 +131,15 @@ export function createNativeByteReadable(
 	// this package's tsconfig omits the DOM lib that defines
 	// `UnderlyingByteSource`; the runtime supports it (see the datagram
 	// readables), so bypass the constructor's overloads here.
+	const state: PullState = { cancelled: false };
 	return new ReadableStream<Uint8Array>(
 		{
 			type: "bytes",
-			pull: (controller: ByteController) => pullOnce(owner, controller),
-			cancel: (reason: unknown) => owner.onCancel(reason),
+			pull: (controller: ByteController) => pullOnce(owner, controller, state),
+			cancel: (reason: unknown) => {
+				state.cancelled = true;
+				owner.onCancel(reason);
+			},
 		} as unknown as object,
 		{ highWaterMark: 0 },
 	);
