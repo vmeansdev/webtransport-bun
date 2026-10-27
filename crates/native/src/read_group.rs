@@ -540,9 +540,12 @@ impl StreamReadGroup {
         }
     }
 
-    /// Stop stream `key`'s feeder at its next credit check. A read already in
-    /// flight completes (the owner's stop/reset/dispose aborts it), and what it
-    /// returns is still queued; the JS side drops entries for a cancelled key.
+    /// Stop stream `key`'s feeder at its next credit check. Entries the key
+    /// already queued are purged now, and whatever a read still in flight
+    /// returns (the owner's stop/reset/dispose usually aborts it) is dropped
+    /// natively rather than queued — in both cases releasing the payload and
+    /// any reservation it holds, so a cancelled key never leaves anything in
+    /// the queue (`GroupShared::cancel`, `push_fed`).
     /// A prepared key whose feeder has not started is forgotten, and that
     /// feeder ends before it reads. A key that is no longer live is ignored:
     /// nothing is remembered, so no cancel is ever lost or left behind.

@@ -46,6 +46,12 @@ const READ_GROUP_ENV = "WEBTRANSPORT_STREAM_READ_GROUP";
 const DEMAND_CREDIT = 1;
 /** Entries one `next()` may return. */
 const READ_GROUP_MAX_ENTRIES = 4096;
+let readGroupMaxEntries = READ_GROUP_MAX_ENTRIES;
+
+/** Tests: shrink `next()` batches so a teardown crosses batch boundaries. */
+export function setReadGroupMaxEntriesForTests(entries: number): void {
+	readGroupMaxEntries = Math.max(1, Math.floor(entries));
+}
 /** Feeder keys are u32; 0 is never used. */
 const MAX_KEY = 0xffff_ffff;
 
@@ -481,10 +487,26 @@ export class ReadGroupPump {
 		void this.#run();
 	}
 
+	/** Entries still queued natively (0 for a group without the getter). */
+	#queued(): number {
+		return this.#group.queued ?? 0;
+	}
+
+	/**
+	 * Drain while any stream is attached, and then until the native queue is
+	 * empty: one `next()` returns at most `readGroupMaxEntries`, so a pump
+	 * whose last stream detached mid-backlog keeps going until the tail is
+	 * gone (entries for detached keys are discarded by `#dispatch`) instead
+	 * of leaving it in the process-global queue for unrelated traffic to
+	 * drain. Nothing can queue behind it once no stream is attached: every
+	 * detached key's feeder has either ended (its terminal entry was its
+	 * last) or been cancelled, and the native side drops a cancelled key's
+	 * entries (read_group.rs `cancel`, `push_fed`).
+	 */
 	async #run(): Promise<void> {
 		try {
-			while (this.#active > 0) {
-				const batch = await this.#group.next(READ_GROUP_MAX_ENTRIES);
+			while (this.#active > 0 || this.#queued() > 0) {
+				const batch = await this.#group.next(readGroupMaxEntries);
 				if (batch === null) break;
 				const entries = batch.length >> 1;
 				if (entries > 0) {
@@ -514,7 +536,7 @@ export class ReadGroupPump {
 		} finally {
 			this.#running = false;
 			// A feeder started while the last `next()` was resolving.
-			if (this.#active > 0) this.#start();
+			if (this.#active > 0 || this.#queued() > 0) this.#start();
 		}
 	}
 
@@ -550,6 +572,9 @@ export class ReadGroupPump {
 }
 
 let processPump: ReadGroupPump | null = null;
+/** Readables built on the direct pull while the group was active, because
+ * their handle had no `feedReadGroup`. */
+let directFallbacks = 0;
 let groupFactory: (() => NativeReadGroup) | null = null;
 
 /** The addon loader registers the native group constructor here. */
@@ -568,15 +593,32 @@ export function createIncomingReadable(
 	handle: GroupFeedableHandle,
 	owner: NativeReadableOwner,
 ): ReadableStream<Uint8Array> {
-	if (!readGroupEnabled || !groupFactory || !handle.feedReadGroup) {
+	if (!readGroupEnabled || !groupFactory) {
+		return createNativeByteReadable(owner);
+	}
+	if (!handle.feedReadGroup) {
+		// Counted, not silent: a handle from an addon without the feeder.
+		directFallbacks++;
 		return createNativeByteReadable(owner);
 	}
 	processPump ??= new ReadGroupPump(groupFactory());
 	return processPump.attach(handle, owner);
 }
 
-export function readGroupConfig(): Readonly<{ enabled: boolean }> {
-	return Object.freeze({ enabled: readGroupEnabled });
+/**
+ * `enabled` is the knob; `active` is whether the group is actually in use —
+ * false when the loaded addon has no `StreamReadGroup`, which leaves every
+ * readable on the direct pull. A harness or test that expects the group
+ * checks `active`, never `enabled` alone.
+ */
+export function readGroupConfig(): Readonly<{
+	enabled: boolean;
+	active: boolean;
+}> {
+	return Object.freeze({
+		enabled: readGroupEnabled,
+		active: readGroupEnabled && groupFactory !== null,
+	});
 }
 
 /** The process pump's live state (tests): attached streams, running native
@@ -588,6 +630,7 @@ export function readGroupStateSnapshot(): {
 	nativeQueued: number;
 	nativeQueuedBytes: number;
 	nativeLiveKeys: number;
+	directFallbacks: number;
 } {
 	const native = processPump?.nativeQueue();
 	return {
@@ -597,5 +640,6 @@ export function readGroupStateSnapshot(): {
 		nativeQueued: native?.queued ?? 0,
 		nativeQueuedBytes: native?.queuedBytes ?? 0,
 		nativeLiveKeys: native?.liveKeys ?? 0,
+		directFallbacks,
 	};
 }

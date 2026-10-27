@@ -270,6 +270,7 @@ function fakeGroup() {
 	let waiter: ((v: Array<number | Value> | null) => void) | null = null;
 	let backlog: Array<number | Value> = [];
 	const cancelled = new Set<number>();
+	let max = 4096;
 	const order: string[] = [];
 	let closed = false;
 	const flush = () => {
@@ -283,17 +284,22 @@ function fakeGroup() {
 		if (backlog.length === 0) return;
 		const w = waiter;
 		waiter = null;
-		const out = backlog;
-		backlog = [];
+		// Like native `next(maxEntries)`: at most `max` entries per crossing.
+		const out = backlog.slice(0, max * 2);
+		backlog = backlog.slice(max * 2);
 		w(out);
 	};
 	const group = {
 		id: 7,
-		next: (_max: number) =>
+		next: (maxEntries: number) =>
 			new Promise<Array<number | Value> | null>((resolve) => {
+				max = maxEntries;
 				waiter = resolve;
 				flush();
 			}),
+		get queued() {
+			return backlog.length >> 1;
+		},
 		prepare: (key: number, credit: number) => {
 			if (failPrepare) throw new Error("E_INVALID_ARGUMENT: key already live");
 			prepares.push([key, credit]);
@@ -343,6 +349,12 @@ function fakeGroup() {
 		/** Entries queued and not yet taken by `next()`. */
 		get queued() {
 			return backlog.length >> 1;
+		},
+		/** Queue entries without resolving a pending `next()` (they were
+		 * queued while the pump was between crossings). */
+		enqueue(...entries: Array<number | Value>) {
+			for (let i = 0; i + 1 < entries.length; i += 2)
+				backlog.push(entries[i] as number, entries[i + 1] as Value);
 		},
 		push(...entries: Array<number | Value>) {
 			for (let i = 0; i + 1 < entries.length; i += 2)
@@ -681,6 +693,46 @@ describe("read group pump (fix A)", () => {
 		expect(g.queued).toBe(0);
 	});
 
+	it("drains a backlog past the per-crossing cap before it stops (r3 A-B1)", async () => {
+		__TESTING__.setReadGroupMaxEntriesForTests(2);
+		try {
+			const g = fakeGroup();
+			const pump = new __TESTING__.ReadGroupPumpForTests(g.group);
+			const streams = Array.from({ length: 5 }, () => {
+				const f = feedable();
+				const o = ownerFor({ read: async () => null });
+				const r = pump.attach(f.handle, o.owner).getReader();
+				return { f, o, pending: r.read() };
+			});
+			await tick();
+			// Every feeder has ended natively (so a release sends no cancel)...
+			for (const s of streams) s.f.finish(null);
+			await tick();
+			expect(pump.feeding).toBe(0);
+			// ...its last entries were queued while the loop was busy, and the
+			// session then closed: every stream is released in one go.
+			for (const s of streams) s.o.release();
+			g.enqueue(
+				...streams.flatMap((s) => [
+					s.f.feeds[0]?.[1] as number,
+					new Uint8Array(3),
+				]),
+				...streams.flatMap((s) => [s.f.feeds[0]?.[1] as number, null]),
+			);
+			expect(g.queued).toBe(10);
+			for (const s of streams)
+				expect((await within(s.pending, "released read")).done).toBe(true);
+			// Five crossings of two, not one: the tail is drained, then the
+			// pump stops.
+			for (let i = 0; i < 10 && (g.queued > 0 || g.parked); i++) await tick();
+			expect(g.queued).toBe(0);
+			expect(g.parked).toBe(false);
+			expect(pump.size).toBe(0);
+		} finally {
+			__TESTING__.setReadGroupMaxEntriesForTests(4096);
+		}
+	});
+
 	it("cancels the last stream's feeder before the pump stops (r2 A-B1)", async () => {
 		const g = fakeGroup();
 		const pump = new __TESTING__.ReadGroupPumpForTests(g.group);
@@ -824,20 +876,24 @@ describe("read group knob", () => {
 		);
 
 	it("is on by default", async () => {
+		// `active`: the loaded addon really has the group, so default-on is
+		// not silently the direct pull.
 		expect(await config({ WEBTRANSPORT_STREAM_READ_GROUP: undefined })).toEqual(
-			{ enabled: true },
+			{ enabled: true, active: true },
 		);
 	});
 
 	it("is turned off by WEBTRANSPORT_STREAM_READ_GROUP=0", async () => {
 		expect(await config({ WEBTRANSPORT_STREAM_READ_GROUP: "0" })).toEqual({
 			enabled: false,
+			active: false,
 		});
 	});
 
 	it("stays on for 1", async () => {
 		expect(await config({ WEBTRANSPORT_STREAM_READ_GROUP: "1" })).toEqual({
 			enabled: true,
+			active: true,
 		});
 	});
 });
@@ -965,6 +1021,8 @@ const transferBody = `${guardSrc}
 	const echo = await guard(Promise.all(echoes), 30_000, "client echoes");
 	report({
 		cfg: __TESTING__.readGroupConfigForTests(),
+		group: __TESTING__.readGroupDiagnosticsSnapshotForTests(),
+		state: __TESTING__.readGroupStateSnapshotForTests(),
 		bidiOk: got.bidi.map((g, s) => g.n === expected(s).n && g.sum === expected(s).sum),
 		uniOk: got.uni.n === expected(99).n && got.uni.sum === expected(99).sum,
 		echo: echo.map((e) => e.n),
@@ -1013,12 +1071,31 @@ describe("real transfers (fixes A and B)", () => {
 					WT_TEST_PORT: String(nextPort(28600, 200)),
 				}),
 			) as {
-				cfg: { enabled: boolean };
+				cfg: { enabled: boolean; active: boolean };
+				group: {
+					crossings: number;
+					entries: number;
+					dataEntries: number;
+					maxEntriesPerCrossing: number;
+				};
+				state: { directFallbacks: number };
 				bidiOk: boolean[];
 				uniOk: boolean;
 				echo: number[];
 			};
-			expect(res.cfg.enabled).toBe(!arm.name.startsWith("direct"));
+			const grouped = !arm.name.startsWith("direct");
+			expect(res.cfg).toEqual({ enabled: grouped, active: grouped });
+			if (grouped) {
+				// The bytes really rode the group: crossings carried entries,
+				// some crossing carried several streams' entries at once, and
+				// no readable fell back to the direct pull.
+				expect(res.group.crossings).toBeGreaterThan(0);
+				expect(res.group.dataEntries).toBeGreaterThan(0);
+				expect(res.group.maxEntriesPerCrossing).toBeGreaterThan(1);
+				expect(res.state.directFallbacks).toBe(0);
+			} else {
+				expect(res.group.crossings).toBe(0);
+			}
 			expect(res.bidiOk).toEqual(new Array(8).fill(true));
 			expect(res.uniOk).toBe(true);
 			expect(res.echo).toEqual(new Array(8).fill(132_000));
@@ -1098,6 +1175,8 @@ describe("client bidi readable cancel (fix B, B4)", () => {
 const stalledBody = `${guardSrc}
 	const { createServer, WebTransport } = await import(PUBLIC_MODULE);
 	const { __TESTING__ } = await import(INTERNAL_MODULE);
+	// One entry per crossing: every teardown crosses the drain boundary.
+	if (process.env.WT_MAX_ENTRIES) __TESTING__.setReadGroupMaxEntriesForTests(Number(process.env.WT_MAX_ENTRIES));
 	const port = Number(process.env.WT_TEST_PORT);
 	const STREAMS = 16;
 	const UNREAD = 4;
@@ -1187,6 +1266,7 @@ describe("read group under stalled consumers (A-B1, C-B1)", () => {
 			await runChild(stalledBody, {
 				WEBTRANSPORT_STREAM_READ_GROUP: undefined,
 				WEBTRANSPORT_STREAM_BATCH_BYTES: undefined,
+				WT_MAX_ENTRIES: "1",
 				WT_TEST_PORT: String(nextPort(28900, 100)),
 			}),
 		) as {
@@ -1219,6 +1299,7 @@ describe("read group under stalled consumers (A-B1, C-B1)", () => {
 			nativeQueued: 0,
 			nativeQueuedBytes: 0,
 			nativeLiveKeys: 0,
+			directFallbacks: 0,
 		});
 	}, 60_000);
 });
@@ -1231,6 +1312,8 @@ describe("read group under stalled consumers (A-B1, C-B1)", () => {
 const raceBody = `${guardSrc}
 	const { createServer, WebTransport } = await import(PUBLIC_MODULE);
 	const { __TESTING__ } = await import(INTERNAL_MODULE);
+	// One entry per crossing: every teardown crosses the drain boundary.
+	if (process.env.WT_MAX_ENTRIES) __TESTING__.setReadGroupMaxEntriesForTests(Number(process.env.WT_MAX_ENTRIES));
 	const port = Number(process.env.WT_TEST_PORT);
 	const ROUNDS = 60;
 	const leftovers = [];
@@ -1301,14 +1384,20 @@ const raceBody = `${guardSrc}
 
 describe("read group teardown race (r2 A-B1)", () => {
 	for (const arm of [
-		{ name: "batching off", batch: undefined },
-		{ name: "batching on", batch: "65536" },
+		{ name: "batching off", batch: undefined, maxEntries: undefined },
+		{ name: "batching on", batch: "65536", maxEntries: undefined },
+		{
+			name: "batching on, one entry per crossing",
+			batch: "65536",
+			maxEntries: "1",
+		},
 	]) {
 		it(`leaves no queued entry, live key or reserved byte behind (${arm.name})`, async () => {
 			const res = childResult(
 				await runChild(raceBody, {
 					WEBTRANSPORT_STREAM_READ_GROUP: undefined,
 					WEBTRANSPORT_STREAM_BATCH_BYTES: arm.batch,
+					WT_MAX_ENTRIES: arm.maxEntries,
 					WT_TEST_PORT: String(nextPort(29000, 100)),
 				}),
 			) as {
@@ -1325,6 +1414,7 @@ describe("read group teardown race (r2 A-B1)", () => {
 				nativeQueued: 0,
 				nativeQueuedBytes: 0,
 				nativeLiveKeys: 0,
+				directFallbacks: 0,
 				queuedGlobal: 0,
 			});
 		}, 60_000);

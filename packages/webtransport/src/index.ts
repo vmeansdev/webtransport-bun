@@ -79,6 +79,7 @@ import {
 	readGroupDiagnosticsSnapshot,
 	readGroupStateSnapshot,
 	resetReadGroupDiagnostics,
+	setReadGroupMaxEntriesForTests,
 } from "./read-group.js";
 import {
 	BidiStream,
@@ -5054,6 +5055,7 @@ export const __TESTING__ = {
 	ReadGroupPumpForTests: ReadGroupPump,
 	readGroupConfigForTests: readGroupConfig,
 	readGroupStateSnapshotForTests: readGroupStateSnapshot,
+	setReadGroupMaxEntriesForTests,
 	readGroupDiagnosticsSnapshotForTests: readGroupDiagnosticsSnapshot,
 	resetReadGroupDiagnosticsForTests: resetReadGroupDiagnostics,
 	/** The addon's group constructor, when this addon has one. */
