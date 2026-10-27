@@ -1086,12 +1086,13 @@ describe("real transfers (fixes A and B)", () => {
 			const grouped = !arm.name.startsWith("direct");
 			expect(res.cfg).toEqual({ enabled: grouped, active: grouped });
 			if (grouped) {
-				// The bytes really rode the group: crossings carried entries,
-				// some crossing carried several streams' entries at once, and
-				// no readable fell back to the direct pull.
+				// The bytes really rode the group: crossings carried entries and
+				// no readable fell back to the direct pull. (That one crossing
+				// carries several streams is pinned deterministically by the
+				// "one crossing for many streams" test below.)
 				expect(res.group.crossings).toBeGreaterThan(0);
+				expect(res.group.entries).toBeGreaterThan(0);
 				expect(res.group.dataEntries).toBeGreaterThan(0);
-				expect(res.group.maxEntriesPerCrossing).toBeGreaterThan(1);
 				expect(res.state.directFallbacks).toBe(0);
 			} else {
 				expect(res.group.crossings).toBe(0);
@@ -1419,4 +1420,83 @@ describe("read group teardown race (r2 A-B1)", () => {
 			});
 		}, 60_000);
 	}
+});
+
+// N-1 (r4): the point of the group, pinned without relying on network
+// timing. Every stream has a read waiting (its feeder parked in a native
+// read); the peer's bytes for all of them are sent; then the JS thread is
+// blocked synchronously, so every feeder completes and queues while the
+// pump's next() cannot resolve. When the thread is released, one crossing
+// carries every stream's entry.
+const oneCrossingBody = `${guardSrc}
+	const { createServer, WebTransport } = await import(PUBLIC_MODULE);
+	const { __TESTING__ } = await import(INTERNAL_MODULE);
+	const port = Number(process.env.WT_TEST_PORT);
+	const STREAMS = 6;
+	const accepted = Promise.withResolvers();
+	const readers = [];
+	const server = createServer({
+		port,
+		host: "127.0.0.1",
+		tls: { certPem: "", keyPem: "" },
+		onSession: async (s) => {
+			const uni = s.incomingUnidirectionalStreams.getReader();
+			for (let i = 0; i < STREAMS; i++) {
+				const { value: readable } = await guard(uni.read(), 10_000, "server accept " + i);
+				readers.push(readable.getReader());
+			}
+			accepted.resolve();
+		},
+	});
+	const wt = new WebTransport("https://127.0.0.1:" + port, {
+		tls: { insecureSkipVerify: true },
+	});
+	await guard(wt.ready, 10_000, "client ready");
+	const writers = [];
+	for (let i = 0; i < STREAMS; i++) {
+		const w = (await guard(wt.createUnidirectionalStream(), 10_000, "client open " + i)).getWriter();
+		// A one-byte header so the server can accept the stream.
+		await guard(w.write(new Uint8Array([i])), 10_000, "client header " + i);
+		writers.push(w);
+	}
+	await guard(accepted.promise, 10_000, "server accepted all");
+	// Drain each header so every feeder is started and parked.
+	for (const [i, r] of readers.entries()) await guard(r.read(), 10_000, "header read " + i);
+	// Every stream now has a read waiting on an empty queue.
+	const pending = readers.map((r, i) => guard(r.read(), 10_000, "payload read " + i));
+	await Bun.sleep(20);
+	__TESTING__.resetReadGroupDiagnosticsForTests();
+	// Issue every payload write at once and let the microtasks hand them to
+	// the addon — no macrotask (and so no pump resolution) runs in between.
+	const writes = writers.map((w, i) => guard(w.write(new Uint8Array(1000).fill(i)), 10_000, "client payload " + i));
+	for (let k = 0; k < 50; k++) await null;
+	// Block the JS thread: the native side sends and receives, every feeder
+	// reads and queues, and the pump's next() resolution waits for the thread.
+	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 750);
+	await guard(Promise.all(writes), 10_000, "client payload writes");
+	const values = await guard(Promise.all(pending), 10_000, "payload reads");
+	report({
+		lengths: values.map((v) => v.value?.byteLength ?? -1),
+		group: __TESTING__.readGroupDiagnosticsSnapshotForTests(),
+	});
+	wt.close();
+	server.close();
+	process.exit(0);
+`;
+
+describe("one crossing for many streams (r4 N-1)", () => {
+	it("delivers every stream completed while the thread was busy in a single crossing", async () => {
+		const res = childResult(
+			await runChild(oneCrossingBody, {
+				WEBTRANSPORT_STREAM_READ_GROUP: undefined,
+				WEBTRANSPORT_STREAM_BATCH_BYTES: undefined,
+				WT_TEST_PORT: String(nextPort(29100, 100)),
+			}),
+		) as {
+			lengths: number[];
+			group: { crossings: number; maxEntriesPerCrossing: number };
+		};
+		expect(res.lengths).toEqual(new Array(6).fill(1000));
+		expect(res.group.maxEntriesPerCrossing).toBe(6);
+	}, 60_000);
 });

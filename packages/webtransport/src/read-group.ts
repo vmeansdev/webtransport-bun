@@ -44,7 +44,9 @@ const READ_GROUP_ENV = "WEBTRANSPORT_STREAM_READ_GROUP";
 /** Credit for one outstanding pull: one byte admits exactly one native read
  * (the feeder reads while its credit is positive; a read spends its length). */
 const DEMAND_CREDIT = 1;
-/** Entries one `next()` may return. */
+/** Entries one `next()` may return. Native also caps a crossing at 1 MiB of
+ * payload and releases each entry's buffer and reservation as soon as its
+ * JavaScript copy exists (read_group.rs `GROUP_CROSSING_MAX_BYTES`). */
 const READ_GROUP_MAX_ENTRIES = 4096;
 let readGroupMaxEntries = READ_GROUP_MAX_ENTRIES;
 

@@ -310,6 +310,33 @@ impl GroupShared {
         self.credits.lock().map(|c| c.live.len()).unwrap_or(0)
     }
 
+    /// Take the next entry for a crossing, or None once it is full: at most
+    /// `max_entries`, and no data entry that would take the crossing past
+    /// `max_bytes` unless it is the first (terminal entries cost nothing). One entry per lock, so the caller
+    /// converts and drops each before the next is taken.
+    fn take_for_crossing(
+        &self,
+        taken: &mut CrossingTally,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> Option<GroupEntry> {
+        if taken.entries >= max_entries.max(1) {
+            return None;
+        }
+        let mut queue = self.queue.lock().ok()?;
+        let len = match &queue.entries.front()?.payload {
+            GroupPayload::Data(chunk) => chunk.len(),
+            _ => 0,
+        };
+        if taken.entries > 0 && len > 0 && taken.bytes + len > max_bytes {
+            return None;
+        }
+        let entry = queue.entries.pop_front()?;
+        taken.entries += 1;
+        taken.bytes += len;
+        Some(entry)
+    }
+
     #[cfg(test)]
     fn queued(&self) -> usize {
         self.queue.lock().map(|q| q.entries.len()).unwrap_or(0)
@@ -334,6 +361,19 @@ impl GroupShared {
             }
         }
     }
+}
+
+/// Payload bytes one `next()` crossing may carry. A crossing always takes
+/// its first entry, then stops before an entry that would exceed this, so
+/// one crossing never materializes more than this in JavaScript (or one
+/// entry, if a single batch is larger) on top of what is still queued.
+pub(crate) const GROUP_CROSSING_MAX_BYTES: usize = 1024 * 1024;
+
+/// What a crossing has taken so far.
+#[derive(Default)]
+pub(crate) struct CrossingTally {
+    entries: usize,
+    bytes: usize,
 }
 
 static NEXT_GROUP_ID: AtomicU32 = AtomicU32::new(1);
@@ -427,21 +467,27 @@ impl ToNapiValue for GroupBatch {
     /// A flat array `[key0, value0, key1, value1, ...]`: each value is the
     /// batch's `Uint8Array`, `null` for EOF, or the error code string — the
     /// same three shapes `readBatch` resolves with.
+    ///
+    /// Entries are taken off the queue **one at a time** and each payload is
+    /// dropped — releasing its buffer and any receive reservation — as soon
+    /// as its JavaScript copy exists, so at any moment at most one entry is
+    /// held twice. The crossing also stops at [`GROUP_CROSSING_MAX_BYTES`]
+    /// (`take_for_crossing`); what is left stays queued, under its
+    /// reservations, for the next `next()`.
     unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> Result<napi::sys::napi_value> {
-        let drained: Vec<GroupEntry> = match val.shared.queue.lock() {
-            Ok(mut queue) => {
-                queue.woken = false;
-                let n = queue.entries.len().min(val.max_entries.max(1));
-                queue.entries.drain(..n).collect()
-            }
-            Err(_) => Vec::new(),
-        };
+        if let Ok(mut queue) = val.shared.queue.lock() {
+            queue.woken = false;
+        }
         let mut array = std::ptr::null_mut();
-        napi::check_status!(unsafe {
-            napi::sys::napi_create_array_with_length(env, drained.len() * 2, &mut array)
-        })?;
-        for (i, entry) in drained.into_iter().enumerate() {
+        napi::check_status!(unsafe { napi::sys::napi_create_array(env, &mut array) })?;
+        let mut taken = CrossingTally::default();
+        while let Some(entry) =
+            val.shared
+                .take_for_crossing(&mut taken, val.max_entries, GROUP_CROSSING_MAX_BYTES)
+        {
             let key = unsafe { u32::to_napi_value(env, entry.key)? };
+            // Each arm consumes the payload: it is dropped (and its
+            // reservation released) when the conversion returns.
             let value = match entry.payload {
                 GroupPayload::Data(FeedChunk::Batch(batch)) => unsafe {
                     CoalescedChunks::to_napi_value(env, batch)?
@@ -452,7 +498,7 @@ impl ToNapiValue for GroupBatch {
                 GroupPayload::End => unsafe { Null::to_napi_value(env, Null)? },
                 GroupPayload::Error(code) => unsafe { String::to_napi_value(env, code)? },
             };
-            let at = (i * 2) as u32;
+            let at = ((taken.entries - 1) * 2) as u32;
             napi::check_status!(unsafe { napi::sys::napi_set_element(env, array, at, key) })?;
             napi::check_status!(unsafe { napi::sys::napi_set_element(env, array, at + 1, value) })?;
         }
@@ -875,6 +921,62 @@ mod tests {
         assert_eq!(shared.queued_bytes(), 0);
         assert_eq!(reserved(&b), (0, 0, 0));
         assert_eq!(shared.live_keys(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_crossing_respects_its_byte_cap_and_releases_each_entry_as_taken() {
+        // r4 C-B1: a crossing must not hold every drained entry (and its
+        // reservation) while it copies them into JavaScript.
+        let b = budget();
+        let shared = Arc::new(GroupShared::new());
+        let mut credits = Vec::new();
+        for key in 1..=6u32 {
+            shared.prepare(key, 1 << 20).unwrap();
+            let Registration::Fed(c) = shared.claim(key) else {
+                panic!("claim")
+            };
+            shared.push_fed(key, &c, GroupPayload::Data(reserved_batch(&b, 400)));
+            credits.push(c);
+        }
+        shared.push_fed(1, &credits[0], GroupPayload::End);
+        assert_eq!(reserved(&b).0, 2400);
+        // A 1,000-byte cap: two 400-byte entries fit, the third would not.
+        let mut taken = CrossingTally::default();
+        let mut keys = Vec::new();
+        while let Some(entry) = shared.take_for_crossing(&mut taken, 4096, 1000) {
+            keys.push(entry.key);
+            // "Copy into JS", then drop: the reservation goes with it, while
+            // everything not yet taken stays reserved.
+            drop(entry);
+            assert_eq!(reserved(&b).0 as usize, shared.queued_bytes());
+        }
+        assert_eq!(keys, vec![1, 2]);
+        assert_eq!(taken.bytes, 800);
+        assert_eq!(reserved(&b).0, 1600);
+        // The next crossing continues where this one stopped.
+        let mut next = CrossingTally::default();
+        let mut more = Vec::new();
+        while let Some(entry) = shared.take_for_crossing(&mut next, 4096, 1000) {
+            more.push(entry.key);
+        }
+        assert_eq!(more, vec![3, 4]);
+        // The entry cap still applies, and a first entry larger than the
+        // byte cap is still taken alone (a crossing always makes progress).
+        let mut one = CrossingTally::default();
+        assert_eq!(shared.take_for_crossing(&mut one, 1, 1000).unwrap().key, 5);
+        assert!(shared.take_for_crossing(&mut one, 1, 1000).is_none());
+        let mut tiny = CrossingTally::default();
+        assert_eq!(
+            shared.take_for_crossing(&mut tiny, 4096, 10).unwrap().key,
+            6
+        );
+        // A terminal entry costs no bytes.
+        assert_eq!(
+            shared.take_for_crossing(&mut tiny, 4096, 10).unwrap().key,
+            1
+        );
+        assert!(shared.take_for_crossing(&mut tiny, 4096, 10).is_none());
+        assert_eq!(reserved(&b), (0, 0, 0));
     }
 
     #[tokio::test]
