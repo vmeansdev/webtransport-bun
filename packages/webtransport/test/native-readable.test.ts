@@ -1472,7 +1472,15 @@ const oneCrossingBody = `${guardSrc}
 	for (let k = 0; k < 50; k++) await null;
 	// Block the JS thread: the native side sends and receives, every feeder
 	// reads and queues, and the pump's next() resolution waits for the thread.
-	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 750);
+	// Poll the group's synchronous queue count in short slices until every
+	// stream's entry is queued, with a labelled deadline.
+	const slice = new Int32Array(new SharedArrayBuffer(4));
+	const deadline = performance.now() + 15_000;
+	while (__TESTING__.readGroupStateSnapshotForTests().nativeQueued < STREAMS) {
+		if (performance.now() > deadline)
+			throw new Error("timed out after 15000 ms: all " + STREAMS + " entries queued while the JS thread was blocked (queued " + __TESTING__.readGroupStateSnapshotForTests().nativeQueued + ")");
+		Atomics.wait(slice, 0, 0, 5);
+	}
 	await guard(Promise.all(writes), 10_000, "client payload writes");
 	const values = await guard(Promise.all(pending), 10_000, "payload reads");
 	report({
