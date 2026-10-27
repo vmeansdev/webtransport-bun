@@ -32,7 +32,9 @@
 //! where QUIC flow control pushes back on the peer — the same contract a
 //! parked `read` gives.
 //!
-//! Opt-in: nothing creates a group unless the JS layer's knob asks for one.
+//! On by default in the JS layer (`WEBTRANSPORT_STREAM_READ_GROUP=0` turns
+//! it off); the group is created lazily on the first accepted stream, and
+//! nothing creates one when the knob is off.
 
 use napi::bindgen_prelude::{Null, ToNapiValue, TypeName};
 use napi::Result;

@@ -12,6 +12,7 @@
 
 import { describe, expect, it } from "bun:test";
 import { __TESTING__ } from "../src/internal.js";
+import { parseReadGroupEnabled } from "../src/read-group.js";
 import { childResult, runChild } from "./helpers/child.js";
 import { nextPort } from "./helpers/network.js";
 
@@ -628,26 +629,48 @@ describe("read group pump (fix A)", () => {
 });
 
 describe("read group knob", () => {
-	it("is off unless set to 1, with a 256 KiB default window", async () => {
-		const off = childResult(
+	it("parses: off only for 0", () => {
+		expect(parseReadGroupEnabled(undefined)).toBe(true);
+		expect(parseReadGroupEnabled("")).toBe(true);
+		expect(parseReadGroupEnabled("1")).toBe(true);
+		expect(parseReadGroupEnabled("0")).toBe(false);
+		expect(parseReadGroupEnabled(" 0 ")).toBe(false);
+	});
+
+	const config = async (env: Record<string, string | undefined>) =>
+		childResult(
 			await runChild(
 				`const { __TESTING__ } = await import(INTERNAL_MODULE);
 				 report(__TESTING__.readGroupConfigForTests());`,
-				{ WEBTRANSPORT_STREAM_READ_GROUP: undefined },
+				env,
 			),
 		);
-		expect(off).toEqual({ enabled: false, window: 256 * 1024 });
-		const on = childResult(
-			await runChild(
-				`const { __TESTING__ } = await import(INTERNAL_MODULE);
-				 report(__TESTING__.readGroupConfigForTests());`,
-				{
-					WEBTRANSPORT_STREAM_READ_GROUP: "1",
-					WEBTRANSPORT_STREAM_READ_GROUP_WINDOW: "65536",
-				},
-			),
-		);
-		expect(on).toEqual({ enabled: true, window: 65536 });
+
+	it("is on by default, with a 256 KiB default window", async () => {
+		expect(
+			await config({
+				WEBTRANSPORT_STREAM_READ_GROUP: undefined,
+				WEBTRANSPORT_STREAM_READ_GROUP_WINDOW: undefined,
+			}),
+		).toEqual({ enabled: true, window: 256 * 1024 });
+	});
+
+	it("is turned off by WEBTRANSPORT_STREAM_READ_GROUP=0", async () => {
+		expect(
+			await config({
+				WEBTRANSPORT_STREAM_READ_GROUP: "0",
+				WEBTRANSPORT_STREAM_READ_GROUP_WINDOW: undefined,
+			}),
+		).toEqual({ enabled: false, window: 256 * 1024 });
+	});
+
+	it("stays on for 1 and honours the window knob", async () => {
+		expect(
+			await config({
+				WEBTRANSPORT_STREAM_READ_GROUP: "1",
+				WEBTRANSPORT_STREAM_READ_GROUP_WINDOW: "65536",
+			}),
+		).toEqual({ enabled: true, window: 65536 });
 	});
 });
 
@@ -772,9 +795,17 @@ const transferBody = `
 describe("real transfers (fixes A and B)", () => {
 	for (const arm of [
 		{
-			name: "direct",
+			name: "direct (read group off)",
+			env: {
+				WEBTRANSPORT_STREAM_READ_GROUP: "0",
+				WEBTRANSPORT_STREAM_BATCH_BYTES: undefined,
+			},
+		},
+		{
+			name: "read group (default, knob unset)",
 			env: {
 				WEBTRANSPORT_STREAM_READ_GROUP: undefined,
+				WEBTRANSPORT_STREAM_READ_GROUP_WINDOW: undefined,
 				WEBTRANSPORT_STREAM_BATCH_BYTES: undefined,
 			},
 		},
@@ -807,7 +838,7 @@ describe("real transfers (fixes A and B)", () => {
 				uniOk: boolean;
 				echo: number[];
 			};
-			expect(res.cfg.enabled).toBe(arm.name.startsWith("read group"));
+			expect(res.cfg.enabled).toBe(!arm.name.startsWith("direct"));
 			expect(res.bidiOk).toEqual(new Array(8).fill(true));
 			expect(res.uniOk).toBe(true);
 			expect(res.echo).toEqual(new Array(8).fill(132_000));

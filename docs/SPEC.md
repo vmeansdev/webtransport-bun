@@ -765,6 +765,30 @@ batched and the unbatched path, so a comparison between them is measured by one
 instrument. The snapshot is reachable only through the unstable `__TESTING__`
 bag.
 
+### Cross-stream read group
+
+Server-accepted incoming readables (bidi and uni) are fed by one
+process-level native read group **by default**. Each stream gets a native
+feeder that loops the handle's own `read()` (or `readBatch` when
+`WEBTRANSPORT_STREAM_BATCH_BYTES` is set); one `next()` crossing hands
+JavaScript every queued stream's chunks, which are demultiplexed into each
+stream's byte stream. The consumer's `read()` resolves on the JS thread as
+before; only the number of Node-API crossings changes.
+
+- `WEBTRANSPORT_STREAM_READ_GROUP=0` turns it off: every readable then pulls
+  the addon directly, one crossing per read. Unset or any other value leaves
+  it on. Read **once at module initialization**.
+- `WEBTRANSPORT_STREAM_READ_GROUP_WINDOW` is the per-stream read-ahead window
+  in bytes (default `262144`, 256 KiB). A feeder runs at most one window plus
+  one batch ahead of its consumer; a stalled reader stalls only its own
+  feeder.
+- Feeders start lazily, on a readable's first pull: a stream that is never
+  read holds no read-ahead, and `openReadSink` can still claim it. Once the
+  feeder has started the stream counts as read and `openReadSink` throws
+  `E_SINK_READ_ACTIVE`; a read on a sink-owned stream errors with
+  `E_SINK_ACTIVE`, exactly as on the direct path.
+- Client-side readables always use the direct pull.
+
 ## API stability and semver
 
 ### The three exported surfaces

@@ -1874,7 +1874,8 @@ const nativeLoad = tryLoadNativeAddon(
 const native = nativeLoad.addon as NativeAddon | undefined;
 const nativeLoadFailures = nativeLoad.failures;
 {
-	// Opt-in cross-stream delivery (read-group.ts); an addon without the
+	// Cross-stream delivery (read-group.ts), on unless
+	// WEBTRANSPORT_STREAM_READ_GROUP=0; an addon without the
 	// class leaves every readable on the direct pull.
 	const ReadGroup = (
 		native as { StreamReadGroup?: new () => NativeReadGroup } | undefined

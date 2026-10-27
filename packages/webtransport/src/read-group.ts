@@ -2,16 +2,18 @@
  * Cross-stream batched receive delivery, the JavaScript half (the native half
  * and the reasoning are in crates/native/src/read_group.rs).
  *
- * With `WEBTRANSPORT_STREAM_READ_GROUP=1`, every native-backed incoming
- * readable this process builds is fed by one process-level read group: each
- * stream's handle runs a native feeder, one pump awaits the group's `next()`
- * — one crossing for whatever every stream had queued — and demultiplexes the
- * entries into each stream's web readable. The consumer's `read()` resolves
+ * By default, every server-accepted incoming readable this process builds is
+ * fed by one process-level read group: each stream's handle runs a native
+ * feeder, one pump awaits the group's `next()` — one crossing for whatever
+ * every stream had queued — and demultiplexes the entries into each stream's
+ * web readable. The consumer's `read()` resolves
  * on the JS thread exactly as before, so a stamp taken there means what it
  * always meant.
  *
- * The lever is OFF by default; with the knob unset this module builds
- * nothing and every readable pulls the addon directly (native-readable.ts).
+ * The lever is ON by default; `WEBTRANSPORT_STREAM_READ_GROUP=0` turns it
+ * off, and then this module builds nothing and every readable pulls the addon
+ * directly (native-readable.ts), as does every readable when the addon has
+ * no group. Client-side readables always pull directly.
  *
  * Per-stream backpressure is a byte window: the feeder may run at most one
  * window (plus one batch) ahead of the consumer, and the window is re-granted
@@ -48,8 +50,16 @@ export function parseReadGroupWindow(raw: string | undefined): number {
 	return Math.min(value, 0xffff_ffff);
 }
 
+/**
+ * The read group is on unless the knob is exactly `0` (surrounding
+ * whitespace ignored): unset, empty, `1` or anything else keeps it on.
+ */
+export function parseReadGroupEnabled(raw: string | undefined): boolean {
+	return raw?.trim() !== "0";
+}
+
 // Read once, like the batch knob: delivery shape never changes mid-process.
-const readGroupEnabled = process.env[READ_GROUP_ENV] === "1";
+const readGroupEnabled = parseReadGroupEnabled(process.env[READ_GROUP_ENV]);
 const readGroupWindow = parseReadGroupWindow(
 	process.env[READ_GROUP_WINDOW_ENV],
 );
@@ -457,8 +467,9 @@ export function configureReadGroup(
 }
 
 /**
- * The readable for a native-backed incoming stream: group-fed when the knob
- * is on and the addon supports it, a direct pull otherwise.
+ * The readable for a native-backed incoming stream: group-fed unless the knob
+ * is off (`WEBTRANSPORT_STREAM_READ_GROUP=0`) or the addon or handle lacks the
+ * group, a direct pull otherwise.
  */
 export function createIncomingReadable(
 	handle: GroupFeedableHandle,
