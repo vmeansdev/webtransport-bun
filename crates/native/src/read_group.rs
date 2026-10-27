@@ -166,8 +166,9 @@ impl GroupShared {
         self.closed.load(Ordering::Acquire)
     }
 
-    /// Queue one entry and wake `next`. A closed group drops the entry, which
-    /// releases the batch's byte reservations with it.
+    /// Queue one entry and wake `next` (tests; feeders use `push_fed`). A
+    /// closed group drops the entry, which releases its reservations.
+    #[cfg(test)]
     fn push(&self, key: u32, payload: GroupPayload) {
         if self.is_closed() {
             return;
@@ -178,6 +179,30 @@ impl GroupShared {
         // `notify_one` stores a permit when `next` is not parked yet, so a
         // push between `next`'s empty check and its await is never lost.
         self.ready.notify_one();
+    }
+
+    /// Queue a feeder's entry unless its key was cancelled (or the group
+    /// closed). The check runs under the queue lock, which `cancel` also
+    /// holds while it marks the key and purges its queued entries, so a read
+    /// that completes after a cancel can never leave an entry behind that no
+    /// `next()` would drain: it is dropped here, releasing its reservations.
+    fn push_fed(&self, key: u32, credit: &Credit, payload: GroupPayload) {
+        let rejected = match self.queue.lock() {
+            Ok(mut queue) => {
+                if self.is_closed() || credit.cancelled.load(Ordering::Acquire) {
+                    Some(payload)
+                } else {
+                    queue.entries.push_back(GroupEntry { key, payload });
+                    None
+                }
+            }
+            Err(_) => Some(payload),
+        };
+        if rejected.is_none() {
+            self.ready.notify_one();
+        }
+        // Dropped outside the lock: a batch's drop releases its budget.
+        drop(rejected);
     }
 
     /// Create `key`'s credit before its feeder starts. Fails if the key is
@@ -240,17 +265,54 @@ impl GroupShared {
         let Some(credit) = credits.live.get(&key).cloned() else {
             return;
         };
-        credit.cancelled.store(true, Ordering::Release);
+        // Mark and purge under the queue lock (see `push_fed`): entries the
+        // key already queued are dropped now, and later ones never land.
+        let purged: Vec<GroupEntry> = match self.queue.lock() {
+            Ok(mut queue) => {
+                credit.cancelled.store(true, Ordering::Release);
+                let (purged, kept): (Vec<GroupEntry>, Vec<GroupEntry>) =
+                    queue.entries.drain(..).partition(|e| e.key == key);
+                queue.entries.extend(kept);
+                purged
+            }
+            Err(_) => {
+                credit.cancelled.store(true, Ordering::Release);
+                Vec::new()
+            }
+        };
         if credit.claimed.load(Ordering::Acquire) {
             credit.notify.notify_one();
         } else {
             credits.live.remove(&key);
         }
+        drop(credits);
+        drop(purged);
+    }
+
+    /// Payload bytes queued and not yet drained (diagnostics and tests).
+    fn queued_bytes(&self) -> usize {
+        self.queue
+            .lock()
+            .map(|q| {
+                q.entries
+                    .iter()
+                    .map(|e| match &e.payload {
+                        GroupPayload::Data(chunk) => chunk.len(),
+                        _ => 0,
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
     }
 
     /// Live keys (prepared or feeding): diagnostics and tests.
     fn live_keys(&self) -> usize {
         self.credits.lock().map(|c| c.live.len()).unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    fn queued(&self) -> usize {
+        self.queue.lock().map(|q| q.entries.len()).unwrap_or(0)
     }
 
     fn has_ready(&self) -> bool {
@@ -328,14 +390,14 @@ where
                 if matches!(chunk, FeedChunk::Batch(_)) {
                     group.batched_entries.fetch_add(1, Ordering::Relaxed);
                 }
-                group.push(key, GroupPayload::Data(chunk));
+                group.push_fed(key, &credit, GroupPayload::Data(chunk));
             }
             Ok(None) => {
-                group.push(key, GroupPayload::End);
+                group.push_fed(key, &credit, GroupPayload::End);
                 break;
             }
             Err(error) => {
-                group.push(key, GroupPayload::Error(error.reason.clone()));
+                group.push_fed(key, &credit, GroupPayload::Error(error.reason.clone()));
                 break;
             }
         }
@@ -517,6 +579,12 @@ impl StreamReadGroup {
     #[napi(getter)]
     pub fn batched_entries(&self) -> f64 {
         self.shared.batched_entries.load(Ordering::Relaxed) as f64
+    }
+
+    /// Payload bytes queued and not yet drained (diagnostics and tests).
+    #[napi(getter)]
+    pub fn queued_bytes(&self) -> f64 {
+        self.shared.queued_bytes() as f64
     }
 
     /// Entries queued and not yet drained (diagnostics and tests).
@@ -727,6 +795,83 @@ mod tests {
             panic!("a re-prepared key must feed");
         };
         assert!(!credit.cancelled.load(Ordering::Acquire));
+    }
+
+    fn budget() -> crate::client_stream::StreamBudget {
+        crate::client_stream::StreamBudget {
+            server_metrics: Arc::new(crate::server_metrics::ServerMetrics::default()),
+            session_metrics: Arc::new(crate::session_registry::SessionMetrics::default()),
+            stream_queued: Arc::new(AtomicU64::new(0)),
+            max_global: 1 << 20,
+            max_session: 1 << 18,
+            max_stream: 1 << 16,
+            capacity_notify: crate::client_stream::StreamBudget::new_notify(),
+            backpressure_timeout_ms: 1000,
+        }
+    }
+
+    /// A batch (`CHUNK_BATCH` on) holding a real three-tier reservation.
+    fn reserved_batch(b: &crate::client_stream::StreamBudget, len: usize) -> FeedChunk {
+        assert!(b.try_reserve(len as u64));
+        FeedChunk::Batch(CoalescedChunks::from_chunks_for_tests(vec![
+            crate::client_stream::StreamChunk::new(vec![1u8; len], Some(b.clone()), len as u64),
+        ]))
+    }
+
+    fn reserved(b: &crate::client_stream::StreamBudget) -> (u64, u64, u64) {
+        (
+            b.server_metrics.queued_bytes_global.load(Ordering::Relaxed),
+            b.session_metrics.queued_bytes.load(Ordering::Relaxed),
+            b.stream_queued.load(Ordering::Relaxed),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_cancel_purges_queued_entries_and_returns_their_budget() {
+        let b = budget();
+        let shared = prepared(1, 1 << 20);
+        shared.prepare(2, 1 << 20).unwrap();
+        let Registration::Fed(c1) = shared.claim(1) else {
+            panic!("claim 1")
+        };
+        let Registration::Fed(c2) = shared.claim(2) else {
+            panic!("claim 2")
+        };
+        shared.push_fed(1, &c1, GroupPayload::Data(reserved_batch(&b, 300)));
+        shared.push_fed(2, &c2, GroupPayload::Data(reserved_batch(&b, 50)));
+        shared.push_fed(1, &c1, GroupPayload::Data(reserved_batch(&b, 200)));
+        assert_eq!(reserved(&b), (550, 550, 550));
+        shared.cancel(1);
+        // Key 1's entries are gone and their reservations returned; key 2's
+        // entry is untouched.
+        assert_eq!(drain(&shared), vec![(2, "data", 50)]);
+        assert_eq!(reserved(&b), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_read_that_completes_after_the_cancel_is_dropped_with_its_budget() {
+        // r2 A-B1: the pump may already have stopped (its last stream was
+        // detached) when an in-flight read wins the race with the abort. The
+        // entry must not land in a queue nothing drains.
+        let b = budget();
+        let shared = prepared(7, 1);
+        let gate = Arc::new(Notify::new());
+        let (g, bb) = (gate.clone(), b.clone());
+        let task = tokio::spawn(run_feeder(shared.clone(), 7, move || {
+            let (g, bb) = (g.clone(), bb.clone());
+            async move {
+                g.notified().await;
+                Ok(Some(reserved_batch(&bb, 1400)))
+            }
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        shared.cancel(7);
+        gate.notify_one();
+        assert!(task.await.unwrap().is_none());
+        assert_eq!(shared.queued(), 0);
+        assert_eq!(shared.queued_bytes(), 0);
+        assert_eq!(reserved(&b), (0, 0, 0));
+        assert_eq!(shared.live_keys(), 0);
     }
 
     #[tokio::test]

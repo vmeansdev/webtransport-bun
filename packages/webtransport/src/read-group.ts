@@ -77,6 +77,11 @@ export type NativeReadGroup = {
 	readonly batchedEntries?: number;
 	/** Monotonic count of every data entry the feeders produced. */
 	readonly dataEntries?: number;
+	/** Entries / payload bytes queued natively and not yet drained, and keys
+	 * prepared or feeding (diagnostics and tests). */
+	readonly queued?: number;
+	readonly queuedBytes?: number;
+	readonly liveKeys?: number;
 };
 
 /** A receive handle that can feed a group. */
@@ -277,6 +282,15 @@ export class ReadGroupPump {
 		return this.#feeding.size;
 	}
 
+	/** The native group's queue and live keys (tests and diagnostics). */
+	nativeQueue(): { queued: number; queuedBytes: number; liveKeys: number } {
+		return {
+			queued: this.#group.queued ?? 0,
+			queuedBytes: this.#group.queuedBytes ?? 0,
+			liveKeys: this.#group.liveKeys ?? 0,
+		};
+	}
+
 	nativeBatchedEntries(): number {
 		return this.#group.batchedEntries ?? 0;
 	}
@@ -397,11 +411,12 @@ export class ReadGroupPump {
 					return pullAnswered(sink);
 				},
 				cancel: (reason: unknown) => {
-					const wasStarted = sink.started;
+					// Cancel before detaching (which may stop the pump): a prepared
+					// key whose feeder has not claimed it yet is forgotten
+					// natively, and a running feeder's queued and late entries are
+					// dropped there, so nothing is left for a stopped pump.
+					if (sink.started) this.#cancelFeeder(key);
 					this.#detach(key);
-					// A prepared key whose feeder has not claimed it yet is
-					// forgotten natively, so that feeder ends unread.
-					if (wasStarted) this.#cancelFeeder(key);
 					owner.onCancel(reason);
 				},
 			} as unknown as object,
@@ -410,16 +425,22 @@ export class ReadGroupPump {
 	}
 
 	/** Stop a feeder that may still be running. Only keys whose feed has not
-	 * resolved are cancelled, so a reused key is never hit. */
+	 * resolved are cancelled, so a reused key is never hit. Natively the
+	 * cancel also drops the key's queued entries and any its in-flight read
+	 * produces later, releasing their reservations (read_group.rs `cancel`),
+	 * so a pump that stops because this was its last stream leaves nothing
+	 * behind in the group's queue. */
 	#cancelFeeder(key: number): void {
 		if (this.#feeding.has(key)) this.#group.cancel(key);
 	}
 
 	/** The owner released the handle: detach, stop the feeder, settle. */
 	#released(key: number): void {
-		const sink = this.#detach(key);
+		const sink = this.#sinks.get(key);
 		if (!sink) return;
+		// Cancel first: see the readable's cancel.
 		if (sink.started) this.#cancelFeeder(key);
+		this.#detach(key);
 		if (sink.controller) closeQuietly(sink.controller);
 	}
 
@@ -444,8 +465,8 @@ export class ReadGroupPump {
 	 * and pinning its handle.
 	 */
 	#fail(key: number, err: unknown, stopFeeder = false): void {
+		if (stopFeeder && this.#sinks.get(key)?.started) this.#cancelFeeder(key);
 		const sink = this.#detach(key);
-		if (stopFeeder && sink?.started) this.#cancelFeeder(key);
 		if (!sink || sink.owner.current() === null) return;
 		try {
 			sink.controller?.error(sink.owner.onError(err));
@@ -564,10 +585,17 @@ export function readGroupStateSnapshot(): {
 	attached: number;
 	feeding: number;
 	heldBytes: number;
+	nativeQueued: number;
+	nativeQueuedBytes: number;
+	nativeLiveKeys: number;
 } {
+	const native = processPump?.nativeQueue();
 	return {
 		attached: processPump?.size ?? 0,
 		feeding: processPump?.feeding ?? 0,
 		heldBytes: processPump?.heldBytes() ?? 0,
+		nativeQueued: native?.queued ?? 0,
+		nativeQueuedBytes: native?.queuedBytes ?? 0,
+		nativeLiveKeys: native?.liveKeys ?? 0,
 	};
 }

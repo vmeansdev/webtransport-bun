@@ -73,6 +73,21 @@ function ownerFor(handle: { read(): Promise<Value> }) {
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
 
+/** Every stream wait carries its own labelled deadline: a lost wake fails the
+ * operation that lost it, by name, not the test at its coarse timeout. */
+function within<T>(p: Promise<T>, label: string, ms = 2000): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	return Promise.race([
+		p.finally(() => clearTimeout(timer)),
+		new Promise<never>((_, reject) => {
+			timer = setTimeout(
+				() => reject(new Error(`timed out after ${ms} ms: ${label}`)),
+				ms,
+			);
+		}),
+	]);
+}
+
 describe("direct native readable (fix B)", () => {
 	it("delivers each crossing as one chunk, in order, then closes on EOF", async () => {
 		const h = scriptedHandle();
@@ -83,15 +98,19 @@ describe("direct native readable (fix B)", () => {
 		const first = reader.read();
 		await tick();
 		h.settle(new Uint8Array([1, 2, 3]));
-		expect(Array.from((await first).value ?? [])).toEqual([1, 2, 3]);
+		expect(Array.from((await within(first, "first")).value ?? [])).toEqual([
+			1, 2, 3,
+		]);
 		const second = reader.read();
 		await tick();
 		h.settle(new Uint8Array([4]));
-		expect(Array.from((await second).value ?? [])).toEqual([4]);
+		expect(Array.from((await within(second, "second")).value ?? [])).toEqual([
+			4,
+		]);
 		const last = reader.read();
 		await tick();
 		h.settle(null);
-		expect((await last).done).toBe(true);
+		expect((await within(last, "last")).done).toBe(true);
 		expect(o.events).toEqual(["bytes:3", "bytes:1", "end"]);
 		expect(h.reads).toBe(3);
 	});
@@ -110,7 +129,7 @@ describe("direct native readable (fix B)", () => {
 		await tick();
 		expect(h.inFlight).toBe(1);
 		h.settle(new Uint8Array(8));
-		await pending;
+		await within(pending, "pending");
 		await tick();
 		await tick();
 		// The chunk satisfied the only waiting read; nothing is read ahead.
@@ -131,7 +150,9 @@ describe("direct native readable (fix B)", () => {
 		await tick();
 		expect(h.inFlight).toBe(1);
 		h.settle(new Uint8Array([9]));
-		expect(Array.from((await pending).value ?? [])).toEqual([9]);
+		expect(Array.from((await within(pending, "pending")).value ?? [])).toEqual([
+			9,
+		]);
 	});
 
 	it("errors the stream with the owner's mapping for an error-code result", async () => {
@@ -143,7 +164,9 @@ describe("direct native readable (fix B)", () => {
 		const pending = reader.read();
 		await tick();
 		h.settle("E_STREAM_RESET");
-		await expect(pending).rejects.toThrow("mapped:E_STREAM_RESET");
+		await expect(within(pending, "pending")).rejects.toThrow(
+			"mapped:E_STREAM_RESET",
+		);
 		expect(o.events).toEqual(["error:E_STREAM_RESET"]);
 	});
 
@@ -156,7 +179,7 @@ describe("direct native readable (fix B)", () => {
 		const pending = reader.read();
 		await tick();
 		h.settle(new Error("boom"));
-		await expect(pending).rejects.toThrow("mapped:boom");
+		await expect(within(pending, "pending")).rejects.toThrow("mapped:boom");
 	});
 
 	it("settles a waiting read with a close when the owner releases mid-read", async () => {
@@ -171,7 +194,7 @@ describe("direct native readable (fix B)", () => {
 		h.settle(new Uint8Array([1]));
 		// What the next pull would have done: the reader is answered, with
 		// no bytes from the released handle and no owner event.
-		expect((await pending).done).toBe(true);
+		expect((await within(pending, "pending")).done).toBe(true);
 		expect(o.events).toEqual([]);
 	});
 
@@ -183,8 +206,8 @@ describe("direct native readable (fix B)", () => {
 			.getReader();
 		const pending = reader.read();
 		await tick();
-		await reader.cancel("bye");
-		expect((await pending).done).toBe(true);
+		await within(reader.cancel("bye"), "reader.cancel('bye')");
+		expect((await within(pending, "pending")).done).toBe(true);
 		h.settle(new Uint8Array([1]));
 		await tick();
 		await tick();
@@ -197,14 +220,14 @@ describe("direct native readable (fix B)", () => {
 		const reader = __TESTING__
 			.createNativeByteReadableForTests(o.owner)
 			.getReader();
-		expect((await reader.read()).done).toBe(true);
+		expect((await within(reader.read(), "reader.read()")).done).toBe(true);
 	});
 
 	it("passes cancel to the owner with its reason", async () => {
 		const h = scriptedHandle();
 		const o = ownerFor(h.handle);
 		const readable = __TESTING__.createNativeByteReadableForTests(o.owner);
-		await readable.cancel("bye");
+		await within(readable.cancel("bye"), "readable.cancel('bye')");
 		expect(o.events).toEqual(["cancel:bye"]);
 		expect(h.reads).toBe(0);
 	});
@@ -223,15 +246,17 @@ describe("direct native readable (fix B)", () => {
 		const first = reader.read(new Uint8Array(2));
 		await tick();
 		h.settle(new Uint8Array([1, 2, 3]));
-		expect(Array.from((await first).value ?? [])).toEqual([1, 2]);
-		const rest = await reader.read(new Uint8Array(8));
+		expect(Array.from((await within(first, "first")).value ?? [])).toEqual([
+			1, 2,
+		]);
+		const rest = await within(reader.read(new Uint8Array(8)), "byob read rest");
 		expect(Array.from(rest.value ?? [])).toEqual([3]);
 		expect(h.reads).toBe(1);
 		// EOF must settle a BYOB read that is already waiting.
 		const end = reader.read(new Uint8Array(4));
 		await tick();
 		h.settle(null);
-		expect((await end).done).toBe(true);
+		expect((await within(end, "end")).done).toBe(true);
 	});
 });
 
@@ -244,6 +269,8 @@ function fakeGroup() {
 	let wakes = 0;
 	let waiter: ((v: Array<number | Value> | null) => void) | null = null;
 	let backlog: Array<number | Value> = [];
+	const cancelled = new Set<number>();
+	const order: string[] = [];
 	let closed = false;
 	const flush = () => {
 		if (!waiter) return;
@@ -272,9 +299,21 @@ function fakeGroup() {
 			prepares.push([key, credit]);
 		},
 		grant: (key: number, bytes: number) => grants.push([key, bytes]),
-		cancel: (key: number) => cancels.push(key),
+		// Models read_group.rs: a cancel drops the key's queued entries, and
+		// entries its feeder produces afterwards never land.
+		cancel: (key: number) => {
+			cancels.push(key);
+			order.push(`cancel:${key}`);
+			cancelled.add(key);
+			const kept: Array<number | Value> = [];
+			for (let i = 0; i + 1 < backlog.length; i += 2)
+				if (backlog[i] !== key)
+					kept.push(backlog[i] as number, backlog[i + 1] as Value);
+			backlog = kept;
+		},
 		wake: () => {
 			wakes++;
+			order.push("wake");
 			if (waiter) {
 				const w = waiter;
 				waiter = null;
@@ -300,8 +339,15 @@ function fakeGroup() {
 		get parked() {
 			return waiter !== null;
 		},
+		order,
+		/** Entries queued and not yet taken by `next()`. */
+		get queued() {
+			return backlog.length >> 1;
+		},
 		push(...entries: Array<number | Value>) {
-			backlog.push(...entries);
+			for (let i = 0; i + 1 < entries.length; i += 2)
+				if (!cancelled.has(entries[i] as number))
+					backlog.push(entries[i] as number, entries[i + 1] as Value);
 			flush();
 		},
 	};
@@ -344,7 +390,7 @@ describe("read group pump (fix A)", () => {
 		expect(g.prepares).toEqual([[key, 1]]);
 		expect(g.parked).toBe(true);
 		g.push(key, null);
-		expect((await pending).done).toBe(true);
+		expect((await within(pending, "pending")).done).toBe(true);
 	});
 
 	it("demultiplexes one crossing's entries into each stream, in order", async () => {
@@ -372,13 +418,15 @@ describe("read group pump (fix A)", () => {
 			ka,
 			new Uint8Array([3]),
 		);
-		expect(Array.from((await pa).value ?? [])).toEqual([1]);
-		expect(Array.from((await pb).value ?? [])).toEqual([2, 2]);
+		expect(Array.from((await within(pa, "pa")).value ?? [])).toEqual([1]);
+		expect(Array.from((await within(pb, "pb")).value ?? [])).toEqual([2, 2]);
 		// The second chunk for a is queued in its stream, not lost.
-		expect(Array.from((await ra.read()).value ?? [])).toEqual([3]);
+		expect(
+			Array.from((await within(ra.read(), "ra.read()")).value ?? []),
+		).toEqual([3]);
 		g.push(ka, null, kb, null);
-		expect((await ra.read()).done).toBe(true);
-		expect((await rb.read()).done).toBe(true);
+		expect((await within(ra.read(), "ra.read()")).done).toBe(true);
+		expect((await within(rb.read(), "rb.read()")).done).toBe(true);
 		expect(oa.events).toEqual(["bytes:1", "bytes:1", "end"]);
 		expect(ob.events).toEqual(["bytes:2", "end"]);
 		await tick();
@@ -404,11 +452,11 @@ describe("read group pump (fix A)", () => {
 		const ka = a.feeds[0]?.[1] as number;
 		const kb = b.feeds[0]?.[1] as number;
 		g.push(ka, new Uint8Array(3), kb, new Uint8Array(5), ka, null);
-		await pa;
-		await pb;
+		await within(pa, "pa");
+		await within(pb, "pb");
 		g.push(kb, null);
-		await ra.read();
-		await rb.read();
+		await within(ra.read(), "ra.read()");
+		await within(rb.read(), "rb.read()");
 		expect(__TESTING__.readGroupDiagnosticsSnapshotForTests()).toEqual({
 			crossings: 2,
 			entries: 4,
@@ -436,7 +484,7 @@ describe("read group pump (fix A)", () => {
 		// The read is answered; with no further read outstanding the consumer
 		// is stalled and the feeder gets no more credit, however long it waits.
 		g.push(key, new Uint8Array(400));
-		expect((await first).value?.byteLength).toBe(400);
+		expect((await within(first, "first")).value?.byteLength).toBe(400);
 		await tick();
 		await tick();
 		expect(g.grants).toEqual([]);
@@ -447,7 +495,7 @@ describe("read group pump (fix A)", () => {
 		await tick();
 		expect(g.grants).toEqual([[key, 400]]);
 		g.push(key, new Uint8Array(100));
-		await second;
+		await within(second, "second");
 		const third = r.read();
 		await tick();
 		expect(g.grants).toEqual([
@@ -455,7 +503,7 @@ describe("read group pump (fix A)", () => {
 			[key, 100],
 		]);
 		g.push(key, null);
-		expect((await third).done).toBe(true);
+		expect((await within(third, "third")).done).toBe(true);
 	});
 
 	it("detaches an attached-but-never-read stream when its owner releases it (C-B1)", async () => {
@@ -471,7 +519,10 @@ describe("read group pump (fix A)", () => {
 		expect(g.prepares).toEqual([]);
 		expect(g.cancels).toEqual([]);
 		// The readable is settled, not left hanging.
-		expect((await readable.getReader().read()).done).toBe(true);
+		expect(
+			(await within(readable.getReader().read(), "readable.getReader().read()"))
+				.done,
+		).toBe(true);
 	});
 
 	it("never reuses a key that is still attached or still feeding (A-N1)", async () => {
@@ -485,8 +536,8 @@ describe("read group pump (fix A)", () => {
 		await tick();
 		expect(a.feeds[0]?.[1]).toBe(1);
 		// A cancel detaches the sink, but its native feeder has not resolved.
-		await ra.cancel("stop");
-		await pa;
+		await within(ra.cancel("stop"), "ra.cancel('stop')");
+		await within(pa, "pa");
 		const b = feedable();
 		pump.setNextKeyForTests(0xffff_ffff);
 		void pump
@@ -523,7 +574,9 @@ describe("read group pump (fix A)", () => {
 		const r = pump
 			.attach(f.handle, ownerFor({ read: async () => null }).owner)
 			.getReader();
-		await expect(r.read()).rejects.toThrow("mapped:E_INVALID_ARGUMENT");
+		await expect(within(r.read(), "r.read()")).rejects.toThrow(
+			"mapped:E_INVALID_ARGUMENT",
+		);
 		expect(f.feeds).toEqual([]);
 		expect(pump.size).toBe(0);
 	});
@@ -544,8 +597,8 @@ describe("read group pump (fix A)", () => {
 		const ka = a.feeds[0]?.[1] as number;
 		const kb = b.feeds[0]?.[1] as number;
 		g.push(ka, "E_STREAM_RESET", kb, new Uint8Array([5]));
-		await expect(pa).rejects.toThrow("mapped:E_STREAM_RESET");
-		expect(Array.from((await pb).value ?? [])).toEqual([5]);
+		await expect(within(pa, "pa")).rejects.toThrow("mapped:E_STREAM_RESET");
+		expect(Array.from((await within(pb, "pb")).value ?? [])).toEqual([5]);
 		expect(oa.events).toEqual(["error:E_STREAM_RESET"]);
 	});
 
@@ -568,9 +621,9 @@ describe("read group pump (fix A)", () => {
 		const ka = a.feeds[0]?.[1] as number;
 		const kb = b.feeds[0]?.[1] as number;
 		g.push(ka, new Uint8Array([1]), kb, new Uint8Array([2]));
-		await expect(pa).rejects.toThrow("mapped:app hook threw");
+		await expect(within(pa, "pa")).rejects.toThrow("mapped:app hook threw");
 		// The rest of the batch still landed on the other stream.
-		expect(Array.from((await pb).value ?? [])).toEqual([2]);
+		expect(Array.from((await within(pb, "pb")).value ?? [])).toEqual([2]);
 		// The failed stream's still-running feeder is told to stop (r2 N7b).
 		expect(g.cancels).toEqual([ka]);
 	});
@@ -584,8 +637,8 @@ describe("read group pump (fix A)", () => {
 		const pending = r.read();
 		await tick();
 		const key = f.feeds[0]?.[1] as number;
-		await r.cancel("stop");
-		expect((await pending).done).toBe(true);
+		await within(r.cancel("stop"), "r.cancel('stop')");
+		expect((await within(pending, "pending")).done).toBe(true);
 		expect(g.cancels).toEqual([key]);
 		expect(o.events).toEqual(["cancel:stop"]);
 		g.push(key, new Uint8Array([1]));
@@ -598,7 +651,10 @@ describe("read group pump (fix A)", () => {
 		const pump = new __TESTING__.ReadGroupPumpForTests(g.group);
 		const f = feedable();
 		const o = ownerFor({ read: async () => null });
-		await pump.attach(f.handle, o.owner).cancel("stop");
+		await within(
+			pump.attach(f.handle, o.owner).cancel("stop"),
+			"pump.attach(f.handle, o.owner).cancel('stop')",
+		);
 		expect(f.feeds).toEqual([]);
 		expect(g.cancels).toEqual([]);
 		expect(o.events).toEqual(["cancel:stop"]);
@@ -616,11 +672,40 @@ describe("read group pump (fix A)", () => {
 		const key = f.feeds[0]?.[1] as number;
 		o.release();
 		g.push(key, new Uint8Array([1]));
-		expect((await pending).done).toBe(true);
+		expect((await within(pending, "pending")).done).toBe(true);
 		// The feeder was still running, so it is told to stop.
 		expect(g.cancels).toEqual([key]);
 		expect(o.events).toEqual([]);
 		expect(pump.size).toBe(0);
+		// The late entry never lands in a queue the stopped pump leaves.
+		expect(g.queued).toBe(0);
+	});
+
+	it("cancels the last stream's feeder before the pump stops (r2 A-B1)", async () => {
+		const g = fakeGroup();
+		const pump = new __TESTING__.ReadGroupPumpForTests(g.group);
+		for (const how of ["release", "cancel"] as const) {
+			const f = feedable();
+			const o = ownerFor({ read: async () => null });
+			const r = pump.attach(f.handle, o.owner).getReader();
+			const pending = r.read();
+			await tick();
+			const key = f.feeds[0]?.[1] as number;
+			g.order.length = 0;
+			if (how === "release") o.release();
+			else await within(r.cancel("stop"), "cancel the last stream");
+			expect((await within(pending, `pending (${how})`)).done).toBe(true);
+			// Cancel first, then the wake that lets the pump stop.
+			expect(g.order).toEqual([`cancel:${key}`, "wake"]);
+			await tick();
+			expect(g.parked).toBe(false);
+			// The in-flight read wins the race with the abort: dropped.
+			g.push(key, new Uint8Array(1400));
+			expect(g.queued).toBe(0);
+			f.finish(null);
+			await tick();
+			expect(pump.feeding).toBe(0);
+		}
 	});
 
 	it("does not cancel a released stream whose feeder already resolved", async () => {
@@ -635,7 +720,7 @@ describe("read group pump (fix A)", () => {
 		f.finish(null);
 		await tick();
 		o.release();
-		expect((await pending).done).toBe(true);
+		expect((await within(pending, "pending")).done).toBe(true);
 		// Only running feeders are cancelled: the key may be reused.
 		expect(g.cancels).toEqual([]);
 		expect(pump.size).toBe(0);
@@ -655,7 +740,7 @@ describe("read group pump (fix A)", () => {
 		// once; disposal then aborts its native read (the feeder's last
 		// entry), which is dropped.
 		g.push(key, "E_STREAM_RESET");
-		expect((await pending).done).toBe(true);
+		expect((await within(pending, "pending")).done).toBe(true);
 		expect(g.cancels).toEqual([key]);
 		expect(o.events).toEqual([]);
 		expect(pump.size).toBe(0);
@@ -668,7 +753,7 @@ describe("read group pump (fix A)", () => {
 		const o = ownerFor({ read: async () => null });
 		const r = pump.attach(f.handle, o.owner).getReader();
 		o.release();
-		expect((await r.read()).done).toBe(true);
+		expect((await within(r.read(), "r.read()")).done).toBe(true);
 		expect(f.feeds).toEqual([]);
 	});
 
@@ -681,7 +766,9 @@ describe("read group pump (fix A)", () => {
 		const pending = r.read();
 		await tick();
 		f.finish("E_INVALID_ARGUMENT: unknown read group");
-		await expect(pending).rejects.toThrow("mapped:E_INVALID_ARGUMENT");
+		await expect(within(pending, "pending")).rejects.toThrow(
+			"mapped:E_INVALID_ARGUMENT",
+		);
 	});
 
 	it("stops pumping (wakes the pending next) when its last feeder ends", async () => {
@@ -695,7 +782,7 @@ describe("read group pump (fix A)", () => {
 		const key = f.feeds[0]?.[1] as number;
 		expect(g.parked).toBe(true);
 		g.push(key, null);
-		expect((await pending).done).toBe(true);
+		expect((await within(pending, "pending")).done).toBe(true);
 		await tick();
 		await tick();
 		expect(g.wakes).toBe(1);
@@ -711,7 +798,9 @@ describe("read group pump (fix A)", () => {
 		const pending = r.read();
 		await tick();
 		h.settle(new Uint8Array([4]));
-		expect(Array.from((await pending).value ?? [])).toEqual([4]);
+		expect(Array.from((await within(pending, "pending")).value ?? [])).toEqual([
+			4,
+		]);
 		expect(pump.size).toBe(0);
 	});
 });
@@ -1108,7 +1197,7 @@ describe("read group under stalled consumers (A-B1, C-B1)", () => {
 				queuedGlobal: number;
 				queuedSession: number;
 			};
-			after: { attached: number; feeding: number; heldBytes: number };
+			after: Record<string, number>;
 			caps: { PER_SESSION_CAP: number; GLOBAL_CAP: number };
 		};
 		const { stalled, after, caps } = res;
@@ -1123,6 +1212,121 @@ describe("read group under stalled consumers (A-B1, C-B1)", () => {
 		expect(stalled.queuedGlobal).toBeLessThanOrEqual(caps.GLOBAL_CAP);
 		// Session close releases every attached stream, read or never read,
 		// and every native feeder ends.
-		expect(after).toEqual({ attached: 0, feeding: 0, heldBytes: 0 });
+		expect(after).toEqual({
+			attached: 0,
+			feeding: 0,
+			heldBytes: 0,
+			nativeQueued: 0,
+			nativeQueuedBytes: 0,
+			nativeLiveKeys: 0,
+		});
 	}, 60_000);
+});
+
+// r2 A-B1: cancel the sole active group-fed readable while its read is in
+// flight and the peer keeps sending, over and over, then leave the server
+// idle. The pump stops with every cancel (it was the last stream); whatever
+// read won the race with the abort must not stay in the native group's queue
+// or hold receive budget. Run with chunk batching off and on.
+const raceBody = `${guardSrc}
+	const { createServer, WebTransport } = await import(PUBLIC_MODULE);
+	const { __TESTING__ } = await import(INTERNAL_MODULE);
+	const port = Number(process.env.WT_TEST_PORT);
+	const ROUNDS = 60;
+	const leftovers = [];
+	// The client opens round i's stream only when the server is ready for it,
+	// so no stream waits unread long enough for its sender to time out.
+	const starts = Array.from({ length: ROUNDS }, () => Promise.withResolvers());
+	let resolveDone;
+	const done = new Promise((r) => { resolveDone = r; });
+	const server = createServer({
+		port,
+		host: "127.0.0.1",
+		tls: { certPem: "", keyPem: "" },
+		onSession: async (s) => {
+			try {
+			const uni = s.incomingUnidirectionalStreams.getReader();
+			for (let i = 0; i < ROUNDS; i++) {
+				starts[i].resolve();
+				const { value: readable } = await guard(uni.read(), 10_000, "server accept " + i);
+				const r = readable.getReader();
+				await guard(r.read(), 10_000, "server first read " + i);
+				// A read is in flight natively while data keeps arriving...
+				const pending = r.read();
+				await Bun.sleep(i % 3);
+				// ...and the stream is cancelled under it.
+				await guard(r.cancel("race"), 10_000, "server cancel " + i);
+				await guard(pending, 10_000, "server pending read " + i);
+				// The pump has stopped (this was its only stream): nothing of
+				// this stream may be left in the native queue.
+				await Bun.sleep(2);
+				const q = __TESTING__.readGroupStateSnapshotForTests();
+				if (q.nativeQueued > 0) leftovers.push({ round: i, ...q });
+			}
+			resolveDone(null);
+			} catch (e) {
+				resolveDone(String(e));
+			}
+		},
+	});
+	const wt = new WebTransport("https://127.0.0.1:" + port, {
+		tls: { insecureSkipVerify: true },
+	});
+	await guard(wt.ready, 10_000, "client ready");
+	for (let i = 0; i < ROUNDS; i++) {
+		await guard(starts[i].promise, 10_000, "server ready for round " + i);
+		const w = (await guard(wt.createUnidirectionalStream(), 10_000, "client open " + i)).getWriter();
+		void (async () => {
+			try {
+				for (let n = 0; n < 512; n++) await w.write(new Uint8Array(1400).fill(i));
+			} catch {}
+		})();
+	}
+	const serverError = await guard(done, 30_000, "server rounds");
+	const settled = () => {
+		const s = __TESTING__.readGroupStateSnapshotForTests();
+		return { ...s, queuedGlobal: server.metricsSnapshot().queuedBytesGlobal };
+	};
+	let state = settled();
+	for (let i = 0; i < 100; i++) {
+		if (state.nativeQueued === 0 && state.nativeLiveKeys === 0 && state.feeding === 0 && state.queuedGlobal === 0) break;
+		await Bun.sleep(20);
+		state = settled();
+	}
+	report({ serverError, state, leftovers });
+	wt.close();
+	server.close();
+	process.exit(0);
+`;
+
+describe("read group teardown race (r2 A-B1)", () => {
+	for (const arm of [
+		{ name: "batching off", batch: undefined },
+		{ name: "batching on", batch: "65536" },
+	]) {
+		it(`leaves no queued entry, live key or reserved byte behind (${arm.name})`, async () => {
+			const res = childResult(
+				await runChild(raceBody, {
+					WEBTRANSPORT_STREAM_READ_GROUP: undefined,
+					WEBTRANSPORT_STREAM_BATCH_BYTES: arm.batch,
+					WT_TEST_PORT: String(nextPort(29000, 100)),
+				}),
+			) as {
+				serverError: string | null;
+				state: Record<string, number>;
+				leftovers: unknown[];
+			};
+			expect(res.serverError).toBeNull();
+			expect(res.leftovers).toEqual([]);
+			expect(res.state).toEqual({
+				attached: 0,
+				feeding: 0,
+				heldBytes: 0,
+				nativeQueued: 0,
+				nativeQueuedBytes: 0,
+				nativeLiveKeys: 0,
+				queuedGlobal: 0,
+			});
+		}, 60_000);
+	}
 });

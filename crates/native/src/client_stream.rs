@@ -556,6 +556,11 @@ impl CoalescedChunks {
         Self::new(vec![StreamChunk::new(bytes, None, 0)])
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_chunks_for_tests(chunks: Vec<StreamChunk>) -> Self {
+        Self::new(chunks)
+    }
+
     fn new(chunks: Vec<StreamChunk>) -> Self {
         let len = chunks.iter().map(|chunk| chunk.as_bytes().len()).sum();
         Self { chunks, len }
