@@ -778,10 +778,17 @@ before; only the number of Node-API crossings changes.
 - `WEBTRANSPORT_STREAM_READ_GROUP=0` turns it off: every readable then pulls
   the addon directly, one crossing per read. Unset or any other value leaves
   it on. Read **once at module initialization**.
-- `WEBTRANSPORT_STREAM_READ_GROUP_WINDOW` is the per-stream read-ahead window
-  in bytes (default `262144`, 256 KiB). A feeder runs at most one window plus
-  one batch ahead of its consumer; a stalled reader stalls only its own
-  feeder.
+- **No read-ahead.** A feeder makes one read per read the consumer has
+  outstanding, exactly the reads the direct pull would make, and nothing
+  more. Bytes a stalled consumer has not asked for stay in the transport,
+  under QUIC flow control and `maxQueuedBytesGlobal` /
+  `maxQueuedBytesPerSession` / `maxQueuedBytesPerStream`; a crossed chunk goes
+  straight to the read that asked for it. (An earlier read-ahead window,
+  `WEBTRANSPORT_STREAM_READ_GROUP_WINDOW`, let up to 256 KiB per stream sit in
+  JavaScript queues outside those budgets and was removed; the variable is
+  ignored.)
+- A stream's state leaves the group when its owner releases it (dispose,
+  reset, session close), whether or not it was ever read.
 - Feeders start lazily, on a readable's first pull: a stream that is never
   read holds no read-ahead, and `openReadSink` can still claim it. Once the
   feeder has started the stream counts as read and `openReadSink` throws

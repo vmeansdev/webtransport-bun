@@ -24,13 +24,24 @@
 //!  * JavaScript demultiplexes the entries into each stream's web readable,
 //!    and the delivery stamp is taken there, as it always was.
 //!
-//! **Backpressure** is a per-stream byte credit. A feeder reads only while its
-//! credit is positive and each delivered batch spends its length, so at most
-//! one window plus one batch is ever queued per stream; JavaScript re-grants
-//! the window as the stream's consumer drains it (`grant`). A consumer that
-//! stops reading stops its feeder, which leaves the bytes in the transport
-//! where QUIC flow control pushes back on the peer — the same contract a
-//! parked `read` gives.
+//! **Backpressure is demand.** A feeder reads only while its byte credit is
+//! positive and each read spends its length. JavaScript grants credit only
+//! for a read the stream's consumer is actually waiting on (one byte of
+//! credit per outstanding pull, `grant`), so a feeder makes exactly the reads
+//! the direct readable would have made, never more: nothing is read ahead
+//! of the consumer. That keeps the receive budgets
+//! (`maxQueuedBytesGlobal` / `PerSession` / `PerStream`) authoritative — the
+//! bytes a stalled consumer has not asked for stay in the transport under
+//! QUIC flow control and the native reservations, exactly as with a parked
+//! `read`, instead of sitting in a JavaScript queue no budget sees. What the
+//! group saves is unchanged: every stream whose read completed while the
+//! event loop was busy crosses in one `next()` resolution.
+//!
+//! **Lifecycle.** JavaScript `prepare`s a key synchronously before it calls
+//! `feedReadGroup`, so a key's native state exists from the moment JavaScript
+//! could cancel it: a cancel either finds the key (prepared or feeding) or
+//! the key's feeder already ended, and nothing has to be remembered for a
+//! feeder that has not registered yet.
 //!
 //! On by default in the JS layer (`WEBTRANSPORT_STREAM_READ_GROUP=0` turns
 //! it off); the group is created lazily on the first accepted stream, and
@@ -40,7 +51,7 @@ use napi::bindgen_prelude::{Null, ToNapiValue, TypeName};
 use napi::Result;
 use napi_derive::napi;
 use once_cell::sync::Lazy;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::Notify;
@@ -79,19 +90,22 @@ struct GroupEntry {
 }
 
 /// One stream's credit: bytes its feeder may still read before JavaScript
-/// grants more. Signed because a batch may overshoot the remainder by up to
-/// one batch.
+/// grants more. Signed because a read overshoots the remainder by up to one
+/// chunk (one byte of credit admits one read).
 pub(crate) struct Credit {
     available: AtomicI64,
     cancelled: AtomicBool,
+    /// Set when the key's feeder claims the prepared credit.
+    claimed: AtomicBool,
     notify: Notify,
 }
 
 impl Credit {
-    fn new(window: i64) -> Self {
+    fn new(initial: i64) -> Self {
         Self {
-            available: AtomicI64::new(window),
+            available: AtomicI64::new(initial),
             cancelled: AtomicBool::new(false),
+            claimed: AtomicBool::new(false),
             notify: Notify::new(),
         }
     }
@@ -105,29 +119,21 @@ struct GroupQueue {
     woken: bool,
 }
 
-/// Live feeders' credits, and keys cancelled before their feeder registered.
-/// One lock covers both, so a cancel and a registration can never miss each
-/// other: whichever comes second sees the first.
+/// Prepared and feeding keys' credits: exactly the keys JavaScript may still
+/// cancel, so the map is bounded by live streams and nothing else.
 #[derive(Default)]
 struct Credits {
     live: HashMap<u32, Arc<Credit>>,
-    cancelled_early: HashSet<u32>,
-    /// Insertion order of `cancelled_early`, for its bound.
-    cancelled_order: VecDeque<u32>,
 }
 
-/// `cancelled_early` only has to bridge the microseconds between a feeder's
-/// start and its registration. A cancel that lands after a feeder already
-/// unregistered (its last entry still in flight to JavaScript) also lands
-/// here and is never consumed, so the set is bounded: the oldest key is
-/// forgotten first, and no real early cancel is that old.
-const CANCELLED_EARLY_CAP: usize = 1024;
-
-/// What a feeder's registration found.
+/// What a feeder's claim of its prepared key found.
 enum Registration {
     Fed(Arc<Credit>),
+    /// The key is already being fed.
     Duplicate,
-    CancelledEarly,
+    /// The key is not prepared: it was cancelled before the feeder started
+    /// (cancel removes an unclaimed key), or never prepared.
+    NotPrepared,
 }
 
 pub(crate) struct GroupShared {
@@ -174,20 +180,37 @@ impl GroupShared {
         self.ready.notify_one();
     }
 
-    fn register(&self, key: u32, window: i64) -> Registration {
+    /// Create `key`'s credit before its feeder starts. Fails if the key is
+    /// still live (prepared or feeding) or the credit is not positive.
+    fn prepare(&self, key: u32, initial: i64) -> std::result::Result<(), &'static str> {
+        if initial <= 0 {
+            return Err("E_INVALID_ARGUMENT: read group credit must be positive");
+        }
         let Ok(mut credits) = self.credits.lock() else {
-            return Registration::Duplicate;
+            return Err("E_INTERNAL: read group lock poisoned");
         };
-        if credits.cancelled_early.remove(&key) {
-            credits.cancelled_order.retain(|k| *k != key);
-            return Registration::CancelledEarly;
-        }
         if credits.live.contains_key(&key) {
-            return Registration::Duplicate;
+            return Err("E_INVALID_ARGUMENT: read group key already live");
         }
-        let credit = Arc::new(Credit::new(window));
-        credits.live.insert(key, credit.clone());
-        Registration::Fed(credit)
+        credits.live.insert(key, Arc::new(Credit::new(initial)));
+        Ok(())
+    }
+
+    /// The feeder takes its prepared credit.
+    fn claim(&self, key: u32) -> Registration {
+        let Ok(credits) = self.credits.lock() else {
+            return Registration::NotPrepared;
+        };
+        match credits.live.get(&key) {
+            None => Registration::NotPrepared,
+            Some(credit) => {
+                if credit.claimed.swap(true, Ordering::AcqRel) {
+                    Registration::Duplicate
+                } else {
+                    Registration::Fed(credit.clone())
+                }
+            }
+        }
     }
 
     fn unregister(&self, key: u32, credit: &Arc<Credit>) {
@@ -206,29 +229,28 @@ impl GroupShared {
         self.credits.lock().ok()?.live.get(&key).cloned()
     }
 
-    /// Stop `key`'s feeder at its next credit check; a key whose feeder has
-    /// not registered yet is remembered, and its registration then ends the
-    /// feeder before it reads anything.
+    /// Stop `key`'s feeder at its next credit check. A prepared key whose
+    /// feeder has not claimed it yet is removed, so that feeder finds nothing
+    /// and ends before it reads. A key that is not live — its feeder already
+    /// ended — needs nothing, and nothing is kept for it.
     fn cancel(&self, key: u32) {
         let Ok(mut credits) = self.credits.lock() else {
             return;
         };
-        match credits.live.get(&key) {
-            Some(credit) => {
-                credit.cancelled.store(true, Ordering::Release);
-                credit.notify.notify_one();
-            }
-            None => {
-                if credits.cancelled_early.insert(key) {
-                    credits.cancelled_order.push_back(key);
-                }
-                while credits.cancelled_order.len() > CANCELLED_EARLY_CAP {
-                    if let Some(old) = credits.cancelled_order.pop_front() {
-                        credits.cancelled_early.remove(&old);
-                    }
-                }
-            }
+        let Some(credit) = credits.live.get(&key).cloned() else {
+            return;
+        };
+        credit.cancelled.store(true, Ordering::Release);
+        if credit.claimed.load(Ordering::Acquire) {
+            credit.notify.notify_one();
+        } else {
+            credits.live.remove(&key);
         }
+    }
+
+    /// Live keys (prepared or feeding): diagnostics and tests.
+    fn live_keys(&self) -> usize {
+        self.credits.lock().map(|c| c.live.len()).unwrap_or(0)
     }
 
     fn has_ready(&self) -> bool {
@@ -269,19 +291,16 @@ pub(crate) fn lookup_group(id: u32) -> Option<Arc<GroupShared>> {
 pub(crate) async fn run_feeder<F, Fut>(
     group: Arc<GroupShared>,
     key: u32,
-    window: u32,
     mut read: F,
 ) -> Option<String>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<Option<FeedChunk>>>,
 {
-    if window == 0 {
-        return Some("E_INVALID_ARGUMENT: read group window must be positive".to_string());
-    }
-    let credit = match group.register(key, i64::from(window)) {
+    let credit = match group.claim(key) {
         Registration::Fed(credit) => credit,
-        Registration::CancelledEarly => return None,
+        // Cancelled before the feeder started: end unread.
+        Registration::NotPrepared => return None,
         Registration::Duplicate => {
             return Some("E_INVALID_ARGUMENT: read group key already fed".to_string())
         }
@@ -405,6 +424,23 @@ impl StreamReadGroup {
         Self { shared, id }
     }
 
+    /// Create stream `key`'s credit (`credit` bytes, positive) before its
+    /// handle's `feedReadGroup(id, key, ..)` is called. Throws if the key is
+    /// still live; a prepared key that is cancelled before its feeder starts
+    /// is forgotten, and that feeder then ends without reading.
+    #[napi]
+    pub fn prepare(&self, key: u32, credit: u32) -> Result<()> {
+        self.shared
+            .prepare(key, i64::from(credit))
+            .map_err(napi::Error::from_reason)
+    }
+
+    /// Keys prepared or feeding (diagnostics and tests).
+    #[napi(getter)]
+    pub fn live_keys(&self) -> u32 {
+        self.shared.live_keys() as u32
+    }
+
     /// The id a handle's `feedReadGroup` names this group by.
     #[napi(getter)]
     pub fn id(&self) -> u32 {
@@ -445,11 +481,9 @@ impl StreamReadGroup {
     /// Stop stream `key`'s feeder at its next credit check. A read already in
     /// flight completes (the owner's stop/reset/dispose aborts it), and what it
     /// returns is still queued; the JS side drops entries for a cancelled key.
-    /// A cancel that lands before the feeder registered is remembered and ends
-    /// that feeder at registration, before it reads anything. (The JS pump
-    /// cancels only feeders it has not seen a terminal entry from, so a
-    /// remembered key is not left behind by streams that already ended,
-    /// except for a cancel racing the feeder's own last entry — one key.)
+    /// A prepared key whose feeder has not started is forgotten, and that
+    /// feeder ends before it reads. A key that is no longer live is ignored:
+    /// nothing is remembered, so no cancel is ever lost or left behind.
     #[napi]
     pub fn cancel(&self, key: u32) {
         self.shared.cancel(key);
@@ -520,11 +554,17 @@ mod tests {
             .collect()
     }
 
+    fn prepared(key: u32, credit: i64) -> Arc<GroupShared> {
+        let shared = Arc::new(GroupShared::new());
+        shared.prepare(key, credit).unwrap();
+        shared
+    }
+
     #[tokio::test]
     async fn feeder_delivers_batches_then_eof_in_order() {
-        let shared = Arc::new(GroupShared::new());
+        let shared = prepared(3, 1 << 20);
         let mut script = vec![data(10), data(20), Ok(None)].into_iter();
-        let out = run_feeder(shared.clone(), 3, 1 << 20, || {
+        let out = run_feeder(shared.clone(), 3, || {
             let next = script.next().unwrap();
             async move { next }
         })
@@ -535,14 +575,15 @@ mod tests {
             vec![(3, "data", 10), (3, "data", 20), (3, "end", 0)]
         );
         assert!(shared.credit(3).is_none(), "an ended feeder unregisters");
+        assert_eq!(shared.live_keys(), 0);
         assert_eq!(shared.batched_entries.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]
     async fn feeder_forwards_the_error_code_and_stops() {
-        let shared = Arc::new(GroupShared::new());
+        let shared = prepared(1, 1 << 20);
         let mut calls = 0;
-        run_feeder(shared.clone(), 1, 1 << 20, || {
+        run_feeder(shared.clone(), 1, || {
             calls += 1;
             async { Err(napi::Error::from_reason("E_STREAM_RESET")) }
         })
@@ -556,34 +597,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn feeder_parks_without_credit_until_granted() {
-        let shared = Arc::new(GroupShared::new());
+    async fn one_byte_of_credit_admits_exactly_one_read() {
+        // The JS pump grants one byte per outstanding pull: each grant must
+        // buy one read and no read-ahead, whatever the chunk size.
+        let shared = prepared(9, 1);
         let reads = Arc::new(AtomicU32::new(0));
         let r = reads.clone();
-        let task = tokio::spawn(run_feeder(shared.clone(), 9, 100, move || {
+        let task = tokio::spawn(run_feeder(shared.clone(), 9, move || {
             r.fetch_add(1, Ordering::SeqCst);
-            async { data(100) }
+            async { data(1400) }
         }));
-        // One read spends the whole 100-byte window; the feeder must park.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert_eq!(reads.load(Ordering::SeqCst), 1);
+        // The pump tops the allowance back up to one byte: 1 - 1400 + 1400.
         let credit = shared.credit(9).unwrap();
-        credit.available.fetch_add(150, Ordering::AcqRel);
+        credit.available.fetch_add(1400, Ordering::AcqRel);
         credit.notify.notify_one();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        // 150 of credit allows two more 100-byte reads (the second overshoots
-        // by one batch, never more), then it parks again.
-        assert_eq!(reads.load(Ordering::SeqCst), 3);
-        credit.cancelled.store(true, Ordering::Release);
-        credit.notify.notify_one();
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(reads.load(Ordering::SeqCst), 2, "no read without demand");
+        shared.cancel(9);
         assert!(task.await.unwrap().is_none());
         assert!(shared.credit(9).is_none());
     }
 
     #[tokio::test]
+    async fn an_empty_read_does_not_spend_the_demand() {
+        let shared = prepared(4, 1);
+        let mut script = vec![data(0), data(5)].into_iter();
+        let reads = Arc::new(AtomicU32::new(0));
+        let r = reads.clone();
+        let task = tokio::spawn(run_feeder(shared.clone(), 4, move || {
+            r.fetch_add(1, Ordering::SeqCst);
+            let next = script.next().unwrap_or_else(|| data(1));
+            async move { next }
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        shared.cancel(4);
+        assert!(task.await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn closing_the_group_stops_feeders_and_drops_entries() {
-        let shared = Arc::new(GroupShared::new());
-        let task = tokio::spawn(run_feeder(shared.clone(), 2, 10, || async { data(10) }));
+        let shared = prepared(2, 10);
+        let task = tokio::spawn(run_feeder(shared.clone(), 2, || async { data(10) }));
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         shared.close();
         assert!(task.await.unwrap().is_none());
@@ -592,23 +651,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_key_cannot_be_fed_twice_and_window_must_be_positive() {
-        let shared = Arc::new(GroupShared::new());
-        let Registration::Fed(_held) = shared.register(5, 10) else {
-            panic!("first registration must feed");
+    async fn a_key_cannot_be_prepared_or_fed_twice_and_credit_must_be_positive() {
+        let shared = prepared(5, 10);
+        assert!(shared.prepare(5, 10).unwrap_err().contains("already live"));
+        let Registration::Fed(_held) = shared.claim(5) else {
+            panic!("first claim must feed");
         };
-        let dup = run_feeder(shared.clone(), 5, 10, || async { data(1) }).await;
+        let dup = run_feeder(shared.clone(), 5, || async { data(1) }).await;
         assert!(dup.unwrap().contains("already fed"));
-        let zero = run_feeder(shared.clone(), 6, 0, || async { data(1) }).await;
-        assert!(zero.unwrap().contains("window"));
+        assert!(shared.prepare(6, 0).unwrap_err().contains("positive"));
     }
 
     #[tokio::test]
-    async fn a_cancel_before_registration_ends_the_feeder_unread() {
-        let shared = Arc::new(GroupShared::new());
+    async fn a_cancel_before_the_feeder_starts_ends_it_unread() {
+        let shared = prepared(4, 100);
         shared.cancel(4);
+        assert_eq!(
+            shared.live_keys(),
+            0,
+            "an unclaimed cancelled key is forgotten"
+        );
         let mut reads = 0;
-        let out = run_feeder(shared.clone(), 4, 100, || {
+        let out = run_feeder(shared.clone(), 4, || {
             reads += 1;
             async { data(1) }
         })
@@ -616,34 +680,65 @@ mod tests {
         assert!(out.is_none());
         assert_eq!(reads, 0, "a pre-cancelled feeder reads nothing");
         assert!(drain(&shared).is_empty());
-        let credits = shared.credits.lock().unwrap();
-        assert!(credits.cancelled_early.is_empty());
-        assert!(credits.cancelled_order.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancels_are_never_lost_however_many_feeders_are_pending() {
+        // C-B3: thousands of start-then-cancel streams whose feeders have not
+        // registered yet. Every one of them must end unread, and nothing may
+        // be left behind once they have.
+        let shared = Arc::new(GroupShared::new());
+        let n = 5000u32;
+        for key in 1..=n {
+            shared.prepare(key, 1).unwrap();
+            shared.cancel(key);
+        }
+        assert_eq!(shared.live_keys(), 0);
+        let reads = Arc::new(AtomicU32::new(0));
+        for key in 1..=n {
+            let r = reads.clone();
+            let out = run_feeder(shared.clone(), key, move || {
+                r.fetch_add(1, Ordering::SeqCst);
+                async { data(1) }
+            })
+            .await;
+            assert!(out.is_none());
+        }
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        assert_eq!(shared.live_keys(), 0);
     }
 
     #[test]
-    fn late_cancels_of_finished_feeders_stay_bounded() {
+    fn late_cancels_of_finished_feeders_leave_nothing_behind() {
         let shared = GroupShared::new();
         for key in 0..5000 {
             shared.cancel(key);
         }
-        let credits = shared.credits.lock().unwrap();
-        assert_eq!(credits.cancelled_early.len(), CANCELLED_EARLY_CAP);
-        assert_eq!(credits.cancelled_order.len(), CANCELLED_EARLY_CAP);
-        assert!(credits.cancelled_early.contains(&4999));
-        assert!(!credits.cancelled_early.contains(&0));
+        assert_eq!(shared.live_keys(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_cancel_after_the_feeder_ended_does_not_touch_a_reprepared_key() {
+        let shared = prepared(8, 1);
+        run_feeder(shared.clone(), 8, || async { Ok(None) }).await;
+        shared.cancel(8);
+        shared.prepare(8, 1).unwrap();
+        let Registration::Fed(credit) = shared.claim(8) else {
+            panic!("a re-prepared key must feed");
+        };
+        assert!(!credit.cancelled.load(Ordering::Acquire));
     }
 
     #[tokio::test]
     async fn data_and_batched_counts_are_kept_side_by_side() {
-        let shared = Arc::new(GroupShared::new());
+        let shared = prepared(8, 1 << 20);
         let mut script = vec![
             Ok(Some(FeedChunk::Single(PayloadBuffer::from(vec![1u8; 3])))),
             data(4),
             Ok(None),
         ]
         .into_iter();
-        run_feeder(shared.clone(), 8, 1 << 20, || {
+        run_feeder(shared.clone(), 8, || {
             let next = script.next().unwrap();
             async move { next }
         })

@@ -34,6 +34,11 @@ export type NativeReadableOwner = {
 	 * E_SINK_READ_ACTIVE). Called before every direct read and when a group
 	 * feeder starts reading. */
 	onRead?: () => void;
+	/** Set by a read group (read-group.ts) when it attaches the stream; the
+	 * owner calls it whenever it releases the handle (dispose, reset, session
+	 * close), so a stream that was attached but never read does not stay in
+	 * the group's pump. */
+	released?: () => void;
 	/** Bytes about to be delivered (connection statistics). */
 	onBytes?: (bytes: number) => void;
 	/** The peer finished cleanly; called before the stream closes. */

@@ -77,6 +77,7 @@ import {
 	ReadGroupPump,
 	readGroupConfig,
 	readGroupDiagnosticsSnapshot,
+	readGroupStateSnapshot,
 	resetReadGroupDiagnostics,
 } from "./read-group.js";
 import {
@@ -4387,6 +4388,8 @@ class ServerIncomingBidiResource implements ServerIncomingStreamResource {
 			}
 		}
 		this.onDisposed(this);
+		// A group-fed readable detaches from the pump and settles.
+		this.readOwner.released?.();
 	}
 
 	dispose(): void {
@@ -4583,6 +4586,8 @@ class ServerIncomingUniResource implements ServerIncomingStreamResource {
 			}
 		}
 		this.onDisposed(this);
+		// A group-fed readable detaches from the pump and settles.
+		this.readOwner.released?.();
 	}
 
 	dispose(): void {
@@ -5048,6 +5053,7 @@ export const __TESTING__ = {
 	/** The cross-stream delivery pump (read-group.ts), driven by a fake group. */
 	ReadGroupPumpForTests: ReadGroupPump,
 	readGroupConfigForTests: readGroupConfig,
+	readGroupStateSnapshotForTests: readGroupStateSnapshot,
 	readGroupDiagnosticsSnapshotForTests: readGroupDiagnosticsSnapshot,
 	resetReadGroupDiagnosticsForTests: resetReadGroupDiagnostics,
 	/** The addon's group constructor, when this addon has one. */

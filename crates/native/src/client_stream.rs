@@ -1798,22 +1798,17 @@ impl ClientBidiStreamHandle {
 
     /// Feed this stream's receive half into a read group (`read_group.rs`):
     /// loop `readBatch(max_bytes)` — or `read()` when `max_bytes` is 0, the
-    /// batch knob's off state — under the group's per-stream credit,
-    /// queueing each chunk, the EOF, or the error code under `key`. Resolves
-    /// when the stream ends, its key is cancelled, or the group closes. Never
-    /// rejects; an unknown group or a bad window resolves as an error string.
+    /// batch knob's off state — under the credit JavaScript `prepare`d for
+    /// `key` and grants per outstanding pull, queueing each chunk, the EOF,
+    /// or the error code under `key`. Resolves when the stream ends, its key
+    /// is cancelled, or the group closes. Never rejects; an unknown group or
+    /// a key already being fed resolves as an error string.
     #[napi]
-    pub async fn feed_read_group(
-        &self,
-        group_id: u32,
-        key: u32,
-        max_bytes: u32,
-        window: u32,
-    ) -> Option<String> {
+    pub async fn feed_read_group(&self, group_id: u32, key: u32, max_bytes: u32) -> Option<String> {
         let Some(group) = crate::read_group::lookup_group(group_id) else {
             return Some("E_INVALID_ARGUMENT: unknown read group".to_string());
         };
-        crate::read_group::run_feeder(group, key, window, || async move {
+        crate::read_group::run_feeder(group, key, || async move {
             use crate::read_group::FeedChunk;
             if max_bytes == 0 {
                 Ok(self.read_inner().await?.map(FeedChunk::Single))
@@ -2737,22 +2732,17 @@ impl ClientUniRecvHandle {
 
     /// Feed this stream's receive half into a read group (`read_group.rs`):
     /// loop `readBatch(max_bytes)` — or `read()` when `max_bytes` is 0, the
-    /// batch knob's off state — under the group's per-stream credit,
-    /// queueing each chunk, the EOF, or the error code under `key`. Resolves
-    /// when the stream ends, its key is cancelled, or the group closes. Never
-    /// rejects; an unknown group or a bad window resolves as an error string.
+    /// batch knob's off state — under the credit JavaScript `prepare`d for
+    /// `key` and grants per outstanding pull, queueing each chunk, the EOF,
+    /// or the error code under `key`. Resolves when the stream ends, its key
+    /// is cancelled, or the group closes. Never rejects; an unknown group or
+    /// a key already being fed resolves as an error string.
     #[napi]
-    pub async fn feed_read_group(
-        &self,
-        group_id: u32,
-        key: u32,
-        max_bytes: u32,
-        window: u32,
-    ) -> Option<String> {
+    pub async fn feed_read_group(&self, group_id: u32, key: u32, max_bytes: u32) -> Option<String> {
         let Some(group) = crate::read_group::lookup_group(group_id) else {
             return Some("E_INVALID_ARGUMENT: unknown read group".to_string());
         };
-        crate::read_group::run_feeder(group, key, window, || async move {
+        crate::read_group::run_feeder(group, key, || async move {
             use crate::read_group::FeedChunk;
             if max_bytes == 0 {
                 Ok(self.read_inner().await?.map(FeedChunk::Single))

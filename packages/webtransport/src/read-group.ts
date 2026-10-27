@@ -15,10 +15,16 @@
  * directly (native-readable.ts), as does every readable when the addon has
  * no group. Client-side readables always pull directly.
  *
- * Per-stream backpressure is a byte window: the feeder may run at most one
- * window (plus one batch) ahead of the consumer, and the window is re-granted
- * only when the consumer has drained what was delivered — a stalled reader
- * stalls its feeder and nothing else.
+ * Backpressure is demand, exactly as on the direct pull: a feeder may make
+ * one read per pull the consumer has outstanding (one byte of credit per
+ * pull, re-granted by the next pull), so nothing is read ahead of the
+ * consumer. Bytes a stalled reader has not asked for stay in the transport,
+ * under QUIC flow control and the native receive budgets
+ * (`maxQueuedBytesGlobal` / `PerSession` / `PerStream`); a crossed chunk
+ * goes straight to the read that asked for it rather than into a JavaScript
+ * queue no budget sees. What the group saves is unchanged: every stream
+ * whose read completed while the event loop was busy crosses in one
+ * `next()` resolution.
  */
 
 import {
@@ -34,21 +40,14 @@ import {
 } from "./stream-chunk-batch.js";
 
 const READ_GROUP_ENV = "WEBTRANSPORT_STREAM_READ_GROUP";
-const READ_GROUP_WINDOW_ENV = "WEBTRANSPORT_STREAM_READ_GROUP_WINDOW";
 
-/** Default per-stream window: 256 KiB, the Node adapters' highWaterMark. */
-export const DEFAULT_READ_GROUP_WINDOW = 256 * 1024;
+/** Credit for one outstanding pull: one byte admits exactly one native read
+ * (the feeder reads while its credit is positive; a read spends its length). */
+const DEMAND_CREDIT = 1;
 /** Entries one `next()` may return. */
 const READ_GROUP_MAX_ENTRIES = 4096;
-
-export function parseReadGroupWindow(raw: string | undefined): number {
-	if (raw === undefined) return DEFAULT_READ_GROUP_WINDOW;
-	const trimmed = raw.trim();
-	if (!/^\d+$/.test(trimmed)) return DEFAULT_READ_GROUP_WINDOW;
-	const value = Number(trimmed);
-	if (!Number.isFinite(value) || value <= 0) return DEFAULT_READ_GROUP_WINDOW;
-	return Math.min(value, 0xffff_ffff);
-}
+/** Feeder keys are u32; 0 is never used. */
+const MAX_KEY = 0xffff_ffff;
 
 /**
  * The read group is on unless the knob is exactly `0` (surrounding
@@ -60,9 +59,6 @@ export function parseReadGroupEnabled(raw: string | undefined): boolean {
 
 // Read once, like the batch knob: delivery shape never changes mid-process.
 const readGroupEnabled = parseReadGroupEnabled(process.env[READ_GROUP_ENV]);
-const readGroupWindow = parseReadGroupWindow(
-	process.env[READ_GROUP_WINDOW_ENV],
-);
 
 /** The addon's group, as this module needs it. */
 export type NativeReadGroup = {
@@ -70,6 +66,9 @@ export type NativeReadGroup = {
 	next(
 		maxEntries: number,
 	): Promise<Array<number | Uint8Array | string | null> | null>;
+	/** Create `key`'s native credit before its feeder is started; throws if
+	 * the key is still live. */
+	prepare(key: number, credit: number): void;
 	grant(key: number, bytes: number): void;
 	cancel(key: number): void;
 	wake(): void;
@@ -86,7 +85,6 @@ export type GroupFeedableHandle = {
 		groupId: number,
 		key: number,
 		maxBytes: number,
-		window: number,
 	) => Promise<string | null | undefined>;
 };
 
@@ -208,27 +206,75 @@ type Sink = {
 	controller: ByteController | null;
 	/** The feeder starts on the first pull, never at attach. */
 	started: boolean;
-	/** Bytes the feeder has been allowed in total, and has delivered. */
+	/** Credit the feeder has been allowed in total, and bytes it delivered:
+	 * `granted - delivered > 0` means a read is outstanding. */
 	granted: number;
 	delivered: number;
+	/** Settles the pending pull once its read is answered (data, EOF, error
+	 * or detach), so the stream calls pull again for a read still waiting —
+	 * the same promise-returning pull the direct readable uses. */
+	wake: (() => void) | null;
 };
+
+function settlePull(sink: Sink): void {
+	const wake = sink.wake;
+	sink.wake = null;
+	wake?.();
+}
+
+function pullAnswered(sink: Sink): Promise<void> {
+	return new Promise<void>((resolve) => {
+		sink.wake = resolve;
+	});
+}
 
 export class ReadGroupPump {
 	readonly #group: NativeReadGroup;
-	readonly #window: number;
 	readonly #sinks = new Map<number, Sink>();
+	/** Keys whose native feeder has not resolved yet (it may outlive its
+	 * sink): never reused, and the only keys a cancel is sent for. */
+	readonly #feeding = new Set<number>();
 	#nextKey = 1;
 	#running = false;
 	/** Sinks whose feeder has started; the pump runs only while > 0. */
 	#active = 0;
-	/** Released keys to cancel once the current batch is dispatched. */
-	readonly #pendingCancels = new Set<number>();
-	/** Keys whose terminal entry the current batch carried. */
-	readonly #terminalInBatch = new Set<number>();
 
-	constructor(group: NativeReadGroup, window = DEFAULT_READ_GROUP_WINDOW) {
+	constructor(group: NativeReadGroup) {
 		this.#group = group;
-		this.#window = window;
+	}
+
+	/** Tests: where key allocation resumes (exercises the u32 wrap). */
+	setNextKeyForTests(key: number): void {
+		this.#nextKey = key;
+	}
+
+	/** The next free key, skipping any still attached or still feeding, so a
+	 * wrap can never alias a live stream. */
+	#allocateKey(): number {
+		for (;;) {
+			const key = this.#nextKey;
+			this.#nextKey = key >= MAX_KEY ? 1 : key + 1;
+			if (!this.#sinks.has(key) && !this.#feeding.has(key)) return key;
+		}
+	}
+
+	/** Bytes crossed into attached readables that no reader has taken yet
+	 * (each byte stream's queue). With demand credit this stays at most one
+	 * partially consumed chunk per stream (a BYOB read smaller than the
+	 * chunk), the same bound as the direct pull. */
+	heldBytes(): number {
+		let held = 0;
+		for (const sink of this.#sinks.values()) {
+			const desired = (sink.controller as { desiredSize?: number | null })
+				?.desiredSize;
+			if (typeof desired === "number" && desired < 0) held -= desired;
+		}
+		return held;
+	}
+
+	/** Keys whose native feeder is still running (tests and diagnostics). */
+	get feeding(): number {
+		return this.#feeding.size;
 	}
 
 	nativeBatchedEntries(): number {
@@ -254,10 +300,12 @@ export class ReadGroupPump {
 	 * pull holds none, and a native stream sink (`openReadSink`) can still
 	 * claim the handle; starting the feeder marks the stream as read (the
 	 * owner's `onRead`), after which a sink is refused with
-	 * E_SINK_READ_ACTIVE. Once started, a stream holds at
-	 * most one window plus one batch ahead of its consumer: the native part is
-	 * also inside the stream's own `maxQueuedBytesPerStream` reservation until
-	 * it crosses; the crossed part sits in the byte stream's JS queue.
+	 * E_SINK_READ_ACTIVE. Once started, the feeder makes one read per pull
+	 * the consumer has outstanding and nothing more (see the module docs).
+	 *
+	 * The pump sets the owner's `released` hook: an owner that releases the
+	 * handle (dispose, reset, session close) detaches the stream here, stops
+	 * its feeder and settles its readable, read or not.
 	 */
 	attach(
 		handle: GroupFeedableHandle,
@@ -265,22 +313,32 @@ export class ReadGroupPump {
 	): ReadableStream<Uint8Array> {
 		const feed = handle.feedReadGroup;
 		if (typeof feed !== "function") return createNativeByteReadable(owner);
-		const key = this.#nextKey++;
-		if (this.#nextKey > 0xffff_ffff) this.#nextKey = 1;
+		const key = this.#allocateKey();
 		const sink: Sink = {
 			owner,
 			controller: null,
 			started: false,
-			granted: this.#window,
+			granted: DEMAND_CREDIT,
 			delivered: 0,
+			wake: null,
 		};
 		this.#sinks.set(key, sink);
+		owner.released = () => this.#released(key);
 		const startFeeder = () => {
 			sink.started = true;
 			owner.onRead?.();
 			this.#active++;
-			void feed
-				.call(
+			try {
+				// The first pull's demand: one read.
+				this.#group.prepare(key, DEMAND_CREDIT);
+			} catch (err) {
+				this.#fail(key, err);
+				return;
+			}
+			this.#feeding.add(key);
+			let fed: Promise<string | null | undefined>;
+			try {
+				fed = feed.call(
 					handle,
 					this.#group.id,
 					key,
@@ -289,12 +347,25 @@ export class ReadGroupPump {
 					// same chunks the direct readable's `readStreamChunk` would
 					// cross.
 					streamBatchConfig().batchBytes,
-					this.#window,
-				)
-				.then((code) => {
+				);
+			} catch (err) {
+				// Forget the prepared key: no feeder will claim it.
+				this.#group.cancel(key);
+				this.#feeding.delete(key);
+				this.#fail(key, err);
+				return;
+			}
+			fed.then(
+				(code) => {
+					this.#feeding.delete(key);
 					// A feeder that could not start is a stream that cannot read.
 					if (typeof code === "string") this.#fail(key, new Error(code));
-				});
+				},
+				(err: unknown) => {
+					this.#feeding.delete(key);
+					this.#fail(key, err);
+				},
+			);
 			this.#start();
 		};
 		return new ReadableStream<Uint8Array>(
@@ -303,36 +374,34 @@ export class ReadGroupPump {
 				start: (controller: ByteController) => {
 					sink.controller = controller;
 				},
-				// A pull means the consumer is waiting on an empty queue:
-				// everything delivered so far has been read. The first one starts
-				// the feeder with a full window; later ones top the allowance back
-				// up to a full window once half is spent, so a grant crosses once
-				// per half window rather than once per read.
-				pull: () => {
-					if (!this.#sinks.has(key)) return;
+				// A pull means the consumer is waiting on an empty queue. The
+				// first one starts the feeder with one read's credit; later ones
+				// grant one more read unless the last one is still outstanding.
+				pull: (): Promise<void> | undefined => {
+					if (!this.#sinks.has(key)) return undefined;
 					if (!sink.started) {
 						if (sink.owner.current() === null) {
-							this.#detach(key);
-							if (sink.controller) closeQuietly(sink.controller);
-							return;
+							this.#released(key);
+							return undefined;
 						}
+						const answered = pullAnswered(sink);
 						startFeeder();
-						return;
+						return answered;
 					}
 					const allowed = sink.granted - sink.delivered;
-					if (allowed < this.#window / 2) {
-						const add = this.#window - allowed;
+					if (allowed <= 0) {
+						const add = DEMAND_CREDIT - allowed;
 						sink.granted += add;
 						this.#group.grant(key, add);
 					}
+					return pullAnswered(sink);
 				},
 				cancel: (reason: unknown) => {
 					const wasStarted = sink.started;
 					this.#detach(key);
-					// A key whose feeder has not registered yet is remembered as
-					// cancelled natively (read_group.rs), so the cancel is never
-					// lost to a registration race.
-					if (wasStarted) this.#group.cancel(key);
+					// A prepared key whose feeder has not claimed it yet is
+					// forgotten natively, so that feeder ends unread.
+					if (wasStarted) this.#cancelFeeder(key);
 					owner.onCancel(reason);
 				},
 			} as unknown as object,
@@ -340,10 +409,25 @@ export class ReadGroupPump {
 		);
 	}
 
+	/** Stop a feeder that may still be running. Only keys whose feed has not
+	 * resolved are cancelled, so a reused key is never hit. */
+	#cancelFeeder(key: number): void {
+		if (this.#feeding.has(key)) this.#group.cancel(key);
+	}
+
+	/** The owner released the handle: detach, stop the feeder, settle. */
+	#released(key: number): void {
+		const sink = this.#detach(key);
+		if (!sink) return;
+		if (sink.started) this.#cancelFeeder(key);
+		if (sink.controller) closeQuietly(sink.controller);
+	}
+
 	#detach(key: number): Sink | undefined {
 		const sink = this.#sinks.get(key);
 		if (!sink) return undefined;
 		this.#sinks.delete(key);
+		settlePull(sink);
 		if (sink.started) {
 			this.#active--;
 			// Let a pending `next()` resolve so a pump with no feeders left
@@ -361,7 +445,7 @@ export class ReadGroupPump {
 	 */
 	#fail(key: number, err: unknown, stopFeeder = false): void {
 		const sink = this.#detach(key);
-		if (stopFeeder && sink?.started) this.#group.cancel(key);
+		if (stopFeeder && sink?.started) this.#cancelFeeder(key);
 		if (!sink || sink.owner.current() === null) return;
 		try {
 			sink.controller?.error(sink.owner.onError(err));
@@ -388,12 +472,6 @@ export class ReadGroupPump {
 					if (entries > diag.maxEntriesPerCrossing)
 						diag.maxEntriesPerCrossing = entries;
 				}
-				this.#pendingCancels.clear();
-				this.#terminalInBatch.clear();
-				for (let i = 0; i + 1 < batch.length; i += 2) {
-					if (!((batch[i + 1] ?? null) instanceof Uint8Array))
-						this.#terminalInBatch.add(batch[i] as number);
-				}
 				for (let i = 0; i + 1 < batch.length; i += 2) {
 					const value = batch[i + 1] ?? null;
 					if (value instanceof Uint8Array) {
@@ -411,9 +489,6 @@ export class ReadGroupPump {
 						this.#fail(key, err, value instanceof Uint8Array);
 					}
 				}
-				for (const key of this.#pendingCancels) {
-					if (!this.#terminalInBatch.has(key)) this.#group.cancel(key);
-				}
 			}
 		} finally {
 			this.#running = false;
@@ -426,17 +501,12 @@ export class ReadGroupPump {
 		const sink = this.#sinks.get(key);
 		// A cancelled stream's late entries are dropped.
 		if (!sink || !sink.controller) return;
-		// A released stream (the owner disposed or reset it) settles a waiting
-		// reader the way the direct readable's next pull would — it closes —
-		// and its feeder is told to stop.
+		// A released stream (an owner without the `released` hook, or one
+		// that dropped its handle without releasing) settles a waiting reader
+		// the way the direct readable's next pull would — it closes — and its
+		// feeder is told to stop (a no-op natively if it already ended).
 		if (sink.owner.current() === null) {
-			this.#detach(key);
-			// Data means the feeder may still be running; a terminal entry means
-			// it already ended. The cancel waits for the end of this batch and is
-			// dropped if the same batch also carried the key's terminal entry, so
-			// a feeder that already unregistered is never cancelled.
-			if (value instanceof Uint8Array) this.#pendingCancels.add(key);
-			closeQuietly(sink.controller);
+			this.#released(key);
 			return;
 		}
 		if (typeof value === "string") {
@@ -449,10 +519,12 @@ export class ReadGroupPump {
 			closeByteStream(sink.controller);
 			return;
 		}
-		if (typeof value === "number" || value.byteLength === 0) return;
+		if (typeof value === "number") return;
+		if (value.byteLength === 0) return;
 		sink.delivered += value.byteLength;
 		sink.owner.onBytes?.(value.byteLength);
 		sink.controller.enqueue(value);
+		settlePull(sink);
 	}
 }
 
@@ -478,13 +550,24 @@ export function createIncomingReadable(
 	if (!readGroupEnabled || !groupFactory || !handle.feedReadGroup) {
 		return createNativeByteReadable(owner);
 	}
-	processPump ??= new ReadGroupPump(groupFactory(), readGroupWindow);
+	processPump ??= new ReadGroupPump(groupFactory());
 	return processPump.attach(handle, owner);
 }
 
-export function readGroupConfig(): Readonly<{
-	enabled: boolean;
-	window: number;
-}> {
-	return Object.freeze({ enabled: readGroupEnabled, window: readGroupWindow });
+export function readGroupConfig(): Readonly<{ enabled: boolean }> {
+	return Object.freeze({ enabled: readGroupEnabled });
+}
+
+/** The process pump's live state (tests): attached streams, running native
+ * feeders, and bytes crossed but not yet taken by a reader. */
+export function readGroupStateSnapshot(): {
+	attached: number;
+	feeding: number;
+	heldBytes: number;
+} {
+	return {
+		attached: processPump?.size ?? 0,
+		feeding: processPump?.feeding ?? 0,
+		heldBytes: processPump?.heldBytes() ?? 0,
+	};
 }
