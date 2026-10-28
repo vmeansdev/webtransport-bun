@@ -104,8 +104,6 @@ pub mod read_group;
 pub(crate) mod read_ownership;
 pub mod reuseport_steering;
 mod send_path_diagnostics;
-// Ring core for the native stream sink; the napi surface arrives in
-// RFC_STREAM_SINK phase 3, so the module is test-only until then.
 pub mod server;
 pub mod server_metrics;
 pub mod server_napi;
