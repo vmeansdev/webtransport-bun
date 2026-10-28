@@ -100,6 +100,8 @@ new head.
   regenerate every `gaRequired` evidence artifact at the new head; the pending
   gate table above; external `LOKALISE_API_TOKEN` rotation and published-history
   purge; the interactive IWA Direct Sockets proof; and the 24h/72h soaks.
+- **History rewritten 2026-10-29** (token rotated, history purged): SHAs cited in
+  this repo predate the rewrite; resolve them via `docs/HISTORY_REWRITE_2026-10.md`.
 
 ## Capacity gates ruling 2026-10-28
 
