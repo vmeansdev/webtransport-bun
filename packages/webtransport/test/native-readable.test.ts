@@ -1,6 +1,6 @@
 /**
  * G11-T fixes B and A: the direct byte-stream readable every native-backed
- * incoming stream uses (native-readable.ts), and the opt-in cross-stream
+ * incoming stream uses (native-readable.ts), and the default-on cross-stream
  * read group that feeds many of them through one crossing (read-group.ts,
  * crates/native/src/read_group.rs).
  *

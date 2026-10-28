@@ -356,6 +356,30 @@ release candidate can be redone.
   `WTRANSPORT_DATAGRAM_PUMP=0` restores the inline path. It is an unsupported
   knob (see below), kept for paired A/B measurement.
 
+## Cross-stream read group
+
+Server-accepted incoming streams (bidi and uni) are read through one
+process-level native **read group by default**. One Node-API crossing hands
+JavaScript every queued stream's chunks. At high stream counts this replaces a
+crossing per stream per read. Native server only: client streams and the wasm
+backend always pull directly. Semantics are in `docs/SPEC.md` ("Cross-stream
+read group").
+
+- **Opt out with `WEBTRANSPORT_STREAM_READ_GROUP=0`.** It is read once at module
+  load, and only the exact value `0` turns the group off. Every readable then
+  pulls the addon directly, one crossing per read. Use it to rule the group in
+  or out of a regression. It is supported and keeps its meaning across 1.x.
+- **Memory is bounded by the same budgets as the direct path.** The group
+  reads nothing ahead: a stream's feeder makes one native read per read its
+  consumer has outstanding. Bytes a stalled reader has not asked for stay in
+  the transport, under QUIC flow control and
+  `maxQueuedBytesGlobal` / `PerSession` / `PerStream`. On top of that, the
+  group holds at most one crossing in flight: up to 4096 entries and 1 MiB of
+  payload. Each entry's native buffer and reservation are released as soon as
+  its JavaScript copy exists. Per-stream state (a key and a feeder) leaves the
+  group when the stream is released (dispose, reset, session close), whether
+  or not it was ever read.
+
 ## Escape hatches
 
 Two supported variables put back a pre-1.0 delivery path. Both are read once

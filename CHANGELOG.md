@@ -89,6 +89,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Cross-stream read group, on by default (native server).** Server-accepted
+  incoming streams are read through one process-level native read group, so
+  every stream whose read completed while the event loop was busy crosses
+  Node-API in a single `next()`. Consumer-visible semantics are unchanged: no
+  read-ahead (one native read per outstanding consumer read), terminal events
+  never merged, and memory bounded by the existing QUIC windows and
+  `maxQueuedBytes*` budgets plus one in-flight crossing (at most 4096 entries
+  and 1 MiB). `WEBTRANSPORT_STREAM_READ_GROUP=0` opts out (read once at module
+  load). Native client streams and the wasm backend keep the direct pull. See
+  `docs/SPEC.md` ("Cross-stream read group"), `docs/OPERATIONS.md` and
+  `docs/PARITY_MATRIX.md`.
 - **Wire-visible: sessions closed by `server.close()` now report close code
   `3993` with reason `E_SERVER_CLOSING`** (previously application code `0` with
   the free-text reason `"server closing"`). The new pair is a stable, well-known
