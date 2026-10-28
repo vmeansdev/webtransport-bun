@@ -141,6 +141,33 @@ async function drainReports(
 	return collected;
 }
 
+/**
+ * Wait until the pacer has finished every admitted target, or fail with
+ * `label`. A clump's reports are written while its targets are sent, and the
+ * outstanding count drops only after the whole clump is done, so once it is
+ * zero every report of the schedule so far is in the ring. Draining before
+ * that can split a clump across two reads.
+ */
+async function awaitScheduleIdle(
+	server: WebTransportServer,
+	label: string,
+	budgetMs = 5000,
+): Promise<void> {
+	const deadline = Date.now() + budgetMs;
+	for (;;) {
+		const pending = JSON.parse(
+			__TESTING__.serverInternals(server).__pacerStatsJson?.() ?? "{}",
+		).pendingTargets as number | undefined;
+		if (pending === 0) return;
+		if (Date.now() >= deadline) {
+			throw new Error(
+				`${label}: the pacer still had ${pending ?? "unknown"} targets outstanding after ${budgetMs} ms`,
+			);
+		}
+		await Bun.sleep(5);
+	}
+}
+
 /** Wait until the schedule has no outstanding work, or the budget runs out. */
 async function drainSchedule(
 	server: WebTransportServer,
@@ -370,6 +397,9 @@ describe("paced mirror: on the schedule", () => {
 					payload(0xb5),
 				);
 				expect(admission.admitted).toBe(4);
+				// The whole clump's reports first, so `max` is what splits them
+				// below and not the pacer thread's progress.
+				await awaitScheduleIdle(server, "P-R1 schedule");
 
 				const first = await drainReports(server, 2, 5000, 2);
 				expect(first.map((r) => r.target)).toEqual(["gone-a", "gone-b"]);
