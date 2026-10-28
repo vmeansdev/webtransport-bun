@@ -337,6 +337,30 @@ release candidate can be redone.
   `WTRANSPORT_DATAGRAM_PUMP=0` restores the inline path. It is an unsupported
   knob (see below), kept for paired A/B measurement.
 
+## Escape hatches
+
+Two supported variables put back a pre-1.0 delivery path. Both are read once
+per process (at addon load or module load), default to the shipped path, and
+exist so an operator can rule a regression in or out without a rebuild. They
+are supported: they keep their meaning across 1.x. Use them for diagnosis, not
+as a standing configuration.
+
+- **`WEBTRANSPORT_PAYLOAD_DELIVERY=buffer-copy`** (native addon). By default,
+  payloads of 256 KiB or less reach JavaScript as engine-owned `ArrayBuffer`
+  copies. Their bytes are reported to the engine, so its garbage collector
+  sees the pressure. Measured at 1000 datagrams/s, that keeps RSS flat. The
+  pre-1.0 path, `buffer-copy` (`napi_create_buffer_copy`), never triggered a
+  full collection under the same load and grew about 100 MB/h. Any other value
+  keeps the default. Larger payloads keep the zero-copy handover either way.
+- **`WEBTRANSPORT_DATAGRAM_SEND_SYNC=0`** (JavaScript side). By default,
+  `session.sendDatagram()` first tries a synchronous, promise-free native
+  send. It falls back to the parking Node-API call, which returns a promise,
+  only when the session's byte budget is full. `datagramSendsAsync` in the
+  server snapshot counts those fallbacks. `=0` sends every datagram through
+  the parking call, as before 1.0. Each one hands JavaScript a promise that is
+  a reference on the host event loop, so an echo server under overload can
+  again outlive its own `close()`. Any other value keeps the default.
+
 ## Unsupported tuning knobs
 
 The variables below exist for measurement campaigns. They are **not** part
@@ -359,6 +383,7 @@ falls back to its default. The process is never aborted.
 | `WEBTRANSPORT_NATIVE_SEND_PATH_DIAGNOSTICS` | `0` | `0` \| `1` (process-wide send-path phase banks) |
 | `WEBTRANSPORT_NATIVE_SERVER_UDP_SNDBUF_BYTES` | unset | `0` or `65536..=67108864` |
 | `WTRANSPORT_DATAGRAM_PUMP` | pump on | `0` selects the legacy inline datagram read |
+| `WEBTRANSPORT_DATAGRAM_BATCH_DIAGNOSTICS` | off | `1` arms per-process incoming-datagram batch counters, readable only through `__TESTING__` (JavaScript side, read at module load) |
 
 Two cases are refused at `createServer` rather than replaced by a default,
 because there is no safe default to fall back to. Both fail with a

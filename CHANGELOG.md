@@ -11,8 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **One payload to many sessions.** `WebTransportServer.sendDatagramMirror(targets, payload)`
   fans one datagram out to many of that server's sessions across a single
-  Node-API crossing. Synchronous and non-parking — the fan-out of
-  `trySendDatagram`, not of `sendDatagram` — with a failures-only envelope that
+  Node-API crossing. Synchronous and non-parking — the fan-out of the
+  promise-free fast path `session.sendDatagram()` tries first, not of its
+  parking fallback (there is no public `trySendDatagram`; that name is the
+  addon's internal binding) — with a failures-only envelope that
   is a **set, not a prefix**: every target is attempted independently, so a
   reaped subscriber never stops a broadcast. Targets are owner-scoped by server,
   duplicates are delivered to twice, the peak byte reservation is one payload,

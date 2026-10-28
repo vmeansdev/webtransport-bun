@@ -773,8 +773,8 @@ export interface WebTransportServer {
 	 * Send one payload to many of this server's sessions across a single native
 	 * crossing.
 	 *
-	 * Synchronous and non-parking — the fan-out of `session.trySendDatagram()`,
-	 * not of `session.sendDatagram()`. Every target is attempted independently:
+	 * Synchronous and non-parking — the fan-out of the promise-free fast path
+	 * `session.sendDatagram()` tries first, not of its parking fallback. Every target is attempted independently:
 	 * a subscriber that left between the caller's snapshot and this call lands
 	 * in `failures` and the rest still receive. Duplicated ids are delivered to
 	 * twice, and ids belonging to another server in this process are reported as
@@ -1791,6 +1791,12 @@ function getNativeOrThrow(): NativeAddon {
 // ---------------------------------------------------------------------------
 
 const DATAGRAM_BATCH_ENV = "WEBTRANSPORT_DATAGRAM_BATCH";
+/**
+ * Unsupported internal knob, not public API (docs/OPERATIONS.md,
+ * "Unsupported tuning knobs"): it only arms the counters, and the counters are
+ * readable through `__TESTING__.datagramBatchDiagnosticsSnapshotForTests()`
+ * alone — the same unstable seam every excluded surface uses.
+ */
 const DATAGRAM_BATCH_DIAGNOSTICS_ENV =
 	"WEBTRANSPORT_DATAGRAM_BATCH_DIAGNOSTICS";
 const DEFAULT_DATAGRAM_BATCH = 64;

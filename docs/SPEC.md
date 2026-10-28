@@ -528,8 +528,10 @@ that server's sessions across a single Node-API crossing. It is **native-only**,
 for a stronger reason than batched sending: the crossing it amortizes does not
 exist on wasm, and the wasm backend has no session registry to fan out through.
 
-It is the fan-out of `trySendDatagram`, **not** of `sendDatagram`: the call is
-synchronous, hands JavaScript no promise, and never waits. A promise costs more
+It is the fan-out of the promise-free fast path that `session.sendDatagram()`
+tries first, **not** of its parking fallback: the call is synchronous, hands
+JavaScript no promise, and never waits. (That fast path is the addon's
+internal `trySendDatagram`; it is not a method on the public session.) A promise costs more
 than the whole fan-out below roughly a thousand targets; a serial parking
 fan-out would let one slow subscriber hold every other; a concurrent one would
 allocate a future per target — the allocation the API exists to avoid.

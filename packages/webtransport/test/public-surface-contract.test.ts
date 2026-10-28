@@ -12,9 +12,14 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import type { WasmLimitsOptions } from "../src/backend.js";
 import { connectWasm } from "../src/backend.js";
 import * as rootSurface from "../src/index.js";
-import type { PortableServer, PortableServerSession } from "../src/portable.js";
+import type {
+	PortableLimits,
+	PortableServer,
+	PortableServerSession,
+} from "../src/portable.js";
 import * as portableSurface from "../src/portable.js";
 import * as wasmSurface from "../src/wasm.js";
 import { InMemoryRelay } from "../src/wasm-relay.js";
@@ -188,6 +193,27 @@ type _AssertNoReflectorOnNative = Assert<
 			rootSurface.WebTransportServer,
 			{ setDatagramReflector(rule: unknown): void }
 		>
+	>
+>;
+
+// Explicit QUIC flow-control windows are native-only (PARITY_MATRIX.md §3):
+// they configure quinn's transport, which the wasm backend does not expose. They
+// are on the root `LimitsOptions` (server and client), and on neither the wasm
+// limits nor the portable ones.
+type QuicWindowKeys = "streamReceiveWindow" | "receiveWindow" | "sendWindow";
+type _AssertQuicWindowsOnNativeLimits = Assert<
+	HasKey<rootSurface.LimitsOptions, QuicWindowKeys>
+>;
+type _AssertNoQuicWindowsOnWasmLimits = Assert<
+	Not<HasKey<WasmLimitsOptions, "streamReceiveWindow">>
+>;
+type _AssertNoQuicWindowsOnPortableLimits = Assert<
+	Not<HasKey<PortableLimits, "streamReceiveWindow">>
+>;
+type _AssertQuicWindowsOptional = Assert<
+	Extends<
+		Record<string, never>,
+		Pick<rootSurface.LimitsOptions, QuicWindowKeys>
 	>
 >;
 
@@ -499,6 +525,34 @@ describe("three-surface public API model", () => {
 
 		expect(portableSurface.createServer.constructor.name).toBe("AsyncFunction");
 		expect(wasmSurface.createServer.constructor.name).toBe("AsyncFunction");
+	});
+});
+
+describe("explicit QUIC windows (native-only)", () => {
+	test("the root server accepts all three windows and the addon applies them", async () => {
+		const windows = {
+			streamReceiveWindow: 512 * 1024,
+			receiveWindow: 4 * 1024 * 1024,
+			sendWindow: 3 * 1024 * 1024,
+		};
+		const applied = rootSurface.__TESTING__.transportWindowsForLimitsForTests(
+			windows,
+		) as Record<string, number> | undefined;
+		expect(applied).toMatchObject(windows);
+		const server = rootSurface.createServer({
+			host: "127.0.0.1",
+			port: nativePort(),
+			tls: { certPem: "", keyPem: "" },
+			limits: windows,
+			onSession: () => {},
+		});
+		await server.close();
+	});
+
+	test("they default to absent, so the governors keep deriving them", () => {
+		for (const key of ["streamReceiveWindow", "receiveWindow", "sendWindow"]) {
+			expect(key in rootSurface.DEFAULT_LIMITS).toBe(false);
+		}
 	});
 });
 
