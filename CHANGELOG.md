@@ -5,10 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## Unreleased (1.0.0)
+
+This section is the 1.0.0 release (the package is `1.0.0-rc.1` until it is
+cut). Surfaces under **Experimental** ship in 1.0 but may change in a 1.x minor
+(`docs/SPEC.md`, "Experimental surfaces"). **Removed and internalized** lists
+what was on the release-candidate branch and is deliberately not public in
+1.0.
 
 ### Added
 
+- **Batched incoming datagrams (native).** `incomingDatagrams()` drains the
+  native channel in batches of up to `WEBTRANSPORT_DATAGRAM_BATCH` items per
+  Node-API crossing (default `64`; `0` restores one crossing per datagram,
+  range `0`–`256`). The public iterator still yields one `Uint8Array` at a
+  time, in receive order. Buffering and close-tail deviations are in
+  `docs/SPEC.md` ("Incoming datagram delivery").
+- **`session.sendDatagramBatch(datagrams)` (native).** Many datagrams in one
+  crossing with a resolved **prefix** envelope `{ sent, error? }`. Payloads are
+  copied before it returns, there is one backpressure deadline for the whole
+  call, and an array longer than the 256-element native cap is chunked
+  transparently. Native-only; `/portable` keeps `sendDatagram()`.
+- **Promise-free `sendDatagram()` (native, server and client).**
+  `session.sendDatagram()` first tries a synchronous native send that hands
+  JavaScript no promise. It falls back to the parking call, and counts it in
+  `datagramSendsAsync`, only when the byte budget is full. The call signature
+  is unchanged. `WEBTRANSPORT_DATAGRAM_SEND_SYNC=0` is the escape hatch
+  (`docs/OPERATIONS.md`, "Escape hatches").
+- **Explicit QUIC flow-control windows (native).** `limits.streamReceiveWindow`,
+  `limits.receiveWindow` and `limits.sendWindow` set the advertised transport
+  windows independently of the `maxQueuedBytes*` governors. Each window is
+  still derived from its governor when omitted, which is the old behavior.
+  Native-only (server and client). See `docs/OPERATIONS.md` ("Flow-control
+  windows") for the memory budget.
+- New server metrics: `datagramSendsAsync`, `sessionsClosedByIdle`,
+  `sessionsClosedByReap`, `sessionsClosedOther`, `nativeAsyncOpsPending`, and the
+  native handle and registry gauges (`nativeSessionRegistryEntries`,
+  `nativeTrackedTasks`, `nativeRateLimitEntries`, `native*HandlesLive`). All
+  are documented in `docs/METRICS.md`.
 - **One payload to many sessions.** `WebTransportServer.sendDatagramMirror(targets, payload)`
   fans one datagram out to many of that server's sessions across a single
   Node-API crossing. Synchronous and non-parking — the fan-out of the
@@ -87,8 +121,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The wasm backend rejects streams that never associate with a session using
   `WT_BUFFERED_STREAM_REJECTED`.
 
+### Experimental
+
+- **Egress pacer and the paced mirror.** `createServer({ egressPacer: { pps,
+  clump?, queueMs? } })` turns on a process-wide native egress pacer.
+  `server.sendDatagramMirrorPaced(targets, payload)` hands a fan-out to its
+  schedule and returns an **admission** envelope `{ admitted, refused }`.
+  `server.readMirrorReports(max?)` drains per-target failures out of band from
+  a 4,096-entry ring; `mirrorReportsDropped` counts what overflowed. New
+  metrics: `datagramMirrorPacedCalls`, `datagramMirrorPacedTargets`,
+  `mirrorReportsDropped`. The first pacer configuration a process resolves
+  wins, and a conflicting `egressPacer` fails with `E_INVALID_ARGUMENT`.
+  `WEBTRANSPORT_PACER_PPS` / `_CLUMP` / `_QUEUE_MS` remain a documented fallback
+  when no server passes the option. `sendDatagramMirror` itself is never paced.
+- **Multi-process binds.** `ServerOptions.reusePort` (`SO_REUSEPORT`, unix),
+  `quicLb` (QUIC-LB keyless connection IDs carrying a cleartext server ID,
+  draft-ietf-quic-load-balancers-21 §5.3) and `reusePortSteering` (attach a
+  pinned BPF `SK_REUSEPORT` program and sockarray, Linux). Plus the
+  balancer-side decoders `decodeQuicLbServerId`, `decodeQuicLbConfigRotation`
+  and `quicLbCidLength` on the root entrypoint. Costs and topology are in
+  `docs/OPERATIONS.md`.
+- **Native stream sink.** `openReadSink(stream, opts?)` (and the
+  `openReadSink` method on native streams) drains a stream's readable half off
+  the JS event loop into a `SharedArrayBuffer` ring. A Worker consumes it with
+  `SinkReader`, also importable from the native-free `./sink-reader` subpath.
+  The wasm backend has the same API shape (shape parity, not latency parity).
+  Its `E_SINK_*` codes join the `ErrorCode` union as the experimental
+  `ExperimentalSinkErrorCode` subset. See `docs/RFC_STREAM_SINK.md`.
+- **Incoming stream chunk batching** (`WEBTRANSPORT_STREAM_BATCH_BYTES`, off by
+  default). One crossing coalesces the chunks that have already arrived on a
+  stream. Terminal events are never merged and byte accounting is unchanged.
+
 ### Changed
 
+- **Engine-owned payload delivery (native).** Datagrams and stream chunks of
+  256 KiB or less now reach JavaScript as engine-owned `ArrayBuffer` copies
+  whose bytes the engine's garbage collector accounts for. Under sustained
+  load RSS stays flat where `napi_create_buffer_copy` delivery grew about
+  100 MB/h. `WEBTRANSPORT_PAYLOAD_DELIVERY=buffer-copy` is the escape hatch.
+- **Native server runtime: 2 Tokio workers** (was 1). The per-datagram
+  injection-queue hops are gone, so the second worker is headroom. Every other
+  count measured worse. Not configurable through the public API.
+- **Server close contract.** `server.close()` resolves only after the server's
+  owned sessions are closed and every pending `onSession` callback has
+  settled. `nativeAsyncOpsPending` exposes what the addon still holds on the
+  host event loop. Sessions it ends carry the wire-visible pair below.
+- **Two native transport defaults** (no public knob, recorded in
+  `docs/OPERATIONS.md`): the per-connection datagram receive buffer is now
+  256 KiB (was 64 KiB), and the wtransport fork reads datagrams in a
+  dedicated per-connection pump task instead of inline in the driver's
+  `select!`.
 - **Cross-stream read group, on by default (native server).** Server-accepted
   incoming streams are read through one process-level native read group, so
   every stream whose read completed while the event loop was busy crosses
@@ -138,7 +220,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silently dropping datagrams. `/wasm` remains a candidate surface.
 - All nine `parity-*.test.ts` suites now run against both backends.
 
+### Removed and internalized
+
+None of these were in a published release. They existed on the 1.0
+release-candidate branch for measurement campaigns and are not public in 1.0.
+They remain reachable for this repository's tests and harnesses through the
+unstable `__TESTING__.serverInternals(server)` accessor (`docs/SPEC.md`,
+"Semver rules").
+
+- **Datagram reflector:** `WebTransportServer.setDatagramReflector()`, the
+  `DatagramReflectorRule` / `ReflectorMatch` / `ReflectorOp` type exports, the
+  `serverReflectRingBypass()` getter, and 14 `datagramReflect*` metrics.
+- **Campaign getters and diagnostics:** `serverWorkerThreads()`,
+  `serverRecvRuntime()`, `serverAckCadence()`, `serverUdpSendBufferBytes()`,
+  `serverUdpSendBatch()`, `serverDatagramDriver()`,
+  `serverUdpSendEagainMode()`, `__sendPathDiagnostics()`,
+  `__pacerStatsSnapshot()` and `__pacerStatsJson()`.
+- **Campaign metrics:** `udpSendBatch*` (8), `datagramPumpsSpawned`,
+  `datagramPumpsLive`, `quicSessions` and the six `quic*` loss-attribution
+  sums. The public `metricsSnapshot()` strips them at runtime.
+- **Unsupported tuning knobs** (`WEBTRANSPORT_NATIVE_*`, `WTRANSPORT_DATAGRAM_PUMP`,
+  `WEBTRANSPORT_DATAGRAM_BATCH_DIAGNOSTICS`, `WEBTRANSPORT_PACER_NICE` /
+  `_SCHED`) are listed in `docs/OPERATIONS.md` as unsupported. An invalid
+  value now logs one warning and falls back to the default; it no longer
+  aborts the process.
+- **Comparison supervisor out of the addon crate.** The comparison-campaign
+  supervisor (`comparison-supervisor`, `observe-directory-identity`, and its
+  secure filesystem boundary) moved from `crates/native` to its own workspace
+  crate, `crates/compare-supervisor`. The addon crate is a plain `cdylib` again
+  (no `rlib`, no bins) and no longer depends on `ed25519-dalek` or `rand_core`.
+
 ### Fixed
+
+- Clients bind their endpoint in the destination's address family, so an
+  ephemeral port draw can no longer take a port a local IPv4 socket already
+  owns.
+- The platform trust store is read once per process instead of once per
+  `WebTransport` connect.
+- A clean connection end no longer discards datagrams still queued for the
+  application.
+- A receive batch that consumed a `RESET_STREAM` latches it, so batching can
+  no longer downgrade a reset to a clean EOF.
+- Hot async Node-API calls resolve an error string instead of rejecting. Under
+  Bun, a rejection leaked a strong self-reference on its handle.
+- The client session handle implements the promise-free datagram send, so the
+  fast path is live on clients too.
 
 - A wasm session that closed itself reported `reason: undefined` from `closed`; the
   caller's close reason is now retained locally, matching native.
