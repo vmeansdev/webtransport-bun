@@ -241,9 +241,14 @@ unstable `__TESTING__.serverInternals(server)` accessor (`docs/SPEC.md`,
   sums. The public `metricsSnapshot()` strips them at runtime.
 - **Unsupported tuning knobs** (`WEBTRANSPORT_NATIVE_*`, `WTRANSPORT_DATAGRAM_PUMP`,
   `WEBTRANSPORT_DATAGRAM_BATCH_DIAGNOSTICS`, `WEBTRANSPORT_PACER_NICE` /
-  `_SCHED`) are listed in `docs/OPERATIONS.md` as unsupported. An invalid
-  value now logs one warning and falls back to the default; it no longer
-  aborts the process.
+  `_SCHED`, `WEBTRANSPORT_PACER_PPS` / `_CLUMP` / `_QUEUE_MS`) are listed
+  in `docs/OPERATIONS.md` as unsupported or fallback-only. A malformed or
+  out-of-range value now logs one warning and falls back to the default; it
+  never aborts the process and never fails `createServer`. Two
+  well-formed requests that cannot be honoured still fail `createServer`
+  with a recoverable `E_INTERNAL: server startup failed`: EAGAIN `drop` mode
+  combined with UDP send batching, and a UDP send buffer the OS caps below
+  the requested size.
 - **Comparison supervisor out of the addon crate.** The comparison-campaign
   supervisor (`comparison-supervisor`, `observe-directory-identity`, and its
   secure filesystem boundary) moved from `crates/native` to its own workspace

@@ -185,7 +185,14 @@ pub(crate) fn server_udp_send_buffer_bytes() -> Result<Option<usize>, String> {
     RESOLVED
         .get_or_init(|| {
             let raw = std::env::var("WEBTRANSPORT_NATIVE_SERVER_UDP_SNDBUF_BYTES").ok();
-            parse_server_udp_send_buffer_bytes(raw.as_deref())
+            // Like every other unsupported knob, a malformed value warns once
+            // and falls back to the default (the untouched bind path) instead
+            // of failing every createServer in the process. A valid value the
+            // OS will not honour is still a startup error, raised at bind.
+            parse_server_udp_send_buffer_bytes(raw.as_deref()).or_else(|msg| {
+                warn_invalid_knob(&msg, "0, the default bind path");
+                Ok(None)
+            })
         })
         .clone()
 }
@@ -2212,7 +2219,7 @@ mod server_udp_send_buffer_bytes_tests {
             "1", "65535", "67108865", "abc", " 65536", "+65536", "65536.0",
         ] {
             let err = parse_server_udp_send_buffer_bytes(Some(raw))
-                .expect_err("invalid send-buffer knob must fail closed");
+                .expect_err("the parser must reject an invalid send-buffer knob");
             assert!(err.contains("WEBTRANSPORT_NATIVE_SERVER_UDP_SNDBUF_BYTES"));
             assert!(err.contains(raw));
         }

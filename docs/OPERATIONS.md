@@ -443,11 +443,16 @@ falls back to its default. The process is never aborted.
 | `WEBTRANSPORT_DATAGRAM_BATCH_DIAGNOSTICS` | off | `1` arms per-process incoming-datagram batch counters, readable only through `__TESTING__` (JavaScript side, read at module load) |
 
 Two cases are refused at `createServer` rather than replaced by a default,
-because there is no safe default to fall back to. Both fail with a
-recoverable `E_INTERNAL: server startup failed: ...`, never an abort:
-`WEBTRANSPORT_NATIVE_UDP_SEND_EAGAIN_MODE=drop` together with a non-zero
-`WEBTRANSPORT_NATIVE_UDP_SEND_BATCH`, and a malformed
-`WEBTRANSPORT_NATIVE_SERVER_UDP_SNDBUF_BYTES`.
+because the request itself cannot be honoured. Both fail with a recoverable
+`E_INTERNAL: server startup failed: ...`, never an abort:
+
+- `WEBTRANSPORT_NATIVE_UDP_SEND_EAGAIN_MODE=drop` together with a non-zero
+  `WEBTRANSPORT_NATIVE_UDP_SEND_BATCH` (two valid values that conflict);
+- a well-formed `WEBTRANSPORT_NATIVE_SERVER_UDP_SNDBUF_BYTES` that the OS caps
+  below the requested size at bind.
+
+A *malformed* `WEBTRANSPORT_NATIVE_SERVER_UDP_SNDBUF_BYTES` warns and falls
+back like every other knob.
 
 ## Sizing the JS read side (stream tail latency)
 

@@ -69,13 +69,14 @@ describe("server udp send buffer", () => {
 		expect(stdout).toContain("serverUdpSendBufferBytes=0");
 	}, 60_000);
 
-	it("fails closed on an invalid override", async () => {
-		const { code, stderr } = await child("65535");
-		expect(code).not.toBe(0);
+	it("warns once and falls back to the default path on a malformed override", async () => {
+		const { code, stdout, stderr } = await child("65535");
+		expect(code).toBe(0);
+		expect(stdout).toContain("serverUdpSendBufferBytes=0");
 		expect(stderr).toContain(
-			"E_INTERNAL: server startup failed: WEBTRANSPORT_NATIVE_SERVER_UDP_SNDBUF_BYTES",
+			"webtransport-native: warning: WEBTRANSPORT_NATIVE_SERVER_UDP_SNDBUF_BYTES must be unset, empty, 0, or an integer 65536..=67108864, got '65535'; ignoring it and using the default (0, the default bind path)",
 		);
-		expect(stderr).toContain("'65535'");
+		expect(stderr).not.toContain("server startup failed");
 	}, 60_000);
 
 	it("either starts with the requested knob or fails explicitly on an OS send-buffer cap", async () => {
