@@ -835,17 +835,20 @@ Removing one outright still takes a major release.
 
 ## API stability and semver
 
-### The three exported surfaces
+### The exported surfaces
 
-The package exports exactly three entrypoints, and they promise different
-things. `packages/webtransport/test/public-surface-contract.test.ts` freezes all
-three — the export lists at runtime, and the shared session/server contract both
-at compile time (`tsc --noEmit`) and against a live session from each backend.
+The package exports exactly **four** entrypoints: the three API surfaces below
+and the experimental `./sink-reader` subpath. They promise different things.
+`packages/webtransport/test/public-surface-contract.test.ts` freezes all four
+export lists at runtime. It also checks the shared session/server contract of
+the three API surfaces at compile time (`tsc --noEmit`) and against a live
+session from each backend.
 
 | Entrypoint | Contract |
 | --- | --- |
 | `@webtransport-bun/webtransport` (root) | Native Node-API server/client API. `createServer()` is **synchronous**. Node streams (`Duplex`/`Writable`) on the session stream constructors. Native-only capabilities live here and only here: `releaseNativeMemory()`, `exportTicketVault`/`importTicketVault`, `connect()`, `metricsToPrometheus()`, `ServerSession.goAway()`, SNI/cert rotation, keep-alive and congestion-control knobs. |
 | `@webtransport-bun/webtransport/wasm` | Async WASM/IWA API. `createServer()` returns a promise. Backend-specific extensions are allowed and documented here: Direct Sockets binding, `UdpTransport` injection, ticket-store hosts, `serveOverUdp`, self-signed cert generation and `certHashBase64` pinning. |
+| `@webtransport-bun/webtransport/sink-reader` (**experimental**) | The Worker-side consumer of the native stream sink: `SinkReader` and its record types, importable without loading any native code. It is the same `SinkReader` the root re-exports, and it may change in a 1.x minor with the rest of the sink (see "Experimental surfaces"). |
 | `@webtransport-bun/webtransport/portable` | The common async subset implemented by *both* backends: one `createServer()` returning `PortableServer`, whose sessions expose `id`, `peer`, `ready`, `closed`, `close()`, `drain()`, `sendDatagram()`, `incomingDatagrams()`, the two incoming-stream `ReadableStream`s, the two stream constructors, and `metricsSnapshot()`. Stream constructors resolve to W3C `{ readable, writable }` pairs on both backends. `incomingDatagrams()` is equal *within the contract*: same item type, memoization, receive order, and bounded termination, but not identical hidden buffering — native batching stays active behind `/portable`, with the bounds in "Incoming datagram delivery" above. |
 
 Capabilities only one backend can honour stay out of `/portable` by design —

@@ -242,7 +242,8 @@ surfaced through the facade; see the implemented rows above and
 
 `docs/release-status.json` is canonical. Both `native` and `wasm` are currently
 labelled `candidate`; neither is `stable`. Note that the *export lists* of all
-three entrypoints are frozen by
+four entrypoints (root, `/wasm`, `/portable` and the experimental
+`/sink-reader`) are frozen by
 `packages/webtransport/test/public-surface-contract.test.ts` regardless of the
 stability label — freezing names is a semver promise about the API shape, not a
 claim that the behavior behind unpassed gates is settled. See `docs/SPEC.md`,

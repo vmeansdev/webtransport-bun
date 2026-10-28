@@ -21,6 +21,7 @@ import type {
 	PortableServerSession,
 } from "../src/portable.js";
 import * as portableSurface from "../src/portable.js";
+import * as sinkReaderSurface from "../src/sink-reader.js";
 import * as wasmSurface from "../src/wasm.js";
 import { InMemoryRelay } from "../src/wasm-relay.js";
 import type { WasmServerSession } from "../src/wasm-server-session.js";
@@ -279,8 +280,8 @@ const ROOT_EXPORTS = [
 	// (semver-minor) widening of the native surface rather than a reshaping of
 	// it: they are the balancer's half of the `quicLb` server option, and a
 	// balancer cannot reach them anywhere else — the package's `exports` map is
-	// pinned to exactly three subpaths by the test below, so a module that is
-	// not re-exported from one of the three is unreachable for consumers.
+	// pinned to exactly four subpaths by the test below, so a module that is
+	// not re-exported from one of them is unreachable for consumers.
 	"decodeQuicLbConfigRotation",
 	"decodeQuicLbServerId",
 	"exportTicketVault",
@@ -513,6 +514,12 @@ describe("three-surface public API model", () => {
 
 	test("the /wasm surface is frozen", () => {
 		expect(Object.keys(wasmSurface).sort()).toEqual(WASM_EXPORTS);
+	});
+
+	test("the experimental /sink-reader surface is frozen", () => {
+		// The fourth entrypoint: the native-free Worker half of the stream sink.
+		expect(Object.keys(sinkReaderSurface).sort()).toEqual(["SinkReader"]);
+		expect(sinkReaderSurface.SinkReader).toBe(rootSurface.SinkReader);
 	});
 
 	test("the /portable surface is the common subset, and only that", () => {
