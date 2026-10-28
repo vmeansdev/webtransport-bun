@@ -475,6 +475,10 @@ pub(crate) struct PacerCore {
     interval: Duration,
     horizon: Duration,
     cursor: Option<Instant>,
+    /// Resets this schedule made. The process-wide `RESETS` counter is what
+    /// the stats report; this per-instance count is what a test can assert
+    /// exactly, since `RESETS` is shared with every test running in parallel.
+    resets: u64,
 }
 
 impl PacerCore {
@@ -484,6 +488,7 @@ impl PacerCore {
             interval,
             horizon: interval * CATCHUP_CLUMPS,
             cursor: None,
+            resets: 0,
         }
     }
 
@@ -500,6 +505,7 @@ impl PacerCore {
             Some(cursor) if cursor + self.horizon >= now => cursor,
             _ => {
                 if self.cursor.is_some() {
+                    self.resets += 1;
                     RESETS.fetch_add(1, Ordering::Relaxed);
                 }
                 now
@@ -1188,12 +1194,13 @@ mod tests {
         let mut core = PacerCore::new(&cfg);
         let start = Instant::now();
         core.next_txtime(start);
-        let before = RESETS.load(Ordering::Relaxed);
         // One clump of lateness — inside the catch-up allowance, so the cadence
-        // survives instead of restarting on every descheduled tick.
+        // survives instead of restarting on every descheduled tick. Asserted on
+        // this schedule's own count: the global `RESETS` moves under every
+        // parallel test that stalls a schedule of its own.
         let tx = core.next_txtime(start + cfg.interval() * 2);
         assert_eq!(tx, start + cfg.interval(), "one late tick is not a reset");
-        assert_eq!(RESETS.load(Ordering::Relaxed), before);
+        assert_eq!(core.resets, 0);
     }
 
     #[test]
@@ -1212,7 +1219,10 @@ mod tests {
             resumed,
             "a long stall must not owe the schedule a catch-up burst"
         );
-        assert_eq!(RESETS.load(Ordering::Relaxed), before + 1);
+        assert_eq!(core.resets, 1);
+        // The process-wide counter the stats report moved too. Only a lower
+        // bound is sound: parallel tests may add their own resets.
+        assert!(RESETS.load(Ordering::Relaxed) > before);
     }
 
     /// The paced envelope is a set: every target carries its own decision, and a
