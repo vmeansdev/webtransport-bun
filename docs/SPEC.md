@@ -641,7 +641,11 @@ paced envelope is a different object with a different vocabulary.
   server that passes it or, failing that, the environment fallback
   `WEBTRANSPORT_PACER_PPS` / `_CLUMP` / `_QUEUE_MS` on first use. A later server
   that asks for a different configuration fails with `E_INVALID_ARGUMENT`;
-  the identical one is accepted.
+  the identical one is accepted. The configuration is committed only after
+  the server is created, so a failed `createServer` does not consume it.
+  Bounds: `pps` 1–1,000,000, `queueMs` 1–5000. The queue is capped at
+  `pps × queueMs / 1000` targets and at 64 MiB of queued bytes (payload once
+  per job plus target ids). Admission refuses past either bound.
 - **With the pacer off** it throws a `WebTransportError` with code
   `E_UNSUPPORTED_ARGUMENT` rather than quietly running the inline loop, with a
   distinct message from the one an addon built without the pacer produces.

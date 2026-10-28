@@ -22,6 +22,19 @@ const { connectWithRetry } = await import(${JSON.stringify(
 const port = ${nextPort(BASE_PORT, PORT_SPREAD)};
 const accepted = Promise.withResolvers();
 const pacer = JSON.parse(process.env.CHILD_PACER ?? "null");
+const failFirst = JSON.parse(process.env.CHILD_FAIL_FIRST ?? "null");
+if (failFirst) {
+	// A first createServer that fails at bind (the port is taken) must not
+	// consume the process-wide pacer configuration it asked for.
+	const blocker = createServer({ port: port + 1, tls: { certPem: "", keyPem: "" }, onSession: () => {} });
+	try {
+		createServer({ port: port + 1, tls: { certPem: "", keyPem: "" }, egressPacer: failFirst, onSession: () => {} });
+		console.log("firstFail=none");
+	} catch (error) {
+		console.log("firstFail=" + error.message.split(":")[0]);
+	}
+	await blocker.close();
+}
 const server = createServer({
 	port,
 	tls: { certPem: "", keyPem: "" },
@@ -69,6 +82,7 @@ async function child(
 	pacer: unknown,
 	env: Record<string, string | undefined> = {},
 	second: unknown[] = [],
+	failFirst: unknown = null,
 ): Promise<{ code: number; stdout: string; stderr: string }> {
 	const merged: Record<string, string | undefined> = { ...process.env };
 	delete merged.WEBTRANSPORT_PACER_PPS;
@@ -77,6 +91,7 @@ async function child(
 	Object.assign(merged, env, {
 		CHILD_PACER: JSON.stringify(pacer),
 		CHILD_SECOND: JSON.stringify(second),
+		CHILD_FAIL_FIRST: JSON.stringify(failFirst),
 	});
 	const proc = Bun.spawn(["bun", "-e", CHILD], {
 		env: merged,
@@ -153,8 +168,49 @@ describe("egressPacer option", () => {
 		expect(stdout).toContain("egressPacer");
 	}, 30_000);
 
+	it("a failed first createServer does not consume the configuration", async () => {
+		const { code, stdout } = await child({ pps: 60_000 }, {}, [], {
+			pps: 30_000,
+		});
+		expect(code).toBe(0);
+		expect(stdout).toContain("firstFail=E_INTERNAL");
+		expect(stdout).toContain("admitted=1");
+		expect(stdout).toContain("pacer=60000/32/250");
+	}, 30_000);
+
+	it("warns once and turns the pacer off on a malformed WEBTRANSPORT_PACER_PPS", async () => {
+		const { code, stdout, stderr } = await child(null, {
+			WEBTRANSPORT_PACER_PPS: "30000pps",
+		});
+		expect(code).toBe(0);
+		expect(stdout).toContain("pacedError=E_UNSUPPORTED_ARGUMENT");
+		expect(stderr).toContain(
+			"webtransport-native: warning: WEBTRANSPORT_PACER_PPS must be an integer 0..=1000000, got '30000pps'; ignoring it and using the default (0, pacer off)",
+		);
+		expect(stderr.split("WEBTRANSPORT_PACER_PPS").length - 1).toBe(1);
+	}, 30_000);
+
+	it("warns and falls back to the defaults on a malformed clump or window", async () => {
+		const { stdout, stderr } = await child(null, {
+			WEBTRANSPORT_PACER_PPS: "30000",
+			WEBTRANSPORT_PACER_CLUMP: "abc",
+			WEBTRANSPORT_PACER_QUEUE_MS: "999999",
+		});
+		expect(stdout).toContain("admitted=1");
+		expect(stdout).toContain("pacer=30000/32/250");
+		expect(stderr).toContain(
+			"WEBTRANSPORT_PACER_CLUMP must be an integer 1..=64, got 'abc'; ignoring it and using the default (32)",
+		);
+		expect(stderr).toContain(
+			"WEBTRANSPORT_PACER_QUEUE_MS must be an integer 1..=5000, got '999999'; ignoring it and using the default (250)",
+		);
+	}, 30_000);
+
 	it("rejects a malformed option before touching the addon", () => {
 		for (const bad of [
+			{ pps: 1_000_001 },
+			{ pps: Number.MAX_SAFE_INTEGER, queueMs: Number.MAX_SAFE_INTEGER },
+			{ pps: 1000, queueMs: 5001 },
 			{ pps: 0 },
 			{ pps: 1.5 },
 			{ pps: 1000, clump: 65 },

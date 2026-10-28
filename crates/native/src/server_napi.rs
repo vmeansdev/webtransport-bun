@@ -206,21 +206,24 @@ impl ServerHandle {
             // The experimental egress pacer (`egressPacer`): process-wide, so
             // the first configuration wins and a conflicting one is refused.
             // The JS facade has already validated the shape.
-            if let Some(pacer) = server_opts.get("egressPacer").filter(|v| v.is_object()) {
-                let pps = pacer.get("pps").and_then(|v| v.as_u64()).unwrap_or(0);
-                if pps == 0 {
-                    return Err(napi::Error::from_reason(
-                        "E_INVALID_ARGUMENT: egressPacer.pps must be a positive integer"
-                            .to_string(),
-                    ));
+            // Checked here, committed only after the server exists (below), so
+            // a createServer that fails cannot consume the one configuration.
+            let pacer_config = match server_opts.get("egressPacer").filter(|v| v.is_object()) {
+                Some(pacer) => {
+                    let field = |k: &str| pacer.get(k).and_then(|v| v.as_u64());
+                    let wanted = crate::egress_pacer::option_config(
+                        field("pps"),
+                        field("clump"),
+                        field("queueMs"),
+                    )
+                    .and_then(|cfg| crate::egress_pacer::check_config(&cfg).map(|()| cfg))
+                    .map_err(|msg| {
+                        napi::Error::from_reason(format!("E_INVALID_ARGUMENT: {}", msg))
+                    })?;
+                    Some(wanted)
                 }
-                crate::egress_pacer::install_config(crate::egress_pacer::pacer_config(
-                    pps,
-                    pacer.get("clump").and_then(|v| v.as_u64()),
-                    pacer.get("queueMs").and_then(|v| v.as_u64()),
-                ))
-                .map_err(|msg| napi::Error::from_reason(format!("E_INVALID_ARGUMENT: {}", msg)))?;
-            }
+                None => None,
+            };
             let limits = crate::limits::Limits::from_json(&_limits_json);
             let rate_limits = crate::rate_limit::RateLimits::from_json(&_rate_limits_json);
             crate::panic_guard::set_panic_log_verbose(debug);
@@ -274,6 +277,19 @@ impl ServerHandle {
             .map_err(|msg| {
                 napi::Error::from_reason(format!("E_INTERNAL: server startup failed: {}", msg))
             })?;
+            if let Some(cfg) = pacer_config {
+                // The server is up; now the configuration is the process's.
+                // Only a concurrent create from another JS thread can make this
+                // fail after the pre-flight, and then this server is torn down
+                // rather than left running without the pacer it asked for.
+                if let Err(msg) = crate::egress_pacer::install_config(cfg) {
+                    let _ = shutdown_tx.send(());
+                    return Err(napi::Error::from_reason(format!(
+                        "E_INVALID_ARGUMENT: {}",
+                        msg
+                    )));
+                }
+            }
 
             Ok(Self {
                 server_id,

@@ -36,6 +36,27 @@ const CLUMP_DEFAULT: usize = 32;
 /// Milliseconds of scheduled work the admission bound allows by default.
 const QUEUE_MS_DEFAULT: u64 = 250;
 
+/// Registered maximum rate. Above it the configuration is refused (option) or
+/// ignored with a warning (environment): the target-count bound is
+/// `pps × queueMs / 1000`, and an unbounded product is an unbounded queue.
+pub(crate) const PPS_MAX: u64 = 1_000_000;
+
+/// Registered maximum admission window, in milliseconds at the configured rate.
+pub(crate) const QUEUE_MS_MAX: u64 = 5_000;
+
+/// Byte cap on everything the schedule holds: each queued job's payload once,
+/// plus every queued target id and its per-entry overhead. The pacer's own
+/// documented cap (docs/OPERATIONS.md, "Egress pacer"), independent of the
+/// session/global byte governors, which only see a datagram once the pacer
+/// thread hands it to a session. A submission whose admitted prefix would
+/// cross it is refused from that index on with `E_WOULD_BLOCK`, like the
+/// target-count bound.
+pub(crate) const QUEUED_BYTES_MAX: u64 = 64 * 1024 * 1024;
+
+/// Accounted cost of one queued target beyond its id bytes (the `String`
+/// header in the job's target vector).
+const TARGET_OVERHEAD_BYTES: u64 = 24;
+
 /// How many clumps of lateness the schedule will pay back at once before it
 /// gives up on the debt and restarts the cadence at `now`.
 ///
@@ -108,24 +129,108 @@ static CONFIG: OnceLock<Option<PacerConfig>> = OnceLock::new();
 /// The resolved configuration. `None` means the pacer is off and the mirror
 /// send runs its inline loop unchanged.
 ///
-/// Every malformed or out-of-range value is clamped or read as off. This path
-/// must never throw: it runs inside a synchronous N-API method whose whole
+/// A malformed or out-of-range environment value warns once and falls back to
+/// its default (see [`config_from_env`]). This path must never throw: it runs inside a synchronous N-API method whose whole
 /// contract is that it does not.
 pub(crate) fn config() -> Option<&'static PacerConfig> {
     CONFIG.get_or_init(config_from_env).as_ref()
 }
 
 /// The environment fallback (`WEBTRANSPORT_PACER_PPS`, `_CLUMP`, `_QUEUE_MS`).
+///
+/// Like every other knob, a malformed or out-of-range value logs one warning
+/// (this runs once, behind `CONFIG`) and falls back to its default: off for
+/// the rate, 32 for the clump, 250 for the window.
 fn config_from_env() -> Option<PacerConfig> {
-    let pps = env_u64("WEBTRANSPORT_PACER_PPS").unwrap_or(0);
-    if pps == 0 {
-        return None;
+    let env = |name: &str| std::env::var(name).ok();
+    let pps = match parse_knob(
+        "WEBTRANSPORT_PACER_PPS",
+        env("WEBTRANSPORT_PACER_PPS").as_deref(),
+        0,
+        PPS_MAX,
+    ) {
+        Knob::Unset | Knob::Value(0) => return None,
+        Knob::Value(v) => v,
+        Knob::Invalid(msg) => {
+            crate::warn_invalid_knob(&msg, "0, pacer off");
+            return None;
+        }
+    };
+    let clump = match parse_knob(
+        "WEBTRANSPORT_PACER_CLUMP",
+        env("WEBTRANSPORT_PACER_CLUMP").as_deref(),
+        1,
+        CLUMP_MAX as u64,
+    ) {
+        Knob::Value(v) => Some(v),
+        Knob::Unset => None,
+        Knob::Invalid(msg) => {
+            crate::warn_invalid_knob(&msg, &CLUMP_DEFAULT.to_string());
+            None
+        }
+    };
+    let queue_ms = match parse_knob(
+        "WEBTRANSPORT_PACER_QUEUE_MS",
+        env("WEBTRANSPORT_PACER_QUEUE_MS").as_deref(),
+        1,
+        QUEUE_MS_MAX,
+    ) {
+        Knob::Value(v) => Some(v),
+        Knob::Unset => None,
+        Knob::Invalid(msg) => {
+            crate::warn_invalid_knob(&msg, &QUEUE_MS_DEFAULT.to_string());
+            None
+        }
+    };
+    Some(pacer_config(pps, clump, queue_ms))
+}
+
+/// One integer knob, read: unset (or empty), a value in `min..=max`, or why it
+/// is invalid. Pure so the rules are testable without the process memo.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Knob {
+    Unset,
+    Value(u64),
+    Invalid(String),
+}
+
+pub(crate) fn parse_knob(name: &str, raw: Option<&str>, min: u64, max: u64) -> Knob {
+    let Some(raw) = raw.map(str::trim) else {
+        return Knob::Unset;
+    };
+    if raw.is_empty() {
+        return Knob::Unset;
     }
-    Some(pacer_config(
-        pps,
-        env_u64("WEBTRANSPORT_PACER_CLUMP"),
-        env_u64("WEBTRANSPORT_PACER_QUEUE_MS"),
-    ))
+    match raw.parse::<u64>() {
+        Ok(v) if (min..=max).contains(&v) => Knob::Value(v),
+        _ => Knob::Invalid(format!(
+            "{name} must be an integer {min}..={max}, got '{raw}'"
+        )),
+    }
+}
+
+/// The `egressPacer` option, bounds-checked: `pps` 1..=[`PPS_MAX`], `clump`
+/// 1..=64, `queueMs` 1..=[`QUEUE_MS_MAX`]. The facade checks the same bounds;
+/// this is the backstop for a caller that reaches the addon directly.
+pub(crate) fn option_config(
+    pps: Option<u64>,
+    clump: Option<u64>,
+    queue_ms: Option<u64>,
+) -> Result<PacerConfig, String> {
+    let pps = pps
+        .filter(|v| (1..=PPS_MAX).contains(v))
+        .ok_or_else(|| format!("egressPacer.pps must be an integer 1..={PPS_MAX}"))?;
+    if clump.is_some_and(|v| !(1..=CLUMP_MAX as u64).contains(&v)) {
+        return Err(format!(
+            "egressPacer.clump must be an integer 1..={CLUMP_MAX}"
+        ));
+    }
+    if queue_ms.is_some_and(|v| !(1..=QUEUE_MS_MAX).contains(&v)) {
+        return Err(format!(
+            "egressPacer.queueMs must be an integer 1..={QUEUE_MS_MAX}"
+        ));
+    }
+    Ok(pacer_config(pps, clump, queue_ms))
 }
 
 /// A configuration with the same clamps and defaults whichever source it came
@@ -146,8 +251,20 @@ pub(crate) fn pacer_config(pps: u64, clump: Option<u64>, queue_ms: Option<u64>) 
 /// for the identical configuration is fine (several servers in one process may
 /// all pass it); asking for a different one, or for a pacer after the process
 /// already resolved "off", is refused rather than silently ignored.
+///
+/// Call it only once the server that asked has been created (TLS parsed,
+/// socket bound): a `createServer` that fails must not consume the process's
+/// one configuration. [`check_config`] is the non-committing pre-flight.
 pub(crate) fn install_config(wanted: PacerConfig) -> Result<(), String> {
     reconcile(CONFIG.get_or_init(|| Some(wanted)).as_ref(), &wanted)
+}
+
+/// Would [`install_config`] accept `wanted` right now? Commits nothing.
+pub(crate) fn check_config(wanted: &PacerConfig) -> Result<(), String> {
+    match CONFIG.get() {
+        None => Ok(()),
+        Some(resolved) => reconcile(resolved.as_ref(), wanted),
+    }
 }
 
 fn reconcile(resolved: Option<&PacerConfig>, wanted: &PacerConfig) -> Result<(), String> {
@@ -162,10 +279,6 @@ fn reconcile(resolved: Option<&PacerConfig>, wanted: &PacerConfig) -> Result<(),
                 .to_string(),
         ),
     }
-}
-
-fn env_u64(name: &str) -> Option<u64> {
-    std::env::var(name).ok()?.trim().parse::<u64>().ok()
 }
 
 /// Scheduling priority the pacer thread should ask the kernel for.
@@ -209,10 +322,20 @@ pub(crate) fn parse_priority(nice: Option<&str>, sched: Option<&str>) -> Priorit
 fn priority_request() -> &'static PriorityRequest {
     static REQUEST: OnceLock<PriorityRequest> = OnceLock::new();
     REQUEST.get_or_init(|| {
-        parse_priority(
-            std::env::var("WEBTRANSPORT_PACER_NICE").ok().as_deref(),
-            std::env::var("WEBTRANSPORT_PACER_SCHED").ok().as_deref(),
-        )
+        let nice = std::env::var("WEBTRANSPORT_PACER_NICE").ok();
+        let sched = std::env::var("WEBTRANSPORT_PACER_SCHED").ok();
+        let request = parse_priority(nice.as_deref(), sched.as_deref());
+        if request.malformed {
+            crate::warn_invalid_knob(
+                &format!(
+                    "WEBTRANSPORT_PACER_NICE must be an integer and WEBTRANSPORT_PACER_SCHED must be rr:<prio>, got '{}' / '{}'",
+                    nice.unwrap_or_default(),
+                    sched.unwrap_or_default()
+                ),
+                "the unparsable one unset",
+            );
+        }
+        request
     })
 }
 
@@ -408,12 +531,16 @@ struct Job {
     /// One copy of the payload for the whole fan-out, exactly as the inline
     /// path holds one — `Arc` only because the job outlives the JS call.
     payload: Arc<Vec<u8>>,
+    /// What this job charges against [`QUEUED_BYTES_MAX`]; released when the
+    /// pacer thread has finished it.
+    bytes: u64,
 }
 
 #[derive(Default)]
 struct Queue {
     jobs: VecDeque<Job>,
     pending_targets: u64,
+    pending_bytes: u64,
     thread_running: bool,
 }
 
@@ -601,7 +728,11 @@ pub(crate) fn stats_json(since: Option<u32>) -> String {
     let Some(cfg) = config() else {
         return "{}".to_string();
     };
-    let pending = pacer().queue.lock().map(|q| q.pending_targets).unwrap_or(0);
+    let (pending, pending_bytes) = pacer()
+        .queue
+        .lock()
+        .map(|q| (q.pending_targets, q.pending_bytes))
+        .unwrap_or((0, 0));
     let now = Counters::load();
     let window = since.and_then(|token| {
         let earlier = read_mark(token)?;
@@ -622,6 +753,8 @@ pub(crate) fn stats_json(since: Option<u32>) -> String {
         // See `max_pending` for why the millisecond knob is nominal.
         "maxPendingTargets": cfg.max_pending(),
         "pendingTargets": pending,
+        "maxPendingBytes": QUEUED_BYTES_MAX,
+        "pendingBytes": pending_bytes,
         // Reports waiting to be drained, all servers in this process together.
         "pendingReports": reports().lock().map(|ring| ring.len()).unwrap_or(0),
         "priority": priority_json(),
@@ -636,6 +769,36 @@ pub(crate) fn stats_json(since: Option<u32>) -> String {
 /// Pure so the admission rule is testable without a thread: the tail past the
 /// bound becomes `E_WOULD_BLOCK`, which is the code a caller already handles for
 /// a target with no byte budget.
+/// How many of `candidates` (already within the target-count bound) also fit
+/// the byte cap: the job's payload is charged once, then each target its id
+/// length plus [`TARGET_OVERHEAD_BYTES`], in order. Returns the count and the
+/// bytes the admitted job would charge.
+pub(crate) fn admit_by_bytes(
+    pending_bytes: u64,
+    payload_len: usize,
+    candidates: &[String],
+    max_bytes: u64,
+) -> (usize, u64) {
+    let mut charged = payload_len as u64;
+    if pending_bytes.saturating_add(charged) > max_bytes {
+        return (0, 0);
+    }
+    let mut admitted = 0;
+    for target in candidates {
+        let next = charged + target.len() as u64 + TARGET_OVERHEAD_BYTES;
+        if pending_bytes.saturating_add(next) > max_bytes {
+            break;
+        }
+        charged = next;
+        admitted += 1;
+    }
+    if admitted == 0 {
+        (0, 0)
+    } else {
+        (admitted, charged)
+    }
+}
+
 pub(crate) fn admit_count(pending: u64, wanted: usize, max_pending: u64) -> usize {
     let room = max_pending.saturating_sub(pending);
     (wanted as u64).min(room) as usize
@@ -769,7 +932,14 @@ pub(crate) fn submit(
             // everything and let the caller fall back per target.
             Err(_) => return crate::datagram_mirror::fan_out(targets.len(), |_| Some(WOULD_BLOCK)),
         };
-        let decisions = admit_per_index(queue.pending_targets, in_cap, cfg.max_pending());
+        let by_count = admit_count(queue.pending_targets, in_cap, cfg.max_pending());
+        let (room, job_bytes) = admit_by_bytes(
+            queue.pending_bytes,
+            payload.len(),
+            &targets[..by_count],
+            QUEUED_BYTES_MAX,
+        );
+        let decisions = admit_per_index(0, in_cap, room as u64);
         let accepted: Vec<String> = decisions
             .iter()
             .enumerate()
@@ -779,10 +949,12 @@ pub(crate) fn submit(
         let admitted = accepted.len();
         if admitted > 0 {
             queue.pending_targets += admitted as u64;
+            queue.pending_bytes += job_bytes;
             queue.jobs.push_back(Job {
                 owner_server_id,
                 targets: accepted,
                 payload: Arc::new(payload.to_vec()),
+                bytes: job_bytes,
             });
         }
         if !queue.thread_running && admitted > 0 {
@@ -913,6 +1085,10 @@ fn run(cfg: PacerConfig) {
                 }
             },
         );
+        // The job's bytes are released whole, once nothing of it is queued.
+        if let Ok(mut queue) = pacer.queue.lock() {
+            queue.pending_bytes = queue.pending_bytes.saturating_sub(job.bytes);
+        }
     }
 }
 
@@ -1283,6 +1459,50 @@ mod tests {
             queue_ms: 1,
         };
         assert_eq!(tiny.max_pending(), 32);
+    }
+
+    #[test]
+    fn knobs_parse_in_range_and_name_the_bad_value() {
+        assert_eq!(parse_knob("K", None, 1, 9), Knob::Unset);
+        assert_eq!(parse_knob("K", Some(" "), 1, 9), Knob::Unset);
+        assert_eq!(parse_knob("K", Some(" 7 "), 1, 9), Knob::Value(7));
+        assert_eq!(
+            parse_knob("WEBTRANSPORT_PACER_PPS", Some("30000pps"), 0, PPS_MAX),
+            Knob::Invalid(
+                "WEBTRANSPORT_PACER_PPS must be an integer 0..=1000000, got '30000pps'".into()
+            )
+        );
+        assert!(matches!(
+            parse_knob("K", Some("10"), 1, 9),
+            Knob::Invalid(_)
+        ));
+        assert!(matches!(parse_knob("K", Some("0"), 1, 9), Knob::Invalid(_)));
+    }
+
+    #[test]
+    fn the_option_is_bounded() {
+        assert!(option_config(Some(PPS_MAX), Some(64), Some(QUEUE_MS_MAX)).is_ok());
+        assert!(option_config(Some(PPS_MAX + 1), None, None).is_err());
+        assert!(option_config(Some(0), None, None).is_err());
+        assert!(option_config(None, None, None).is_err());
+        assert!(option_config(Some(1), Some(65), None).is_err());
+        assert!(option_config(Some(1), None, Some(QUEUE_MS_MAX + 1)).is_err());
+        // The largest admissible target-count bound is finite and small.
+        let max = option_config(Some(PPS_MAX), Some(64), Some(QUEUE_MS_MAX)).unwrap();
+        assert_eq!(max.max_pending(), 5_000_000);
+    }
+
+    #[test]
+    fn the_byte_cap_charges_the_payload_once_and_each_target() {
+        let ids: Vec<String> = (0..10).map(|i| format!("id-{i}")).collect();
+        // Room for the payload and exactly three 4-byte ids.
+        let cap = 100 + 3 * (4 + TARGET_OVERHEAD_BYTES);
+        assert_eq!(admit_by_bytes(0, 100, &ids, cap), (3, cap));
+        // A payload that alone overflows admits nothing.
+        assert_eq!(admit_by_bytes(0, 200, &ids, 100), (0, 0));
+        // What is already queued counts.
+        assert_eq!(admit_by_bytes(cap - 100, 100, &ids, cap), (0, 0));
+        assert_eq!(admit_by_bytes(0, 0, &ids, QUEUED_BYTES_MAX).0, 10);
     }
 
     #[test]

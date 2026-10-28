@@ -612,11 +612,16 @@ export type LogEvent = {
  * @experimental Egress pacer surface; may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
  */
 export type EgressPacerOptions = {
-	/** Datagrams per second. A positive integer. */
+	/** Datagrams per second, an integer 1–1,000,000. */
 	pps: number;
 	/** Datagrams per burst unit, 1–64. Default 32. */
 	clump?: number;
-	/** Admission bound in milliseconds of work at the configured rate. Default 250. */
+	/**
+	 * Admission bound in milliseconds of work at the configured rate, 1–5000.
+	 * Default 250. Independently of it, everything queued (each job's payload
+	 * once plus every target id) is capped at 64 MiB; targets past either bound
+	 * are refused with `E_QUEUE_FULL` in the admission envelope.
+	 */
 	queueMs?: number;
 };
 
@@ -2406,13 +2411,22 @@ class NativeServerSession implements ServerSession {
 // createServer
 // ---------------------------------------------------------------------------
 
+/** Registered maxima, mirrored from egress_pacer.rs (`PPS_MAX`, `QUEUE_MS_MAX`). */
+const EGRESS_PACER_PPS_MAX = 1_000_000;
+const EGRESS_PACER_QUEUE_MS_MAX = 5_000;
+
 /** Why an `egressPacer` option is malformed, or `null` when it is not. */
 function egressPacerOptionsError(value: unknown): string | null {
 	if (typeof value !== "object" || value === null)
 		return "egressPacer must be an object";
 	const { pps, clump, queueMs } = value as Record<string, unknown>;
-	if (typeof pps !== "number" || !Number.isSafeInteger(pps) || pps < 1)
-		return "egressPacer.pps must be a positive integer";
+	if (
+		typeof pps !== "number" ||
+		!Number.isInteger(pps) ||
+		pps < 1 ||
+		pps > EGRESS_PACER_PPS_MAX
+	)
+		return `egressPacer.pps must be an integer 1..${EGRESS_PACER_PPS_MAX}`;
 	if (
 		clump !== undefined &&
 		(typeof clump !== "number" ||
@@ -2424,10 +2438,11 @@ function egressPacerOptionsError(value: unknown): string | null {
 	if (
 		queueMs !== undefined &&
 		(typeof queueMs !== "number" ||
-			!Number.isSafeInteger(queueMs) ||
-			queueMs < 1)
+			!Number.isInteger(queueMs) ||
+			queueMs < 1 ||
+			queueMs > EGRESS_PACER_QUEUE_MS_MAX)
 	)
-		return "egressPacer.queueMs must be a positive integer";
+		return `egressPacer.queueMs must be an integer 1..${EGRESS_PACER_QUEUE_MS_MAX}`;
 	return null;
 }
 

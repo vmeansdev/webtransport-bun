@@ -332,7 +332,20 @@ different one fails with `E_INVALID_ARGUMENT`; the identical one is accepted.
 `WEBTRANSPORT_PACER_PPS` (with `WEBTRANSPORT_PACER_CLUMP` /
 `WEBTRANSPORT_PACER_QUEUE_MS`) remains a documented fallback for processes
 where no server passes the option. It is read on the pacer's first use, and
-the option takes precedence when it comes first. The whole surface is
+the option takes precedence when it comes first. The configuration is
+committed only once the server that asked for it has been created, so a
+`createServer` that fails (TLS, bind) does not consume it.
+
+**Bounds.** `pps` is 1–1,000,000, `clump` 1–64 and `queueMs` 1–5000. An
+option outside them fails `createServer` with `E_INVALID_ARGUMENT`. A
+malformed or out-of-range `WEBTRANSPORT_PACER_*` value logs one warning and
+falls back to its default: the rate falls back to off, the clump to 32 and the
+window to 250. The schedule holds at most `pps × queueMs / 1000` targets and
+at most **64 MiB** of queued bytes: each job's payload once, plus every
+target id. This is the pacer's own cap, separate from the `maxQueuedBytes*`
+governors, which see a datagram only when the pacer hands it to a session.
+Targets past either bound are refused in the admission envelope
+(`E_QUEUE_FULL`). The whole surface is
 experimental (`docs/SPEC.md`, "Experimental surfaces"). See
 `crates/native/docs/egress-pacer.md` for how the schedule behaves.
 
