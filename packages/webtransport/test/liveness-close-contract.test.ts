@@ -324,6 +324,26 @@ describe("createServerCloseContract", () => {
 		]);
 	});
 
+	it("does not wait out the budget when the last callback ends as the drain is installed", async () => {
+		// The final callback completes in the window between the count check
+		// and the resolver install: the count is already zero, and the
+		// resolver it would have called is never called.
+		let pending = 1;
+		const close = createServerCloseContract({
+			closeNative: async () => {},
+			resolveOwnedSessions: () => {},
+			pendingOnSessionCallbacks: () => pending,
+			awaitOnSessionDrain: () => {
+				pending = 0;
+				return new Promise<void>(() => {});
+			},
+			drainTimeoutMs: 3000,
+		});
+		const started = performance.now();
+		await close();
+		expect(performance.now() - started).toBeLessThan(500);
+	});
+
 	it("is bounded when callbacks never return", async () => {
 		const close = createServerCloseContract({
 			closeNative: async () => {},

@@ -90,13 +90,20 @@ async function runClose(deps: ServerCloseDeps): Promise<void> {
 		});
 	}
 	if (deps.pendingOnSessionCallbacks() <= 0) return;
+	// Install the drain resolver BEFORE the authoritative count check: a last
+	// callback that finishes between a check and the install would find no
+	// resolver and leave close() waiting out the whole budget. Installed first,
+	// a callback finishing afterwards resolves `drained`, and one that finished
+	// before shows up as a zero count here.
+	const drained = deps.awaitOnSessionDrain();
+	if (deps.pendingOnSessionCallbacks() <= 0) return;
 	const budget = deps.drainTimeoutMs ?? ONSESSION_DRAIN_TIMEOUT_MS;
 	// Clear the timer if the drain wins the race, so a resolved close does not
 	// keep the event loop alive for the rest of the budget.
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
 		await Promise.race([
-			deps.awaitOnSessionDrain(),
+			drained,
 			new Promise<void>((resolve) => {
 				timer = setTimeout(resolve, budget);
 			}),
