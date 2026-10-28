@@ -611,7 +611,18 @@ paced envelope is a different object with a different vocabulary.
   call returns, no target has been resolved, owner-checked or budget-checked.
   `admitted` is targets the schedule took; `refused` names, per index, the ones
   it would not, always `E_QUEUE_FULL` and always because the queue was already
-  holding its bound of outstanding work. A set, not a prefix, exactly as above.
+  holding its bound of outstanding work (targets or bytes).
+  **Admission is a prefix**, unlike the synchronous envelope: the schedule
+  takes targets in list order until a bound is reached and refuses the rest of
+  the list, so `refused` is always the tail. Under sustained saturation the
+  same trailing positions are refused call after call; a caller that needs
+  fairness must rotate its own target list between calls. Refusals are still
+  reported per index, so the caller never reconstructs the boundary.
+- **No worker, no admission.** If the pacer thread cannot be started (thread
+  exhaustion), nothing is admitted: every in-cap target of that call is
+  refused with `E_QUEUE_FULL`, and any work a dead pacer thread left queued is
+  released and reported as `E_QUEUE_FULL` through `readMirrorReports()`. The
+  call never claims an admission no thread will deliver.
 - **Per-target outcomes are drained out of band.**
   `server.readMirrorReports(max?)` returns `{ target, error }` entries for
   **failures only** — synchronous, promise-free, never throwing, `[]` when

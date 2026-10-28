@@ -148,10 +148,13 @@ export type DatagramMirrorAdmission = {
 	readonly admitted: number;
 	/**
 	 * Targets the schedule refused, in target order, always `E_QUEUE_FULL`:
-	 * the queue was already holding its bound of outstanding work.
+	 * the queue was already holding its bound of outstanding work, or no pacer
+	 * thread could be started.
 	 *
-	 * A set, not a prefix — each refusal names its own index, so a caller never
-	 * has to reconstruct which targets travelled from a boundary. Distinct from
+	 * Admission is a **prefix**: targets are taken in list order until a bound
+	 * is hit, so the refusals are the tail of the list. Rotate the list between
+	 * calls if trailing targets must not starve under sustained saturation.
+	 * Each refusal still names its own index. Distinct from
 	 * the `E_QUEUE_FULL` *reports* that arrive later, which mean the opposite
 	 * end of the path: that target had no byte budget when its turn came.
 	 */
