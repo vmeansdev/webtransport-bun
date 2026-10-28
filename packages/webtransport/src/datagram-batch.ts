@@ -52,7 +52,10 @@ export function sendDatagramBatchChunked(
 		throw new TypeError("sendDatagramBatch expects an array of Uint8Array");
 	}
 	for (let i = 0; i < datagrams.length; i += 1) {
-		if (!ArrayBuffer.isView(datagrams[i])) {
+		// `instanceof Uint8Array`, not `ArrayBuffer.isView`: a Uint16Array or a
+		// DataView is a view too, but not the bytes this API promises to send.
+		// Buffer is a Uint8Array subclass and passes.
+		if (!(datagrams[i] instanceof Uint8Array)) {
 			throw new TypeError(
 				`sendDatagramBatch expects Uint8Array elements; element ${i} is not one`,
 			);

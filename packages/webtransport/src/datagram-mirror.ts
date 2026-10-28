@@ -274,7 +274,9 @@ export function sendDatagramMirrorPacedChecked(
 			"sendDatagramMirrorPaced expects an array of session ids",
 		);
 	}
-	if (!ArrayBuffer.isView(payload)) {
+	// A Uint8Array (Buffer included), not any ArrayBuffer view: a Uint16Array
+	// or DataView would be sent as its underlying bytes, not as the caller's.
+	if (!(payload instanceof Uint8Array)) {
 		throw new TypeError("sendDatagramMirrorPaced expects a Uint8Array payload");
 	}
 	if (targets.length > DATAGRAM_MIRROR_MAX) {
@@ -310,7 +312,9 @@ export function sendDatagramMirrorChecked(
 	if (!Array.isArray(targets)) {
 		throw new TypeError("sendDatagramMirror expects an array of session ids");
 	}
-	if (!ArrayBuffer.isView(payload)) {
+	// A Uint8Array (Buffer included), not any ArrayBuffer view: a Uint16Array
+	// or DataView would be sent as its underlying bytes, not as the caller's.
+	if (!(payload instanceof Uint8Array)) {
 		throw new TypeError("sendDatagramMirror expects a Uint8Array payload");
 	}
 	if (targets.length > DATAGRAM_MIRROR_MAX) {
