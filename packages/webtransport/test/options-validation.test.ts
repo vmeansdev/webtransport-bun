@@ -247,3 +247,68 @@ describe("explicit null is never read as omitted", () => {
 		});
 	}
 });
+
+describe("arrays and other non-plain objects are never option containers", () => {
+	const NOT_PLAIN: [string, unknown][] = [
+		["[]", []],
+		["a Map", new Map()],
+		["a Date", new Date(0)],
+		["a function", () => {}],
+	];
+
+	for (const [label, value] of NOT_PLAIN) {
+		it(`openReadSink rejects options and framing as ${label} on both backends`, () => {
+			for (const opts of [value, { framing: value }]) {
+				expect(() => validateStreamSinkOptions(opts)).toThrow(
+					/^E_SINK_BAD_OPTIONS: (options|framing) must be an object/,
+				);
+				expect(() =>
+					openReadSinkOnNativeHandle(neverNative, opts as never),
+				).toThrow(/^E_SINK_BAD_OPTIONS: /);
+				expect(() => openWasmReadSink(neverWasm, opts as never)).toThrow(
+					/^E_SINK_BAD_OPTIONS: /,
+				);
+			}
+		});
+
+		for (const field of [
+			"egressPacer",
+			"quicLb",
+			"reusePortSteering",
+			"limits",
+			"rateLimits",
+		]) {
+			it(`createServer rejects ${field} as ${label} with E_INVALID_ARGUMENT`, () => {
+				let thrown: unknown;
+				try {
+					createServer({
+						port: 0,
+						tls: { certPem: "", keyPem: "" },
+						onSession: () => {},
+						[field]: value,
+					} as never);
+				} catch (error) {
+					thrown = error;
+				}
+				expect((thrown as { code?: string })?.code).toBe(E_INVALID_ARGUMENT);
+				expect(String((thrown as Error)?.message)).toMatch(
+					new RegExp(`${field} must be an object`),
+				);
+			});
+		}
+
+		it(`connect rejects limits as ${label} with E_INVALID_ARGUMENT`, async () => {
+			await expect(
+				connect(`https://127.0.0.1:${nextPort(27_800, 60)}`, {
+					tls: { insecureSkipVerify: true },
+					limits: value as never,
+				}),
+			).rejects.toThrow(/^E_INVALID_ARGUMENT: limits must be an object/);
+		});
+	}
+
+	it("a null-prototype object is still a valid container", () => {
+		const opts = Object.assign(Object.create(null), { overflow: "block" });
+		expect(() => validateStreamSinkOptions(opts)).not.toThrow();
+	});
+});

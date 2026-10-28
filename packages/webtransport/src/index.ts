@@ -210,6 +210,7 @@ import {
 	unwrapNativeVoid,
 	WebTransportError,
 } from "./errors.js";
+import { isPlainOptionsObject } from "./options.js";
 import {
 	createServerCloseContract,
 	SERVER_CLOSING_CLOSE_CODE,
@@ -2441,8 +2442,7 @@ const EGRESS_PACER_QUEUE_MS_MAX = 5_000;
 
 /** Why an `egressPacer` option is malformed, or `null` when it is not. */
 function egressPacerOptionsError(value: unknown): string | null {
-	if (typeof value !== "object" || value === null)
-		return "egressPacer must be an object";
+	if (!isPlainOptionsObject(value)) return "egressPacer must be an object";
 	const { pps, clump, queueMs } = value as Record<string, unknown>;
 	if (
 		typeof pps !== "number" ||
@@ -2601,11 +2601,7 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 	if (opts.reusePortSteering !== undefined) {
 		const steering = opts.reusePortSteering;
 		const steeringError = (() => {
-			if (
-				typeof steering !== "object" ||
-				steering === null ||
-				Array.isArray(steering)
-			) {
+			if (!isPlainOptionsObject(steering)) {
 				return "reusePortSteering must be an object";
 			}
 			if (
@@ -3660,8 +3656,7 @@ function validateLimitsShape(
 			strictW3CErrors,
 		);
 	};
-	if (typeof limits !== "object" || limits === null || Array.isArray(limits))
-		fail(`${field} must be an object`);
+	if (!isPlainOptionsObject(limits)) fail(`${field} must be an object`);
 	const record = limits as Record<string, unknown>;
 	const numericKeys =
 		field === "limits" ? NUMERIC_LIMIT_KEYS : NUMERIC_RATE_LIMIT_KEYS;

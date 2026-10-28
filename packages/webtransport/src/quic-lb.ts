@@ -21,6 +21,7 @@
  */
 
 import { E_INVALID_ARGUMENT, WebTransportError } from "./errors.js";
+import { isPlainOptionsObject } from "./options.js";
 
 /** §5.3: "The server ID length MUST be at least 1 octet." */
 const MIN_SERVER_ID_LEN = 1;
@@ -147,7 +148,7 @@ export function quicLbCidLength(serverIdLen: number, nonceLen: number): number {
  * would leave the balancer decoding a layout the server does not write.
  */
 export function quicLbOptionsError(value: unknown): string | null {
-	if (typeof value !== "object" || value === null || Array.isArray(value)) {
+	if (!isPlainOptionsObject(value)) {
 		return "quicLb must be an object";
 	}
 	const opts = value as Partial<QuicLbOptions>;

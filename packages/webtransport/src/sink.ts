@@ -8,6 +8,7 @@
  * backend only; see docs/OPERATIONS.md "Sizing the JS read side".
  */
 
+import { isPlainOptionsObject } from "./options.js";
 import {
 	FLAG_CLOCK_WALL,
 	OFF_DROPPED_BYTES,
@@ -119,8 +120,7 @@ export function validateStreamSinkOptions(opts: unknown): void {
 		throw new Error(`E_SINK_BAD_OPTIONS: ${msg}`);
 	};
 	if (opts === undefined) return;
-	if (typeof opts !== "object" || opts === null || Array.isArray(opts))
-		bad("options must be an object");
+	if (!isPlainOptionsObject(opts)) bad("options must be an object");
 	const o = opts as Record<string, unknown>;
 	if (
 		o.ringBytes !== undefined &&
@@ -156,8 +156,7 @@ export function validateStreamSinkOptions(opts: unknown): void {
 	// Only an absent `framing` means "no framing": an explicit `null` is a
 	// wrong type like any other, not a synonym for omitted.
 	if (framing === undefined) return;
-	if (typeof framing !== "object" || framing === null || Array.isArray(framing))
-		bad("framing must be an object");
+	if (!isPlainOptionsObject(framing)) bad("framing must be an object");
 	const f = framing as Record<string, unknown>;
 	// These cross into `u32` N-API fields; range rules beyond that (header
 	// size, width fit, frame cap) stay with the native and wasm cutters.
