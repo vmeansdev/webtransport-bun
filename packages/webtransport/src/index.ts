@@ -1248,6 +1248,22 @@ export type MetricsSnapshot = {
 	 * host event loop open.
 	 */
 	nativeAsyncOpsPending?: number;
+	/**
+	 * Native only, process-wide. Stream sinks (`openReadSink`) currently
+	 * running in this process, client and server streams alike; returns to 0
+	 * once every sink has ended.
+	 *
+	 * @experimental Native stream sink (RFC_STREAM_SINK); may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
+	 */
+	sinksActive?: number;
+	/**
+	 * Native only, process-wide and cumulative. Records sinks dropped in
+	 * `overflow: "drop-newest"` mode (each sink also discloses its own drops
+	 * in-band as `drops` records).
+	 *
+	 * @experimental Native stream sink (RFC_STREAM_SINK); may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
+	 */
+	sinkDroppedRecords?: number;
 	/** Native only. Sessions the QUIC idle timeout ended (peer went away). */
 	sessionsClosedByIdle?: number;
 	/** Native only. Sessions this server ended itself while shutting down. */

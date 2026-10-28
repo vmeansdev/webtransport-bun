@@ -21,6 +21,7 @@ import type {
 	PortableServerSession,
 } from "../src/portable.js";
 import * as portableSurface from "../src/portable.js";
+import { INTERNAL_METRIC_KEYS } from "../src/server-internals.js";
 import * as sinkReaderSurface from "../src/sink-reader.js";
 import * as wasmSurface from "../src/wasm.js";
 import { InMemoryRelay } from "../src/wasm-relay.js";
@@ -242,6 +243,59 @@ type _AssertSinkCodeListComplete = Assert<
 		rootSurface.ExperimentalSinkErrorCode,
 		(typeof EXPERIMENTAL_SINK_CODES)[number]
 	>
+>;
+
+// Every public `MetricsSnapshot` key, listed once. `satisfies` makes this
+// exhaustive in both directions at compile time: a key added to the type and
+// not here, or listed here and not on the type, fails `tsc --noEmit`. The
+// runtime test below then proves the native snapshot emits nothing outside it.
+const TYPED_METRICS_KEYS = {
+	nowMs: true,
+	sessionsActive: true,
+	sessionTasksActive: true,
+	streamTasksActive: true,
+	handshakesInFlight: true,
+	streamsActive: true,
+	datagramsIn: true,
+	datagramsOut: true,
+	datagramsDropped: true,
+	datagramsDroppedRateLimited: true,
+	datagramsDroppedTooLarge: true,
+	datagramsDroppedQueueGlobal: true,
+	datagramsDroppedQueueSession: true,
+	datagramsSkippedQueueFull: true,
+	queuedBytesGlobal: true,
+	backpressureWaitCount: true,
+	backpressureTimeoutCount: true,
+	datagramSendsAsync: true,
+	datagramMirrorCalls: true,
+	datagramMirrorTargets: true,
+	datagramMirrorPacedCalls: true,
+	datagramMirrorPacedTargets: true,
+	mirrorReportsDropped: true,
+	rateLimitedCount: true,
+	limitExceededCount: true,
+	sniCertSelections: true,
+	defaultCertSelections: true,
+	unknownSniRejectedCount: true,
+	nativeSessionRegistryEntries: true,
+	nativeTrackedTasks: true,
+	nativeRateLimitEntries: true,
+	nativeBidiHandlesLive: true,
+	nativeUniSendHandlesLive: true,
+	nativeUniRecvHandlesLive: true,
+	nativeAsyncOpsPending: true,
+	sinksActive: true,
+	sinkDroppedRecords: true,
+	sessionsClosedByIdle: true,
+	sessionsClosedByReap: true,
+	sessionsClosedOther: true,
+	handshakeLatency: true,
+	datagramEnqueueLatency: true,
+	streamOpenLatency: true,
+} as const satisfies Record<keyof rootSurface.MetricsSnapshot, true>;
+type _AssertTypedMetricsKeysExact = Assert<
+	Extends<keyof rootSurface.MetricsSnapshot, keyof typeof TYPED_METRICS_KEYS>
 >;
 
 // --- the frozen export sets -----------------------------------------------
@@ -587,6 +641,41 @@ describe("experimental sink error codes", () => {
 		expect(() => rootSurface.openReadSink({} as never)).toThrow(
 			/^E_SINK_BAD_OPTIONS: /,
 		);
+	});
+});
+
+describe("server metrics snapshot", () => {
+	test("every key the native snapshot emits after stripping is typed", async () => {
+		const port = nativePort();
+		const seen = Promise.withResolvers<rootSurface.ServerSession>();
+		const server = rootSurface.createServer({
+			host: "127.0.0.1",
+			port,
+			tls: { certPem: "", keyPem: "" },
+			onSession: (session) => seen.resolve(session),
+		});
+		try {
+			// A live session, so per-connection and latency fields are emitted.
+			const client = await rootSurface.connect(`https://127.0.0.1:${port}`, {
+				tls: { insecureSkipVerify: true },
+			});
+			await withTimeout(seen.promise, 5000, "metrics session");
+			const typed = new Set(Object.keys(TYPED_METRICS_KEYS));
+			const untyped = Object.keys(server.metricsSnapshot()).filter(
+				(key) => !typed.has(key),
+			);
+			expect(untyped).toEqual([]);
+			// And the unfiltered native snapshot holds nothing that is neither
+			// public nor a declared internal counter.
+			const internal = new Set<string>(INTERNAL_METRIC_KEYS);
+			const unknown = Object.keys(
+				rootSurface.__TESTING__.serverInternals(server).metricsSnapshot(),
+			).filter((key) => !typed.has(key) && !internal.has(key));
+			expect(unknown).toEqual([]);
+			client.close();
+		} finally {
+			await server.close();
+		}
 	});
 });
 

@@ -36,6 +36,8 @@ Use `metricsToPrometheus(snapshot, labels?)` to produce Prometheus exposition fo
 | sessionsClosedByReap | number? | Native only: sessions this server ended itself while shutting down. Omitted on WASM. |
 | sessionsClosedOther | number? | Native only: every other way a session ended (peer close, transport error). Omitted on WASM. |
 | nativeAsyncOpsPending | number? | Native only: unsettled Node-API async operations this server still owns. Non-zero after `close()` resolves means the addon still holds the host event loop open. Omitted on WASM. |
+| sinksActive | number? | **Experimental.** Native only, process-wide: stream sinks (`openReadSink`) currently running in this process, on client and server streams alike. Returns to 0 once every sink has ended; a sink leak gauge. Omitted on WASM. |
+| sinkDroppedRecords | number? | **Experimental.** Native only, process-wide and cumulative: records dropped by sinks in `overflow: "drop-newest"` mode. Each sink also discloses its drops in-band as `drops` records. Omitted on WASM. |
 | nativeSessionRegistryEntries, nativeTrackedTasks, nativeRateLimitEntries, nativeBidiHandlesLive, nativeUniSendHandlesLive, nativeUniRecvHandlesLive | number? | Native only: live sizes of the addon's registries and handle tables. Use them as leak gauges: after load stops they should return to their idle values. Omitted on WASM. |
 | rateLimitedCount | number | Sessions rejected by per-IP/per-prefix rate limit |
 | limitExceededCount | number | Sessions rejected (maxSessions, maxHandshakesInFlight) |
