@@ -10,9 +10,16 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import type { ClientSession, ServerSession } from "../src/index.js";
+import type {
+	ClientSession,
+	ServerSession,
+	WebTransportServer,
+} from "../src/index.js";
 import { __TESTING__, createServer } from "../src/index.js";
-import type { ServerInternals } from "../src/server-internals.js";
+import {
+	INTERNAL_METRIC_KEYS,
+	type ServerInternals,
+} from "../src/server-internals.js";
 import { nextWithTimeout } from "./helpers/harness.js";
 import { connectWithRetry, nextPort } from "./helpers/network.js";
 
@@ -67,6 +74,8 @@ function actionStamp(actual: bigint, sequence: bigint): Uint8Array {
 type Fixture = {
 	/** The internal accessor: the reflector is not on the public server. */
 	server: ServerInternals;
+	/** The same server as the application sees it. */
+	publicServer: WebTransportServer;
 	session: ServerSession;
 	client: ClientSession;
 	fromClient: AsyncIterator<Uint8Array>;
@@ -104,6 +113,7 @@ async function withSession(body: (f: Fixture) => Promise<void>): Promise<void> {
 		toClient = client.incomingDatagrams()[Symbol.asyncIterator]();
 		await body({
 			server: __TESTING__.serverInternals(server),
+			publicServer: server,
 			session,
 			client,
 			fromClient,
@@ -197,6 +207,24 @@ describe("native datagram reflector", () => {
 			expect(readU64(reply, 28)).toBe(77n);
 			expect(readU64(reply, 20)).toBe(5n);
 			expect(server.metricsSnapshot().datagramReflectHits).toBe(1);
+		});
+	});
+
+	it("strips every internal counter from the public snapshot and keeps it on the internal one", async () => {
+		await withSession(async ({ server, publicServer, client, toClient }) => {
+			// A reflected datagram, so even the observation-gated histogram
+			// (`datagramReflectHold`) is present on the internal snapshot.
+			server.setDatagramReflector(G6_RULE);
+			await client.sendDatagram(actionStamp(5n, 1n));
+			await next(toClient, "reflected ack for the strip check");
+			const internal = server.metricsSnapshot() as Record<string, unknown>;
+			const missing = INTERNAL_METRIC_KEYS.filter((key) => !(key in internal));
+			expect(missing).toEqual([]);
+			const publicSnapshot = publicServer.metricsSnapshot();
+			const leaked = INTERNAL_METRIC_KEYS.filter(
+				(key) => key in publicSnapshot,
+			);
+			expect(leaked).toEqual([]);
 		});
 	});
 
