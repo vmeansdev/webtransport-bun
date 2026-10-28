@@ -2652,6 +2652,7 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		}
 	}
 
+	validateQuicWindows(opts.limits);
 	const mergedLimits = { ...DEFAULT_LIMITS, ...opts.limits };
 	const limitsJson = JSON.stringify(mergedLimits);
 	const serverOptsJson = JSON.stringify({
@@ -3485,6 +3486,7 @@ export async function connect(
 	if (opts !== undefined) {
 		validateQpackOptions(opts, opts.strictW3CErrors);
 	}
+	validateQuicWindows(opts?.limits, opts?.strictW3CErrors);
 	const mergedLimits = { ...DEFAULT_LIMITS, ...opts?.limits };
 	const tlsOpts = mapClientTlsOptions(opts?.tls);
 	const optsJson = JSON.stringify({
@@ -3626,6 +3628,38 @@ const VALID_DATAGRAMS_READABLE_TYPE = new Set(["bytes", "default"]);
  * advertising something other than what was asked for would be a worse answer
  * than saying no.
  */
+/**
+ * Reject a malformed explicit QUIC window instead of letting native silently
+ * fall back to the governor-derived one (it reads anything but a positive
+ * integer as "unset"). Omitted stays omitted; set means a positive safe
+ * integer.
+ */
+function validateQuicWindows(
+	limits: Partial<LimitsOptions> | undefined,
+	strictW3CErrors?: boolean,
+): void {
+	if (limits === undefined || limits === null) return;
+	for (const key of [
+		"streamReceiveWindow",
+		"receiveWindow",
+		"sendWindow",
+	] as const) {
+		const value = (limits as Record<string, unknown>)[key];
+		if (value === undefined) continue;
+		if (
+			typeof value !== "number" ||
+			!Number.isSafeInteger(value) ||
+			value < 1
+		) {
+			throw createMappedError(
+				E_INVALID_ARGUMENT as ErrorCode,
+				`E_INVALID_ARGUMENT: limits.${key} must be a positive integer (bytes), got ${String(value)}`,
+				strictW3CErrors,
+			);
+		}
+	}
+}
+
 function validateQpackOptions(
 	opts: {
 		qpackMaxTableCapacity?: number;

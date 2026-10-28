@@ -104,35 +104,93 @@ export function normalizeRingBytes(requested: number | undefined): number {
 	return 2 ** Math.ceil(Math.log2(clamped));
 }
 
+/** Longest timer either backend can arm (`setTimeout`'s 2^31-1 ms ceiling). */
+const MAX_SINK_TIMEOUT_MS = 0x7fff_ffff;
+
+/**
+ * Reject every malformed `openReadSink` option with `E_SINK_BAD_OPTIONS`,
+ * before any buffer is allocated or native code is reached. Both the native
+ * and the wasm sink call it, so an option means the same thing on both and is
+ * never silently coerced (an unknown `overflow` must not quietly become
+ * lossless blocking, a negative timeout must not quietly disable a deadline).
+ */
+export function validateStreamSinkOptions(opts: unknown): void {
+	const bad = (msg: string): never => {
+		throw new Error(`E_SINK_BAD_OPTIONS: ${msg}`);
+	};
+	if (opts === undefined) return;
+	if (typeof opts !== "object" || opts === null || Array.isArray(opts))
+		bad("options must be an object");
+	const o = opts as Record<string, unknown>;
+	if (
+		o.ringBytes !== undefined &&
+		(typeof o.ringBytes !== "number" ||
+			!Number.isFinite(o.ringBytes) ||
+			o.ringBytes <= 0)
+	)
+		bad("ringBytes must be a positive number");
+	if (
+		o.overflow !== undefined &&
+		o.overflow !== "block" &&
+		o.overflow !== "drop-newest"
+	)
+		bad(`overflow must be "block" or "drop-newest", got ${String(o.overflow)}`);
+	if (o.clock !== undefined && o.clock !== "monotonic" && o.clock !== "wall")
+		bad(`clock must be "monotonic" or "wall", got ${String(o.clock)}`);
+	const integerMs = (key: string, min: number): void => {
+		const v = o[key];
+		if (
+			v !== undefined &&
+			(typeof v !== "number" ||
+				!Number.isInteger(v) ||
+				v < min ||
+				v > MAX_SINK_TIMEOUT_MS)
+		)
+			bad(`${key} must be an integer ${min}..${MAX_SINK_TIMEOUT_MS}`);
+	};
+	// A zero stall deadline has no meaning (native would replace it with the
+	// default); zero idle deadline is the documented "off".
+	integerMs("backpressureTimeoutMs", 1);
+	integerMs("idleTimeoutMs", 0);
+	const framing = o.framing;
+	if (framing === undefined || framing === null) return;
+	if (typeof framing !== "object" || Array.isArray(framing))
+		bad("framing must be an object");
+	const f = framing as Record<string, unknown>;
+	// These cross into `u32` N-API fields; range rules beyond that (header
+	// size, width fit, frame cap) stay with the native and wasm cutters.
+	for (const key of ["headerBytes", "lengthOffset", "maxFrameBytes"] as const) {
+		const value = f[key];
+		if (
+			typeof value !== "number" ||
+			!Number.isInteger(value) ||
+			value < 0 ||
+			value > 0xffff_ffff
+		)
+			bad(`framing.${key} must be an integer 0..4294967295`);
+	}
+	if (![1, 2, 4, 8].includes(f.lengthWidth as number))
+		bad("framing.lengthWidth must be 1, 2, 4, or 8");
+	if (
+		f.endianness !== undefined &&
+		f.endianness !== "le" &&
+		f.endianness !== "be"
+	)
+		bad(`framing.endianness must be "le" or "be", got ${String(f.endianness)}`);
+	if (
+		f.lengthIncludesHeader !== undefined &&
+		typeof f.lengthIncludesHeader !== "boolean"
+	)
+		bad("framing.lengthIncludesHeader must be a boolean");
+}
+
 export function openReadSinkOnNativeHandle(
 	native: SinkCapableNativeHandle,
 	opts: StreamSinkOptions = {},
 ): StreamSinkHandle {
+	validateStreamSinkOptions(opts);
 	const ringBytes = normalizeRingBytes(opts.ringBytes);
 	const framing = opts.framing ?? null;
-	if (framing) {
-		// These four cross into `u32` N-API fields; anything else would fail
-		// the binding's conversion with a generic error instead of the
-		// documented E_SINK_BAD_OPTIONS. Range rules beyond `u32` stay native.
-		for (const key of [
-			"headerBytes",
-			"lengthOffset",
-			"lengthWidth",
-			"maxFrameBytes",
-		] as const) {
-			const value = (framing as unknown as Record<string, unknown>)[key];
-			if (
-				typeof value !== "number" ||
-				!Number.isInteger(value) ||
-				value < 0 ||
-				value > 0xffff_ffff
-			) {
-				throw new Error(
-					`E_SINK_BAD_OPTIONS: framing.${key} must be an integer 0..4294967295`,
-				);
-			}
-		}
-	}
 	const sab = new SharedArrayBuffer(SINK_DATA_OFFSET + ringBytes);
 	const view = new Uint8Array(sab);
 	const result = native.openReadSink(view, {

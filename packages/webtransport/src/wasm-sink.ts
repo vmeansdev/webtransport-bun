@@ -9,6 +9,13 @@
  */
 
 import {
+	normalizeRingBytes,
+	type StreamSinkHandle,
+	type StreamSinkOptions,
+	type StreamSinkStats,
+	validateStreamSinkOptions,
+} from "./sink.js";
+import {
 	I32_HEAD,
 	REC_DATA,
 	REC_EOF,
@@ -19,12 +26,6 @@ import {
 	type StreamSinkDescriptor,
 } from "./sink-layout.js";
 import { FrameCutter, RingWriter, wasmRingFlags } from "./sink-ring-writer.js";
-import {
-	normalizeRingBytes,
-	type StreamSinkHandle,
-	type StreamSinkOptions,
-	type StreamSinkStats,
-} from "./sink.js";
 
 /** The slice of a WasmStream the sink producer drives. */
 export interface WasmSinkStream {
@@ -66,6 +67,7 @@ export function openWasmReadSink(
 	opts: StreamSinkOptions = {},
 	captured: CapturedWasmChunk[] = [],
 ): StreamSinkHandle {
+	validateStreamSinkOptions(opts);
 	const ringBytes = normalizeRingBytes(opts.ringBytes);
 	const framing = opts.framing ?? null;
 	const dropNewest = opts.overflow === "drop-newest";

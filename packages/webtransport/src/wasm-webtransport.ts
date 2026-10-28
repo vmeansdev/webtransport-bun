@@ -18,18 +18,22 @@ import {
 	extractStreamErrorCode,
 	WebTransportError,
 } from "./errors.js";
-import { SendScheduler, type SendPolicy } from "./send-scheduler.js";
-import type { StreamSinkHandle, StreamSinkOptions } from "./sink.js";
+import { type SendPolicy, SendScheduler } from "./send-scheduler.js";
+import {
+	type StreamSinkHandle,
+	type StreamSinkOptions,
+	validateStreamSinkOptions,
+} from "./sink.js";
 import type { WebTransportCloseInfo } from "./types.js";
-import { openWasmReadSink, type CapturedWasmChunk } from "./wasm-sink.js";
 import {
 	createW3CMappedError,
-	withW3CBrowserName,
 	validateW3CClientOptions,
 	type W3CClientOptionSurface,
 	type W3CCongestionControl,
 	type W3CDatagramsReadableType,
+	withW3CBrowserName,
 } from "./w3c-client-options.js";
+import { type CapturedWasmChunk, openWasmReadSink } from "./wasm-sink.js";
 
 /** A bidirectional stream as a pair of WHATWG streams. */
 export interface WebTransportBidirectionalStream {
@@ -262,6 +266,9 @@ function streamReadable(
 			openReadSink(opts?: StreamSinkOptions): StreamSinkHandle;
 		}
 	).openReadSink = (opts?: StreamSinkOptions) => {
+		// Before anything is taken over: a rejected option must leave the
+		// readable exactly as it was.
+		validateStreamSinkOptions(opts);
 		if (didPull || cancelled || sinkTaken) {
 			throw new Error("E_SINK_READ_ACTIVE");
 		}
