@@ -170,6 +170,23 @@ export interface ServerInternals {
 	__pacerStatsJson?(token?: number): string;
 	/** Process-wide send-path phase banks; absent on older addons. */
 	__sendPathDiagnostics?(phase?: string): string;
+	/**
+	 * Test seam: feed native server-session events (`session`,
+	 * `session_closed`) through the exact handler the addon's TSFN calls, so a
+	 * test can deliver an accept at a chosen point of the close sequence.
+	 */
+	deliverSessionEventsForTests(
+		events: {
+			name: string;
+			id?: string;
+			peerIp?: string;
+			peerPort?: number;
+			code?: number;
+			reason?: string;
+		}[],
+	): void;
+	/** Test seam: sessions holding a `closed` resolver not yet settled. */
+	ownedSessionCountForTests(): number;
 	/** The unfiltered native snapshot, internal counters included. */
 	metricsSnapshot(): InternalMetricsSnapshot;
 }

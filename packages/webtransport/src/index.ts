@@ -209,7 +209,11 @@ import {
 	unwrapNativeVoid,
 	WebTransportError,
 } from "./errors.js";
-import { createServerCloseContract } from "./server-close.js";
+import {
+	createServerCloseContract,
+	SERVER_CLOSING_CLOSE_CODE,
+	SERVER_CLOSING_CLOSE_REASON,
+} from "./server-close.js";
 import {
 	type InternalMetricsSnapshot,
 	registerServerInternals,
@@ -2710,6 +2714,104 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		}
 	};
 
+	// Set the moment close() starts (before the native close), so a session
+	// event that is already queued in the TSFN batcher cannot reach user code.
+	let closing = false;
+	const closeLateAcceptedSession = (
+		id: string,
+		peerIp: string,
+		peerPort: number,
+	): void => {
+		try {
+			new native.SessionHandle(id, peerIp, peerPort).close(
+				SERVER_CLOSING_CLOSE_CODE,
+				SERVER_CLOSING_CLOSE_REASON,
+			);
+		} catch {
+			// The native close already tore this session down; nothing is
+			// owed to anyone.
+		}
+	};
+	const onSessionEvents = (events: NativeServerSessionEvent[]): void => {
+		for (const evt of events) {
+			if (
+				evt.name === "session" &&
+				evt.id != null &&
+				evt.peerIp != null &&
+				evt.peerPort != null
+			) {
+				if (closing) {
+					// Accepted natively but delivered after close() began: the
+					// TSFN batcher can flush an accept queued before the close.
+					// It must not reach onSession (no callback after close) and
+					// must not register a `closed` resolver the close sweep has
+					// already run past. Close it on the wire with the same pair
+					// every other session of a closing server gets.
+					closeLateAcceptedSession(evt.id, evt.peerIp, evt.peerPort);
+					continue;
+				}
+				let closedResolve!: (info: CloseInfo) => void;
+				const closedPromise = new Promise<CloseInfo>((resolve) => {
+					closedResolve = resolve;
+				});
+				closedResolvers.set(evt.id, closedResolve);
+				const nativeSession = new native.SessionHandle(
+					evt.id,
+					evt.peerIp,
+					evt.peerPort,
+				);
+				const session = new NativeServerSession(
+					nativeSession,
+					closedPromise,
+					mergedLimits.backpressureTimeoutMs,
+				);
+				activeOnSessionCallbacks++;
+				let maybePromise: void | Promise<void>;
+				try {
+					maybePromise = opts.onSession(session);
+				} catch (err) {
+					const msg = err instanceof Error ? err.message : String(err);
+					session.close({
+						code: 0,
+						reason: `onSession callback threw: ${msg}`,
+					});
+					emitUserLog({
+						level: "error",
+						msg: `E_INVALID_ARGUMENT: onSession callback threw: ${msg}`,
+						sessionId: evt.id,
+						peerIp: evt.peerIp,
+						peerPort: evt.peerPort,
+					});
+					onSessionCallbackDone();
+					continue;
+				}
+				if (maybePromise && typeof maybePromise.then === "function") {
+					maybePromise.then(onSessionCallbackDone, (err) => {
+						const msg = err instanceof Error ? err.message : String(err);
+						session.close({
+							code: 0,
+							reason: `onSession callback rejected: ${msg}`,
+						});
+						emitUserLog({
+							level: "error",
+							msg: `E_INVALID_ARGUMENT: onSession callback rejected: ${msg}`,
+							sessionId: evt.id,
+							peerIp: evt.peerIp,
+							peerPort: evt.peerPort,
+						});
+						onSessionCallbackDone();
+					});
+				} else {
+					onSessionCallbackDone();
+				}
+			} else if (evt.name === "session_closed" && evt.id != null) {
+				const resolve = closedResolvers.get(evt.id);
+				closedResolvers.delete(evt.id);
+				if (resolve) resolve({ code: evt.code, reason: evt.reason });
+			}
+		}
+	};
+
 	const handle = new native.ServerHandle(
 		opts.port,
 		opts.host ?? "0.0.0.0",
@@ -2718,75 +2820,7 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		limitsJson,
 		rateLimitsJson,
 		serverOptsJson,
-		(events: NativeServerSessionEvent[]) => {
-			for (const evt of events) {
-				if (
-					evt.name === "session" &&
-					evt.id != null &&
-					evt.peerIp != null &&
-					evt.peerPort != null
-				) {
-					let closedResolve!: (info: CloseInfo) => void;
-					const closedPromise = new Promise<CloseInfo>((resolve) => {
-						closedResolve = resolve;
-					});
-					closedResolvers.set(evt.id, closedResolve);
-					const nativeSession = new native.SessionHandle(
-						evt.id,
-						evt.peerIp,
-						evt.peerPort,
-					);
-					const session = new NativeServerSession(
-						nativeSession,
-						closedPromise,
-						mergedLimits.backpressureTimeoutMs,
-					);
-					activeOnSessionCallbacks++;
-					let maybePromise: void | Promise<void>;
-					try {
-						maybePromise = opts.onSession(session);
-					} catch (err) {
-						const msg = err instanceof Error ? err.message : String(err);
-						session.close({
-							code: 0,
-							reason: `onSession callback threw: ${msg}`,
-						});
-						emitUserLog({
-							level: "error",
-							msg: `E_INVALID_ARGUMENT: onSession callback threw: ${msg}`,
-							sessionId: evt.id,
-							peerIp: evt.peerIp,
-							peerPort: evt.peerPort,
-						});
-						onSessionCallbackDone();
-						continue;
-					}
-					if (maybePromise && typeof maybePromise.then === "function") {
-						maybePromise.then(onSessionCallbackDone, (err) => {
-							const msg = err instanceof Error ? err.message : String(err);
-							session.close({
-								code: 0,
-								reason: `onSession callback rejected: ${msg}`,
-							});
-							emitUserLog({
-								level: "error",
-								msg: `E_INVALID_ARGUMENT: onSession callback rejected: ${msg}`,
-								sessionId: evt.id,
-								peerIp: evt.peerIp,
-								peerPort: evt.peerPort,
-							});
-							onSessionCallbackDone();
-						});
-					} else {
-						onSessionCallbackDone();
-					}
-				} else if (evt.name === "session_closed" && evt.id != null) {
-					const resolve = closedResolvers.get(evt.id);
-					closedResolvers.delete(evt.id);
-					if (resolve) resolve({ code: evt.code, reason: evt.reason });
-				}
-			}
-		},
+		onSessionEvents,
 		logCallback,
 	);
 
@@ -2873,7 +2907,10 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		readMirrorReports: (max) =>
 			decodeMirrorReports(handle.readMirrorReports?.(max) ?? []),
 		close: createServerCloseContract({
-			closeNative: () => handle.close(),
+			closeNative: () => {
+				closing = true;
+				return handle.close();
+			},
 			resolveOwnedSessions: (info) => {
 				for (const [id, resolve] of closedResolvers) {
 					closedResolvers.delete(id);
@@ -2919,6 +2956,9 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 				}
 			: {}),
 		metricsSnapshot: () => handle.metricsSnapshot(),
+		deliverSessionEventsForTests: (events) =>
+			onSessionEvents(events as NativeServerSessionEvent[]),
+		ownedSessionCountForTests: () => closedResolvers.size,
 	});
 	return server;
 }
