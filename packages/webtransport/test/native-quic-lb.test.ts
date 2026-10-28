@@ -236,5 +236,19 @@ describe("QUIC-LB connection-ID decoders", () => {
 		);
 		expect(quicLbCidLength(1, 4)).toBe(6); // draft-21 §5.3 minimum
 		expect(quicLbCidLength(15, 4)).toBe(20); // and its maximum
+		// Validated, not raw arithmetic: lengths no server can issue throw.
+		for (const [id, nonce] of [
+			[0, 0],
+			[0, 4],
+			[1, 3],
+			[19, 1],
+			[16, 4],
+			[1.5, 4],
+			[Number.NaN, 4],
+		] as const) {
+			expect(() => quicLbCidLength(id, nonce)).toThrow(
+				/^E_INVALID_ARGUMENT: quicLbCidLength/,
+			);
+		}
 	});
 });

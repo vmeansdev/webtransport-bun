@@ -20,6 +20,8 @@
  * `.node` binary or opening a socket.
  */
 
+import { E_INVALID_ARGUMENT, WebTransportError } from "./errors.js";
+
 /** §5.3: "The server ID length MUST be at least 1 octet." */
 const MIN_SERVER_ID_LEN = 1;
 /** §5.3: "The nonce length MUST be at least 4 octets." */
@@ -113,9 +115,27 @@ export function decodeQuicLbConfigRotation(cid: Uint8Array): number | null {
  * The wire length of every connection ID this configuration issues:
  * `1 + serverIdLen + nonceLen`, from 6 to 20 octets.
  *
+ * Validated, not raw arithmetic: both lengths must be integers with
+ * `serverIdLen >= 1`, `nonceLen >= 4` and `serverIdLen + nonceLen <= 19`
+ * (draft-21 §5.3), the same bounds the `quicLb` option enforces. Anything else
+ * throws a `WebTransportError` with code `E_INVALID_ARGUMENT`, so a balancer
+ * can never validate CIDs against a length no server can issue.
+ *
  * @experimental QUIC-LB / multi-process steering surface; may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
  */
 export function quicLbCidLength(serverIdLen: number, nonceLen: number): number {
+	if (
+		!Number.isInteger(serverIdLen) ||
+		!Number.isInteger(nonceLen) ||
+		serverIdLen < MIN_SERVER_ID_LEN ||
+		nonceLen < MIN_NONCE_LEN ||
+		serverIdLen + nonceLen > MAX_PLAINTEXT_BLOCK_LEN
+	) {
+		throw new WebTransportError(
+			E_INVALID_ARGUMENT,
+			`E_INVALID_ARGUMENT: quicLbCidLength needs integers serverIdLen >= ${MIN_SERVER_ID_LEN}, nonceLen >= ${MIN_NONCE_LEN} and serverIdLen + nonceLen <= ${MAX_PLAINTEXT_BLOCK_LEN}, got (${serverIdLen}, ${nonceLen})`,
+		);
+	}
 	return 1 + serverIdLen + nonceLen;
 }
 
