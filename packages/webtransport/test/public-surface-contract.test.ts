@@ -14,11 +14,11 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { connectWasm } from "../src/backend.js";
 import * as rootSurface from "../src/index.js";
-import * as portableSurface from "../src/portable.js";
 import type { PortableServer, PortableServerSession } from "../src/portable.js";
+import * as portableSurface from "../src/portable.js";
+import * as wasmSurface from "../src/wasm.js";
 import { InMemoryRelay } from "../src/wasm-relay.js";
 import type { WasmServerSession } from "../src/wasm-server-session.js";
-import * as wasmSurface from "../src/wasm.js";
 import { withTimeout } from "./helpers/harness.js";
 import { nextPort, openWTWithRetry } from "./helpers/network.js";
 import { loadWasmModule, wasmAvailable } from "./helpers/wasm-availability.js";
@@ -178,10 +178,16 @@ type _AssertPacedMirrorOnNative = Assert<
 type _AssertNoReflectorOnPortable = Assert<
 	Not<Extends<PortableServer, { setDatagramReflector(rule: unknown): unknown }>>
 >;
-type _AssertReflectorOnNative = Assert<
-	Extends<
-		rootSurface.WebTransportServer,
-		{ setDatagramReflector(rule: unknown): void }
+// The datagram reflector is excluded from the 1.0 surface altogether: it is a
+// capacity-campaign instrument, reachable only through the unstable
+// `__TESTING__.serverInternals(server)` accessor. Off the native root server
+// too, not just off the portable one.
+type _AssertNoReflectorOnNative = Assert<
+	Not<
+		Extends<
+			rootSurface.WebTransportServer,
+			{ setDatagramReflector(rule: unknown): void }
+		>
 	>
 >;
 

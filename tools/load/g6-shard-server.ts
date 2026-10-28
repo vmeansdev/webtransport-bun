@@ -15,7 +15,10 @@
  */
 import { readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
-import { createServer } from "../../packages/webtransport/src/index.ts";
+import {
+	__TESTING__,
+	createServer,
+} from "../../packages/webtransport/src/index.ts";
 import {
 	G6_V3_ACK_REFLECTOR_RULE,
 	resolveAckReflectorMode,
@@ -161,8 +164,12 @@ async function main(): Promise<void> {
 		// WEBTRANSPORT_NATIVE_STDERR_WARNINGS=1 in this process's environment,
 		// and the addon writes warn/error events verbatim to stderr itself.
 	});
+	// The reflector, the campaign getters, the diagnostics and the campaign
+	// counters are not public API; harnesses reach them through the internal
+	// accessor (packages/webtransport/src/server-internals.ts).
+	const internals = __TESTING__.serverInternals(server);
 	if (ackReflector === "native")
-		server.setDatagramReflector(G6_V3_ACK_REFLECTOR_RULE);
+		internals.setDatagramReflector(G6_V3_ACK_REFLECTOR_RULE);
 	// Read back from the addon, not from a flag we were handed: the scan's
 	// kill gate is only worth anything if this is the count native actually
 	// built its server runtime with.
@@ -179,7 +186,7 @@ async function main(): Promise<void> {
 	// Same reasoning: report the UDP send batch the addon actually resolved.
 	const serverUdpSendBatch = server.serverUdpSendBatch();
 	const serverUdpSendEagainMode = server.serverUdpSendEagainMode();
-	const reflectRingBypass = server.serverReflectRingBypass();
+	const reflectRingBypass = internals.serverReflectRingBypass();
 	const datagramDriver = server.serverDatagramDriver();
 	let reflectorCounters: ReflectorCounters = {
 		hits: 0,
@@ -241,7 +248,7 @@ async function main(): Promise<void> {
 	let stormSampler: ReturnType<typeof setInterval> | null = null;
 
 	const boundary = (): BoundarySnapshot => {
-		const metrics = server.metricsSnapshot();
+		const metrics = internals.metricsSnapshot();
 		reflectorCounters = reconcileReflectorCounters(state, reflectorCounters, {
 			hits: metrics.datagramReflectHits ?? 0,
 			sent: metrics.datagramReflectSent ?? 0,
@@ -368,7 +375,7 @@ async function main(): Promise<void> {
 						arms,
 						stormSample(
 							Date.now(),
-							server.metricsSnapshot() as unknown as Record<string, unknown>,
+							internals.metricsSnapshot() as unknown as Record<string, unknown>,
 						),
 					);
 				sample();

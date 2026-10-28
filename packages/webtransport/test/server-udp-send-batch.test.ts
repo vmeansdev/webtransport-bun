@@ -13,14 +13,14 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { createServer } from "../src/index.js";
+import { __TESTING__, createServer } from "../src/index.js";
 import { nextPort } from "./helpers/network.js";
 
 const BASE_PORT = 26_800;
 const PORT_SPREAD = 60;
 
 const CHILD = `
-const { createServer } = await import(${JSON.stringify(
+const { __TESTING__, createServer } = await import(${JSON.stringify(
 	new URL("../src/index.ts", import.meta.url).href,
 )});
 const { connectWithRetry } = await import(${JSON.stringify(
@@ -35,7 +35,7 @@ const server = createServer({
 });
 console.log("udpSendBatch=" + server.serverUdpSendBatch());
 console.log("udpSendEagainMode=" + server.serverUdpSendEagainMode());
-console.log("reflectRingBypass=" + server.serverReflectRingBypass());
+console.log("reflectRingBypass=" + __TESTING__.serverInternals(server).serverReflectRingBypass());
 const client = await connectWithRetry("https://127.0.0.1:" + port, {
 	tls: { insecureSkipVerify: true },
 });
@@ -138,7 +138,9 @@ describe("server udp send batch", () => {
 		try {
 			expect(server.serverUdpSendBatch()).toBe(0);
 			expect(server.serverUdpSendEagainMode()).toBe("wait");
-			expect(server.serverReflectRingBypass()).toBe("off");
+			expect(
+				__TESTING__.serverInternals(server).serverReflectRingBypass(),
+			).toBe("off");
 		} finally {
 			await server.close();
 		}

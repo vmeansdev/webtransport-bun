@@ -31,7 +31,7 @@ describe("G6 shard server source-bound configuration", () => {
 			'const ackReflector = resolveAckReflectorMode(requireArg("ack-reflector"));',
 		);
 		expect(source).toContain(
-			'if (ackReflector === "native")\n\t\tserver.setDatagramReflector(G6_V3_ACK_REFLECTOR_RULE);',
+			'if (ackReflector === "native")\n\t\tinternals.setDatagramReflector(G6_V3_ACK_REFLECTOR_RULE);',
 		);
 		expect(source).toContain("reflectorCounters = reconcileReflectorCounters(");
 		expect(source).toContain("ackReflector,\n");

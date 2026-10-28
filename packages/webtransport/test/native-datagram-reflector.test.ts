@@ -3,15 +3,16 @@
  * native and never reaches JavaScript; everything else takes the ordinary
  * path untouched. Pinned from the outside: the reply bytes, the metrics,
  * the non-delivery, and the clear.
+ *
+ * The reflector is excluded from the 1.0 public surface: it is reached here
+ * through `__TESTING__.serverInternals(server)`, and the last case pins that
+ * the public server object and its public snapshot carry none of it.
  */
 
 import { describe, expect, it } from "bun:test";
-import { createServer } from "../src/index.js";
-import type {
-	ClientSession,
-	ServerSession,
-	WebTransportServer,
-} from "../src/index.js";
+import type { ClientSession, ServerSession } from "../src/index.js";
+import { __TESTING__, createServer } from "../src/index.js";
+import type { ServerInternals } from "../src/server-internals.js";
 import { nextWithTimeout } from "./helpers/harness.js";
 import { connectWithRetry, nextPort } from "./helpers/network.js";
 
@@ -64,7 +65,8 @@ function actionStamp(actual: bigint, sequence: bigint): Uint8Array {
 }
 
 type Fixture = {
-	server: WebTransportServer;
+	/** The internal accessor: the reflector is not on the public server. */
+	server: ServerInternals;
 	session: ServerSession;
 	client: ClientSession;
 	fromClient: AsyncIterator<Uint8Array>;
@@ -100,7 +102,13 @@ async function withSession(body: (f: Fixture) => Promise<void>): Promise<void> {
 		const session = await accepted.promise;
 		fromClient = session.incomingDatagrams()[Symbol.asyncIterator]();
 		toClient = client.incomingDatagrams()[Symbol.asyncIterator]();
-		await body({ server, session, client, fromClient, toClient });
+		await body({
+			server: __TESTING__.serverInternals(server),
+			session,
+			client,
+			fromClient,
+			toClient,
+		});
 	} finally {
 		await fromClient?.return?.();
 		await toClient?.return?.();
@@ -190,5 +198,27 @@ describe("native datagram reflector", () => {
 			expect(readU64(reply, 20)).toBe(5n);
 			expect(server.metricsSnapshot().datagramReflectHits).toBe(1);
 		});
+	});
+
+	it("is absent from the public server and from its public snapshot", async () => {
+		const server = createServer({
+			port: nextPort(BASE_PORT, PORT_SPREAD),
+			tls: { certPem: "", keyPem: "" },
+			onSession: () => {},
+		});
+		try {
+			const bag = server as unknown as Record<string, unknown>;
+			expect(bag.setDatagramReflector).toBeUndefined();
+			expect(bag.serverReflectRingBypass).toBeUndefined();
+			const internals = __TESTING__.serverInternals(server);
+			internals.setDatagramReflector(G6_RULE);
+			expect(internals.metricsSnapshot().datagramReflectHits).toBe(0);
+			const publicKeys = Object.keys(server.metricsSnapshot());
+			expect(publicKeys.filter((k) => k.startsWith("datagramReflect"))).toEqual(
+				[],
+			);
+		} finally {
+			await server.close();
+		}
 	});
 });

@@ -1,5 +1,6 @@
 /** Owned ephemeral-socket measurement proof; no fixed-port killing or remote I/O. */
 import {
+	__TESTING__,
 	connect,
 	createServer,
 } from "../../packages/webtransport/src/index.ts";
@@ -48,7 +49,9 @@ async function main(): Promise<void> {
 			throw Error(
 				"native invalid phase returned an error value instead of throwing",
 			);
-		server.setDatagramReflector(G6_V3_ACK_REFLECTOR_RULE);
+		__TESTING__
+			.serverInternals(server)
+			.setDatagramReflector(G6_V3_ACK_REFLECTOR_RULE);
 		await readNativeSendPath(server.__sendPathDiagnostics, "connect", enabled);
 		client = await bounded(
 			connect(`https://127.0.0.1:${server.address.port}`, {

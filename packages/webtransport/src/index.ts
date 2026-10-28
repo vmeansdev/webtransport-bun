@@ -60,15 +60,14 @@ export type { Resettable, StopSendable } from "./streams.js";
 export { WT_RESET, WT_STOP_SENDING } from "./streams.js";
 
 import {
+	createNativeByteReadable,
+	type NativeReadableOwner,
+} from "./native-readable.js";
+import {
 	type QuicLbOptions,
 	quicLbOptionsError,
 	quicLbOptionsToJson,
 } from "./quic-lb.js";
-
-import {
-	createNativeByteReadable,
-	type NativeReadableOwner,
-} from "./native-readable.js";
 import {
 	configureReadGroup,
 	createIncomingReadable,
@@ -107,8 +106,9 @@ export type {
 	StreamSinkDescriptor,
 	StreamSinkFraming,
 } from "./sink-layout.js";
-export { SinkReader } from "./sink-reader.js";
 export type { SinkRecord, SinkRecordType } from "./sink-reader.js";
+export { SinkReader } from "./sink-reader.js";
+
 import {
 	openReadSinkOnNativeHandle,
 	type SinkCapableNativeHandle,
@@ -186,10 +186,7 @@ import {
 	sendDatagramMirrorChecked,
 	sendDatagramMirrorPacedChecked,
 } from "./datagram-mirror.js";
-import {
-	type DatagramReflectorRule,
-	datagramReflectorRuleChecked,
-} from "./datagram-reflector.js";
+import { datagramReflectorRuleChecked } from "./datagram-reflector.js";
 import { createMonotonicDeadline, sleep, withDeadline } from "./deadline.js";
 import {
 	E_BACKPRESSURE_TIMEOUT,
@@ -211,6 +208,12 @@ import {
 	WebTransportError,
 } from "./errors.js";
 import { createServerCloseContract } from "./server-close.js";
+import {
+	type InternalMetricsSnapshot,
+	registerServerInternals,
+	serverInternals,
+	withoutInternalMetrics,
+} from "./server-internals.js";
 import {
 	parseStreamBatchBytes,
 	readStreamChunk,
@@ -845,12 +848,6 @@ export interface WebTransportServer {
 	 */
 	readMirrorReports(max?: number): readonly MirrorReport[];
 	/**
-	 * Install, replace, or clear (`null`) this server's datagram reflector: a
-	 * matched datagram is answered in native with a rewritten copy of its
-	 * first bytes and never reaches `incomingDatagrams()`. Native-only.
-	 */
-	setDatagramReflector(rule: DatagramReflectorRule | null): void;
-	/**
 	 * Effective Tokio worker count of the native server runtime in this
 	 * process. 2 unless `WEBTRANSPORT_NATIVE_SERVER_WORKERS` overrode it before
 	 * the addon built its runtime; that override exists for measurement-campaign
@@ -872,8 +869,6 @@ export interface WebTransportServer {
 	serverDatagramDriver(): string;
 	/** Linux sendmmsg EAGAIN policy: "wait" | "drop". */
 	serverUdpSendEagainMode(): string;
-	/** Native reflector direct-lane mode: "off" | "on". */
-	serverReflectRingBypass(): string;
 	close(): Promise<void>;
 	metricsSnapshot(): MetricsSnapshot;
 }
@@ -884,12 +879,6 @@ export type {
 	DatagramMirrorResult,
 	MirrorReport,
 } from "./datagram-mirror.js";
-
-export type {
-	DatagramReflectorRule,
-	ReflectorMatch,
-	ReflectorOp,
-} from "./datagram-reflector.js";
 
 // ---------------------------------------------------------------------------
 // Browser-style facade types (RFC_CLIENT_FACADE, PARITY_MATRIX)
@@ -1210,22 +1199,6 @@ export type MetricsSnapshot = {
 	 * number. Absent entirely on an addon built without the pacer.
 	 */
 	mirrorReportsDropped?: number;
-	/** Native only. Datagrams the per-server reflector matched. */
-	datagramReflectHits?: number;
-	/** Native only. Reflected replies the transport accepted. */
-	datagramReflectSent?: number;
-	/** Native only. Reflected replies dropped because the sender queue was full. */
-	datagramReflectQueueFull?: number;
-	/** Native only. Reflected replies the transport refused; dropped, never retried. */
-	datagramReflectSendErrors?: number;
-	datagramReflectRingBypassMarked?: number;
-	datagramReflectRingBypassRefreshed?: number;
-	datagramReflectRingBypassRefused?: number;
-	datagramReflectRingBypassExpired?: number;
-	datagramReflectRingBypassed?: number;
-	datagramReflectRingDirectBlocked?: number;
-	datagramReflectRingDirectErrors?: number;
-	datagramReflectRingGsoFallback?: number;
 	/** Native only, process-wide. Cross-connection UDP send batching
 	 * (`WEBTRANSPORT_NATIVE_UDP_SEND_BATCH`): sendmmsg calls, datagrams sent
 	 * through them, datagrams sent one at a time instead, WouldBlocks handed
@@ -1243,13 +1216,6 @@ export type MetricsSnapshot = {
 	datagramPumpsSpawned?: number;
 	datagramPumpsLive?: number;
 	udpSendBatchMaxBatch?: number;
-	datagramReflectSendErrorsByReason?: {
-		notConnected: number;
-		unsupportedByPeer: number;
-		tooLarge: number;
-	};
-	/** Native only. Receive-to-reflection duration. Present when any observation. */
-	datagramReflectHold?: HistogramSnapshot | null;
 	/**
 	 * Native only. Connections that were live when this snapshot was taken and
 	 * therefore contributed to the `quic*` sums below.
@@ -1726,7 +1692,7 @@ interface NativeServerHandle {
 	/** Linux sendmmsg EAGAIN policy; version-bound with the prebuild. */
 	serverUdpSendEagainMode(): string;
 	serverReflectRingBypass(): string;
-	metricsSnapshot(): MetricsSnapshot;
+	metricsSnapshot(): InternalMetricsSnapshot;
 	__sendPathDiagnostics?(phase?: string): string;
 }
 interface NativeAddon {
@@ -2759,7 +2725,7 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		}
 	}
 
-	return {
+	const server: WebTransportServer = {
 		address: { host: opts.host ?? "0.0.0.0", port: handle.port },
 		congestionControl: opts.congestionControl ?? "default",
 		...pacerStatsForwards(handle),
@@ -2834,17 +2800,6 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 			),
 		readMirrorReports: (max) =>
 			decodeMirrorReports(handle.readMirrorReports?.(max) ?? []),
-		setDatagramReflector: (rule) =>
-			datagramReflectorRuleChecked((native) => {
-				const install = handle.setDatagramReflector;
-				if (typeof install !== "function") {
-					throw new WebTransportError(
-						E_UNSUPPORTED_ARGUMENT,
-						"E_UNSUPPORTED_ARGUMENT: this addon was built without the datagram reflector, so setDatagramReflector has nothing to install",
-					);
-				}
-				install.call(handle, native as never);
-			}, rule),
 		close: createServerCloseContract({
 			closeNative: () => handle.close(),
 			resolveOwnedSessions: (info) => {
@@ -2866,15 +2821,33 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		serverUdpSendBatch: () => handle.serverUdpSendBatch(),
 		serverDatagramDriver: () => handle.serverDatagramDriver(),
 		serverUdpSendEagainMode: () => handle.serverUdpSendEagainMode(),
-		serverReflectRingBypass: () => handle.serverReflectRingBypass(),
 		...(typeof handle.__sendPathDiagnostics === "function"
 			? {
 					__sendPathDiagnostics: (phase?: string) =>
 						handle.__sendPathDiagnostics!(phase),
 				}
 			: {}),
-		metricsSnapshot: () => handle.metricsSnapshot(),
+		metricsSnapshot: () => withoutInternalMetrics(handle.metricsSnapshot()),
 	};
+	// Surfaces excluded from the 1.0 contract stay reachable for tests and
+	// tools/ harnesses through `__TESTING__.serverInternals(server)` only; see
+	// server-internals.ts for the one mechanism every excluded surface uses.
+	registerServerInternals(server, {
+		setDatagramReflector: (rule) =>
+			datagramReflectorRuleChecked((native) => {
+				const install = handle.setDatagramReflector;
+				if (typeof install !== "function") {
+					throw new WebTransportError(
+						E_UNSUPPORTED_ARGUMENT,
+						"E_UNSUPPORTED_ARGUMENT: this addon was built without the datagram reflector, so setDatagramReflector has nothing to install",
+					);
+				}
+				install.call(handle, native as never);
+			}, rule),
+		serverReflectRingBypass: () => handle.serverReflectRingBypass(),
+		metricsSnapshot: () => handle.metricsSnapshot(),
+	});
+	return server;
 }
 
 // ---------------------------------------------------------------------------
@@ -5008,6 +4981,12 @@ function createNativeServerSessionForTests(nativeHandle: any): ServerSession {
 
 /** @internal */
 export const __TESTING__ = {
+	/**
+	 * Server surfaces excluded from the 1.0 contract (reflector, campaign
+	 * getters and diagnostics, campaign counters). Unstable; see
+	 * server-internals.ts.
+	 */
+	serverInternals,
 	createNativeClientSessionForTests,
 	createNativeServerSessionForTests,
 	createServerIncomingBidiStreamsForTests: createServerIncomingBidiStreams,

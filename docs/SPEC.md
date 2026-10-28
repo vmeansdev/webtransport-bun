@@ -833,3 +833,10 @@ behavior under gates that have not passed.
   construction hooks). It is not part of this spec, is excluded from the frozen
   export list, and may be reshaped or removed in any release without a major
   bump. Do not depend on it outside this repository's own tests.
+- **Server internals are excluded, not hidden by convention**:
+  `__TESTING__.serverInternals(server)` is the one mechanism for server
+  surfaces kept off the 1.0 contract (the native datagram reflector, the
+  measurement-campaign getters and diagnostics, and campaign-only counters).
+  The public `WebTransportServer` does not carry them and the public
+  `metricsSnapshot()` strips those counters at runtime. Like the rest of
+  `__TESTING__`, it is unstable.

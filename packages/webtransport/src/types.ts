@@ -164,14 +164,6 @@ export type MetricsSnapshot = {
 	datagramPumpsSpawned?: number;
 	datagramPumpsLive?: number;
 	udpSendBatchMaxBatch?: number;
-	datagramReflectRingBypassMarked?: number;
-	datagramReflectRingBypassRefreshed?: number;
-	datagramReflectRingBypassRefused?: number;
-	datagramReflectRingBypassExpired?: number;
-	datagramReflectRingBypassed?: number;
-	datagramReflectRingDirectBlocked?: number;
-	datagramReflectRingDirectErrors?: number;
-	datagramReflectRingGsoFallback?: number;
 
 	rateLimitedCount: number;
 	limitExceededCount: number;
