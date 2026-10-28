@@ -10,7 +10,7 @@
 // structural type says nothing about what the object actually does.
 
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { WasmLimitsOptions } from "../src/backend.js";
 import { connectWasm } from "../src/backend.js";
@@ -214,6 +214,32 @@ type _AssertQuicWindowsOptional = Assert<
 	Extends<
 		Record<string, never>,
 		Pick<rootSurface.LimitsOptions, QuicWindowKeys>
+	>
+>;
+
+// The native stream sink's E_SINK_* codes are on the ErrorCode union, as an
+// experimental subset: present for programmatic matching, but not under the
+// stable-code promise (SPEC.md, "Experimental surfaces").
+const EXPERIMENTAL_SINK_CODES = [
+	"E_SINK_ACTIVE",
+	"E_SINK_ALREADY_OPEN",
+	"E_SINK_BAD_BUFFER",
+	"E_SINK_BAD_OPTIONS",
+	"E_SINK_CLOSED",
+	"E_SINK_FRAME_FAULT",
+	"E_SINK_INTERNAL",
+	"E_SINK_LIMIT",
+	"E_SINK_OVERSIZED",
+	"E_SINK_READ_ACTIVE",
+	"E_SINK_STALLED",
+] as const satisfies readonly rootSurface.ExperimentalSinkErrorCode[];
+type _AssertSinkCodesOnErrorCode = Assert<
+	Extends<rootSurface.ExperimentalSinkErrorCode, rootSurface.ErrorCode>
+>;
+type _AssertSinkCodeListComplete = Assert<
+	Extends<
+		rootSurface.ExperimentalSinkErrorCode,
+		(typeof EXPERIMENTAL_SINK_CODES)[number]
 	>
 >;
 
@@ -525,6 +551,35 @@ describe("three-surface public API model", () => {
 
 		expect(portableSurface.createServer.constructor.name).toBe("AsyncFunction");
 		expect(wasmSurface.createServer.constructor.name).toBe("AsyncFunction");
+	});
+});
+
+describe("experimental sink error codes", () => {
+	test("every E_SINK_* code the sink can produce is on the ErrorCode union", () => {
+		// Drift guard: a new sink code in the TypeScript or native sources must
+		// be added to the union (and this list) before it can ship.
+		const roots = [
+			new URL("../src/", import.meta.url),
+			new URL("../../../crates/native/src/", import.meta.url),
+		];
+		const found = new Set<string>();
+		for (const root of roots) {
+			for (const name of readdirSync(root)) {
+				if (!/\.(ts|rs)$/.test(name)) continue;
+				const text = readFileSync(new URL(name, root), "utf8");
+				for (const m of text.matchAll(/\bE_SINK_[A-Z_]+\b/g)) {
+					// A fixed-width padding literal in stream_sink.rs, not a code.
+					if (!m[0].includes("_PAD")) found.add(m[0]);
+				}
+			}
+		}
+		expect([...found].sort()).toEqual([...EXPERIMENTAL_SINK_CODES]);
+	});
+
+	test("the sink throws codes from that set", () => {
+		expect(() => rootSurface.openReadSink({} as never)).toThrow(
+			/^E_SINK_BAD_OPTIONS: /,
+		);
 	});
 });
 

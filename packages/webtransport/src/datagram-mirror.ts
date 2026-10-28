@@ -140,6 +140,8 @@ export type NativeDatagramMirrorAdmission = {
  * attempt them later. `admitted` says how many it took, and nothing here can be
  * mistaken for how many arrived. Delivery is `admitted` minus the failures that
  * later arrive through `readMirrorReports()`.
+ *
+ * @experimental Egress pacer surface; may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
  */
 export type DatagramMirrorAdmission = {
 	/** Targets accepted onto the pacer's schedule. Not a delivery count. */
@@ -166,6 +168,8 @@ export type NativeMirrorReport = { target: string; code: number };
  * broadcast to 10,000 subscribers produces nothing here. `E_SESSION_CLOSED`
  * entries are the reap list and `E_QUEUE_FULL` entries are the retry list,
  * exactly as in the synchronous envelope.
+ *
+ * @experimental Egress pacer surface; may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
  */
 export type MirrorReport = {
 	/** The session id, as the caller wrote it in its target list. */

@@ -3,7 +3,6 @@
  * Used by the native facade and the wasm facade so option errors stay aligned.
  */
 
-import type { ErrorCode } from "./types.js";
 import {
 	E_BACKPRESSURE_TIMEOUT,
 	E_HANDSHAKE_TIMEOUT,
@@ -21,6 +20,7 @@ import {
 	E_UNSUPPORTED_ARGUMENT,
 	WebTransportError,
 } from "./errors.js";
+import type { ErrorCode } from "./types.js";
 
 export type W3CCongestionControl = "default" | "throughput" | "low-latency";
 export type W3CDatagramsReadableType = "bytes" | "default";
@@ -71,6 +71,21 @@ export function normalizeW3CBrowserName(code: ErrorCode): string | undefined {
 			// Close reason only, never a thrown WebTransportError.code, so it
 			// has no browser name to map to. Listed explicitly rather than left
 			// to `default` so the exhaustiveness check keeps its teeth.
+			return undefined;
+		case "E_SINK_ACTIVE":
+		case "E_SINK_ALREADY_OPEN":
+		case "E_SINK_BAD_BUFFER":
+		case "E_SINK_BAD_OPTIONS":
+		case "E_SINK_CLOSED":
+		case "E_SINK_FRAME_FAULT":
+		case "E_SINK_INTERNAL":
+		case "E_SINK_LIMIT":
+		case "E_SINK_OVERSIZED":
+		case "E_SINK_READ_ACTIVE":
+		case "E_SINK_STALLED":
+			// Experimental stream-sink codes: the sink throws them as plain
+			// Errors or records them in its ring, never through the W3C facade,
+			// so they have no browser name either.
 			return undefined;
 		default: {
 			const _exhaustive: never = code;

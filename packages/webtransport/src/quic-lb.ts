@@ -39,6 +39,8 @@ const RESERVED_CONFIG_ROTATION = 0b111;
  * and `configRotation`, and each carries a distinct `serverId`. Distinct server
  * IDs of equal length cannot collide in the ID portion, so no two instances
  * claim each other's connection IDs.
+ *
+ * @experimental QUIC-LB / multi-process steering surface; may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
  */
 export type QuicLbOptions = {
 	/**
@@ -81,6 +83,8 @@ export type QuicLbOptions = {
  * unroutable (§3.2) even though its bytes parse.
  *
  * Pure: no addon, no I/O. The returned array is a copy, not a view.
+ *
+ * @experimental QUIC-LB / multi-process steering surface; may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
  */
 export function decodeQuicLbServerId(
 	cid: Uint8Array,
@@ -97,6 +101,8 @@ export function decodeQuicLbServerId(
  *
  * A result of `7` means the reserved "unroutable" codepoint (§3.2), not a
  * routable generation.
+ *
+ * @experimental QUIC-LB / multi-process steering surface; may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
  */
 export function decodeQuicLbConfigRotation(cid: Uint8Array): number | null {
 	const first = cid[0];
@@ -106,6 +112,8 @@ export function decodeQuicLbConfigRotation(cid: Uint8Array): number | null {
 /**
  * The wire length of every connection ID this configuration issues:
  * `1 + serverIdLen + nonceLen`, from 6 to 20 octets.
+ *
+ * @experimental QUIC-LB / multi-process steering surface; may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
  */
 export function quicLbCidLength(serverIdLen: number, nonceLen: number): number {
 	return 1 + serverIdLen + nonceLen;

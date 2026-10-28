@@ -99,31 +99,69 @@ impl PacerConfig {
     }
 }
 
-/// Read the knobs once. `None` means the pacer is off and the mirror send runs
-/// its inline loop unchanged.
+/// The process-wide pacer configuration, resolved once: by the first
+/// `createServer({ egressPacer })` ([`install_config`]) or, failing that, from
+/// the environment on first use. One schedule and one thread per process, so
+/// there is exactly one configuration.
+static CONFIG: OnceLock<Option<PacerConfig>> = OnceLock::new();
+
+/// The resolved configuration. `None` means the pacer is off and the mirror
+/// send runs its inline loop unchanged.
 ///
 /// Every malformed or out-of-range value is clamped or read as off. This path
 /// must never throw: it runs inside a synchronous N-API method whose whole
 /// contract is that it does not.
 pub(crate) fn config() -> Option<&'static PacerConfig> {
-    static CONFIG: OnceLock<Option<PacerConfig>> = OnceLock::new();
-    CONFIG
-        .get_or_init(|| {
-            let pps = env_u64("WEBTRANSPORT_PACER_PPS").unwrap_or(0);
-            if pps == 0 {
-                return None;
-            }
-            Some(PacerConfig {
-                pps,
-                clump: env_u64("WEBTRANSPORT_PACER_CLUMP")
-                    .map(|v| (v as usize).clamp(1, CLUMP_MAX))
-                    .unwrap_or(CLUMP_DEFAULT),
-                queue_ms: env_u64("WEBTRANSPORT_PACER_QUEUE_MS")
-                    .unwrap_or(QUEUE_MS_DEFAULT)
-                    .max(1),
-            })
-        })
-        .as_ref()
+    CONFIG.get_or_init(config_from_env).as_ref()
+}
+
+/// The environment fallback (`WEBTRANSPORT_PACER_PPS`, `_CLUMP`, `_QUEUE_MS`).
+fn config_from_env() -> Option<PacerConfig> {
+    let pps = env_u64("WEBTRANSPORT_PACER_PPS").unwrap_or(0);
+    if pps == 0 {
+        return None;
+    }
+    Some(pacer_config(
+        pps,
+        env_u64("WEBTRANSPORT_PACER_CLUMP"),
+        env_u64("WEBTRANSPORT_PACER_QUEUE_MS"),
+    ))
+}
+
+/// A configuration with the same clamps and defaults whichever source it came
+/// from. `pps` must be non-zero.
+pub(crate) fn pacer_config(pps: u64, clump: Option<u64>, queue_ms: Option<u64>) -> PacerConfig {
+    PacerConfig {
+        pps,
+        clump: clump
+            .map(|v| (v as usize).clamp(1, CLUMP_MAX))
+            .unwrap_or(CLUMP_DEFAULT),
+        queue_ms: queue_ms.unwrap_or(QUEUE_MS_DEFAULT).max(1),
+    }
+}
+
+/// Install the `egressPacer` server option as the process-wide configuration.
+///
+/// The option wins over the environment when it arrives first. Asking again
+/// for the identical configuration is fine (several servers in one process may
+/// all pass it); asking for a different one, or for a pacer after the process
+/// already resolved "off", is refused rather than silently ignored.
+pub(crate) fn install_config(wanted: PacerConfig) -> Result<(), String> {
+    reconcile(CONFIG.get_or_init(|| Some(wanted)).as_ref(), &wanted)
+}
+
+fn reconcile(resolved: Option<&PacerConfig>, wanted: &PacerConfig) -> Result<(), String> {
+    match resolved {
+        Some(c) if c == wanted => Ok(()),
+        Some(c) => Err(format!(
+            "egressPacer {{ pps: {}, clump: {}, queueMs: {} }} conflicts with the process-wide egress pacer already configured as {{ pps: {}, clump: {}, queueMs: {} }}; the pacer has one schedule per process",
+            wanted.pps, wanted.clump, wanted.queue_ms, c.pps, c.clump, c.queue_ms
+        )),
+        None => Err(
+            "egressPacer cannot be enabled: this process already resolved the egress pacer as off (no option and no WEBTRANSPORT_PACER_PPS when it was first used)"
+                .to_string(),
+        ),
+    }
 }
 
 fn env_u64(name: &str) -> Option<u64> {
@@ -1245,6 +1283,21 @@ mod tests {
             queue_ms: 1,
         };
         assert_eq!(tiny.max_pending(), 32);
+    }
+
+    #[test]
+    fn the_option_reconciles_against_the_one_process_configuration() {
+        let a = pacer_config(30_000, Some(32), None);
+        assert_eq!(a, cfg(30_000, 32));
+        assert_eq!(pacer_config(1, Some(999), Some(0)).clump, CLUMP_MAX);
+        assert_eq!(pacer_config(1, Some(0), Some(0)).queue_ms, 1);
+        assert!(reconcile(Some(&a), &a).is_ok());
+        let b = pacer_config(60_000, Some(32), None);
+        let conflict = reconcile(Some(&a), &b).unwrap_err();
+        assert!(conflict.contains("conflicts"), "{conflict}");
+        assert!(reconcile(None, &a)
+            .unwrap_err()
+            .contains("resolved the egress pacer as off"));
     }
 
     #[test]

@@ -35,6 +35,7 @@ import {
 	type StreamSinkDescriptor,
 } from "./sink-layout.js";
 
+/** @experimental Native stream sink (RFC_STREAM_SINK); may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces"). */
 export type SinkRecordType =
 	| "data"
 	| "message"
@@ -43,6 +44,7 @@ export type SinkRecordType =
 	| "reset"
 	| "drops";
 
+/** @experimental Native stream sink (RFC_STREAM_SINK); may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces"). */
 export interface SinkRecord {
 	type: SinkRecordType;
 	/** Arrival stamp in the descriptor's clock domain. */
@@ -78,6 +80,7 @@ const RECORD_TYPE_NAMES: Record<number, SinkRecordType> = {
 
 const TEXT_DECODER = new TextDecoder();
 
+/** @experimental Native stream sink (RFC_STREAM_SINK); may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces"). */
 export class SinkReader {
 	readonly #i32: Int32Array;
 	readonly #dv: DataView;

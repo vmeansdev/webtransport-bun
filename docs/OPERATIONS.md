@@ -317,6 +317,25 @@ benefit on a real path: over a WAN, where BDP routinely exceeds 256 KiB, the
 default window — not the CPU — is what caps a single stream. Widen when you
 measure a stalled sender on a long path; do not widen speculatively.
 
+## Egress pacer (experimental)
+
+The paced mirror (`sendDatagramMirrorPaced` / `readMirrorReports`) needs the
+native egress pacer. Turn it on with the server option:
+
+```ts
+createServer({ port, tls, onSession, egressPacer: { pps: 30_000, clump: 32, queueMs: 250 } });
+```
+
+The pacer is **process-wide**: one schedule and one OS thread. The first
+configuration a process resolves wins. A later `createServer` asking for a
+different one fails with `E_INVALID_ARGUMENT`; the identical one is accepted.
+`WEBTRANSPORT_PACER_PPS` (with `WEBTRANSPORT_PACER_CLUMP` /
+`WEBTRANSPORT_PACER_QUEUE_MS`) remains a documented fallback for processes
+where no server passes the option. It is read on the pacer's first use, and
+the option takes precedence when it comes first. The whole surface is
+experimental (`docs/SPEC.md`, "Experimental surfaces"). See
+`crates/native/docs/egress-pacer.md` for how the schedule behaves.
+
 ## Transport defaults that changed for 1.0
 
 Two native transport defaults changed after `1.0.0-rc.1`. Neither has a
@@ -383,6 +402,7 @@ falls back to its default. The process is never aborted.
 | `WEBTRANSPORT_NATIVE_SEND_PATH_DIAGNOSTICS` | `0` | `0` \| `1` (process-wide send-path phase banks) |
 | `WEBTRANSPORT_NATIVE_SERVER_UDP_SNDBUF_BYTES` | unset | `0` or `65536..=67108864` |
 | `WTRANSPORT_DATAGRAM_PUMP` | pump on | `0` selects the legacy inline datagram read |
+| `WEBTRANSPORT_PACER_NICE`, `WEBTRANSPORT_PACER_SCHED` | unset | thread priority of the (experimental) egress pacer: a nice value, or `rr:<prio>` |
 | `WEBTRANSPORT_DATAGRAM_BATCH_DIAGNOSTICS` | off | `1` arms per-process incoming-datagram batch counters, readable only through `__TESTING__` (JavaScript side, read at module load) |
 
 Two cases are refused at `createServer` rather than replaced by a default,
@@ -461,6 +481,8 @@ The rules that follow from the measurements, in order of leverage:
 
 ## Multi-process binds (`reusePort`)
 
+*Experimental: may change in a 1.x minor (`docs/SPEC.md`, "Experimental surfaces").*
+
 `createServer({ reusePort: true })` sets `SO_REUSEPORT` on the bind socket so
 several server processes can listen on one port. It is **native-backend only**
 (the WASM backend has its own options type and owns no socket) and **unix
@@ -511,6 +533,8 @@ sessions") and 4 ("Four disclosures you must read before deploying any steered
 pattern").
 
 ## QUIC-LB connection IDs (`quicLb`)
+
+*Experimental: may change in a 1.x minor (`docs/SPEC.md`, "Experimental surfaces").*
 
 `reusePort` gives you a group of processes on one port; `quicLb` gives the
 thing steering that group something rebind-stable to steer *by*. With

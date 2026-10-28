@@ -62,9 +62,14 @@ export const TASK_STATE_NAMES = [
 	"stalled",
 	"closed",
 ] as const;
+/** @experimental Native stream sink (RFC_STREAM_SINK); may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces"). */
 export type SinkTaskStateName = (typeof TASK_STATE_NAMES)[number];
 
-/** Descriptor a StreamSinkHandle hands to the worker's SinkReader. */
+/**
+ * Descriptor a StreamSinkHandle hands to the worker's SinkReader.
+ *
+ * @experimental Native stream sink (RFC_STREAM_SINK); may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
+ */
 export interface StreamSinkDescriptor {
 	version: 1;
 	/** Bytes in the data region (power of two). */
@@ -81,7 +86,11 @@ export interface StreamSinkDescriptor {
 	framing: StreamSinkFraming | null;
 }
 
-/** Declarative length-prefix framing (RFC_STREAM_SINK §3). */
+/**
+ * Declarative length-prefix framing (RFC_STREAM_SINK §3).
+ *
+ * @experimental Native stream sink (RFC_STREAM_SINK); may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
+ */
 export interface StreamSinkFraming {
 	headerBytes: number;
 	lengthOffset: number;

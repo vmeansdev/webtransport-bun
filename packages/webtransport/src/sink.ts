@@ -14,12 +14,13 @@ import {
 	OFF_DROPPED_RECORDS,
 	OFF_HIGH_WATER,
 	SINK_DATA_OFFSET,
-	TASK_STATE_NAMES,
 	type SinkTaskStateName,
 	type StreamSinkDescriptor,
 	type StreamSinkFraming,
+	TASK_STATE_NAMES,
 } from "./sink-layout.js";
 
+/** @experimental Native stream sink (RFC_STREAM_SINK); may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces"). */
 export interface StreamSinkOptions {
 	/** Ring data-region size in bytes; power of two. Default 4 MiB. */
 	ringBytes?: number;
@@ -39,6 +40,7 @@ export interface StreamSinkOptions {
 	idleTimeoutMs?: number;
 }
 
+/** @experimental Native stream sink (RFC_STREAM_SINK); may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces"). */
 export interface StreamSinkStats {
 	bytesIn: number;
 	records: number;
@@ -49,6 +51,7 @@ export interface StreamSinkStats {
 	state: SinkTaskStateName;
 }
 
+/** @experimental Native stream sink (RFC_STREAM_SINK); may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces"). */
 export interface StreamSinkHandle {
 	/** Post to the consuming Worker together with `descriptor` (shared). */
 	readonly buffer: SharedArrayBuffer;

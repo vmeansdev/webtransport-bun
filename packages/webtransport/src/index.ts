@@ -121,6 +121,8 @@ import {
  * accepts the Node facade classes (BidiStream / RecvStream) and the W3C
  * incoming-stream wrappers a server session yields, all of which carry an
  * `openReadSink` method with the same contract.
+ *
+ * @experimental Native stream sink (RFC_STREAM_SINK); may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
  */
 export function openReadSink(
 	stream:
@@ -168,7 +170,7 @@ export {
 	E_UNSUPPORTED_ARGUMENT,
 	WebTransportError,
 } from "./errors.js";
-export type { ErrorCode } from "./types.js";
+export type { ErrorCode, ExperimentalSinkErrorCode } from "./types.js";
 
 import {
 	DATAGRAM_BATCH_MAX,
@@ -604,6 +606,20 @@ export type LogEvent = {
 // Server options & interface
 // ---------------------------------------------------------------------------
 
+/**
+ * Configuration of the process-wide egress pacer ({@link ServerOptions.egressPacer}).
+ *
+ * @experimental Egress pacer surface; may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
+ */
+export type EgressPacerOptions = {
+	/** Datagrams per second. A positive integer. */
+	pps: number;
+	/** Datagrams per burst unit, 1–64. Default 32. */
+	clump?: number;
+	/** Admission bound in milliseconds of work at the configured rate. Default 250. */
+	queueMs?: number;
+};
+
 /** Options for {@link createServer}. Limits/rateLimits merge with defaults. */
 export type ServerOptions = {
 	host?: string /** @default "0.0.0.0" */;
@@ -668,6 +684,8 @@ export type ServerOptions = {
 	 * its siblings. Use it for eBPF-steered (`SK_REUSEPORT`) topologies, where
 	 * steering follows the connection ID, and for benchmarks. See
 	 * docs/OPERATIONS.md ("Multi-process binds (reusePort)").
+	 *
+	 * @experimental QUIC-LB / multi-process steering surface; may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
 	 */
 	reusePort?: boolean;
 
@@ -705,6 +723,8 @@ export type ServerOptions = {
 	 *   tls, onSession,
 	 * });
 	 * ```
+	 *
+	 * @experimental QUIC-LB / multi-process steering surface; may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
 	 */
 	quicLb?: QuicLbOptions;
 
@@ -727,6 +747,8 @@ export type ServerOptions = {
 	 * kernel drops the sockarray entry when the socket closes; a fast
 	 * close-and-rebind can transiently see the slot still occupied, which is
 	 * retryable exactly like `AddrInUse`.
+	 *
+	 * @experimental QUIC-LB / multi-process steering surface; may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
 	 */
 	reusePortSteering?: {
 		/** Absolute bpffs path of the pinned `REUSEPORT_SOCKARRAY`. */
@@ -736,6 +758,27 @@ export type ServerOptions = {
 		/** Absolute bpffs path of the pinned `sk_reuseport` program to attach. */
 		attachProgPinPath?: string;
 	};
+
+	/**
+	 * Turn on the native egress pacer that
+	 * {@link WebTransportServer.sendDatagramMirrorPaced} schedules onto:
+	 * `pps` datagrams per second, released in clumps of `clump` (1–64, default
+	 * 32), admitting at most `queueMs` milliseconds of work at the configured
+	 * rate (default 250). Absent (the default), the pacer stays off unless the
+	 * `WEBTRANSPORT_PACER_PPS` environment variable (with
+	 * `WEBTRANSPORT_PACER_CLUMP` / `WEBTRANSPORT_PACER_QUEUE_MS`) is set. That
+	 * variable is kept as a documented fallback.
+	 *
+	 * The pacer is **process-wide**: one schedule and one thread per process.
+	 * The first configuration a process resolves wins: this option on the
+	 * first server that passes it, otherwise the environment on first use. A
+	 * later server that asks for a different configuration fails with
+	 * `E_INVALID_ARGUMENT`. Passing the identical configuration again is fine.
+	 * Native backend only.
+	 *
+	 * @experimental Egress pacer surface; may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
+	 */
+	egressPacer?: EgressPacerOptions;
 
 	/** Called on each accepted session (must not block; long work should be async) */
 	onSession: (session: ServerSession) => void | Promise<void>;
@@ -811,7 +854,11 @@ export interface WebTransportServer {
 	 *
 	 * Throws a `WebTransportError` with code `E_UNSUPPORTED_ARGUMENT` when the
 	 * pacer is unavailable, with two distinguishable messages: the addon was
-	 * built without the pacer, or `WEBTRANSPORT_PACER_PPS` is unset. Native-only.
+	 * built without the pacer, or the pacer is off (no
+	 * {@link ServerOptions.egressPacer} and no `WEBTRANSPORT_PACER_PPS`).
+	 * Native-only.
+	 *
+	 * @experimental Egress pacer surface; may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
 	 */
 	sendDatagramMirrorPaced(
 		targets: readonly string[],
@@ -836,6 +883,8 @@ export interface WebTransportServer {
 	 * reconciles against the pacer's own `deferredFailures`.
 	 *
 	 * Omitting `max` drains everything pending. Native-only.
+	 *
+	 * @experimental Egress pacer surface; may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
 	 */
 	readMirrorReports(max?: number): readonly MirrorReport[];
 	close(): Promise<void>;
@@ -1157,15 +1206,23 @@ export type MetricsSnapshot = {
 	 * rather than a share of {@link datagramMirrorCalls}: the two envelopes
 	 * report different things — delivery and admission — and a counter that
 	 * summed them would name neither.
+	 *
+	 * @experimental Egress pacer surface; may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
 	 */
 	datagramMirrorPacedCalls?: number;
-	/** Native only. Targets those paced calls offered to the schedule. */
+	/**
+	 * Native only. Targets those paced calls offered to the schedule.
+	 *
+	 * @experimental Egress pacer surface; may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
+	 */
 	datagramMirrorPacedTargets?: number;
 	/**
 	 * Native only. Deferred mirror reports lost to ring overflow — the visible
 	 * cost of polling `readMirrorReports()` too slowly. Process-wide, like the
 	 * pacer's schedule, so a second server in this process reads the same
 	 * number. Absent entirely on an addon built without the pacer.
+	 *
+	 * @experimental Egress pacer surface; may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
 	 */
 	mirrorReportsDropped?: number;
 
@@ -2349,6 +2406,31 @@ class NativeServerSession implements ServerSession {
 // createServer
 // ---------------------------------------------------------------------------
 
+/** Why an `egressPacer` option is malformed, or `null` when it is not. */
+function egressPacerOptionsError(value: unknown): string | null {
+	if (typeof value !== "object" || value === null)
+		return "egressPacer must be an object";
+	const { pps, clump, queueMs } = value as Record<string, unknown>;
+	if (typeof pps !== "number" || !Number.isSafeInteger(pps) || pps < 1)
+		return "egressPacer.pps must be a positive integer";
+	if (
+		clump !== undefined &&
+		(typeof clump !== "number" ||
+			!Number.isInteger(clump) ||
+			clump < 1 ||
+			clump > 64)
+	)
+		return "egressPacer.clump must be an integer 1..64";
+	if (
+		queueMs !== undefined &&
+		(typeof queueMs !== "number" ||
+			!Number.isSafeInteger(queueMs) ||
+			queueMs < 1)
+	)
+		return "egressPacer.queueMs must be a positive integer";
+	return null;
+}
+
 /**
  * Forward the pacer's diagnostic accessors, or forward nothing.
  *
@@ -2521,6 +2603,16 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		}
 	}
 
+	if (opts.egressPacer !== undefined && opts.egressPacer !== null) {
+		const pacerError = egressPacerOptionsError(opts.egressPacer);
+		if (pacerError !== null) {
+			throw createMappedError(
+				E_INVALID_ARGUMENT as ErrorCode,
+				`E_INVALID_ARGUMENT: ${pacerError}`,
+			);
+		}
+	}
+
 	const mergedLimits = { ...DEFAULT_LIMITS, ...opts.limits };
 	const limitsJson = JSON.stringify(mergedLimits);
 	const serverOptsJson = JSON.stringify({
@@ -2534,6 +2626,19 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		...(opts.reusePortSteering === undefined || opts.reusePortSteering === null
 			? {}
 			: { reusePortSteering: opts.reusePortSteering }),
+		...(opts.egressPacer === undefined || opts.egressPacer === null
+			? {}
+			: {
+					egressPacer: {
+						pps: opts.egressPacer.pps,
+						...(opts.egressPacer.clump === undefined
+							? {}
+							: { clump: opts.egressPacer.clump }),
+						...(opts.egressPacer.queueMs === undefined
+							? {}
+							: { queueMs: opts.egressPacer.queueMs }),
+					},
+				}),
 		...(opts.qpackMaxTableCapacity === undefined
 			? {}
 			: { qpackMaxTableCapacity: opts.qpackMaxTableCapacity }),
@@ -2726,7 +2831,7 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 						// stop.
 						throw new WebTransportError(
 							E_UNSUPPORTED_ARGUMENT,
-							"E_UNSUPPORTED_ARGUMENT: sendDatagramMirrorPaced needs the egress pacer; set WEBTRANSPORT_PACER_PPS before creating the server",
+							"E_UNSUPPORTED_ARGUMENT: sendDatagramMirrorPaced needs the egress pacer; pass createServer({ egressPacer: { pps } }) or set WEBTRANSPORT_PACER_PPS before creating the server",
 						);
 					}
 					return admission;

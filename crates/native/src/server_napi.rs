@@ -203,6 +203,24 @@ impl ServerHandle {
                     ));
                 }
             }
+            // The experimental egress pacer (`egressPacer`): process-wide, so
+            // the first configuration wins and a conflicting one is refused.
+            // The JS facade has already validated the shape.
+            if let Some(pacer) = server_opts.get("egressPacer").filter(|v| v.is_object()) {
+                let pps = pacer.get("pps").and_then(|v| v.as_u64()).unwrap_or(0);
+                if pps == 0 {
+                    return Err(napi::Error::from_reason(
+                        "E_INVALID_ARGUMENT: egressPacer.pps must be a positive integer"
+                            .to_string(),
+                    ));
+                }
+                crate::egress_pacer::install_config(crate::egress_pacer::pacer_config(
+                    pps,
+                    pacer.get("clump").and_then(|v| v.as_u64()),
+                    pacer.get("queueMs").and_then(|v| v.as_u64()),
+                ))
+                .map_err(|msg| napi::Error::from_reason(format!("E_INVALID_ARGUMENT: {}", msg)))?;
+            }
             let limits = crate::limits::Limits::from_json(&_limits_json);
             let rate_limits = crate::rate_limit::RateLimits::from_json(&_rate_limits_json);
             crate::panic_guard::set_panic_log_verbose(debug);

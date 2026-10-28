@@ -73,7 +73,29 @@ export type ErrorCode =
 	| "E_RATE_LIMITED"
 	| "E_INVALID_ARGUMENT"
 	| "E_UNSUPPORTED_ARGUMENT"
-	| "E_INTERNAL";
+	| "E_INTERNAL"
+	| ExperimentalSinkErrorCode;
+
+/**
+ * Error codes of the native stream sink (`openReadSink` / `SinkReader`,
+ * RFC_STREAM_SINK). They are thrown as `Error`s whose message starts with the
+ * code, or carried in-band as a sink ring's terminal record.
+ *
+ * @experimental Like the sink itself, this set may change in a 1.x minor
+ * (docs/SPEC.md, "Experimental surfaces"); the codes above it are stable.
+ */
+export type ExperimentalSinkErrorCode =
+	| "E_SINK_ACTIVE"
+	| "E_SINK_ALREADY_OPEN"
+	| "E_SINK_BAD_BUFFER"
+	| "E_SINK_BAD_OPTIONS"
+	| "E_SINK_CLOSED"
+	| "E_SINK_FRAME_FAULT"
+	| "E_SINK_INTERNAL"
+	| "E_SINK_LIMIT"
+	| "E_SINK_OVERSIZED"
+	| "E_SINK_READ_ACTIVE"
+	| "E_SINK_STALLED";
 
 /** Shared native rate limits configured per endpoint/server. */
 export type RateLimitOptions = {

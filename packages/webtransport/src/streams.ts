@@ -332,6 +332,8 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
 	 * error with E_SINK_ACTIVE afterwards (which destroys this Duplex, both
 	 * halves — finish writing before reading-side errors matter, or use a
 	 * uni stream). Throws E_SINK_READ_ACTIVE once facade reading started.
+	 *
+	 * @experimental Native stream sink (RFC_STREAM_SINK); may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
 	 */
 	openReadSink(opts?: StreamSinkOptions): StreamSinkHandle {
 		const h = this.#nativeHandle;
@@ -608,6 +610,8 @@ export class RecvStream extends Readable implements StopSendable {
 	 * SinkReader, off the JS event loop. One-way: facade reads error with
 	 * E_SINK_ACTIVE afterwards. Throws E_SINK_READ_ACTIVE once facade
 	 * reading started.
+	 *
+	 * @experimental Native stream sink (RFC_STREAM_SINK); may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
 	 */
 	openReadSink(opts?: StreamSinkOptions): StreamSinkHandle {
 		const h = this.#nativeHandle;

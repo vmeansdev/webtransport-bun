@@ -595,12 +595,14 @@ Contract points worth stating:
   target, so a mirrored datagram is indistinguishable from a looped one in the
   per-session counters a delivery ratio reads.
 
-### The paced mirror
+### The paced mirror (experimental)
+
+*Experimental: see "Experimental surfaces" below.*
 
 `server.sendDatagramMirrorPaced(targets, payload)` is a **separate** method that
 hands the same fan-out to the native egress pacer's schedule. It exists so that
 the contract above can stay exactly what it says: `sendDatagramMirror` is not
-paced and never will be, whatever `WEBTRANSPORT_PACER_PPS` is set to. Pacing
+paced and never will be, whatever the pacer is configured to. Pacing
 changes what a successful count *means* — from "quinn took it" to "a schedule
 accepted it" — and that is the one word the synchronous contract sells, so the
 paced envelope is a different object with a different vocabulary.
@@ -632,7 +634,15 @@ paced envelope is a different object with a different vocabulary.
 - **Metrics.** `datagramMirrorPacedCalls` and `datagramMirrorPacedTargets` move;
   `datagramMirrorCalls`, `datagramMirrorTargets` and `datagramSendsAsync` do
   not. No promise is created here either.
-- **With the pacer knob off** it throws a `WebTransportError` with code
+- **Turning the pacer on.** `createServer({ egressPacer: { pps, clump?,
+  queueMs? } })` configures it (clump 1–64, default 32; queueMs default 250).
+  The pacer is process-wide: one schedule and one thread. The first
+  configuration a process resolves wins, either this option on the first
+  server that passes it or, failing that, the environment fallback
+  `WEBTRANSPORT_PACER_PPS` / `_CLUMP` / `_QUEUE_MS` on first use. A later server
+  that asks for a different configuration fails with `E_INVALID_ARGUMENT`;
+  the identical one is accepted.
+- **With the pacer off** it throws a `WebTransportError` with code
   `E_UNSUPPORTED_ARGUMENT` rather than quietly running the inline loop, with a
   distinct message from the one an addon built without the pacer produces.
   Native-only, like the synchronous mirror.
@@ -733,6 +743,9 @@ threw.
 
 ## Incoming stream chunk delivery
 
+*Chunk batching (`WEBTRANSPORT_STREAM_BATCH_BYTES`) is experimental: see
+"Experimental surfaces" below. The default, unbatched path is stable.*
+
 Receive-side stream data crosses Node-API once per quinn assembler chunk by
 default. `WEBTRANSPORT_STREAM_BATCH_BYTES` turns on a coalescing crossing
 instead: the addon's `readBatch(maxBytes)` parks for the first chunk and then
@@ -798,6 +811,24 @@ before; only the number of Node-API crossings changes.
   `E_SINK_ACTIVE`, exactly as on the direct path.
 - Client-side readables always use the direct pull.
 
+## Experimental surfaces
+
+The surfaces below ship in 1.0 but are **experimental**. They are documented,
+tested and supported, but their shape **may change in a 1.x minor release**,
+not only in a major one. Each export is tagged `@experimental` in its TSDoc,
+and `docs/PARITY_MATRIX.md` marks each one. Everything else in this spec is
+stable.
+
+| Surface | What may change | Reference |
+|---|---|---|
+| Stream chunk batching (`WEBTRANSPORT_STREAM_BATCH_BYTES`, off by default) | the knob's name and its byte-budget semantics | "Incoming stream chunk delivery" above |
+| Egress pacer: `ServerOptions.egressPacer`, `sendDatagramMirrorPaced()`, `readMirrorReports()`, `EgressPacerOptions`, `DatagramMirrorAdmission`, `MirrorReport`, and the metrics `datagramMirrorPacedCalls`, `datagramMirrorPacedTargets`, `mirrorReportsDropped` | the option's shape, admission and report semantics, the ring size, and the `WEBTRANSPORT_PACER_*` fallback | "The paced mirror" above; `crates/native/docs/egress-pacer.md` |
+| Multi-process binds: `ServerOptions.reusePort`, `quicLb` (`QuicLbOptions`), `reusePortSteering`, and the decoders `decodeQuicLbServerId`, `decodeQuicLbConfigRotation`, `quicLbCidLength` | option shapes and validation, and the CID layout version (draft-ietf-quic-load-balancers) | `docs/OPERATIONS.md` ("Multi-process binds", "QUIC-LB connection IDs"); `docs/quic-lb.md` |
+| Native stream sink: `openReadSink()` (and the stream methods of the same name), `SinkReader`, `StreamSink*`, `SinkRecord*`, `SinkTaskStateName`, the `./sink-reader` subpath, and the `E_SINK_*` error codes (`ExperimentalSinkErrorCode`) | options, ring layout version, record types, and the set of `E_SINK_*` codes | `docs/RFC_STREAM_SINK.md` |
+
+An experimental surface becomes stable when this table stops listing it.
+Removing one outright still takes a major release.
+
 ## API stability and semver
 
 ### The three exported surfaces
@@ -829,6 +860,16 @@ behavior under gates that have not passed.
 - **Stable surface**: Types and functions in this spec are the public API.
 - **Semver**: Major (X.0.0) for breaking changes; minor (x.Y.0) for additive changes; patch (x.y.Z) for fixes.
 - **Error codes**: E_* codes are stable; do not remove or change meaning.
+  The stable set is `E_TLS`, `E_HANDSHAKE_TIMEOUT`, `E_SESSION_CLOSED`,
+  `E_SESSION_IDLE_TIMEOUT`, `E_SERVER_CLOSING` (close reason only), `E_STREAM_RESET`,
+  `E_STOP_SENDING`, `E_QUEUE_FULL`, `E_BACKPRESSURE_TIMEOUT`, `E_LIMIT_EXCEEDED`,
+  `E_RATE_LIMITED`, `E_INVALID_ARGUMENT`, `E_UNSUPPORTED_ARGUMENT` and `E_INTERNAL`.
+  The `ErrorCode` union also carries the native stream sink's codes
+  (`ExperimentalSinkErrorCode`: `E_SINK_ACTIVE`, `E_SINK_ALREADY_OPEN`,
+  `E_SINK_BAD_BUFFER`, `E_SINK_BAD_OPTIONS`, `E_SINK_CLOSED`,
+  `E_SINK_FRAME_FAULT`, `E_SINK_INTERNAL`, `E_SINK_LIMIT`, `E_SINK_OVERSIZED`,
+  `E_SINK_READ_ACTIVE`, `E_SINK_STALLED`). Those are **experimental** with the
+  sink and may change in a 1.x minor.
 - **Metrics fields**: ServerMetricsSnapshot and SessionMetricsSnapshot field names are stable; new fields may be added in minor releases.
 - **`__TESTING__` is explicitly unstable**: the root module's `__TESTING__`
   export is a bag of internal test seams (addon loading, session/stream
