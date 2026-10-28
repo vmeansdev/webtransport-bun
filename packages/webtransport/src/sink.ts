@@ -153,8 +153,10 @@ export function validateStreamSinkOptions(opts: unknown): void {
 	integerMs("backpressureTimeoutMs", 1);
 	integerMs("idleTimeoutMs", 0);
 	const framing = o.framing;
-	if (framing === undefined || framing === null) return;
-	if (typeof framing !== "object" || Array.isArray(framing))
+	// Only an absent `framing` means "no framing": an explicit `null` is a
+	// wrong type like any other, not a synonym for omitted.
+	if (framing === undefined) return;
+	if (typeof framing !== "object" || framing === null || Array.isArray(framing))
 		bad("framing must be an object");
 	const f = framing as Record<string, unknown>;
 	// These cross into `u32` N-API fields; range rules beyond that (header

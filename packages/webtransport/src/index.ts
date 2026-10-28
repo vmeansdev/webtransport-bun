@@ -2586,7 +2586,9 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		);
 	}
 
-	if (opts.quicLb !== undefined && opts.quicLb !== null) {
+	// Only an absent option means "default": an explicit `null` (or any other
+	// wrong type) is rejected by the validators below, never read as omitted.
+	if (opts.quicLb !== undefined) {
 		const quicLbError = quicLbOptionsError(opts.quicLb);
 		if (quicLbError !== null) {
 			throw createMappedError(
@@ -2596,10 +2598,14 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		}
 	}
 
-	if (opts.reusePortSteering !== undefined && opts.reusePortSteering !== null) {
+	if (opts.reusePortSteering !== undefined) {
 		const steering = opts.reusePortSteering;
 		const steeringError = (() => {
-			if (typeof steering !== "object") {
+			if (
+				typeof steering !== "object" ||
+				steering === null ||
+				Array.isArray(steering)
+			) {
 				return "reusePortSteering must be an object";
 			}
 			if (
@@ -2625,7 +2631,7 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 			if (opts.reusePort !== true) {
 				return "reusePortSteering requires reusePort: true";
 			}
-			if (opts.quicLb === undefined || opts.quicLb === null) {
+			if (opts.quicLb === undefined) {
 				return (
 					"reusePortSteering requires quicLb — without QUIC-LB CIDs every " +
 					"packet falls back to the kernel hash and the steering program " +
@@ -2642,7 +2648,7 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		}
 	}
 
-	if (opts.egressPacer !== undefined && opts.egressPacer !== null) {
+	if (opts.egressPacer !== undefined) {
 		const pacerError = egressPacerOptionsError(opts.egressPacer);
 		if (pacerError !== null) {
 			throw createMappedError(
@@ -2652,7 +2658,8 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		}
 	}
 
-	validateQuicWindows(opts.limits);
+	validateLimitsShape(opts.limits);
+	validateLimitsShape(opts.rateLimits, undefined, "rateLimits");
 	const mergedLimits = { ...DEFAULT_LIMITS, ...opts.limits };
 	const limitsJson = JSON.stringify(mergedLimits);
 	const serverOptsJson = JSON.stringify({
@@ -2660,13 +2667,13 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		enable0Rtt: opts.enable0Rtt === true,
 		allowEarlySession: opts.allowEarlySession === true,
 		reusePort: opts.reusePort === true,
-		...(opts.quicLb === undefined || opts.quicLb === null
+		...(opts.quicLb === undefined
 			? {}
 			: { quicLb: quicLbOptionsToJson(opts.quicLb) }),
-		...(opts.reusePortSteering === undefined || opts.reusePortSteering === null
+		...(opts.reusePortSteering === undefined
 			? {}
 			: { reusePortSteering: opts.reusePortSteering }),
-		...(opts.egressPacer === undefined || opts.egressPacer === null
+		...(opts.egressPacer === undefined
 			? {}
 			: {
 					egressPacer: {
@@ -3486,7 +3493,7 @@ export async function connect(
 	if (opts !== undefined) {
 		validateQpackOptions(opts, opts.strictW3CErrors);
 	}
-	validateQuicWindows(opts?.limits, opts?.strictW3CErrors);
+	validateLimitsShape(opts?.limits, opts?.strictW3CErrors);
 	const mergedLimits = { ...DEFAULT_LIMITS, ...opts?.limits };
 	const tlsOpts = mapClientTlsOptions(opts?.tls);
 	const optsJson = JSON.stringify({
@@ -3628,6 +3635,53 @@ const VALID_DATAGRAMS_READABLE_TYPE = new Set(["bytes", "default"]);
  * advertising something other than what was asked for would be a worse answer
  * than saying no.
  */
+/** Every numeric `limits` field native reads (the windows are checked below). */
+const NUMERIC_LIMIT_KEYS = [
+	...Object.keys(DEFAULT_LIMITS),
+	"keepAliveIntervalMs",
+] as const;
+
+/**
+ * Reject a malformed `limits` object instead of letting native silently fall
+ * back to defaults: native reads `null`, a non-number or (for the explicit
+ * QUIC windows) anything but a positive integer as "unset". Only an absent
+ * field means default; `limits: null` itself is rejected too.
+ */
+function validateLimitsShape(
+	limits: unknown,
+	strictW3CErrors?: boolean,
+	field = "limits",
+): void {
+	if (limits === undefined) return;
+	const fail = (msg: string): never => {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			`E_INVALID_ARGUMENT: ${msg}`,
+			strictW3CErrors,
+		);
+	};
+	if (typeof limits !== "object" || limits === null || Array.isArray(limits))
+		fail(`${field} must be an object`);
+	const record = limits as Record<string, unknown>;
+	const numericKeys =
+		field === "limits" ? NUMERIC_LIMIT_KEYS : NUMERIC_RATE_LIMIT_KEYS;
+	for (const key of numericKeys) {
+		const value = record[key];
+		if (
+			value !== undefined &&
+			(typeof value !== "number" || !Number.isFinite(value))
+		)
+			fail(`${field}.${key} must be a finite number, got ${String(value)}`);
+	}
+	if (field === "limits") validateQuicWindows(record, strictW3CErrors);
+}
+
+/** Every numeric `rateLimits` field native reads. */
+const NUMERIC_RATE_LIMIT_KEYS = [
+	...Object.keys(DEFAULT_RATE_LIMITS),
+	"handshakesBurstPerPrefix",
+] as const;
+
 /**
  * Reject a malformed explicit QUIC window instead of letting native silently
  * fall back to the governor-derived one (it reads anything but a positive
@@ -3635,10 +3689,9 @@ const VALID_DATAGRAMS_READABLE_TYPE = new Set(["bytes", "default"]);
  * integer.
  */
 function validateQuicWindows(
-	limits: Partial<LimitsOptions> | undefined,
+	limits: Record<string, unknown>,
 	strictW3CErrors?: boolean,
 ): void {
-	if (limits === undefined || limits === null) return;
 	for (const key of [
 		"streamReceiveWindow",
 		"receiveWindow",

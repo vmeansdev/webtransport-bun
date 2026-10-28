@@ -137,3 +137,113 @@ describe("explicit QUIC window options", () => {
 		});
 	}
 });
+
+describe("explicit null is never read as omitted", () => {
+	for (const key of [
+		"framing",
+		"overflow",
+		"clock",
+		"backpressureTimeoutMs",
+		"idleTimeoutMs",
+		"ringBytes",
+	]) {
+		it(`openReadSink rejects ${key}: null on both backends`, () => {
+			const opts = { [key]: null };
+			expect(() => validateStreamSinkOptions(opts)).toThrow(
+				/^E_SINK_BAD_OPTIONS: /,
+			);
+			expect(() =>
+				openReadSinkOnNativeHandle(neverNative, opts as never),
+			).toThrow(/^E_SINK_BAD_OPTIONS: /);
+			expect(() => openWasmReadSink(neverWasm, opts as never)).toThrow(
+				/^E_SINK_BAD_OPTIONS: /,
+			);
+		});
+	}
+
+	it("openReadSink rejects options: null", () => {
+		expect(() => validateStreamSinkOptions(null)).toThrow(
+			/^E_SINK_BAD_OPTIONS: options must be an object/,
+		);
+	});
+
+	const SERVER_NULLS: [string, Record<string, unknown>, RegExp][] = [
+		["egressPacer", { egressPacer: null }, /egressPacer must be an object/],
+		["quicLb", { quicLb: null }, /quicLb must be an object/],
+		["reusePort", { reusePort: null }, /reusePort must be a boolean/],
+		[
+			"reusePortSteering",
+			{ reusePortSteering: null },
+			/reusePortSteering must be an object/,
+		],
+		["limits", { limits: null }, /limits must be an object/],
+		["rateLimits", { rateLimits: null }, /rateLimits must be an object/],
+		[
+			"limits.maxSessions",
+			{ limits: { maxSessions: null } },
+			/limits\.maxSessions must be a finite number/,
+		],
+		[
+			"limits.keepAliveIntervalMs",
+			{ limits: { keepAliveIntervalMs: null } },
+			/limits\.keepAliveIntervalMs must be a finite number/,
+		],
+		[
+			"limits.streamReceiveWindow",
+			{ limits: { streamReceiveWindow: null } },
+			/limits\.streamReceiveWindow must be/,
+		],
+		[
+			"limits.receiveWindow",
+			{ limits: { receiveWindow: null } },
+			/limits\.receiveWindow must be/,
+		],
+		[
+			"limits.sendWindow",
+			{ limits: { sendWindow: null } },
+			/limits\.sendWindow must be/,
+		],
+		[
+			"rateLimits.handshakesPerSec",
+			{ rateLimits: { handshakesPerSec: null } },
+			/rateLimits\.handshakesPerSec must be a finite number/,
+		],
+		[
+			"rateLimits.handshakesBurstPerPrefix",
+			{ rateLimits: { handshakesBurstPerPrefix: null } },
+			/rateLimits\.handshakesBurstPerPrefix must be a finite number/,
+		],
+	];
+	for (const [label, extra, message] of SERVER_NULLS) {
+		it(`createServer rejects ${label}: null with E_INVALID_ARGUMENT`, () => {
+			let thrown: unknown;
+			try {
+				createServer({
+					port: 0,
+					tls: { certPem: "", keyPem: "" },
+					onSession: () => {},
+					...extra,
+				} as never);
+			} catch (error) {
+				thrown = error;
+			}
+			expect((thrown as { code?: string })?.code).toBe(E_INVALID_ARGUMENT);
+			expect(String((thrown as Error)?.message)).toMatch(message);
+		});
+	}
+
+	for (const [label, limits] of [
+		["limits", null],
+		["limits.receiveWindow", { receiveWindow: null }],
+		["limits.idleTimeoutMs", { idleTimeoutMs: null }],
+	] as const) {
+		it(`connect rejects ${label}: null with E_INVALID_ARGUMENT`, async () => {
+			await expect(
+				connect(`https://127.0.0.1:${nextPort(27_800, 60)}`, {
+					tls: { insecureSkipVerify: true },
+					limits: limits as never,
+				}),
+			).rejects.toThrow(/^E_INVALID_ARGUMENT: limits/);
+		});
+	}
+});
