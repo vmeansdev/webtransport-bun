@@ -13,6 +13,55 @@ cut). Surfaces under **Experimental** ship in 1.0 but may change in a 1.x minor
 what was on the release-candidate branch and is deliberately not public in
 1.0.
 
+### Changed (breaking from 1.0.0-rc.1)
+
+Everything an application written against `1.0.0-rc.1` can observe
+differently. Each entry says how to restore the old behavior where an escape
+hatch exists. Checked against the rc.1 candidate (875dfbfe).
+
+- **`limits` and `rateLimits` are validated instead of silently defaulted.**
+  `createServer`, `connect` and `new WebTransport` now throw
+  `E_INVALID_ARGUMENT` for any of these, where rc.1 quietly used the default:
+  - a `limits` / `rateLimits` value that is `null` or not a plain object
+    (for example an array or a `Map`);
+  - a numeric field set to `null` or to a non-finite value (`NaN`,
+    `Infinity`, a string).
+  An absent field still means "default".
+- **Server shutdown close code.** Sessions ended by `server.close()` now close
+  with code `3993` and reason `E_SERVER_CLOSING`, on the wire and in the local
+  `closed` fallback. rc.1 used application code `0` with reason
+  `"server closing"` on the wire and `"server closed"` locally; match on the
+  new pair. An accept still in flight when `close()` starts is closed with the
+  same pair and never reaches `onSession`.
+- **Incoming datagrams are plain `Uint8Array`s (native).** Payloads now
+  arrive as a `Uint8Array` over an engine-owned `ArrayBuffer`. In rc.1 they
+  were Node `Buffer`s. The declared type was always `Uint8Array`, but code
+  that called `Buffer` methods on them (`toString("utf8")`, `readUInt16LE`,
+  ...) must wrap them with `Buffer.from(d.buffer, d.byteOffset,
+  d.byteLength)`. `WEBTRANSPORT_PAYLOAD_DELIVERY=buffer-copy` restores
+  `Buffer` delivery.
+- **Incoming datagrams are read in batches by default (native).**
+  `WEBTRANSPORT_DATAGRAM_BATCH` defaults to `64`, where rc.1 used one Node-API
+  crossing per datagram. Delivery order and the item type are unchanged.
+  Buffering grows by up to one batch per session, and how much of a backlog
+  survives a clean peer close can differ (`docs/SPEC.md`, "Incoming datagram
+  delivery"). `WEBTRANSPORT_DATAGRAM_BATCH=0` restores the rc.1 path.
+- **Server incoming streams are read through the cross-stream read group by
+  default (native).** Chunk sizes and timing across streams can differ; the
+  bytes and their order per stream do not. `WEBTRANSPORT_STREAM_READ_GROUP=0`
+  restores the rc.1 direct pull.
+- **Resource profile of the native server.** It now runs 2 Tokio worker
+  threads (rc.1: 1), buffers up to 256 KiB of inbound datagrams per
+  connection (rc.1: 64 KiB), and runs one extra datagram pump task per
+  connection. There is no public knob for these (`docs/OPERATIONS.md`,
+  "Transport defaults that changed for 1.0").
+- **Not breaking, listed for completeness.** The surfaces under "Removed and
+  internalized" below were never in rc.1, so no rc.1 caller can depend on
+  them: the reflector, the campaign getters, `__sendPathDiagnostics`, the
+  `__pacerStats*` accessors and the campaign metrics. The same goes for the
+  new validation on options rc.1 did not have: sink options, `egressPacer`,
+  `quicLb`, `reusePort`, `reusePortSteering` and the QUIC windows.
+
 ### Added
 
 - **Batched incoming datagrams (native).** `incomingDatagrams()` drains the
