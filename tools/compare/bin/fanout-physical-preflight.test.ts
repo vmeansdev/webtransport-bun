@@ -934,7 +934,7 @@ describe("fanout-physical-preflight --loopback", () => {
 				"cargo",
 				"build",
 				"-p",
-				"native",
+				"compare-supervisor",
 				"--release",
 				"--bin",
 				"comparison-supervisor",

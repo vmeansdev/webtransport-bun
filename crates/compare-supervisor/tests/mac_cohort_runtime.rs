@@ -5447,7 +5447,7 @@ fn no_mac_receipt_is_signed_outside_the_binary() {
     assert_eq!(
         files,
         vec!["cohort-fixture-signing.ts".to_owned()],
-        "§5 residual 1: only the explicit fixture producer signs Mac receipts outside crates/native",
+        "§5 residual 1: only the explicit fixture producer signs Mac receipts outside crates/compare-supervisor",
     );
 }
 

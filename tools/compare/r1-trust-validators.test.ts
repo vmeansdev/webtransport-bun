@@ -1930,7 +1930,7 @@ describe("measurement admission: the controller's copy of the supervisor's rules
 		// against the record the supervisor issued, so the two encoders have to
 		// agree byte for byte or every honest leg is refused. This string was
 		// produced by `MeasurementGrant::canonical_bytes` in
-		// `crates/native/src/secure_fs.rs` for exactly these fields; the escapes
+		// `crates/compare-supervisor/src/secure_fs.rs` for exactly these fields; the escapes
 		// in `candidate` are here because a quote or a backslash is where two
 		// hand-written JSON encoders diverge first.
 		expect(

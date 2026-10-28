@@ -2520,7 +2520,7 @@ export interface FanoutLinuxServerIdentityV1 {
  * Whole milliseconds, because the rig's parser reads `baselineBusyMs`,
  * `finalBusyMs` and `busyMs` with `as_u64` and requires
  * `finalBusyMs - baselineBusyMs == busyMs` exactly
- * (`crates/native/src/secure_fs.rs:12112-12117`, `:16764-16773`). A fractional
+ * (`crates/compare-supervisor/src/secure_fs.rs:12112-12117`, `:16764-16773`). A fractional
  * reading would be refused there, so it is refused here, where the reader can
  * still be told which value was wrong.
  */
@@ -2663,7 +2663,7 @@ export interface FanoutSnapshotBindingV1 {
  * `rig-cohort-acceptance/v1`, `rig-warmup-drained-receipt/v1`,
  * `rig-measure-start-ack/v1`, `rig-barrier-acceptance/v1` and
  * `rig-relay-observation-receipt/v1` -- were a second implementation of records
- * `crates/native/src/secure_fs.rs` already mints, and none of them was ever the
+ * `crates/compare-supervisor/src/secure_fs.rs` already mints, and none of them was ever the
  * authoritative one.
  *
  * The joins that used to live here went with them, to the place that can hold
@@ -3505,7 +3505,7 @@ export class FanoutLinuxAuthority {
 	 *
 	 * It does **not** re-check the barrier's four retained-record bindings. The
 	 * rig holds those records and checks all four before it hands the barrier
-	 * down the pipe (`crates/native/src/secure_fs.rs:16385-16412`, then
+	 * down the pipe (`crates/compare-supervisor/src/secure_fs.rs:16385-16412`, then
 	 * `:16424`); a child re-check would be a check of digests some caller
 	 * stated, which is exactly the opinion this side must not have.
 	 */
@@ -3771,7 +3771,7 @@ export class FanoutLinuxAuthority {
 	 * signed; the pid, pgid and nonce are the child's own; the two cohort
 	 * digests are the ones this side verified; and the three busy numbers are
 	 * two readings of the loop with their difference. That difference is
-	 * re-derived by the rig (`crates/native/src/secure_fs.rs:16766-16773`), so
+	 * re-derived by the rig (`crates/compare-supervisor/src/secure_fs.rs:16766-16773`), so
 	 * a third independent number is not something the child could state even if
 	 * it wanted to.
 	 *

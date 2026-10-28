@@ -189,6 +189,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "compare-supervisor"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "ed25519-dalek",
+ "libc",
+ "rand_core 0.6.4",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -801,7 +813,6 @@ dependencies = [
  "base64",
  "bytes",
  "dashmap",
- "ed25519-dalek",
  "idna",
  "libc",
  "mimalloc",
@@ -810,7 +821,6 @@ dependencies = [
  "napi-derive",
  "once_cell",
  "quinn-proto",
- "rand_core 0.6.4",
  "rustls",
  "rustls-native-certs",
  "serde",

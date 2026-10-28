@@ -15,7 +15,7 @@
  * stub, not `comparison-supervisor`, because the Mac cohort dispatch arms and
  * the `--cohort-mac-signing-key-fd` / `--cohort-staged-rig-public-key-fd`
  * options are S5-MAC-RS's and do not exist in the binary at this HEAD
- * (`crates/native/src/bin/comparison-supervisor.rs:926` registers exactly the
+ * (`crates/compare-supervisor/src/bin/comparison-supervisor.rs:926` registers exactly the
  * two *rig* cohort descriptors, and nothing else). Everything this slice owns
  * is real: real `sudo`, a real `_wtcompare` process, real inherited
  * descriptors, real pipes, a real process group and a real `kill(2)`.

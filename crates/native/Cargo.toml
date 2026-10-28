@@ -4,17 +4,7 @@ version = "0.3.0"
 edition = "2021"
 
 [lib]
-# rlib added for R1: the comparison-supervisor binary and the secure_fs
-# integration test target link the library crate; the addon remains a cdylib.
-crate-type = ["cdylib", "rlib"]
-
-[[bin]]
-name = "comparison-supervisor"
-path = "src/bin/comparison-supervisor.rs"
-
-[[bin]]
-name = "observe-directory-identity"
-path = "src/bin/observe-directory-identity.rs"
+crate-type = ["cdylib"]
 
 [features]
 default = []
@@ -35,11 +25,6 @@ serde_json = "1"
 url = "2"
 sha2 = "0.10"
 base64 = "0.22"
-# Cross-supervisor Ed25519 (RFC 8032) for Mac/rig receipt authentication.
-# pkcs8 so comparison-supervisor keygen-ed25519 writes interchangeable .pk8
-# private keys; public leaves remain raw 32-byte verifying keys.
-ed25519-dalek = { version = "2.1", features = ["rand_core", "pkcs8", "std"] }
-rand_core = { version = "0.6", features = ["getrandom"] }
 # SO_REUSEPORT on the server bind socket (the `reusePort` option). The "all"
 # feature gates set_reuse_port; the version matches what wtransport already
 # locks so there is one socket2 in the tree.
@@ -58,8 +43,7 @@ x509-parser = "0.18.1"
 mimalloc = { version = "0.1", default-features = false }
 
 # The egress pacer's thread-priority knobs use this on Linux (`setpriority`
-# is per-thread there), and the R1 secure filesystem boundary uses it for its
-# handle-relative syscalls on both macOS and Linux.
+# is per-thread there), as do reusePortSteering's BPF syscalls.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

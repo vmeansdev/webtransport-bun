@@ -1520,7 +1520,7 @@ const SERVER_IDENTITY = {
 // Round three's authority ruling (design §1.1) makes the rig supervisor
 // process the sole Linux signer, and takes the five rig records out of the
 // server child. The production signer is `cohort::rig` in
-// `crates/native/src/secure_fs.rs`; what these tests need is a TS stand-in that
+// `crates/compare-supervisor/src/secure_fs.rs`; what these tests need is a TS stand-in that
 // signs the same five records from the same inputs -- the child's exact frame
 // bytes -- so every property this file asserted about those records still has
 // something to assert against.
@@ -1956,7 +1956,7 @@ const MEASUREMENT_GRANT_SHA = HEX("5");
  *
  * The Mac checks those bindings against the rig records the controller
  * presented, and the rig re-checks them at `present_start_barrier`
- * (`crates/native/src/secure_fs.rs:16385-16412`). The server child does not, and
+ * (`crates/compare-supervisor/src/secure_fs.rs:16385-16412`). The server child does not, and
  * cannot: since the authority ruling it holds none of the four records.
  */
 function linuxStartBarrier(
@@ -2636,7 +2636,7 @@ describe("linux is the cohort authority", () => {
 		// A barrier whose retained-record bindings name records the *rig* is not
 		// holding is the rig's refusal and not the child's, since the authority
 		// ruling: `present_start_barrier` checks all four
-		// (`crates/native/src/secure_fs.rs:16385-16412`) before the barrier ever
+		// (`crates/compare-supervisor/src/secure_fs.rs:16385-16412`) before the barrier ever
 		// reaches the pipe, and the child holds none of the four. A child that
 		// refused here would be refusing on digests a caller stated. Proven on a
 		// throwaway session so this one stays unarmed.
@@ -3315,7 +3315,7 @@ describe("linux is the cohort authority", () => {
 		expect(unsourced.ok === false && unsourced.code).toBe("COHORT_NOT_READY");
 
 		// A fractional reading is refused here rather than at the rig's `as_u64`
-		// (`crates/native/src/secure_fs.rs:12112-12117`), where nothing can say
+		// (`crates/compare-supervisor/src/secure_fs.rs:12112-12117`), where nothing can say
 		// which of the three busy fields was wrong.
 		const fractional = openLinuxSession({
 			authority: { linuxClockId: HEX("a"), loop: { busyMs: () => 17.5 } },
@@ -4117,7 +4117,7 @@ async function macDriveToExport(
 		loop: { busyMs: () => 0 },
 	});
 	// The rig supervisor is the Linux signer; this stands in for the process
-	// `crates/native/src/secure_fs.rs`'s `cohort::rig` runs (design §1.1).
+	// `crates/compare-supervisor/src/secure_fs.rs`'s `cohort::rig` runs (design §1.1).
 	const rig = new ScriptedRigSupervisor(harness.rigKeys, clock, {
 		receiptValidityMs: MAC_VALIDITY_MS,
 	});
@@ -6653,7 +6653,7 @@ describe("B3.5 e2e: the rig supervisor installs a cohort and spawns the real ser
 					"cargo",
 					"build",
 					"-p",
-					"native",
+					"compare-supervisor",
 					"--release",
 					"--bin",
 					"comparison-supervisor",
@@ -6732,7 +6732,7 @@ describe("B3.5 e2e: the rig supervisor installs a cohort and spawns the real ser
 			//    `rig-accept-cohort-request/v1` per execution, so there is no
 			//    campaign-scoped file to open and no fd 8 or 9 to pass.
 			//    `cohort_install_descriptors` resolves exactly two names
-			//    (`crates/native/src/bin/comparison-supervisor.rs`).
+			//    (`crates/compare-supervisor/src/bin/comparison-supervisor.rs`).
 			const keyPath = join(boot, "rig.pk8");
 			writeFileSync(keyPath, Buffer.from(cohort.rig.privatePkcs8Der));
 
@@ -6780,7 +6780,7 @@ describe("B3.5 e2e: the rig supervisor installs a cohort and spawns the real ser
 				// six: the grant and its Mac signature, plus this execution's
 				// Phase-A `rig-execution-acceptance/v1` and the rig signature
 				// over it. The rig above reads that key set with `exact_fields`
-				// (`RIG_ACCEPT_COHORT_FIELDS`, `crates/native/src/secure_fs.rs`).
+				// (`RIG_ACCEPT_COHORT_FIELDS`, `crates/compare-supervisor/src/secure_fs.rs`).
 				// `CohortRigChannel.acceptCohort` (`tools/compare/remote-supervisor.ts`)
 				// still builds the four-key form, and `CohortRigChannelConfig`
 				// carries no acceptance record and no signature over one, so the
@@ -7197,7 +7197,7 @@ describe("B3.5 conformance: the scripted Mac binary answers a cohort re-open as 
 					"cargo",
 					"build",
 					"-p",
-					"native",
+					"compare-supervisor",
 					"--release",
 					"--bin",
 					"comparison-supervisor",
@@ -7489,7 +7489,7 @@ describe("A5 e2e: the real rig runs the ordinary arm's signed server lifecycle",
 					"cargo",
 					"build",
 					"-p",
-					"native",
+					"compare-supervisor",
 					"--release",
 					"--bin",
 					"comparison-supervisor",
@@ -7902,7 +7902,7 @@ describe("A5 e2e: the real rig runs the ordinary arm's signed server lifecycle",
 					"cargo",
 					"build",
 					"-p",
-					"native",
+					"compare-supervisor",
 					"--release",
 					"--bin",
 					"comparison-supervisor",

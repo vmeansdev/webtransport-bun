@@ -24,7 +24,7 @@
  *      script (`buildRigSupervisorWrapperScript`) that runs over SSH
  *      and exec's the rig-resident supervisor. Both honor the four
  *      `--*-fd` bootstrap FDs the Rust binary expects at
- *      `crates/native/src/bin/comparison-supervisor.rs:88-92`, and the
+ *      `crates/compare-supervisor/src/bin/comparison-supervisor.rs:88-92`, and the
  *      `--control-in-fd` / `--control-out-fd` pair that give the
  *      controller↔supervisor frame channel (per the supervisor's
  *      `control_descriptors` at `comparison-supervisor.rs:567-573`).
@@ -4469,7 +4469,7 @@ const MAC_FANOUT_COHORT_SCOPED_RETENTION: readonly string[] = [
  * Bind the cohort's Mac clock from the record the binary states it in.
  *
  * The barrier is the first signed record carrying `macClockId`
- * (`crates/native/src/secure_fs.rs`, the `cohort-start-barrier/v1` mint reads
+ * (`crates/compare-supervisor/src/secure_fs.rs`, the `cohort-start-barrier/v1` mint reads
  * `self.identity.mac_clock_id()`; no earlier Mac mint states it: the grant
  * receipts carry the instance nonce and key only). It counts as the binary's
  * own observation only if the same binary instance issued it: the barrier's

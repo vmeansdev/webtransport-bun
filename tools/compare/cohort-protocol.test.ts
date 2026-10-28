@@ -235,7 +235,7 @@ function shardsFromLeaves(
 			// The grant's subscriber total, not this shard's own count: the eight
 			// shards partition one global subscriber run. Mirrors
 			// `expect_count(entry, "lastSubscriberIndexExclusive", subscriber_count)`
-			// at `crates/native/src/secure_fs.rs:12556`.
+			// at `crates/compare-supervisor/src/secure_fs.rs:12556`.
 			lastSubscriberIndexExclusive: subscriberCount,
 			subscriberCount: members.length,
 			orderedSubscriberIdsSha256: sha256HexOfBytes(
@@ -3809,7 +3809,7 @@ describe("cohort-protocol B3.5 §4.1 grant vector and per-cell grant parameters"
 	 * (deviation 2026-09-09), and 2026-09-08 from the retired ticker
 	 * 10k row (same shape) under the physical-budget amendment D3.
 	 *
-	 * `crates/native/tests/cohort_protocol.rs` holds this same literal as
+	 * `crates/compare-supervisor/tests/cohort_protocol.rs` holds this same literal as
 	 * `RUST_PINNED_TICKER100_GRANT_HEX` and feeds it to the real
 	 * `CohortGrantV1::parse_signed`. A pinned byte string is what the pair
 	 * needs: the defect it exists to catch was two correct-looking readings of

@@ -522,7 +522,7 @@ describe("server-observation-artifact: cohort shape by cell identity", () => {
 // sides of the language boundary.
 //
 // The literal below is pinned in Rust at
-// `crates/native/tests/rig_cohort_runtime.rs`
+// `crates/compare-supervisor/tests/rig_cohort_runtime.rs`
 // (`RUST_PINNED_MEASURE_START_ACK_HEX`) and asserted here against this
 // module's own type. A key added, renamed or removed on either side moves the
 // bytes, and a slice that moves them alone breaks the other language's test.

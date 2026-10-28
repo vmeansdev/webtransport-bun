@@ -4618,8 +4618,8 @@ function validateAllowlistShape(
 		);
 	}
 	const expectedNative = [
-		"crates/native/src/bin/comparison-supervisor.rs",
-		"crates/native/src/secure_fs.rs",
+		"crates/compare-supervisor/src/bin/comparison-supervisor.rs",
+		"crates/compare-supervisor/src/secure_fs.rs",
 	];
 	if (
 		new Set(allowlist.nativeSources).size !== allowlist.nativeSources.length

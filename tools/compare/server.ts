@@ -1300,7 +1300,7 @@ export async function serveFanoutCohortRelay(
  * Whole non-negative milliseconds, monotonic by construction: the accumulator
  * only grows and `Math.floor` is monotone. The rig re-derives
  * `finalBusyMs - baselineBusyMs` and reads all three with `as_u64`
- * (`crates/native/src/secure_fs.rs:16826-16831`, `:12112-12117`), so a
+ * (`crates/compare-supervisor/src/secure_fs.rs:16826-16831`, `:12112-12117`), so a
  * fractional or shrinking reading would be refused there; it cannot arise here.
  *
  * There is deliberately no fallback: a child built without this observer does
@@ -1591,7 +1591,7 @@ export function decideCohortBind(args: {
 	// unless `lastSubscriberIndexExclusive === grantSubscriberCount`
 	// (`cohort-protocol.ts:361`) and Rust runs
 	// `expect_count(entry, "lastSubscriberIndexExclusive", subscriber_count)`
-	// (`crates/native/src/secure_fs.rs:12556`).
+	// (`crates/compare-supervisor/src/secure_fs.rs:12556`).
 	//
 	// What stays true is the ordering: the narrow check gates the socket, the
 	// full codec gates the relay, and a grant that fails either never reaches

@@ -289,7 +289,7 @@ const MIRROR_SOURCES = [
 	"tools/compare/bin/stage-live-campaign.ts",
 	"tools/compare/bin/frozen-run-section-9.6.fragment.sh",
 	"tools/compare/bin/frozen-run-section-9.7.fragment.sh",
-	"crates/native/src/secure_fs.rs",
+	"crates/compare-supervisor/src/secure_fs.rs",
 ] as const;
 
 describe("the recorded deviations", () => {
@@ -692,9 +692,9 @@ describe("frozen run fragments and stage timeouts (D5)", () => {
 	});
 });
 
-describe("crates/native/src/secure_fs.rs mirror", () => {
+describe("crates/compare-supervisor/src/secure_fs.rs mirror", () => {
 	test("COHORT_CELLS is the table, row for row", () => {
-		const source = read("crates/native/src/secure_fs.rs");
+		const source = read("crates/compare-supervisor/src/secure_fs.rs");
 		const start = source.indexOf("pub const COHORT_CELLS: &[CohortCell] = &[");
 		const end = source.indexOf("];", start);
 		if (start < 0 || end < 0) throw new Error("COHORT_CELLS not found");
@@ -739,7 +739,7 @@ describe("crates/native/src/secure_fs.rs mirror", () => {
 		// `COHORT_PROTOCOL: overflow` on 2026-09-09; it is now derived from
 		// the frozen table the rig binary carries, and this pin is what keeps
 		// the TS side's largest schedule inside it.
-		const source = read("crates/native/src/secure_fs.rs");
+		const source = read("crates/compare-supervisor/src/secure_fs.rs");
 		expect(source).toContain(
 			"pub const WARMUP_REPETITIONS_PER_ARM: usize = 1;",
 		);

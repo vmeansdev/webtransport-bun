@@ -23,7 +23,7 @@ import {
 } from "./cross-supervisor-protocol.ts";
 
 const SECURE_FS_RS = new URL(
-	"../../crates/native/src/secure_fs.rs",
+	"../../crates/compare-supervisor/src/secure_fs.rs",
 	import.meta.url,
 );
 

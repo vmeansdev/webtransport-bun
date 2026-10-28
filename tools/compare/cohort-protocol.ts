@@ -370,7 +370,7 @@ export function parsePublisherRoleGrant(
  * `lastSubscriberIndexExclusive` is the end of the one global subscriber run
  * every shard indexes into — which is why `firstSubscriberIndex` is a literal
  * `0` on all eight shards. Mirrors `parse_shards(map, subscriber_count)`
- * (`crates/native/src/secure_fs.rs:12531`, bound at `:12556`); the sum check
+ * (`crates/compare-supervisor/src/secure_fs.rs:12531`, bound at `:12556`); the sum check
  * the Rust does at `:12572` is vacuous under any other reading.
  */
 export function parseSubscriberShard(
@@ -1007,7 +1007,7 @@ export function parseCohortGrant(
 /**
  * The grant's publishers and shards against the leaf manifest they claim to
  * partition — the binary's `verify_presented_topology`
- * (`crates/native/src/secure_fs.rs:18854-18970`), rule for rule.
+ * (`crates/compare-supervisor/src/secure_fs.rs:18854-18970`), rule for rule.
  *
  * `leaves` is the manifest's own array in its canonical order, so a leaf's
  * position is its commitment index. Publishers are the leading leaves, one

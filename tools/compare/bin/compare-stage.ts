@@ -9,7 +9,7 @@
  * supervisor / Bun executables on each host.
  *
  * The bytes it writes are exactly what the supervisor reads at
- * `crates/native/src/bin/comparison-supervisor.rs:88-92` over the four
+ * `crates/compare-supervisor/src/bin/comparison-supervisor.rs:88-92` over the four
  * `--*-fd` arguments, and what the campaign entrypoint reads at
  * `tools/compare/run-campaign.ts:1259-1275` against the authority anchor
  * set. Once a campaign's authority digest is added to that anchor set, the

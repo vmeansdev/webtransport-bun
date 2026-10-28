@@ -2254,7 +2254,7 @@ describe("completion amendment terminal ack authentication and carrier bounds", 
 		);
 		// Amendment C3's two-sided transcript pin: the Rust side asserts this
 		// same digest by name (`TS_UNSIGNED_EXPORT_ACK_TRANSCRIPT_SHA256`,
-		// crates/native/tests/mac_cohort_runtime.rs:1630, and
+		// crates/compare-supervisor/tests/mac_cohort_runtime.rs:1630, and
 		// `.scratch/2026-09-05-cohort-completion/protocol-vectors.json`).
 		expect(Buffer.from(transcript).toString("hex")).toBe(
 			UNSIGNED_EXPORT_ACK_TRANSCRIPT_HEX,
@@ -2386,7 +2386,7 @@ test("chat-10k production-length cohort ID fits the bounded open carrier", () =>
 //
 // The Rust side (`the_chat_1k_evidence_vector_is_reproducible_and_pinned`,
 // `the_ticker_100_evidence_vector_is_reproducible_and_pinned`,
-// crates/native/tests/mac_cohort_runtime.rs:5139/:5166) runs one deterministic
+// crates/compare-supervisor/tests/mac_cohort_runtime.rs:5139/:5166) runs one deterministic
 // lifecycle per cell, digests and signs the 33-member
 // `cohort-observation-evidence/v1` it assembled, and pins size + digest. The
 // files under fixtures/cohort-evidence-vectors/ are that lifecycle's exact

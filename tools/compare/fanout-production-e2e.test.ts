@@ -2312,7 +2312,7 @@ function buildSupervisorBinaries(): void {
 			"cargo",
 			"build",
 			"-p",
-			"native",
+			"compare-supervisor",
 			"--release",
 			"--bin",
 			"comparison-supervisor",
@@ -2484,7 +2484,7 @@ const COHORT_REQUESTS: readonly (Record<string, unknown> & {
 ];
 
 /**
- * The exact frames `crates/native/src/bin/comparison-supervisor.rs` decodes in
+ * The exact frames `crates/compare-supervisor/src/bin/comparison-supervisor.rs` decodes in
  * its own `cohort_dispatch_tests` module, pinned here so neither side of the
  * cross-language pair can move alone.
  *

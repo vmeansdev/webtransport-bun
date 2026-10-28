@@ -98,8 +98,8 @@
 	"fixtureTs": ["r1-fixtures.ts", "cohort-fixture-signing.ts"],
 	"checkerTs": ["check-official-io.ts"],
 	"nativeSources": [
-		"crates/native/src/bin/comparison-supervisor.rs",
-		"crates/native/src/secure_fs.rs"
+		"crates/compare-supervisor/src/bin/comparison-supervisor.rs",
+		"crates/compare-supervisor/src/secure_fs.rs"
 	],
 	"resolvedStaticImports": [
 		{

@@ -623,7 +623,7 @@ describe("S1 — §2.12 server-child lifecycle schemas", () => {
 		// admitted `1234.5` here would be admitting a record the rig could never
 		// turn into a receipt. The Rust half of this refusal is
 		// `a_fractional_baseline_busy_ms_cannot_reach_a_rig_receipt`
-		// (`crates/native/tests/rig_cohort_runtime.rs`); both sides refuse, and
+		// (`crates/compare-supervisor/tests/rig_cohort_runtime.rs`); both sides refuse, and
 		// the accepted integer form is vector 9, pinned in both languages.
 		const busyCases: readonly (readonly [number, boolean])[] = [
 			[0, true],
@@ -890,7 +890,7 @@ describe("the Rust rig knows every code this child can send", () => {
 			"..",
 			"..",
 			"crates",
-			"native",
+			"compare-supervisor",
 			"src",
 			"bin",
 			"comparison-supervisor.rs",
@@ -944,7 +944,7 @@ describe("the Rust rig knows every code this child can send", () => {
 						"..",
 						"..",
 						"crates",
-						"native",
+						"compare-supervisor",
 						"src",
 						"secure_fs.rs",
 					),

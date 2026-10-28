@@ -3924,7 +3924,7 @@ export const R1_RED_COMMAND_SET = Object.freeze([
 	},
 	{
 		id: "native-secure-fs",
-		argv: ["cargo", "test", "-p", "native", "--test", "secure_fs"],
+		argv: ["cargo", "test", "-p", "compare-supervisor", "--test", "secure_fs"],
 		network: "none",
 	},
 	{

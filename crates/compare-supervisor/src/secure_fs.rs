@@ -1,7 +1,7 @@
 //! Native, descriptor-relative comparison filesystem boundary (R1).
 //!
 //! This module is the production side of the R1 secure-filesystem contract in
-//! `crates/native/tests/secure_fs.rs`.  Every OS operation is routed through
+//! `crates/compare-supervisor/tests/secure_fs.rs`.  Every OS operation is routed through
 //! the sealed [`SecureFsSyscalls`] seam; production uses real libc calls and
 //! tests inject `ScriptedSyscalls` with an exact ordered call queue.  There is
 //! no NAPI surface here and no pathname-based official I/O.
@@ -22,9 +22,9 @@
 //! * sealed launches validate every descriptor, consume role/addon/startup
 //!   streams to EOF, and produce a `bun-role-launch-receipt/v1`.
 
-// This module is compiled three times: as `native::secure_fs` (cdylib+rlib),
-// `#[path]`-included by the frozen integration test, and `#[path]`-included
-// by the comparison-supervisor binary.  In the private inclusions most of the
+// This module is compiled three ways: as the root of the `compare_supervisor`
+// library (crates/compare-supervisor), `#[path]`-included by the frozen
+// integration tests, and `#[path]`-included by the two binaries.  In the private inclusions most of the
 // public surface and the platform-conditional halves are necessarily unused;
 // dead-code analysis stays fully active for the library build.
 #![cfg_attr(test, allow(dead_code))]
@@ -12033,7 +12033,7 @@ pub mod cross_supervisor {
 ///
 /// This module is codec and arithmetic only.  It spawns nothing, opens no
 /// socket, and has no production caller yet; the supervisor binary validates
-/// records through it, and `crates/native/tests/cohort_protocol.rs` drives it
+/// records through it, and `crates/compare-supervisor/tests/cohort_protocol.rs` drives it
 /// adversarially.  Every record here follows the same house rules as
 /// [`supervisor::records`]: canonical single-line JSON with sorted keys and one
 /// trailing LF, exact key sets, escape-aware duplicate-key rejection, typed

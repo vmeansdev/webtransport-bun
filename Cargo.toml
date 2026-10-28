@@ -3,6 +3,7 @@ members = [
   "crates/native",
   "crates/reference",
   "crates/adversary",
+  "crates/compare-supervisor",
 ]
 resolver = "2"
 exclude = ["vendor"]

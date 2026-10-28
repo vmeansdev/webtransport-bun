@@ -162,7 +162,7 @@ export interface RoleClock {
  * artifact's `provenance.clockMethod` names it.
  *
  * `clock_gettime(CLOCK_MONOTONIC_RAW)` is what the Mac supervisor binary reads
- * (`crates/native/src/secure_fs.rs:18748-18770`, `observe_mac_continuous_ns`),
+ * (`crates/compare-supervisor/src/secure_fs.rs:18748-18770`, `observe_mac_continuous_ns`),
  * and the barrier it mints -- `measureStartAtMacNs`, `measureStopAtMacNs` --
  * is compared numerically against the child's own reading when the child
  * sleeps until the start and stamps each delivery. Two processes on two clocks

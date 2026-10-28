@@ -189,14 +189,14 @@ describe("server-snapshot-protocol: readServerSnapshotFrame", () => {
 /**
  * `ServerLoopUtilizationFrameV1` is one codec with two implementations:
  * `isServerLoopUtilizationFrameV1` here and `SERVER_LOOP_UTILIZATION_FIELDS`
- * in `crates/native/src/secure_fs.rs`, which the rig runs `exact_fields`
+ * in `crates/compare-supervisor/src/secure_fs.rs`, which the rig runs `exact_fields`
  * against before it digests the frame the child sent. The two key sets agreed
  * by inspection and nothing enforced it, which is the shape of defect the
  * design's "a codec change with no conformance vector is not done" rule exists
  * to catch.
  *
  * These are the bytes. The Rust half pins the same literal in
- * `crates/native/tests/rig_cohort_runtime.rs` as
+ * `crates/compare-supervisor/tests/rig_cohort_runtime.rs` as
  * `TS_SERVER_LOOP_UTILIZATION_HEX` and asserts its own production constant
  * against them, so a key added, renamed or reordered on either side turns one
  * of the two suites red.
