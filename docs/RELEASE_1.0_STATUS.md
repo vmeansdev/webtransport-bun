@@ -100,3 +100,18 @@ new head.
   regenerate every `gaRequired` evidence artifact at the new head; the pending
   gate table above; external `LOKALISE_API_TOKEN` rotation and published-history
   purge; the interactive IWA Direct Sockets proof; and the 24h/72h soaks.
+
+## Capacity gates ruling 2026-10-28
+
+Nikita ruled the bare-metal capacity gates G1–G11 passed for 1.0, each stated
+with its own figure and placement phrase as recorded in
+`docs/research/2026-08-21-bare-metal-capacity.md` (the verdict ledger). G10
+carries a remark: no cloud verdict exists (DigitalOcean reruns stopped on
+provider-side loss between the NICs), its scenario is superseded by the
+paced-broadcast PASS, and a dedicated bare-metal rerun is parked. These gates
+are capacity evidence for the documentation; they are not `release-status.json`
+claims and do not change the coupled GA model above.
+
+The candidate recorded above (`875dfbfe`) is stale: `rebind4-staging` is 967
+commits past it (175 touching product sources), and every `gaRequired` claim
+must be regenerated at a newly frozen candidate before promote.
