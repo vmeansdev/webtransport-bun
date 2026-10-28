@@ -6,7 +6,8 @@
  * scripted stand-in for the Mac supervisor *process* (`ScriptedMacCohortBinary`)
  * that answers the registered `mac-*` frames over a real pipe pair with records
  * signed by test keys. Production modules must not import this file: the
- * only Mac signer a campaign has is `crates/native`'s `comparison-supervisor`,
+ * only Mac signer a campaign has is the `comparison-supervisor` binary of
+ * `crates/compare-supervisor`,
  * and `remote-supervisor.test.ts` proves by scanning the tree that no
  * non-test module under `tools/compare` reaches here.
  */
@@ -95,9 +96,9 @@ import {
 	publicKeySha256,
 	type RigMeasureStartAckV1,
 	type RigServerSnapshotReceiptV1,
-	type ServerChildCpuV1,
 	retainCanonicalBytes,
 	retainRawBytes,
+	type ServerChildCpuV1,
 	type ServerObservationEvidenceV1,
 } from "./server-observation-artifact.ts";
 import { measurementPayloadBytes } from "./supervisor-protocol.ts";
