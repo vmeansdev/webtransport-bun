@@ -931,7 +931,7 @@ pub(crate) fn submit(
     let in_cap = crate::datagram_mirror::split_at_cap(targets.len());
     let pacer = pacer();
 
-    let (decisions, admitted) = {
+    let (decisions, admitted, orphans) = {
         let mut queue = match pacer.queue.lock() {
             Ok(queue) => queue,
             // A poisoned pacer must not take the broadcast down: refuse
@@ -963,37 +963,73 @@ pub(crate) fn submit(
                 bytes: job_bytes,
             });
         }
+        let mut decisions = decisions;
+        let mut admitted = admitted;
+        let mut orphans = Vec::new();
         if !queue.thread_running && admitted > 0 {
-            let cfg = *cfg;
-            match std::thread::Builder::new()
-                .name("wt-egress-pacer".to_string())
-                .spawn(move || run(cfg))
-            {
-                Ok(_) => {
+            match spawn_pacer_thread(*cfg) {
+                Ok(()) => {
                     queue.thread_running = true;
                     THREAD_STARTS.fetch_add(1, Ordering::Relaxed);
                 }
-                // Out of threads is not a reason to take the broadcast down
-                // from inside a synchronous N-API method. The job stays queued
-                // and the next submission tries the spawn again.
+                // No worker means nothing would ever deliver or report what
+                // is queued, so admission must not be claimed. Fail closed
+                // without throwing from inside a synchronous N-API method:
+                // this submission is rolled back and refused target by target
+                // (E_QUEUE_FULL, the retry list), and any job a dead worker
+                // left behind is released and reported the same way, so the
+                // queue never holds bytes no thread will drain.
                 Err(_) => {
                     THREAD_START_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    queue.jobs.pop_back();
+                    queue.pending_targets -= admitted as u64;
+                    queue.pending_bytes -= job_bytes;
+                    orphans.extend(queue.jobs.drain(..));
+                    queue.pending_targets = 0;
+                    queue.pending_bytes = 0;
+                    decisions.iter_mut().for_each(|d| *d = false);
+                    admitted = 0;
                 }
             }
         }
-        (decisions, admitted)
+        (decisions, admitted, orphans)
     };
     pacer.wake.notify_one();
+    for job in orphans {
+        for target in &job.targets {
+            record_report(job.owner_server_id, target, WOULD_BLOCK);
+        }
+    }
 
     ADMITTED.fetch_add(admitted as u64, Ordering::Relaxed);
     REFUSED.fetch_add((in_cap - admitted) as u64, Ordering::Relaxed);
+    // `fan_out` only asks about in-cap indices and records the over-cap tail
+    // as TooManyTargets itself; the lookup is still bounds-checked so a raw
+    // caller past the cap can never reach a panic across N-API.
     crate::datagram_mirror::fan_out(targets.len(), |index| {
-        if decisions[index] {
+        if decisions.get(index).copied().unwrap_or(false) {
             None
         } else {
             Some(WOULD_BLOCK)
         }
     })
+}
+
+/// Test seam: make the next pacer-thread spawns fail, as an exhausted process
+/// would.
+#[cfg(test)]
+static FAIL_SPAWN_FOR_TESTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn spawn_pacer_thread(cfg: PacerConfig) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_SPAWN_FOR_TESTS.load(Ordering::SeqCst) {
+        return Err(std::io::Error::other("injected pacer spawn failure"));
+    }
+    std::thread::Builder::new()
+        .name("wt-egress-pacer".to_string())
+        .spawn(move || run(cfg))
+        .map(|_| ())
 }
 
 /// Clears `thread_running` if the pacer thread leaves any way other than the
@@ -1469,6 +1505,69 @@ mod tests {
             queue_ms: 1,
         };
         assert_eq!(tiny.max_pending(), 32);
+    }
+
+    /// Serializes the tests that drive the process-wide queue through
+    /// [`submit`]; both keep the spawn seam failing, so no real pacer thread
+    /// is ever started from the unit tests.
+    static SUBMIT_TESTS: Mutex<()> = Mutex::new(());
+
+    fn queue_totals() -> (usize, u64, u64) {
+        let q = pacer().queue.lock().unwrap();
+        (q.jobs.len(), q.pending_targets, q.pending_bytes)
+    }
+
+    #[test]
+    fn a_failed_spawn_admits_nothing_and_leaves_nothing_queued() {
+        let _serial = SUBMIT_TESTS.lock().unwrap_or_else(|p| p.into_inner());
+        FAIL_SPAWN_FOR_TESTS.store(true, Ordering::SeqCst);
+        let owner = u64::MAX - 101;
+        // A job a dead worker left behind: it must be released and reported.
+        {
+            let mut q = pacer().queue.lock().unwrap();
+            q.jobs.push_back(Job {
+                owner_server_id: owner,
+                targets: vec!["orphan".to_string()],
+                payload: Arc::new(vec![1, 2, 3]),
+                bytes: 3 + 6 + TARGET_OVERHEAD_BYTES,
+            });
+            q.pending_targets += 1;
+            q.pending_bytes += 3 + 6 + TARGET_OVERHEAD_BYTES;
+        }
+        let failures_before = THREAD_START_FAILURES.load(Ordering::Relaxed);
+        let targets: Vec<String> = (0..5).map(|i| format!("t{i}")).collect();
+        let outcome = submit(&cfg(30_000, 32), owner, &targets, &[9; 16]);
+        FAIL_SPAWN_FOR_TESTS.store(false, Ordering::SeqCst);
+
+        assert_eq!(outcome.sent, 0, "nothing is admitted without a worker");
+        assert_eq!(outcome.failed, vec![0u32, 1, 2, 3, 4]);
+        // WouldBlock is the refusal code the facade surfaces as E_QUEUE_FULL.
+        assert!(outcome
+            .codes
+            .iter()
+            .all(|c| *c == crate::datagram_mirror::MirrorFailure::WouldBlock as u8));
+        assert_eq!(queue_totals(), (0, 0, 0));
+        assert!(THREAD_START_FAILURES.load(Ordering::Relaxed) > failures_before);
+        let reported = drain_reports(owner, 16);
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0].0, "orphan");
+    }
+
+    #[test]
+    fn a_raw_call_past_the_cap_reports_the_tail_instead_of_panicking() {
+        let _serial = SUBMIT_TESTS.lock().unwrap_or_else(|p| p.into_inner());
+        FAIL_SPAWN_FOR_TESTS.store(true, Ordering::SeqCst);
+        let cap = crate::datagram_mirror::DATAGRAM_MIRROR_MAX as usize;
+        let targets: Vec<String> = (0..cap + 3).map(|i| format!("t{i}")).collect();
+        let outcome = submit(&cfg(30_000, 32), u64::MAX - 102, &targets, &[0; 8]);
+        FAIL_SPAWN_FOR_TESTS.store(false, Ordering::SeqCst);
+
+        assert_eq!(outcome.sent + outcome.failed.len(), cap + 3);
+        let tail: Vec<u8> = outcome.codes[outcome.codes.len() - 3..].to_vec();
+        assert!(tail
+            .iter()
+            .all(|c| *c == crate::datagram_mirror::MirrorFailure::TooManyTargets as u8));
+        assert_eq!(queue_totals(), (0, 0, 0));
     }
 
     #[test]
