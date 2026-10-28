@@ -185,6 +185,7 @@ import {
 	type NativeDatagramMirrorAdmission,
 	type NativeDatagramMirrorResult,
 	type NativeMirrorReport,
+	normalizeMirrorReportsMax,
 	sendDatagramMirrorChecked,
 	sendDatagramMirrorPacedChecked,
 } from "./datagram-mirror.js";
@@ -891,7 +892,10 @@ export interface WebTransportServer {
 	 * costs a constant rather than a growth path. `drained + mirrorReportsDropped`
 	 * reconciles against the pacer's own `deferredFailures`.
 	 *
-	 * Omitting `max` drains everything pending. Native-only.
+	 * Omitting `max` (or passing `Infinity`) drains everything pending. Any
+	 * other `max` is normalized, never rejected: fractions floor, `NaN` and
+	 * values at or below zero read nothing, and values above the ring's 4,096
+	 * entries are clamped. Native-only.
 	 *
 	 * @experimental Egress pacer surface; may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
 	 */
@@ -2904,8 +2908,11 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 				targets,
 				payload,
 			),
-		readMirrorReports: (max) =>
-			decodeMirrorReports(handle.readMirrorReports?.(max) ?? []),
+		readMirrorReports: (max) => {
+			const bounded = normalizeMirrorReportsMax(max);
+			if (bounded === 0) return decodeMirrorReports([]);
+			return decodeMirrorReports(handle.readMirrorReports?.(bounded) ?? []);
+		},
 		close: createServerCloseContract({
 			closeNative: () => {
 				closing = true;

@@ -78,7 +78,14 @@ async function sendChunks(
 			start,
 			start + DATAGRAM_BATCH_MAX,
 		) as Uint8Array[];
-		const elapsed = start === 0 ? 0 : Math.max(0, performance.now() - started);
+		// Whole milliseconds within u32: the native parameter is `u32`.
+		const elapsed =
+			start === 0
+				? 0
+				: Math.min(
+						0xffff_ffff,
+						Math.floor(Math.max(0, performance.now() - started)),
+					);
 		const result = await send(chunk, elapsed);
 		sent += result.sent;
 		// A short chunk without a code cannot happen — native reports why it

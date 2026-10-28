@@ -110,6 +110,29 @@ export function openReadSinkOnNativeHandle(
 ): StreamSinkHandle {
 	const ringBytes = normalizeRingBytes(opts.ringBytes);
 	const framing = opts.framing ?? null;
+	if (framing) {
+		// These four cross into `u32` N-API fields; anything else would fail
+		// the binding's conversion with a generic error instead of the
+		// documented E_SINK_BAD_OPTIONS. Range rules beyond `u32` stay native.
+		for (const key of [
+			"headerBytes",
+			"lengthOffset",
+			"lengthWidth",
+			"maxFrameBytes",
+		] as const) {
+			const value = (framing as unknown as Record<string, unknown>)[key];
+			if (
+				typeof value !== "number" ||
+				!Number.isInteger(value) ||
+				value < 0 ||
+				value > 0xffff_ffff
+			) {
+				throw new Error(
+					`E_SINK_BAD_OPTIONS: framing.${key} must be an integer 0..4294967295`,
+				);
+			}
+		}
+	}
 	const sab = new SharedArrayBuffer(SINK_DATA_OFFSET + ringBytes);
 	const view = new Uint8Array(sab);
 	const result = native.openReadSink(view, {

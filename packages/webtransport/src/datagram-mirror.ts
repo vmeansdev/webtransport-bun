@@ -224,6 +224,23 @@ export function decodeMirrorAdmission(
 }
 
 /** Turn one drained native batch into reports an application can act on. */
+/** Fixed capacity of the native reports ring (`MIRROR_REPORTS_CAP`). */
+export const MIRROR_REPORTS_RING_CAP = 4_096;
+
+/**
+ * Normalize `readMirrorReports(max)` before it crosses into a `u32` N-API
+ * parameter, so no `number` can make the never-throwing reader throw:
+ * `undefined` and `+Infinity` drain everything (`undefined`); `NaN`, values
+ * at or below 0, values that floor to 0 and non-numbers read nothing (`0`);
+ * fractions floor; anything above the ring's capacity is clamped to it (the
+ * ring can never hold more).
+ */
+export function normalizeMirrorReportsMax(max: unknown): number | undefined {
+	if (max === undefined || max === Number.POSITIVE_INFINITY) return undefined;
+	if (typeof max !== "number" || Number.isNaN(max) || max <= 0) return 0;
+	return Math.min(Math.floor(max), MIRROR_REPORTS_RING_CAP);
+}
+
 export function decodeMirrorReports(
 	native: readonly NativeMirrorReport[],
 ): readonly MirrorReport[] {
