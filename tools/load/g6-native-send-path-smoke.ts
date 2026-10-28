@@ -36,12 +36,13 @@ async function main(): Promise<void> {
 		tls: { certPem: "", keyPem: "" },
 		onSession: () => {},
 	});
+	const internals = __TESTING__.serverInternals(server);
 	let client: Awaited<ReturnType<typeof connect>> | undefined;
 	let incoming: AsyncIterator<Uint8Array> | undefined;
 	try {
 		let invalidPhaseThrew = false;
 		try {
-			server.__sendPathDiagnostics!("invalid");
+			internals.__sendPathDiagnostics!("invalid");
 		} catch {
 			invalidPhaseThrew = true;
 		}
@@ -52,7 +53,11 @@ async function main(): Promise<void> {
 		__TESTING__
 			.serverInternals(server)
 			.setDatagramReflector(G6_V3_ACK_REFLECTOR_RULE);
-		await readNativeSendPath(server.__sendPathDiagnostics, "connect", enabled);
+		await readNativeSendPath(
+			internals.__sendPathDiagnostics,
+			"connect",
+			enabled,
+		);
 		client = await bounded(
 			connect(`https://127.0.0.1:${server.address.port}`, {
 				tls: { insecureSkipVerify: true },
@@ -63,7 +68,7 @@ async function main(): Promise<void> {
 		incoming = client.incomingDatagrams()[Symbol.asyncIterator]();
 		let sequence = 0;
 		for (const phase of ["connect", "steady", "drain", "idle"] as const) {
-			await readNativeSendPath(server.__sendPathDiagnostics, phase, enabled);
+			await readNativeSendPath(internals.__sendPathDiagnostics, phase, enabled);
 			if (phase === "idle") continue;
 			for (let i = 0; i < 3; i++) {
 				const bytes = new Uint8Array(64),
@@ -85,7 +90,7 @@ async function main(): Promise<void> {
 		await bounded(server.close(), "server close", 5_000);
 	}
 	const snapshot = await readNativeSendPath(
-		server.__sendPathDiagnostics,
+		internals.__sendPathDiagnostics,
 		"closed",
 		enabled,
 	);

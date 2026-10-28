@@ -43,7 +43,7 @@ impl RecvRuntimeMode {
 
 /// Parse `WEBTRANSPORT_NATIVE_SERVER_RECV_RUNTIME`. Unset means the shared
 /// runtime; only the two literal modes are honoured; anything else is an
-/// error the caller turns into a fail-closed abort.
+/// error the caller reports once and replaces with the default.
 pub(crate) fn parse_recv_runtime_mode(raw: Option<&str>) -> Result<RecvRuntimeMode, ()> {
     match raw {
         None | Some("shared") => Ok(RecvRuntimeMode::Shared),
@@ -61,11 +61,14 @@ pub(crate) fn server_recv_runtime_mode() -> RecvRuntimeMode {
         match parse_recv_runtime_mode(raw.as_deref()) {
             Ok(mode) => mode,
             Err(()) => {
-                eprintln!(
-                    "webtransport-native: FATAL E_INTERNAL: WEBTRANSPORT_NATIVE_SERVER_RECV_RUNTIME must be 'shared' or 'dedicated', got '{}'",
-                    raw.unwrap_or_default()
+                crate::warn_invalid_knob(
+                    &format!(
+                        "WEBTRANSPORT_NATIVE_SERVER_RECV_RUNTIME must be 'shared' or 'dedicated', got '{}'",
+                        raw.unwrap_or_default()
+                    ),
+                    "shared",
                 );
-                std::process::abort();
+                RecvRuntimeMode::Shared
             }
         }
     })

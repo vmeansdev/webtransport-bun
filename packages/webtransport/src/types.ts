@@ -151,19 +151,6 @@ export type MetricsSnapshot = {
 	datagramMirrorCalls?: number;
 	/** Native only. Targets those mirror calls attempted. */
 	datagramMirrorTargets?: number;
-	/** Native only, process-wide UDP batcher counters. */
-	udpSendBatchCalls?: number;
-	udpSendBatchMessages?: number;
-	udpSendBatchFallback?: number;
-	udpSendBatchBlocked?: number;
-	/** Flusher disconnect or fallback WouldBlock losses. */
-	udpSendBatchDropped?: number;
-	/** Unsent suffixes deliberately discarded by EAGAIN drop mode. */
-	udpSendBatchCongestionDropped?: number;
-	udpSendBatchErrors?: number;
-	datagramPumpsSpawned?: number;
-	datagramPumpsLive?: number;
-	udpSendBatchMaxBatch?: number;
 
 	rateLimitedCount: number;
 	limitExceededCount: number;

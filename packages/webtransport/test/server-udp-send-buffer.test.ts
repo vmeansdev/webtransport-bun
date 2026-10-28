@@ -6,7 +6,7 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { createServer } from "../src/index.js";
+import { __TESTING__, createServer } from "../src/index.js";
 import { nextPort } from "./helpers/network.js";
 
 const BASE_PORT = 26_900;
@@ -14,7 +14,7 @@ const PORT_SPREAD = 60;
 const REQUESTED = "26214400";
 
 const CHILD = `
-const { createServer } = await import(${JSON.stringify(
+const { __TESTING__, createServer } = await import(${JSON.stringify(
 	new URL("../src/index.ts", import.meta.url).href,
 )});
 const server = createServer({
@@ -22,7 +22,7 @@ const server = createServer({
 	tls: { certPem: "", keyPem: "" },
 	onSession: () => {},
 });
-console.log("serverUdpSendBufferBytes=" + server.serverUdpSendBufferBytes());
+console.log("serverUdpSendBufferBytes=" + __TESTING__.serverInternals(server).serverUdpSendBufferBytes());
 await server.close();
 `;
 
@@ -55,7 +55,9 @@ describe("server udp send buffer", () => {
 			onSession: () => {},
 		});
 		try {
-			expect(server.serverUdpSendBufferBytes()).toBe(0);
+			expect(
+				__TESTING__.serverInternals(server).serverUdpSendBufferBytes(),
+			).toBe(0);
 		} finally {
 			await server.close();
 		}

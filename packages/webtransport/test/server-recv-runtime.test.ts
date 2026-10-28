@@ -10,14 +10,14 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { createServer } from "../src/index.js";
+import { __TESTING__, createServer } from "../src/index.js";
 import { nextPort } from "./helpers/network.js";
 
 const BASE_PORT = 26_600;
 const PORT_SPREAD = 60;
 
 const CHILD = `
-const { createServer } = await import(${JSON.stringify(
+const { __TESTING__, createServer } = await import(${JSON.stringify(
 	new URL("../src/index.ts", import.meta.url).href,
 )});
 const { connectWithRetry } = await import(${JSON.stringify(
@@ -30,7 +30,7 @@ const server = createServer({
 	tls: { certPem: "", keyPem: "" },
 	onSession: (s) => accepted.resolve(s),
 });
-console.log("recv=" + server.serverRecvRuntime());
+console.log("recv=" + __TESTING__.serverInternals(server).serverRecvRuntime());
 const client = await connectWithRetry("https://127.0.0.1:" + port, {
 	tls: { insecureSkipVerify: true },
 });
@@ -72,7 +72,9 @@ describe("server receive runtime", () => {
 			onSession: () => {},
 		});
 		try {
-			expect(server.serverRecvRuntime()).toBe("shared");
+			expect(__TESTING__.serverInternals(server).serverRecvRuntime()).toBe(
+				"shared",
+			);
 		} finally {
 			await server.close();
 		}
@@ -94,11 +96,16 @@ describe("server receive runtime", () => {
 		expect(stdout).toContain("datagram=7,7,7");
 	}, 60_000);
 
-	it("fails closed on an unknown mode rather than falling back", async () => {
-		const { code, stderr } = await child("both");
-		expect(code).not.toBe(0);
+	it("warns once and falls back to shared on an unknown mode", async () => {
+		const { code, stdout, stderr } = await child("both");
+		expect(code).toBe(0);
+		expect(stdout).toContain("recv=shared");
+		expect(stdout).toContain("datagram=7,7,7");
 		expect(stderr).toContain(
-			"FATAL E_INTERNAL: WEBTRANSPORT_NATIVE_SERVER_RECV_RUNTIME must be 'shared' or 'dedicated', got 'both'",
+			"webtransport-native: warning: WEBTRANSPORT_NATIVE_SERVER_RECV_RUNTIME must be 'shared' or 'dedicated', got 'both'; ignoring it and using the default (shared)",
 		);
+		expect(
+			stderr.split("WEBTRANSPORT_NATIVE_SERVER_RECV_RUNTIME").length - 1,
+		).toBe(1);
 	}, 60_000);
 });

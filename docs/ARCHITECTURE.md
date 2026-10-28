@@ -13,11 +13,12 @@ The addon is implemented in Rust using napi-rs. QUIC/HTTP3/WebTransport is imple
     drives server accept loop, server-side sessions, and stream bridges. The
     count is resolved by `server_worker_threads()` rather than written as a
     literal: it is 2 unless `WEBTRANSPORT_NATIVE_SERVER_WORKERS` names another
-    integer in 1..=8, and any other value aborts the process. That override
-    exists for measurement-campaign A/B runs only — 2 stays the shipped
-    default, because every alternative measured worse (macOS: 89k/s at two,
-    82k/s at four, 48k/s at ten). The effective value is readable from the
-    server handle as `serverWorkerThreads()`.
+    integer in 1..=8; any other value logs one warning and falls back to 2.
+    That override is an unsupported internal knob for measurement-campaign A/B
+    runs only — 2 stays the shipped default, because every alternative
+    measured worse (macOS: 89k/s at two, 82k/s at four, 48k/s at ten). The
+    effective value is readable through the internal
+    `__TESTING__.serverInternals(server).serverWorkerThreads()`.
   - **CLIENT_RUNTIME** (`wt-client`), `Builder::new_multi_thread().worker_threads(1)`:
     drives client connections and client-side stream bridges.
 - `new_multi_thread` is required for both. Synchronous N-API entry points call

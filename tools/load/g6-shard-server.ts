@@ -173,21 +173,21 @@ async function main(): Promise<void> {
 	// Read back from the addon, not from a flag we were handed: the scan's
 	// kill gate is only worth anything if this is the count native actually
 	// built its server runtime with.
-	const serverWorkers = server.serverWorkerThreads();
+	const serverWorkers = internals.serverWorkerThreads();
 	// Same reasoning: report what the addon actually built, not the env var
 	// we were handed.
-	const serverRecvRuntime = server.serverRecvRuntime();
+	const serverRecvRuntime = internals.serverRecvRuntime();
 	// Same reasoning: report what the addon actually built, not the env var
 	// we were handed.
-	const serverAckCadence = server.serverAckCadence();
+	const serverAckCadence = internals.serverAckCadence();
 	// Same reasoning: report the UDP send buffer bytes the addon actually
 	// resolved, not the env var we were handed.
-	const serverUdpSendBufferBytes = server.serverUdpSendBufferBytes();
+	const serverUdpSendBufferBytes = internals.serverUdpSendBufferBytes();
 	// Same reasoning: report the UDP send batch the addon actually resolved.
-	const serverUdpSendBatch = server.serverUdpSendBatch();
-	const serverUdpSendEagainMode = server.serverUdpSendEagainMode();
+	const serverUdpSendBatch = internals.serverUdpSendBatch();
+	const serverUdpSendEagainMode = internals.serverUdpSendEagainMode();
 	const reflectRingBypass = internals.serverReflectRingBypass();
-	const datagramDriver = server.serverDatagramDriver();
+	const datagramDriver = internals.serverDatagramDriver();
 	let reflectorCounters: ReflectorCounters = {
 		hits: 0,
 		sent: 0,
@@ -310,7 +310,7 @@ async function main(): Promise<void> {
 	// persists boundary snapshots through deltaRecord, which keeps numeric
 	// keys only and would drop this object.
 	const pacerStats = (): Record<string, unknown> => {
-		const raw = server.__pacerStatsJson?.();
+		const raw = internals.__pacerStatsJson?.();
 		if (raw === undefined) return {};
 		try {
 			const parsed: unknown = JSON.parse(raw);
@@ -326,7 +326,7 @@ async function main(): Promise<void> {
 		ev: "ready",
 		sendPathProducerSha256,
 		sendPathDiagnostics: await readNativeSendPath(
-			server.__sendPathDiagnostics,
+			internals.__sendPathDiagnostics,
 			undefined,
 			nativeSendPathEnabled,
 		),
@@ -364,7 +364,7 @@ async function main(): Promise<void> {
 			// The native send-path cuts know only the steady path's phases; an
 			// arms boundary reads the live snapshot without cutting a phase.
 			const sendPathDiagnostics = await readNativeSendPath(
-				server.__sendPathDiagnostics,
+				internals.__sendPathDiagnostics,
 				isArmsPhase(msg.phase) ? undefined : msg.phase,
 				nativeSendPathEnabled,
 			);
@@ -399,7 +399,7 @@ async function main(): Promise<void> {
 				pacerStats: pacerStats(),
 				arms: armsEchoNow(true),
 				sendPathDiagnostics: await readNativeSendPath(
-					server.__sendPathDiagnostics,
+					internals.__sendPathDiagnostics,
 					undefined,
 					nativeSendPathEnabled,
 				),
@@ -415,7 +415,7 @@ async function main(): Promise<void> {
 		}),
 	]);
 	const sendPathDiagnostics = await readNativeSendPath(
-		server.__sendPathDiagnostics,
+		internals.__sendPathDiagnostics,
 		"closed",
 		nativeSendPathEnabled,
 	);

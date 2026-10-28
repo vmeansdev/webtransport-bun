@@ -211,6 +211,7 @@ import { createServerCloseContract } from "./server-close.js";
 import {
 	type InternalMetricsSnapshot,
 	registerServerInternals,
+	type ServerInternals,
 	serverInternals,
 	withoutInternalMetrics,
 } from "./server-internals.js";
@@ -749,16 +750,6 @@ export type ServerOptions = {
 /** Returned by {@link createServer}. Use address, close(), and metricsSnapshot(). */
 export interface WebTransportServer {
 	readonly address: { host: string; port: number };
-	/**
-	 * Diagnostic, unstable, NOT public API (see egress_pacer.rs): windowed
-	 * pacer counters for bench tooling. **Absent** (not `"{}"`) on addons built
-	 * without the pacer accessors, so a caller can tell a stale addon from a
-	 * live addon whose pacer knob is simply off — the latter returns `"{}"`.
-	 */
-	__pacerStatsSnapshot?(): number;
-	__pacerStatsJson?(token?: number): string;
-	/** Diagnostic-only process-wide phase banks; absent on older addons. */
-	__sendPathDiagnostics?(phase?: string): string;
 	/** Effective congestion-control mode applied to all server connections. */
 	readonly congestionControl: "default" | "throughput" | "low-latency";
 	/** Rotate only the default server TLS certificate/key at runtime. Existing sessions stay alive. */
@@ -847,28 +838,6 @@ export interface WebTransportServer {
 	 * Omitting `max` drains everything pending. Native-only.
 	 */
 	readMirrorReports(max?: number): readonly MirrorReport[];
-	/**
-	 * Effective Tokio worker count of the native server runtime in this
-	 * process. 2 unless `WEBTRANSPORT_NATIVE_SERVER_WORKERS` overrode it before
-	 * the addon built its runtime; that override exists for measurement-campaign
-	 * A/B runs, so a load harness can read this back and refuse a shard that did
-	 * not get the count it asked for.
-	 */
-	serverWorkerThreads(): number;
-	/** Endpoint-driver placement the addon resolved: "shared" | "dedicated". */
-	serverRecvRuntime(): string;
-	/** ACK cadence requested of the client the addon resolved: "default" | "relaxed". */
-	serverAckCadence(): string;
-	/** Requested UDP server send buffer bytes the addon resolved; 0 = default bind path. */
-	serverUdpSendBufferBytes(): number;
-	/** Cross-connection UDP send batch size the addon resolved
-	 * (`WEBTRANSPORT_NATIVE_UDP_SEND_BATCH`); 0 = off, one sendmsg per transmit. */
-	serverUdpSendBatch(): number;
-	/** wtransport driver datagram read path in this process: "pump" (default,
-	 * dedicated per-connection task) | "legacy" (`WTRANSPORT_DATAGRAM_PUMP=0`). */
-	serverDatagramDriver(): string;
-	/** Linux sendmmsg EAGAIN policy: "wait" | "drop". */
-	serverUdpSendEagainMode(): string;
 	close(): Promise<void>;
 	metricsSnapshot(): MetricsSnapshot;
 }
@@ -1199,45 +1168,6 @@ export type MetricsSnapshot = {
 	 * number. Absent entirely on an addon built without the pacer.
 	 */
 	mirrorReportsDropped?: number;
-	/** Native only, process-wide. Cross-connection UDP send batching
-	 * (`WEBTRANSPORT_NATIVE_UDP_SEND_BATCH`): sendmmsg calls, datagrams sent
-	 * through them, datagrams sent one at a time instead, WouldBlocks handed
-	 * to a driver because the ring was full, datagrams dropped because the
-	 * flusher was gone or a fallback WouldBlocked, congestion drops admitted
-	 * by EAGAIN drop mode, send errors, largest batch flushed. All zero while
-	 * batching is off. */
-	udpSendBatchCalls?: number;
-	udpSendBatchMessages?: number;
-	udpSendBatchFallback?: number;
-	udpSendBatchBlocked?: number;
-	udpSendBatchDropped?: number;
-	udpSendBatchCongestionDropped?: number;
-	udpSendBatchErrors?: number;
-	datagramPumpsSpawned?: number;
-	datagramPumpsLive?: number;
-	udpSendBatchMaxBatch?: number;
-	/**
-	 * Native only. Connections that were live when this snapshot was taken and
-	 * therefore contributed to the `quic*` sums below.
-	 */
-	quicSessions?: number;
-	/**
-	 * Native only. quinn transport counters summed over those live connections.
-	 * A boundary sample, not a lifetime total — a closed session's counters go
-	 * with it — so two snapshots may only be differenced across a window whose
-	 * session set is stable. Beside the application's own receive tally these
-	 * separate socket-to-quinn loss ({@link quicUdpDatagramsReceived} short of
-	 * what the peer sent) from quinn-to-application loss
-	 * ({@link quicDatagramFramesReceived} short of what the app counted). One
-	 * UDP datagram can carry several DATAGRAM frames, so the two are not
-	 * expected to be equal.
-	 */
-	quicUdpDatagramsReceived?: number;
-	quicUdpDatagramsSent?: number;
-	quicDatagramFramesReceived?: number;
-	quicDatagramFramesSent?: number;
-	quicPacketsSent?: number;
-	quicPacketsLost?: number;
 
 	rateLimitedCount: number;
 	limitExceededCount: number;
@@ -2424,13 +2354,14 @@ class NativeServerSession implements ServerSession {
  * is off, so a forward that substituted `"{}"` for a method the addon does not
  * have would make a stale addon read as a deliberate unpaced run: a paced bench
  * cell would then produce an artifact with no pacer stats and nothing saying
- * why. Callers that need the pacer must check `typeof server.__pacerStatsJson
- * === "function"` and refuse when it is not.
+ * why. Callers that need the pacer must check `typeof
+ * __TESTING__.serverInternals(server).__pacerStatsJson === "function"` and
+ * refuse when it is not.
  */
 function pacerStatsForwards(handle: {
 	__pacerStatsSnapshot?(): number;
 	__pacerStatsJson?(token?: number): string;
-}): Pick<WebTransportServer, "__pacerStatsSnapshot" | "__pacerStatsJson"> {
+}): Pick<ServerInternals, "__pacerStatsSnapshot" | "__pacerStatsJson"> {
 	const snapshot = handle.__pacerStatsSnapshot;
 	const json = handle.__pacerStatsJson;
 	return {
@@ -2728,7 +2659,6 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 	const server: WebTransportServer = {
 		address: { host: opts.host ?? "0.0.0.0", port: handle.port },
 		congestionControl: opts.congestionControl ?? "default",
-		...pacerStatsForwards(handle),
 		updateCert: async (tls) => {
 			const nextCertPem = decodePem(tls.certPem);
 			const nextKeyPem = decodePem(tls.keyPem);
@@ -2814,19 +2744,6 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 					onSessionDrainResolve = resolve;
 				}),
 		}),
-		serverWorkerThreads: () => handle.serverWorkerThreads(),
-		serverRecvRuntime: () => handle.serverRecvRuntime(),
-		serverAckCadence: () => handle.serverAckCadence(),
-		serverUdpSendBufferBytes: () => handle.serverUdpSendBufferBytes(),
-		serverUdpSendBatch: () => handle.serverUdpSendBatch(),
-		serverDatagramDriver: () => handle.serverDatagramDriver(),
-		serverUdpSendEagainMode: () => handle.serverUdpSendEagainMode(),
-		...(typeof handle.__sendPathDiagnostics === "function"
-			? {
-					__sendPathDiagnostics: (phase?: string) =>
-						handle.__sendPathDiagnostics!(phase),
-				}
-			: {}),
 		metricsSnapshot: () => withoutInternalMetrics(handle.metricsSnapshot()),
 	};
 	// Surfaces excluded from the 1.0 contract stay reachable for tests and
@@ -2845,6 +2762,20 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 				install.call(handle, native as never);
 			}, rule),
 		serverReflectRingBypass: () => handle.serverReflectRingBypass(),
+		serverWorkerThreads: () => handle.serverWorkerThreads(),
+		serverRecvRuntime: () => handle.serverRecvRuntime(),
+		serverAckCadence: () => handle.serverAckCadence(),
+		serverUdpSendBufferBytes: () => handle.serverUdpSendBufferBytes(),
+		serverUdpSendBatch: () => handle.serverUdpSendBatch(),
+		serverDatagramDriver: () => handle.serverDatagramDriver(),
+		serverUdpSendEagainMode: () => handle.serverUdpSendEagainMode(),
+		...pacerStatsForwards(handle),
+		...(typeof handle.__sendPathDiagnostics === "function"
+			? {
+					__sendPathDiagnostics: (phase?: string) =>
+						handle.__sendPathDiagnostics!(phase),
+				}
+			: {}),
 		metricsSnapshot: () => handle.metricsSnapshot(),
 	});
 	return server;

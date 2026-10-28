@@ -38,32 +38,32 @@ describe("G6 shard server source-bound configuration", () => {
 	}, 15_000);
 
 	test("reports the worker count native actually built, not the one it was asked for", () => {
-		expect(source).toContain("server.serverWorkerThreads()");
+		expect(source).toContain("internals.serverWorkerThreads()");
 		expect(source).toContain("serverWorkers,\n");
 	}, 15_000);
 
 	test("reports the recv runtime native actually built, not the one it was asked for", () => {
-		expect(source).toContain("server.serverRecvRuntime()");
+		expect(source).toContain("internals.serverRecvRuntime()");
 		expect(source).toContain("serverRecvRuntime,\n");
 	}, 15_000);
 
 	test("reports the UDP send batch native actually resolved, not the one it was asked for", () => {
-		expect(source).toContain("server.serverUdpSendBatch()");
+		expect(source).toContain("internals.serverUdpSendBatch()");
 		expect(source).toContain("serverUdpSendBatch,\n");
 	}, 15_000);
 
 	test("reports the UDP send EAGAIN mode native actually resolved", () => {
-		expect(source).toContain("server.serverUdpSendEagainMode()");
+		expect(source).toContain("internals.serverUdpSendEagainMode()");
 		expect(source).toContain("serverUdpSendEagainMode,\n");
 	}, 15_000);
 
 	test("reports the UDP send-buffer knob native actually resolved, not the env it was handed", () => {
-		expect(source).toContain("server.serverUdpSendBufferBytes()");
+		expect(source).toContain("internals.serverUdpSendBufferBytes()");
 		expect(source).toContain("serverUdpSendBufferBytes,\n");
 	}, 15_000);
 
 	test("reports the ack cadence native actually built, not the one it was asked for", () => {
-		expect(source).toContain("server.serverAckCadence()");
+		expect(source).toContain("internals.serverAckCadence()");
 		expect(source).toContain("serverAckCadence,\n");
 	}, 15_000);
 
@@ -86,7 +86,7 @@ describe("G6 shard server source-bound configuration", () => {
 		// JSON string, "{}" when the pacer is off). It rides the boundary
 		// message so the scan can persist it outside deltaRecord; the
 		// snapshot itself stays as the artifact layer expects it.
-		expect(source).toContain("server.__pacerStatsJson?.()");
+		expect(source).toContain("internals.__pacerStatsJson?.()");
 		expect(source).toContain("const pacerStats = ():");
 		// Both boundary emits (phase and stop) carry it; nothing else does.
 		expect(source.split("pacerStats: pacerStats()").length - 1).toBe(2);

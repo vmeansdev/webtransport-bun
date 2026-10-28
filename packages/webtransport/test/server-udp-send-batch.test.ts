@@ -33,8 +33,8 @@ const server = createServer({
 	tls: { certPem: "", keyPem: "" },
 	onSession: (s) => accepted.resolve(s),
 });
-console.log("udpSendBatch=" + server.serverUdpSendBatch());
-console.log("udpSendEagainMode=" + server.serverUdpSendEagainMode());
+console.log("udpSendBatch=" + __TESTING__.serverInternals(server).serverUdpSendBatch());
+console.log("udpSendEagainMode=" + __TESTING__.serverInternals(server).serverUdpSendEagainMode());
 console.log("reflectRingBypass=" + __TESTING__.serverInternals(server).serverReflectRingBypass());
 const client = await connectWithRetry("https://127.0.0.1:" + port, {
 	tls: { insecureSkipVerify: true },
@@ -56,7 +56,7 @@ for (let i = 0; i < 50; i += 1) {
 	if (back.value && back.value[0] === i) seen += 1;
 }
 console.log("downstream=" + seen);
-const m = server.metricsSnapshot();
+const m = __TESTING__.serverInternals(server).metricsSnapshot();
 console.log("batchCalls=" + (m.udpSendBatchCalls ?? -1) + " batchMessages=" + (m.udpSendBatchMessages ?? -1) + " batchFallback=" + (m.udpSendBatchFallback ?? -1) + " batchBlocked=" + (m.udpSendBatchBlocked ?? -1) + " batchDropped=" + (m.udpSendBatchDropped ?? -1) + " batchCongestionDropped=" + (m.udpSendBatchCongestionDropped ?? -1) + " batchErrors=" + (m.udpSendBatchErrors ?? -1));
 await fromClient.return?.();
 await fromServer.return?.();
@@ -65,7 +65,7 @@ await server.close();
 `;
 
 const STARTUP_REFUSAL_CHILD = `
-const { createServer } = await import(${JSON.stringify(
+const { __TESTING__, createServer } = await import(${JSON.stringify(
 	new URL("../src/index.ts", import.meta.url).href,
 )});
 let server;
@@ -136,8 +136,10 @@ describe("server udp send batch", () => {
 			onSession: () => {},
 		});
 		try {
-			expect(server.serverUdpSendBatch()).toBe(0);
-			expect(server.serverUdpSendEagainMode()).toBe("wait");
+			expect(__TESTING__.serverInternals(server).serverUdpSendBatch()).toBe(0);
+			expect(
+				__TESTING__.serverInternals(server).serverUdpSendEagainMode(),
+			).toBe("wait");
 			expect(
 				__TESTING__.serverInternals(server).serverReflectRingBypass(),
 			).toBe("off");
@@ -151,10 +153,12 @@ describe("server udp send batch", () => {
 		expect(accepted.code).toBe(0);
 		expect(accepted.stdout).toContain("reflectRingBypass=on");
 
+		// Malformed: one warning, then the default (off); the process lives.
 		const rejected = await child("64", "wait", "true");
-		expect(rejected.code).not.toBe(0);
+		expect(rejected.code).toBe(0);
+		expect(rejected.stdout).toContain("reflectRingBypass=off");
 		expect(rejected.stderr).toContain(
-			"FATAL E_INTERNAL: WEBTRANSPORT_NATIVE_REFLECT_RING_BYPASS must be 0 or 1, got 'true'",
+			"webtransport-native: warning: WEBTRANSPORT_NATIVE_REFLECT_RING_BYPASS must be 0 or 1, got 'true'; ignoring it and using the default (0)",
 		);
 	}, 60_000);
 
@@ -190,11 +194,16 @@ describe("server udp send batch", () => {
 		expect(c.batchFallback).toBe(0);
 	}, 60_000);
 
-	it("fails closed on an out-of-range size rather than falling back", async () => {
-		const { code, stderr } = await child("1");
-		expect(code).not.toBe(0);
+	it("warns once and falls back to off on an out-of-range size", async () => {
+		const { code, stdout, stderr } = await child("1");
+		expect(code).toBe(0);
+		expect(stdout).toContain("udpSendBatch=0");
+		expect(stdout).toContain("downstream=50");
 		expect(stderr).toContain(
-			"FATAL E_INTERNAL: WEBTRANSPORT_NATIVE_UDP_SEND_BATCH must be 0 or 2..=1024, got '1'",
+			"webtransport-native: warning: WEBTRANSPORT_NATIVE_UDP_SEND_BATCH must be 0 or 2..=1024, got '1'; ignoring it and using the default (0)",
+		);
+		expect(stderr.split("WEBTRANSPORT_NATIVE_UDP_SEND_BATCH ").length - 1).toBe(
+			1,
 		);
 	}, 60_000);
 
@@ -227,11 +236,13 @@ describe("server udp send batch", () => {
 		expect(rejected.stderr).not.toContain("E_HANDSHAKE_TIMEOUT");
 	}, 20_000);
 
-	it("fails closed on an unknown EAGAIN mode", async () => {
+	it("warns once and falls back to wait on an unknown EAGAIN mode", async () => {
 		const rejected = await child("64", "retry");
-		expect(rejected.code).not.toBe(0);
+		expect(rejected.code).toBe(0);
+		expect(rejected.stdout).toContain("udpSendEagainMode=wait");
+		expect(rejected.stdout).toContain("downstream=50");
 		expect(rejected.stderr).toContain(
-			"FATAL E_INTERNAL: WEBTRANSPORT_NATIVE_UDP_SEND_EAGAIN_MODE must be wait or drop, got 'retry'",
+			"webtransport-native: warning: WEBTRANSPORT_NATIVE_UDP_SEND_EAGAIN_MODE must be wait or drop, got 'retry'; ignoring it and using the default (wait)",
 		);
 	}, 60_000);
 });

@@ -11,14 +11,14 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { createServer } from "../src/index.js";
+import { __TESTING__, createServer } from "../src/index.js";
 import { nextPort } from "./helpers/network.js";
 
 const BASE_PORT = 26_700;
 const PORT_SPREAD = 60;
 
 const CHILD = `
-const { createServer } = await import(${JSON.stringify(
+const { __TESTING__, createServer } = await import(${JSON.stringify(
 	new URL("../src/index.ts", import.meta.url).href,
 )});
 const { connectWithRetry } = await import(${JSON.stringify(
@@ -31,7 +31,7 @@ const server = createServer({
 	tls: { certPem: "", keyPem: "" },
 	onSession: (s) => accepted.resolve(s),
 });
-console.log("ackCadence=" + server.serverAckCadence());
+console.log("ackCadence=" + __TESTING__.serverInternals(server).serverAckCadence());
 const client = await connectWithRetry("https://127.0.0.1:" + port, {
 	tls: { insecureSkipVerify: true },
 });
@@ -73,7 +73,9 @@ describe("server ack cadence", () => {
 			onSession: () => {},
 		});
 		try {
-			expect(server.serverAckCadence()).toBe("default");
+			expect(__TESTING__.serverInternals(server).serverAckCadence()).toBe(
+				"default",
+			);
 		} finally {
 			await server.close();
 		}
@@ -95,11 +97,14 @@ describe("server ack cadence", () => {
 		expect(stdout).toContain("datagram=9,9,9");
 	}, 60_000);
 
-	it("fails closed on an unknown mode rather than falling back", async () => {
-		const { code, stderr } = await child("both");
-		expect(code).not.toBe(0);
+	it("warns once and falls back to the default on an unknown mode", async () => {
+		const { code, stdout, stderr } = await child("both");
+		expect(code).toBe(0);
+		expect(stdout).toContain("ackCadence=default");
+		expect(stdout).toContain("datagram=9,9,9");
 		expect(stderr).toContain(
-			"FATAL E_INTERNAL: WEBTRANSPORT_NATIVE_ACK_CADENCE must be 'default' or 'relaxed', got 'both'",
+			"webtransport-native: warning: WEBTRANSPORT_NATIVE_ACK_CADENCE must be 'default' or 'relaxed', got 'both'; ignoring it and using the default (default)",
 		);
+		expect(stderr.split("WEBTRANSPORT_NATIVE_ACK_CADENCE").length - 1).toBe(1);
 	}, 60_000);
 });

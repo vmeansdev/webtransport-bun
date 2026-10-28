@@ -44,7 +44,10 @@ import {
 import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { $ } from "bun";
-import { createServer } from "../../packages/webtransport/src/index.ts";
+import {
+	__TESTING__,
+	createServer,
+} from "../../packages/webtransport/src/index.ts";
 import { generateLocalhostCert } from "../../packages/webtransport/test/helpers/certs.ts";
 import { canonicalGeneratorIdentity } from "../offbox/host-identity.ts";
 import {
@@ -866,7 +869,9 @@ async function runArm(o: ArmOptions): Promise<unknown> {
 		cpuMs: serverCpuMs(),
 		wallMs: Date.now(),
 		kernel: readKernelUdp(),
-		metrics: o.server.metricsSnapshot(),
+		// The full snapshot: the quinn aggregates the artifact reads are
+		// internal counters, absent from the public metricsSnapshot().
+		metrics: __TESTING__.serverInternals(o.server).metricsSnapshot(),
 	});
 
 	const marks: Marks = {

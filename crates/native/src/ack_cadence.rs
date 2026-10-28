@@ -49,7 +49,7 @@ impl AckCadenceMode {
 
 /// Parse `WEBTRANSPORT_NATIVE_ACK_CADENCE`. Unset means the default cadence;
 /// only the two literal modes are honoured; anything else is an error the
-/// caller turns into a fail-closed abort.
+/// caller reports once and replaces with the default.
 pub(crate) fn parse_ack_cadence_mode(raw: Option<&str>) -> Result<AckCadenceMode, ()> {
     match raw {
         None | Some("default") => Ok(AckCadenceMode::Default),
@@ -67,11 +67,14 @@ pub(crate) fn server_ack_cadence_mode() -> AckCadenceMode {
         match parse_ack_cadence_mode(raw.as_deref()) {
             Ok(mode) => mode,
             Err(()) => {
-                eprintln!(
-                    "webtransport-native: FATAL E_INTERNAL: WEBTRANSPORT_NATIVE_ACK_CADENCE must be 'default' or 'relaxed', got '{}'",
-                    raw.unwrap_or_default()
+                crate::warn_invalid_knob(
+                    &format!(
+                        "WEBTRANSPORT_NATIVE_ACK_CADENCE must be 'default' or 'relaxed', got '{}'",
+                        raw.unwrap_or_default()
+                    ),
+                    "default",
                 );
-                std::process::abort();
+                AckCadenceMode::Default
             }
         }
     })

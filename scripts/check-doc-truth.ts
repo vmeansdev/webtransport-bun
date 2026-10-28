@@ -122,7 +122,9 @@ const SERVER_WORKERS_REQUIRED_SOURCE = [
 	"pub(crate) const DEFAULT_SERVER_WORKER_THREADS: usize = 2;",
 	`std::env::var("${SERVER_WORKERS_ENV}")`,
 	"(1..=8).contains(&n)",
-	"std::process::abort()",
+	// An invalid override warns once and falls back to the default; it never
+	// clamps and never aborts the process.
+	"warn_invalid_knob(",
 ] as const;
 
 function exactConstructor(workers: number): string {
@@ -622,7 +624,9 @@ function checkRuntimeContract(): void {
 			"server_worker_threads() must not derive its worker count from the host",
 		);
 	}
-	if (!resolverBodies.includes("DEFAULT_SERVER_WORKER_THREADS")) {
+	// `Ok(...)`, not the bare name: the invalid-value fallback also names the
+	// constant, and must not satisfy the unset-branch requirement on its own.
+	if (!resolverBodies.includes("Ok(DEFAULT_SERVER_WORKER_THREADS)")) {
 		report(
 			relative(ROOT, RUNTIME_SOURCE_PATH),
 			"server_worker_threads() must return DEFAULT_SERVER_WORKER_THREADS when the override is unset, not merely declare it",
@@ -668,7 +672,7 @@ function methodBody(source: string, signature: string): string | undefined {
 	const start = source.indexOf(signature);
 	if (start < 0) return undefined;
 	const rest = source.slice(start);
-	const next = rest.search(/\n    pub fn /);
+	const next = rest.search(/\n {4}pub fn /);
 	return next < 0 ? rest : rest.slice(0, next);
 }
 

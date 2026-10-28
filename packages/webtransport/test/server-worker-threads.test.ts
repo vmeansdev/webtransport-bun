@@ -9,14 +9,14 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { createServer } from "../src/index.js";
+import { __TESTING__, createServer } from "../src/index.js";
 import { nextPort } from "./helpers/network.js";
 
 const BASE_PORT = 26_400;
 const PORT_SPREAD = 60;
 
 const CHILD = `
-const { createServer } = await import(${JSON.stringify(
+const { __TESTING__, createServer } = await import(${JSON.stringify(
 	new URL("../src/index.ts", import.meta.url).href,
 )});
 const server = createServer({
@@ -24,7 +24,7 @@ const server = createServer({
 	tls: { certPem: "", keyPem: "" },
 	onSession: () => {},
 });
-console.log("workers=" + server.serverWorkerThreads());
+console.log("workers=" + __TESTING__.serverInternals(server).serverWorkerThreads());
 await server.close();
 `;
 
@@ -56,7 +56,7 @@ describe("server worker threads", () => {
 			onSession: () => {},
 		});
 		try {
-			expect(server.serverWorkerThreads()).toBe(2);
+			expect(__TESTING__.serverInternals(server).serverWorkerThreads()).toBe(2);
 		} finally {
 			await server.close();
 		}
@@ -74,19 +74,26 @@ describe("server worker threads", () => {
 		expect(stdout).toContain("workers=2");
 	}, 60_000);
 
-	it("fails closed on an out-of-range override rather than clamping", async () => {
-		const { code, stderr } = await childWorkers("9");
-		expect(code).not.toBe(0);
+	// An unsupported internal knob must never take the process down: an
+	// invalid value warns once and falls back to the default, not a clamp.
+	it("warns once and falls back to 2 on an out-of-range override", async () => {
+		const { code, stdout, stderr } = await childWorkers("9");
+		expect(code).toBe(0);
+		expect(stdout).toContain("workers=2");
 		expect(stderr).toContain(
-			"FATAL E_INTERNAL: WEBTRANSPORT_NATIVE_SERVER_WORKERS must be an integer 1..=8, got '9'",
+			"webtransport-native: warning: WEBTRANSPORT_NATIVE_SERVER_WORKERS must be an integer 1..=8, got '9'; ignoring it and using the default (2)",
+		);
+		expect(stderr.split("WEBTRANSPORT_NATIVE_SERVER_WORKERS").length - 1).toBe(
+			1,
 		);
 	}, 60_000);
 
-	it("fails closed on a non-numeric override", async () => {
-		const { code, stderr } = await childWorkers("abc");
-		expect(code).not.toBe(0);
+	it("warns and falls back to 2 on a non-numeric override", async () => {
+		const { code, stdout, stderr } = await childWorkers("abc");
+		expect(code).toBe(0);
+		expect(stdout).toContain("workers=2");
 		expect(stderr).toContain(
-			"FATAL E_INTERNAL: WEBTRANSPORT_NATIVE_SERVER_WORKERS must be an integer 1..=8, got 'abc'",
+			"webtransport-native: warning: WEBTRANSPORT_NATIVE_SERVER_WORKERS must be an integer 1..=8, got 'abc'; ignoring it and using the default (2)",
 		);
 	}, 60_000);
 });

@@ -548,8 +548,8 @@ pub(crate) fn enabled() -> bool {
         ) {
             Ok(value) => value,
             Err(message) => {
-                eprintln!("webtransport-native: FATAL E_INTERNAL: {message}");
-                std::process::abort();
+                crate::warn_invalid_knob(message, "0");
+                false
             }
         }
     })

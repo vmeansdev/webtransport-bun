@@ -132,9 +132,22 @@ pub mod zero_rtt;
 /// nothing derives it from `available_parallelism()`.
 pub(crate) const DEFAULT_SERVER_WORKER_THREADS: usize = 2;
 
+/// Report an invalid value of an unsupported internal tuning knob.
+///
+/// These knobs (`WEBTRANSPORT_NATIVE_*`, listed in docs/OPERATIONS.md under
+/// "Unsupported tuning knobs") exist for measurement campaigns. A bad value
+/// must not take a production process down, so it logs this one warning —
+/// every caller resolves its knob once, behind a `OnceLock` — and the knob
+/// falls back to its default.
+pub(crate) fn warn_invalid_knob(message: &str, default: &str) {
+    eprintln!(
+        "webtransport-native: warning: {message}; ignoring it and using the default ({default})"
+    );
+}
+
 /// Parse `WEBTRANSPORT_NATIVE_SERVER_WORKERS`. Unset is the measured default;
 /// a plain decimal integer in 1..=8 is honoured; everything else is an error
-/// the caller turns into a fail-closed abort.
+/// the caller reports once and replaces with the default.
 fn parse_server_worker_threads(raw: Option<&str>) -> Result<usize, ()> {
     let Some(raw) = raw else {
         return Ok(DEFAULT_SERVER_WORKER_THREADS);
@@ -195,11 +208,14 @@ pub(crate) fn server_worker_threads() -> usize {
         match parse_server_worker_threads(raw.as_deref()) {
             Ok(n) => n,
             Err(()) => {
-                eprintln!(
-                    "webtransport-native: FATAL E_INTERNAL: WEBTRANSPORT_NATIVE_SERVER_WORKERS must be an integer 1..=8, got '{}'",
-                    raw.unwrap_or_default()
+                warn_invalid_knob(
+                    &format!(
+                        "WEBTRANSPORT_NATIVE_SERVER_WORKERS must be an integer 1..=8, got '{}'",
+                        raw.unwrap_or_default()
+                    ),
+                    "2",
                 );
-                std::process::abort();
+                DEFAULT_SERVER_WORKER_THREADS
             }
         }
     })
@@ -225,8 +241,8 @@ pub(crate) fn server_worker_threads() -> usize {
 /// `DEFAULT_SERVER_WORKER_THREADS` (2) unless
 /// `WEBTRANSPORT_NATIVE_SERVER_WORKERS` names another value in 1..=8. That
 /// knob exists for campaign A/B measurement only — it does not restate the
-/// measurements above, and an out-of-range value aborts rather than falling
-/// back. `scripts/check-doc-truth.ts` pins the default and the resolver.
+/// measurements above, and an out-of-range value warns once and falls back to
+/// the default rather than clamping. `scripts/check-doc-truth.ts` pins the default and the resolver.
 pub(crate) static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(server_worker_threads())

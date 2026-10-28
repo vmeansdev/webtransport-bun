@@ -1,6 +1,7 @@
 /** Isolated native overload proof. Never probes or kills unrelated listeners. */
 import { fileURLToPath } from "node:url";
 import {
+	__TESTING__,
 	connect,
 	createServer,
 	DEFAULT_LIMITS,
@@ -93,9 +94,10 @@ export async function runBoundedOverloadProof() {
 	try {
 		if (!Number.isSafeInteger(port) || port < 1)
 			throw Error("owned ephemeral listener was not bound");
-		if (typeof server.__sendPathDiagnostics !== "function")
+		const internals = __TESTING__.serverInternals(server);
+		if (typeof internals.__sendPathDiagnostics !== "function")
 			throw Error("native diagnostic readout seam is missing");
-		const diagnostics = JSON.parse(server.__sendPathDiagnostics());
+		const diagnostics = JSON.parse(internals.__sendPathDiagnostics());
 		if (diagnostics.enabled !== false)
 			throw Error("diagnostics must be off in the default overload fixture");
 		const ownedClient = Bun.spawn(

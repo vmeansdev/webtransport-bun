@@ -243,7 +243,10 @@ pub(crate) fn server_worker_threads() -> usize {
   let raw = std::env::var("WEBTRANSPORT_NATIVE_SERVER_WORKERS").ok();
   match parse_server_worker_threads(raw.as_deref()) {
     Ok(n) => n,
-    Err(()) => std::process::abort(),
+    Err(()) => {
+      warn_invalid_knob("WEBTRANSPORT_NATIVE_SERVER_WORKERS must be an integer 1..=8", "2");
+      DEFAULT_SERVER_WORKER_THREADS
+    }
   }
 }
 pub(crate) static RUNTIME: Lazy<Runtime> = Lazy::new(|| {

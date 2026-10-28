@@ -12,6 +12,10 @@
  * What lives here, and why it is not public:
  * - the native datagram reflector (`setDatagramReflector`) and its metrics —
  *   a capacity-campaign instrument, excluded from 1.0;
+ * - the transport-campaign getters (`server*()`), which echo unsupported
+ *   tuning knobs back so a harness can refuse a shard that did not get the
+ *   value it asked for;
+ * - the diagnostic readouts (`__sendPathDiagnostics`, `__pacerStats*`);
  * - counters in {@link InternalMetricsSnapshot} that only mean something to
  *   that campaign. The public `metricsSnapshot()` strips them at runtime, so
  *   they are absent in fact, not merely absent from the type.
@@ -47,6 +51,44 @@ export type InternalServerMetrics = {
 	datagramReflectRingDirectBlocked?: number;
 	datagramReflectRingDirectErrors?: number;
 	datagramReflectRingGsoFallback?: number;
+	/** Process-wide. Cross-connection UDP send batching
+	 * (`WEBTRANSPORT_NATIVE_UDP_SEND_BATCH`): sendmmsg calls, datagrams sent
+	 * through them, datagrams sent one at a time instead, WouldBlocks handed
+	 * to a driver because the ring was full, datagrams dropped because the
+	 * flusher was gone or a fallback WouldBlocked, congestion drops admitted
+	 * by EAGAIN drop mode, send errors, largest batch flushed. All zero while
+	 * batching is off. */
+	udpSendBatchCalls?: number;
+	udpSendBatchMessages?: number;
+	udpSendBatchFallback?: number;
+	udpSendBatchBlocked?: number;
+	udpSendBatchDropped?: number;
+	udpSendBatchCongestionDropped?: number;
+	udpSendBatchErrors?: number;
+	udpSendBatchMaxBatch?: number;
+	/** Per-connection datagram pump tasks of the wtransport fork's driver. */
+	datagramPumpsSpawned?: number;
+	datagramPumpsLive?: number;
+	/**
+	 * Connections that were live when this snapshot was taken and therefore
+	 * contributed to the `quic*` sums below.
+	 */
+	quicSessions?: number;
+	/**
+	 * quinn transport counters summed over those live connections. A boundary
+	 * sample, not a lifetime total — a closed session's counters go with it —
+	 * so two snapshots may only be differenced across a window whose session
+	 * set is stable. They separate socket-to-quinn loss
+	 * (`quicUdpDatagramsReceived` short of what the peer sent) from
+	 * quinn-to-application loss (`quicDatagramFramesReceived` short of what the
+	 * app counted).
+	 */
+	quicUdpDatagramsReceived?: number;
+	quicUdpDatagramsSent?: number;
+	quicDatagramFramesReceived?: number;
+	quicDatagramFramesSent?: number;
+	quicPacketsSent?: number;
+	quicPacketsLost?: number;
 };
 
 /** Every key of {@link InternalServerMetrics}; the public snapshot drops these. */
@@ -65,6 +107,23 @@ export const INTERNAL_METRIC_KEYS: readonly (keyof InternalServerMetrics)[] = [
 	"datagramReflectRingDirectBlocked",
 	"datagramReflectRingDirectErrors",
 	"datagramReflectRingGsoFallback",
+	"udpSendBatchCalls",
+	"udpSendBatchMessages",
+	"udpSendBatchFallback",
+	"udpSendBatchBlocked",
+	"udpSendBatchDropped",
+	"udpSendBatchCongestionDropped",
+	"udpSendBatchErrors",
+	"udpSendBatchMaxBatch",
+	"datagramPumpsSpawned",
+	"datagramPumpsLive",
+	"quicSessions",
+	"quicUdpDatagramsReceived",
+	"quicUdpDatagramsSent",
+	"quicDatagramFramesReceived",
+	"quicDatagramFramesSent",
+	"quicPacketsSent",
+	"quicPacketsLost",
 ];
 
 /** A full native snapshot: the public fields plus the internal ones. */
@@ -81,6 +140,36 @@ export interface ServerInternals {
 	/** Native reflector direct-lane mode
 	 * (`WEBTRANSPORT_NATIVE_REFLECT_RING_BYPASS`): "off" | "on". */
 	serverReflectRingBypass(): string;
+	/**
+	 * Effective Tokio worker count of the native server runtime in this
+	 * process. 2 unless `WEBTRANSPORT_NATIVE_SERVER_WORKERS` overrode it before
+	 * the addon built its runtime.
+	 */
+	serverWorkerThreads(): number;
+	/** Endpoint-driver placement the addon resolved: "shared" | "dedicated". */
+	serverRecvRuntime(): string;
+	/** ACK cadence requested of the client the addon resolved: "default" | "relaxed". */
+	serverAckCadence(): string;
+	/** Requested UDP server send buffer bytes the addon resolved; 0 = default bind path. */
+	serverUdpSendBufferBytes(): number;
+	/** Cross-connection UDP send batch size the addon resolved
+	 * (`WEBTRANSPORT_NATIVE_UDP_SEND_BATCH`); 0 = off, one sendmsg per transmit. */
+	serverUdpSendBatch(): number;
+	/** wtransport driver datagram read path in this process: "pump" (default,
+	 * dedicated per-connection task) | "legacy" (`WTRANSPORT_DATAGRAM_PUMP=0`). */
+	serverDatagramDriver(): string;
+	/** Linux sendmmsg EAGAIN policy: "wait" | "drop". */
+	serverUdpSendEagainMode(): string;
+	/**
+	 * Windowed egress-pacer counters for bench tooling. **Absent** (not
+	 * `"{}"`) on addons built without the pacer accessors, so a caller can tell
+	 * a stale addon from a live addon whose pacer is simply off — the latter
+	 * returns `"{}"`.
+	 */
+	__pacerStatsSnapshot?(): number;
+	__pacerStatsJson?(token?: number): string;
+	/** Process-wide send-path phase banks; absent on older addons. */
+	__sendPathDiagnostics?(phase?: string): string;
 	/** The unfiltered native snapshot, internal counters included. */
 	metricsSnapshot(): InternalMetricsSnapshot;
 }

@@ -317,6 +317,56 @@ benefit on a real path: over a WAN, where BDP routinely exceeds 256 KiB, the
 default window — not the CPU — is what caps a single stream. Widen when you
 measure a stalled sender on a long path; do not widen speculatively.
 
+## Transport defaults that changed for 1.0
+
+Two native transport defaults changed after `1.0.0-rc.1`. Neither has a
+public knob; both are recorded here so a capacity plan made against the
+release candidate can be redone.
+
+- **Per-connection datagram receive buffer: 256 KiB** (was 64 KiB). This is
+  quinn's cap on inbound datagrams buffered per connection before the oldest
+  are dropped. At 30k sessions the 64 KiB cap dropped datagrams under
+  read-task contention. It is a ceiling, not an allocation: the worst case is
+  256 KiB per connection that is not being read, on top of the flow-control
+  budget in "Flow-control windows" above.
+- **The wtransport fork reads datagrams in a dedicated per-connection pump
+  task** (was: inline in the connection driver's `select!`). A datagram now
+  wakes only that task instead of re-polling the driver's accept and
+  control-stream futures under the connection lock. Same capacity-1
+  backpressure and error path. Costs one extra Tokio task per connection.
+  `WTRANSPORT_DATAGRAM_PUMP=0` restores the inline path. It is an unsupported
+  knob (see below), kept for paired A/B measurement.
+
+## Unsupported tuning knobs
+
+The variables below exist for measurement campaigns. They are **not** part
+of the supported surface: they may change meaning or disappear in any
+release, and the getters that report their values back are internal
+(`__TESTING__.serverInternals(server)`; see `docs/SPEC.md`, "Semver rules").
+Leave them unset in production. Each one is read once per process. An invalid
+value logs one `webtransport-native: warning: ...` line on stderr and the knob
+falls back to its default. The process is never aborted.
+
+| Variable | Default | Accepted values |
+|---|---|---|
+| `WEBTRANSPORT_NATIVE_SERVER_WORKERS` | `2` | integer `1..=8` (server Tokio workers) |
+| `WEBTRANSPORT_NATIVE_SERVER_RECV_RUNTIME` | `shared` | `shared` \| `dedicated` (endpoint driver on its own thread) |
+| `WEBTRANSPORT_NATIVE_ACK_CADENCE` | `default` | `default` \| `relaxed` (requests ACK_FREQUENCY from the client) |
+| `WEBTRANSPORT_NATIVE_UDP_SEND_BATCH` | `0` (off) | `0` or `2..=1024` (cross-connection `sendmmsg` batch) |
+| `WEBTRANSPORT_NATIVE_UDP_SEND_BATCH_WAIT_US` | `0` | `0..=5000` |
+| `WEBTRANSPORT_NATIVE_UDP_SEND_EAGAIN_MODE` | `wait` | `wait` \| `drop` |
+| `WEBTRANSPORT_NATIVE_REFLECT_RING_BYPASS` | `0` | `0` \| `1` (internal datagram reflector only) |
+| `WEBTRANSPORT_NATIVE_SEND_PATH_DIAGNOSTICS` | `0` | `0` \| `1` (process-wide send-path phase banks) |
+| `WEBTRANSPORT_NATIVE_SERVER_UDP_SNDBUF_BYTES` | unset | `0` or `65536..=67108864` |
+| `WTRANSPORT_DATAGRAM_PUMP` | pump on | `0` selects the legacy inline datagram read |
+
+Two cases are refused at `createServer` rather than replaced by a default,
+because there is no safe default to fall back to. Both fail with a
+recoverable `E_INTERNAL: server startup failed: ...`, never an abort:
+`WEBTRANSPORT_NATIVE_UDP_SEND_EAGAIN_MODE=drop` together with a non-zero
+`WEBTRANSPORT_NATIVE_UDP_SEND_BATCH`, and a malformed
+`WEBTRANSPORT_NATIVE_SERVER_UDP_SNDBUF_BYTES`.
+
 ## Sizing the JS read side (stream tail latency)
 
 Everything a stream delivers to JavaScript is surfaced by **one event loop**,

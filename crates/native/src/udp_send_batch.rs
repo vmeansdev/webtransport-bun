@@ -106,8 +106,8 @@ pub(crate) fn configured_eagain_mode() -> SendEagainMode {
         ) {
             Ok(value) => value,
             Err(message) => {
-                eprintln!("webtransport-native: FATAL E_INTERNAL: {message}");
-                std::process::abort();
+                crate::warn_invalid_knob(&message, "wait");
+                SendEagainMode::Wait
             }
         }
     })
@@ -216,8 +216,8 @@ where
 }
 
 /// Parse `WEBTRANSPORT_NATIVE_UDP_SEND_BATCH`: unset, empty or `0` means off;
-/// `2..=1024` is a batch size; anything else is an error the caller turns
-/// into a fail-closed abort, like the other campaign knobs.
+/// `2..=1024` is a batch size; anything else is an error the caller reports
+/// once and replaces with the default (off), like the other campaign knobs.
 pub(crate) fn parse_batch(raw: Option<&str>) -> Result<Option<usize>, String> {
     match raw.map(str::trim) {
         None | Some("") | Some("0") => Ok(None),
@@ -254,8 +254,8 @@ fn configured_wait() -> Duration {
         ) {
             Ok(value) => value,
             Err(message) => {
-                eprintln!("webtransport-native: FATAL E_INTERNAL: {message}");
-                std::process::abort();
+                crate::warn_invalid_knob(&message, &format!("{DEFAULT_WAIT_US}"));
+                Duration::from_micros(DEFAULT_WAIT_US)
             }
         }
     })
@@ -273,15 +273,15 @@ pub(crate) fn configured_batch() -> Option<usize> {
         ) {
             Ok(value) => value,
             Err(message) => {
-                eprintln!("webtransport-native: FATAL E_INTERNAL: {message}");
-                std::process::abort();
+                crate::warn_invalid_knob(&message, "0");
+                None
             }
         }
     })
 }
 
 /// Refuse an unsupported combination before starting the endpoint. Malformed
-/// individual environment knobs keep their existing fatal-parser diagnostics;
+/// individual environment knobs warn once and fall back to their defaults;
 /// this known combination uses the server's recoverable startup-error path.
 pub(crate) fn validate_configured_output_mode() -> Result<(), String> {
     let batch = configured_batch();

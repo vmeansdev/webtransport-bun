@@ -21,19 +21,20 @@
 
 import { describe, expect, it } from "bun:test";
 import { DATAGRAM_MIRROR_MAX } from "../src/datagram-mirror.js";
-import {
-	createServer,
-	E_QUEUE_FULL,
-	E_SESSION_CLOSED,
-	E_UNSUPPORTED_ARGUMENT,
-	WebTransportError,
-} from "../src/index.js";
 import type {
 	ClientSession,
 	LimitsOptions,
 	MirrorReport,
 	ServerSession,
 	WebTransportServer,
+} from "../src/index.js";
+import {
+	__TESTING__,
+	createServer,
+	E_QUEUE_FULL,
+	E_SESSION_CLOSED,
+	E_UNSUPPORTED_ARGUMENT,
+	WebTransportError,
 } from "../src/index.js";
 import { nextWithTimeout } from "./helpers/harness.js";
 import { connectWithRetry, nextPort } from "./helpers/network.js";
@@ -113,7 +114,7 @@ function payload(marker: number, size = 64): Uint8Array {
 
 /** Pacer counters, or `{}` on an addon/knob that has none. */
 function pacerStats(server: WebTransportServer): Record<string, number> {
-	const json = server.__pacerStatsJson?.() ?? "{}";
+	const json = __TESTING__.serverInternals(server).__pacerStatsJson?.() ?? "{}";
 	return (JSON.parse(json).cumulative ?? {}) as Record<string, number>;
 }
 
@@ -147,8 +148,9 @@ async function drainSchedule(
 ): Promise<void> {
 	const deadline = Date.now() + budgetMs;
 	while (Date.now() < deadline) {
-		const pending = JSON.parse(server.__pacerStatsJson?.() ?? "{}")
-			.pendingTargets as number | undefined;
+		const pending = JSON.parse(
+			__TESTING__.serverInternals(server).__pacerStatsJson?.() ?? "{}",
+		).pendingTargets as number | undefined;
 		if (pending === undefined || pending === 0) return;
 		await Bun.sleep(10);
 	}

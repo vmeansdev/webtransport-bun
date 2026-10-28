@@ -31,11 +31,36 @@ Use `metricsToPrometheus(snapshot, labels?)` to produce Prometheus exposition fo
 | datagramMirrorPacedCalls | number? | Native only: `server.sendDatagramMirrorPaced()` calls served. Its own meter rather than a share of `datagramMirrorCalls`, because the two envelopes report different things — delivery and admission to the egress pacer's schedule — and a counter that summed them would name neither. Omitted on WASM. |
 | datagramMirrorPacedTargets | number? | Native only: targets those paced calls **offered to admission**. `offered − admitted` is the pacer's own `refusedTargets`; delivery stays per-session `datagramsOut`. Omitted on WASM. |
 | mirrorReportsDropped | number? | Native only: deferred mirror reports lost to overflow of the fixed 4,096-entry ring `server.readMirrorReports()` drains — the visible cost of polling too slowly. Process-wide, like the pacer's schedule, so a second server in the process reads the same number. `drained + this` reconciles against the pacer's `deferredFailures`. Omitted on WASM. |
+| datagramSendsAsync | number? | Native only: datagram sends that fell back to the parking Node-API call. Each one hands JavaScript a promise backed by a ThreadsafeFunction, a reference on the host event loop, so this meters exposure to that class. It is not a latency signal. Omitted on WASM. |
+| sessionsClosedByIdle | number? | Native only: sessions the QUIC idle timeout ended (peer went away). Omitted on WASM. |
+| sessionsClosedByReap | number? | Native only: sessions this server ended itself while shutting down. Omitted on WASM. |
+| sessionsClosedOther | number? | Native only: every other way a session ended (peer close, transport error). Omitted on WASM. |
+| nativeAsyncOpsPending | number? | Native only: unsettled Node-API async operations this server still owns. Non-zero after `close()` resolves means the addon still holds the host event loop open. Omitted on WASM. |
+| nativeSessionRegistryEntries, nativeTrackedTasks, nativeRateLimitEntries, nativeBidiHandlesLive, nativeUniSendHandlesLive, nativeUniRecvHandlesLive | number? | Native only: live sizes of the addon's registries and handle tables. Use them as leak gauges: after load stops they should return to their idle values. Omitted on WASM. |
 | rateLimitedCount | number | Sessions rejected by per-IP/per-prefix rate limit |
 | limitExceededCount | number | Sessions rejected (maxSessions, maxHandshakesInFlight) |
 | sniCertSelections | number | Handshakes served by hostname-specific SNI certificates |
 | defaultCertSelections | number | Handshakes served by the default certificate |
 | unknownSniRejectedCount | number | Handshakes rejected because SNI did not match a configured hostname |
+
+## Internal counters (not public)
+
+The native addon also counts things that only a measurement campaign can
+interpret. Before 1.0 some of them sat on `MetricsSnapshot`; they are **not**
+part of the public snapshot. The public `metricsSnapshot()` strips them at
+runtime, and `metricsToPrometheus()` never emitted them. Harnesses read them
+through the unstable `__TESTING__.serverInternals(server).metricsSnapshot()`
+(see `docs/SPEC.md`, "Semver rules"). No compatibility promise applies:
+
+- `datagramReflect*` (14 fields): the internal datagram reflector.
+- `udpSendBatch*` (8 fields): the unsupported
+  `WEBTRANSPORT_NATIVE_UDP_SEND_BATCH` path; all zero while it is off.
+- `datagramPumpsSpawned`, `datagramPumpsLive`: the wtransport fork's
+  per-connection datagram pump tasks.
+- `quicSessions`, `quicUdpDatagramsReceived`, `quicUdpDatagramsSent`,
+  `quicDatagramFramesReceived`, `quicDatagramFramesSent`, `quicPacketsSent`,
+  `quicPacketsLost`: quinn counters summed over live connections. They are a
+  boundary sample for loss attribution, not lifetime totals.
 
 ## WASM governor snapshot (`governor_snapshot_json`)
 

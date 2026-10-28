@@ -16,7 +16,7 @@ const BASE_PORT = 26_900;
 const PORT_SPREAD = 60;
 
 const CHILD = `
-const { createServer } = await import(${JSON.stringify(
+const { __TESTING__, createServer } = await import(${JSON.stringify(
 	new URL("../src/index.ts", import.meta.url).href,
 )});
 const { connectWithRetry } = await import(${JSON.stringify(
@@ -29,7 +29,7 @@ const server = createServer({
 	tls: { certPem: "", keyPem: "" },
 	onSession: (s) => accepted.resolve(s),
 });
-console.log("datagramDriver=" + server.serverDatagramDriver());
+console.log("datagramDriver=" + __TESTING__.serverInternals(server).serverDatagramDriver());
 const client = await connectWithRetry("https://127.0.0.1:" + port, {
 	tls: { insecureSkipVerify: true },
 });
@@ -50,7 +50,7 @@ for (let i = 0; i < 50; i += 1) {
 	if (back.value && back.value[0] === i) down += 1;
 }
 console.log("up=" + up + " down=" + down);
-const m = server.metricsSnapshot();
+const m = __TESTING__.serverInternals(server).metricsSnapshot();
 console.log("pumpsSpawned=" + (m.datagramPumpsSpawned ?? -1) + " pumpsLive=" + (m.datagramPumpsLive ?? -1));
 await fromClient.return?.();
 await fromServer.return?.();
