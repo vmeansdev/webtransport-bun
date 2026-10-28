@@ -1,0 +1,18 @@
+{
+ "commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
+ "claimId": "native-local-gates",
+ "createdAt": "2026-08-06T15:44:27.538Z",
+ "status": "passed",
+ "notes": "Timed canonical bun package suite at the rebound candidate.",
+ "runner": "local-darwin-arm64",
+ "command": [
+  "bash",
+  "-c",
+  "WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN=1 bun test packages/"
+ ],
+ "startedAt": "2026-08-06T15:41:43.538Z",
+ "endedAt": "2026-08-06T15:44:27.538Z",
+ "durationMs": 164002,
+ "exitCode": 0,
+ "artifactSha256": "68e5dca79b9b4231b9d349181c4bbc04d3da77967cbc713b6cee7a61e06dae7b"
+}

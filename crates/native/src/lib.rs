@@ -4,36 +4,250 @@
 //! It owns a dedicated Tokio runtime thread and communicates
 //! with JS via bounded channels + ThreadsafeFunction.
 
+use crate::error::from_upstream_error as wt_from_upstream_error;
 use napi_derive::napi;
+
+/// Route this dylib's Rust allocations through mimalloc. The macOS system
+/// malloc keeps freed small-zone pages resident forever (pressure relief is a
+/// measured no-op on macOS 26), so transport/session churn left
+/// load-proportional RSS behind after fully drained closes. mimalloc purges
+/// freed pages back to the OS within its purge delay, letting post-close RSS
+/// actually recover. See crates/native/src/native_memory.rs for the recorded
+/// diagnosis.
+#[cfg(not(test))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// Test builds interpose a counting delegate over the same mimalloc so
+/// allocation-freedom claims are assertions, not narrative. Delegation keeps
+/// `native_memory.rs`'s "mimalloc is the global allocator" premise true.
+#[cfg(test)]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: alloc_counter::CountingMiMalloc = alloc_counter::CountingMiMalloc;
+
+#[cfg(test)]
+pub(crate) mod alloc_counter {
+    use std::alloc::{GlobalAlloc, Layout};
+    use std::cell::Cell;
+
+    thread_local! {
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+        static COUNT: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub struct CountingMiMalloc;
+
+    unsafe impl GlobalAlloc for CountingMiMalloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            if ARMED.with(Cell::get) {
+                COUNT.with(|c| c.set(c.get() + 1));
+            }
+            unsafe { mimalloc::MiMalloc.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { mimalloc::MiMalloc.dealloc(ptr, layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            if ARMED.with(Cell::get) {
+                COUNT.with(|c| c.set(c.get() + 1));
+            }
+            unsafe { mimalloc::MiMalloc.alloc_zeroed(layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            if ARMED.with(Cell::get) {
+                COUNT.with(|c| c.set(c.get() + 1));
+            }
+            unsafe { mimalloc::MiMalloc.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    /// Run `f` with this thread's allocations counted. Only same-thread
+    /// allocations are observed — drive measured work on the current thread.
+    pub fn measure<R>(f: impl FnOnce() -> R) -> (R, u64) {
+        COUNT.with(|c| c.set(0));
+        ARMED.with(|a| a.set(true));
+        let result = f();
+        ARMED.with(|a| a.set(false));
+        (result, COUNT.with(Cell::get))
+    }
+}
 use once_cell::sync::Lazy;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 use tokio::sync::watch;
 
+pub mod ack_cadence;
+pub mod async_ops;
 pub mod client;
 pub mod client_pool;
 pub mod client_stream;
+pub mod datagram_batch;
+mod datagram_driver;
+pub mod datagram_mirror;
+pub mod datagram_reflector;
+pub mod egress_pacer;
+pub mod error;
 pub mod histogram;
 pub mod limits;
 pub mod metrics;
+pub mod native_memory;
 pub mod panic_guard;
+pub mod payload_buffer;
+pub mod quic_lb;
+pub mod quic_runtime;
 pub mod rate_limit;
+pub mod read_group;
+pub(crate) mod read_ownership;
+pub mod reuseport_steering;
+mod send_path_diagnostics;
 pub mod server;
 pub mod server_metrics;
+pub mod server_napi;
+pub mod server_spawn;
 pub mod server_tls;
 pub mod session;
+pub mod session_napi;
 pub mod session_registry;
 pub mod spawn_tracked;
+pub mod stream_sink;
+pub mod transport_memory;
+pub mod udp_send_batch;
+pub mod zero_rtt;
 
 // ---------------------------------------------------------------------------
 // Global Tokio runtime singleton
 // ---------------------------------------------------------------------------
 
+/// Default server worker count. Every measured alternative was worse (macOS:
+/// 89k/s at two, 82k/s at four, 48k/s at ten), so two remains the default and
+/// nothing derives it from `available_parallelism()`.
+pub(crate) const DEFAULT_SERVER_WORKER_THREADS: usize = 2;
+
+/// Report an invalid value of an unsupported internal tuning knob.
+///
+/// These knobs (`WEBTRANSPORT_NATIVE_*`, listed in docs/OPERATIONS.md under
+/// "Unsupported tuning knobs") exist for measurement campaigns. A bad value
+/// must not take a production process down, so it logs this one warning —
+/// every caller resolves its knob once, behind a `OnceLock` — and the knob
+/// falls back to its default.
+pub(crate) fn warn_invalid_knob(message: &str, default: &str) {
+    eprintln!(
+        "webtransport-native: warning: {message}; ignoring it and using the default ({default})"
+    );
+}
+
+/// Parse `WEBTRANSPORT_NATIVE_SERVER_WORKERS`. Unset is the measured default;
+/// a plain decimal integer in 1..=8 is honoured; everything else is an error
+/// the caller reports once and replaces with the default.
+fn parse_server_worker_threads(raw: Option<&str>) -> Result<usize, ()> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_SERVER_WORKER_THREADS);
+    };
+    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(());
+    }
+    match raw.parse::<usize>() {
+        Ok(n) if (1..=8).contains(&n) => Ok(n),
+        _ => Err(()),
+    }
+}
+
+fn parse_server_udp_send_buffer_bytes(raw: Option<&str>) -> Result<Option<usize>, String> {
+    const NAME: &str = "WEBTRANSPORT_NATIVE_SERVER_UDP_SNDBUF_BYTES";
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    if raw.is_empty() || raw == "0" {
+        return Ok(None);
+    }
+    if !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "{NAME} must be unset, empty, 0, or an integer 65536..=67108864, got '{}'",
+            raw
+        ));
+    }
+    match raw.parse::<usize>() {
+        Ok(value) if (65_536..=67_108_864).contains(&value) => Ok(Some(value)),
+        _ => Err(format!(
+            "{NAME} must be unset, empty, 0, or an integer 65536..=67108864, got '{}'",
+            raw
+        )),
+    }
+}
+
+pub(crate) fn server_udp_send_buffer_bytes() -> Result<Option<usize>, String> {
+    static RESOLVED: std::sync::OnceLock<Result<Option<usize>, String>> =
+        std::sync::OnceLock::new();
+    RESOLVED
+        .get_or_init(|| {
+            let raw = std::env::var("WEBTRANSPORT_NATIVE_SERVER_UDP_SNDBUF_BYTES").ok();
+            // Like every other unsupported knob, a malformed value warns once
+            // and falls back to the default (the untouched bind path) instead
+            // of failing every createServer in the process. A valid value the
+            // OS will not honour is still a startup error, raised at bind.
+            parse_server_udp_send_buffer_bytes(raw.as_deref()).or_else(|msg| {
+                warn_invalid_knob(&msg, "0, the default bind path");
+                Ok(None)
+            })
+        })
+        .clone()
+}
+
+/// Effective server worker count, resolved once per process.
+///
+/// The default is 2 for the reasons documented on [`RUNTIME`]; the environment
+/// knob exists only so a measurement campaign can run an A/B at another value
+/// without shipping a different binary. Resolution is memoised so the runtime
+/// and the `serverWorkerThreads` getter can never disagree.
+pub(crate) fn server_worker_threads() -> usize {
+    static RESOLVED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        let raw = std::env::var("WEBTRANSPORT_NATIVE_SERVER_WORKERS").ok();
+        match parse_server_worker_threads(raw.as_deref()) {
+            Ok(n) => n,
+            Err(()) => {
+                warn_invalid_knob(
+                    &format!(
+                        "WEBTRANSPORT_NATIVE_SERVER_WORKERS must be an integer 1..=8, got '{}'",
+                        raw.unwrap_or_default()
+                    ),
+                    "2",
+                );
+                DEFAULT_SERVER_WORKER_THREADS
+            }
+        }
+    })
+}
+
 /// Server runtime: drives the WebTransport server and all server-side stream bridges.
+///
+/// Two workers, not one. The ~5,300/s delivery cliff was tokio's injection
+/// queue: per-datagram N-API methods used to `RUNTIME.spawn` from outside this
+/// runtime, and a busy worker only drains that queue one task per ~200µs of
+/// work. Those hops are gone (`read_datagram`, `send_datagram`,
+/// `discard_datagram`); hop removal is the cliff fix, two workers is leftover
+/// headroom. After hops-gone, two workers at 80k offered delivered with 0% JS
+/// drop on the Linux heavy runner (run 31951922171). The leftover drop% at
+/// 160k offered on that host is not injection-queue starvation: delivery is
+/// not pinned near 5,300/s, and datagram rate-limit is not the binder.
+/// Ingest drop reasons are counted separately so a later artifact can name
+/// session queue vs global queue vs size. Higher worker counts measured worse
+/// (macOS: 89k/s at two, 82k/s at four, 48k/s at ten), so the default stays
+/// two and is never derived from `available_parallelism()`.
+///
+/// The count comes from [`server_worker_threads`], which is
+/// `DEFAULT_SERVER_WORKER_THREADS` (2) unless
+/// `WEBTRANSPORT_NATIVE_SERVER_WORKERS` names another value in 1..=8. That
+/// knob exists for campaign A/B measurement only — it does not restate the
+/// measurements above, and an out-of-range value warns once and falls back to
+/// the default rather than clamping. `scripts/check-doc-truth.ts` pins the default and the resolver.
 pub(crate) static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
     tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
+        .worker_threads(server_worker_threads())
         .enable_all()
         .thread_name("wt-server")
         .build()
@@ -48,6 +262,10 @@ pub(crate) static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
 
 /// Client runtime: drives client connections and client-side stream bridges.
 /// Isolated from server to avoid same-process deadlock when client+server share a process.
+///
+/// Stays at one worker: the starvation measurements covered the server receive
+/// path only, and nothing in them says anything about the client. Raising this
+/// for symmetry would be an unmeasured change.
 pub(crate) static CLIENT_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
@@ -93,6 +311,18 @@ pub struct LogEvent {
 }
 
 static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+static SESSION_ID_SEED: Lazy<u64> = Lazy::new(|| {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .hash(&mut h);
+    std::process::id().hash(&mut h);
+    h.finish()
+});
 static RATE_LIMIT_CLEANUP_ONCE: std::sync::Once = std::sync::Once::new();
 #[cfg(test)]
 static TSFN_DELIVERY_FAILURE_COUNT: std::sync::atomic::AtomicUsize =
@@ -101,20 +331,68 @@ static TSFN_DELIVERY_FAILURE_COUNT: std::sync::atomic::AtomicUsize =
 static CHANNEL_DELIVERY_FAILURE_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// `WEBTRANSPORT_NATIVE_STDERR_WARNINGS=1`, resolved once per process.
+fn stderr_warnings_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        parse_stderr_warnings(
+            std::env::var("WEBTRANSPORT_NATIVE_STDERR_WARNINGS")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+fn parse_stderr_warnings(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), Some("1"))
+}
+
+#[cfg(test)]
+mod stderr_warnings_tests {
+    use super::parse_stderr_warnings;
+
+    #[test]
+    fn only_the_literal_one_enables_it() {
+        assert!(parse_stderr_warnings(Some("1")));
+        assert!(parse_stderr_warnings(Some(" 1 ")));
+        assert!(!parse_stderr_warnings(None));
+        assert!(!parse_stderr_warnings(Some("")));
+        assert!(!parse_stderr_warnings(Some("true")));
+        assert!(!parse_stderr_warnings(Some("0")));
+    }
+}
+
 fn emit_log(
     tx: &Option<tokio::sync::mpsc::Sender<LogEvent>>,
     redact: bool,
     level: &str,
-    msg: &str,
+    msg: std::fmt::Arguments<'_>,
     session_id: Option<&str>,
     peer_ip: Option<&str>,
     peer_port: Option<u32>,
 ) {
     // Keep stderr quiet by default to avoid log floods during load/soak runs.
     // Full structured details still go through the optional JS log callback.
-    if matches!(level, "error") {
+    // WEBTRANSPORT_NATIVE_STDERR_WARNINGS=1 (diagnostic runs) writes warn and
+    // error events verbatim to stderr from this thread, bypassing the bounded
+    // channel, the N-API batcher and the JS loop, so the one warning a run
+    // exists to capture can neither be dropped under a connect storm nor
+    // perturb the server the way a JS log hook would.
+    if matches!(level, "warn" | "error") && stderr_warnings_enabled() {
+        eprintln!(
+            "webtransport-native: [{level}] {msg}{}{}",
+            session_id
+                .map(|id| format!(" session={id}"))
+                .unwrap_or_default(),
+            peer_ip
+                .map(|ip| format!(" peer={ip}:{}", peer_port.unwrap_or(0)))
+                .unwrap_or_default()
+        );
+    } else if matches!(level, "error") {
         eprintln!("webtransport-native: [{}]", level);
     }
+    // Without a JS listener nothing below is observable; build nothing.
+    let Some(tx) = tx else { return };
     let out_msg = if redact {
         match level {
             "error" => "native error (redacted)",
@@ -127,7 +405,7 @@ fn emit_log(
     } else {
         msg.to_string()
     };
-    if let Some(tx) = tx {
+    {
         if tx
             .try_send(LogEvent {
                 level: level.to_string(),
@@ -172,6 +450,46 @@ pub(crate) fn report_channel_failure(context: &str) {
     eprintln!("webtransport-native: {} channel delivery failed", context);
 }
 
+/// How many accepted streams may be black-hole drained at once, per session
+/// and direction. Draining inline in the accept loop lets one stalled peer
+/// stream block acceptance of every stream behind it, so each drain runs as its
+/// own tracked task; this bound keeps the number of streams actively reading
+/// (and holding quinn chunk buffers) small. Streams past the bound sit idle and
+/// apply QUIC backpressure until a permit frees up. Task count itself is
+/// already bounded by the per-session and global stream caps checked before the
+/// spawn.
+const DISCARD_DRAIN_CONCURRENCY: usize = 16;
+
+/// Wall-clock bound for one black-hole drain once it holds a permit. The N-API
+/// caller only polls the cumulative completion counter against its own
+/// deadline, so nothing else would ever release the permit held by a peer that
+/// opens a stream and then stops sending. On expiry the receive stream is
+/// dropped, which makes quinn send STOP_SENDING, and the stream is left
+/// uncounted — the existing "discarded but incomplete" outcome.
+const DISCARD_DRAIN_STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run one black-hole drain under the concurrency bound and a per-stream
+/// deadline. Kept separate from the accept loops so the permit and timeout
+/// behaviour is testable without a live QUIC session.
+async fn run_bounded_discard<F>(
+    permits: Arc<tokio::sync::Semaphore>,
+    discard: session_registry::StreamDiscardState,
+    timeout: std::time::Duration,
+    drain: F,
+) where
+    F: std::future::Future<Output = std::result::Result<(), String>>,
+{
+    let Ok(_permit) = permits.acquire().await else {
+        return;
+    };
+    // Start the deadline once the permit is held: a stream should not be
+    // charged for the time it spent queued behind other drains.
+    let deadline = tokio::time::Instant::now() + timeout;
+    if let Ok(result) = tokio::time::timeout_at(deadline, drain).await {
+        discard.record_direct(result);
+    }
+}
+
 pub(crate) fn report_channel_closed(context: &str) {
     #[cfg(test)]
     {
@@ -187,8 +505,8 @@ pub(crate) fn report_channel_closed(context: &str) {
 }
 
 fn send_startup_result(
-    startup_tx: &mut Option<std::sync::mpsc::Sender<std::result::Result<(), String>>>,
-    res: std::result::Result<(), String>,
+    startup_tx: &mut Option<std::sync::mpsc::Sender<std::result::Result<u16, String>>>,
+    res: std::result::Result<u16, String>,
 ) {
     if let Some(tx) = startup_tx.take() {
         if tx.send(res).is_err() {
@@ -274,26 +592,89 @@ pub fn smoke_test() -> String {
     .unwrap_or_else(|_| "webtransport-native (panic recovered)".to_string())
 }
 
-/// Client pool metrics snapshot (hits, misses, evictions). For tests and observability.
+/// Client pool metrics snapshot (hits, misses, evictions), for observability.
+/// Wrapped in `catch_panic` like every other `#[napi]` export: a panic (e.g. a
+/// poisoned pool mutex) must not unwind across the FFI boundary (UB).
 #[napi]
-pub fn client_pool_metrics_snapshot() -> metrics::ClientPoolMetricsSnapshot {
-    let s = client_pool::pool_metrics_snapshot();
-    metrics::ClientPoolMetricsSnapshot {
-        hits: s.hits as u32,
-        misses: s.misses as u32,
-        evict_idle: s.evict_idle as u32,
-        evict_broken: s.evict_broken as u32,
+pub fn client_pool_metrics_snapshot() -> napi::Result<metrics::ClientPoolMetricsSnapshot> {
+    panic_guard::catch_panic(|| {
+        let s = client_pool::pool_metrics_snapshot();
+        Ok(metrics::ClientPoolMetricsSnapshot {
+            hits: s.hits as u32,
+            misses: s.misses as u32,
+            evict_idle: s.evict_idle as u32,
+            evict_broken: s.evict_broken as u32,
+        })
+    })
+}
+
+/// Returns the server runtime's worker-thread count, read from the live runtime
+/// rather than restated as a literal, so callers observe what was actually
+/// built. Expected to be 2; see the `RUNTIME` constructor.
+#[napi]
+pub fn runtime_worker_count() -> u32 {
+    panic_guard::catch_panic(|| Ok(RUNTIME.metrics().num_workers() as u32)).unwrap_or(0)
+}
+
+/// Read process-wide native stream-handle ownership without retaining a
+/// ServerHandle. The release harness uses this after dropping JS server
+/// closures so finalizer timing cannot make the post-close sample stale.
+#[napi]
+pub fn native_stream_handles_snapshot() -> metrics::NativeStreamHandlesSnapshot {
+    let (bidi, uni_send, uni_recv) = client_stream::live_native_stream_handles();
+    metrics::NativeStreamHandlesSnapshot {
+        bidi_handles_live: bidi as u32,
+        uni_send_handles_live: uni_send as u32,
+        uni_recv_handles_live: uni_recv as u32,
     }
 }
 
-/// Returns the number of Tokio worker threads (should be 1).
+/// Which delivery path payloads actually took this process: `"arraybuffer"`
+/// (default) or `"buffer-copy"` (the `WEBTRANSPORT_PAYLOAD_DELIVERY` escape
+/// hatch). Read-only — it reports the already-resolved decision and neither
+/// rereads nor mutates the environment, so it can never disagree with the
+/// conversion that payloads are getting.
 #[napi]
-pub fn runtime_worker_count() -> u32 {
-    panic_guard::catch_panic(|| {
-        let _ = &*RUNTIME;
-        Ok(1u32)
-    })
-    .unwrap_or(0)
+pub fn native_payload_delivery_mode() -> &'static str {
+    payload_buffer::payload_delivery_mode().as_str()
+}
+
+/// What flow-control config a `createServer`/`connect` limits JSON resolves
+/// to. Pure function of the argument — it configures nothing and reads no
+/// process state — so a caller can confirm that an explicit `receiveWindow`
+/// (or the governor-derived default) is the value the transport would get.
+#[napi]
+pub fn native_transport_windows(limits_json: String) -> metrics::TransportWindowsSnapshot {
+    let limits = limits::Limits::from_json(&limits_json);
+    let policy = transport_memory::TransportMemoryPolicy::from_limits(&limits);
+    metrics::TransportWindowsSnapshot {
+        stream_receive_window: policy.stream_receive_window as f64,
+        receive_window: policy.receive_window as f64,
+        send_window: policy.send_window as f64,
+        datagram_channel_capacity: policy.datagram_channel_capacity as f64,
+    }
+}
+
+/// The inclusive payload size at or below which delivery stays engine-owned.
+/// Larger payloads take the accounted external handover. Diagnostic only.
+#[napi]
+pub fn native_payload_engine_owned_max_bytes() -> f64 {
+    payload_buffer::ENGINE_OWNED_MAX_BYTES as f64
+}
+
+/// Internal test seam: materialize a batch of payloads through napi-rs's real
+/// per-element array conversion, so the branch a batch delivery takes is the
+/// branch under test. It copies its input and hands back `PayloadBuffer`s; it
+/// reimplements neither materialization nor accounting, and no production
+/// session path calls it.
+#[napi]
+pub fn materialize_payload_batch_for_tests(
+    payloads: Vec<napi::bindgen_prelude::Buffer>,
+) -> Vec<payload_buffer::PayloadBuffer> {
+    payloads
+        .into_iter()
+        .map(|buffer| payload_buffer::PayloadBuffer::from(buffer.as_ref().to_vec()))
+        .collect()
 }
 
 /// Controls whether panic diagnostics include full panic payloads.
@@ -303,9 +684,49 @@ pub fn set_panic_log_verbose(enabled: bool) {
     panic_guard::set_panic_log_verbose(enabled);
 }
 
+/// Force-return freed native allocator memory to the OS.
+///
+/// mimalloc heaps are per-thread, so the collection runs on the calling
+/// thread and is dispatched onto both long-lived runtime threads (each wait
+/// bounded to 500 ms; an idle runtime cannot hang the caller). Intended for
+/// long-lived servers after load spikes and for the release memory evidence
+/// after drain + GC; it is never required for correctness.
+/// Leak-forensics: how many futures are currently parked inside each
+/// instrumented await (see client_stream::await_probe). Diagnostic only.
+#[napi]
+pub fn native_await_probe_snapshot() -> std::collections::HashMap<String, i64> {
+    client_stream::await_probe::snapshot()
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value))
+        .collect()
+}
+
+#[napi]
+pub fn release_native_memory() -> bool {
+    panic_guard::catch_panic(|| {
+        let relief = native_memory::release_drained_residency(true);
+        for rt in [&*RUNTIME, &*CLIENT_RUNTIME] {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+            rt.spawn(async move {
+                native_memory::release_drained_residency(true);
+                let _ = tx.send(());
+            });
+            let _ = rx.recv_timeout(std::time::Duration::from_millis(500));
+        }
+        Ok(relief.applied)
+    })
+    .unwrap_or(false)
+}
+
 /// Well-known close codes for stable error semantics (AGENTS.md).
 pub(crate) const IDLE_TIMEOUT_CLOSE_CODE: u32 = 3990;
 pub(crate) const LIMIT_EXCEEDED_CLOSE_CODE: u32 = 3992;
+/// A session this server ended itself while shutting down. Distinct from an
+/// application close so the app — and the reaped-vs-lost counters — can tell
+/// "we took this session down" from "we lost it".
+pub const SERVER_CLOSING_CLOSE_CODE: u32 = 3993;
+/// Close reason paired with [`SERVER_CLOSING_CLOSE_CODE`].
+pub const SERVER_CLOSING_CLOSE_REASON: &str = "E_SERVER_CLOSING";
 
 /// Extract (code, reason) from ConnectionError for CloseInfo.
 pub(crate) fn extract_close_info(
@@ -330,6 +751,85 @@ pub(crate) fn extract_close_info(
     }
 }
 
+/// Close details for a session whose peer ended it, which `closed()` cannot give.
+///
+/// A peer that ends a session sends a `CLOSE_WEBTRANSPORT_SESSION` capsule and
+/// only then closes the QUIC connection, with `H3_NO_ERROR` — a code about the
+/// transport that says nothing about the session. The capsule's code and reason
+/// reach us on the session operations instead, so ask one of those and fall back
+/// to the transport error for every other way a connection can end.
+///
+/// Bounded: on an already-closed connection the operation returns its error
+/// immediately, and the deadline only caps the case where datagrams the peer
+/// sent before closing are still queued ahead of it.
+pub(crate) async fn resolve_close_info(
+    conn: &wtransport::Connection,
+    transport_err: &wtransport::error::ConnectionError,
+) -> (Option<u32>, Option<String>) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(50);
+    while let Ok(res) = tokio::time::timeout_at(deadline, conn.receive_datagram()).await {
+        match res {
+            // A datagram left over on a session that is already gone.
+            Ok(_) => continue,
+            Err(op_err @ wtransport::error::ConnectionError::ApplicationClosed(_)) => {
+                return extract_close_info(&op_err);
+            }
+            Err(_) => break,
+        }
+    }
+    extract_close_info(transport_err)
+}
+
+/// Releases per-session lifecycle counters (registry entry, per-IP rate-limit
+/// slot, and the `sessions_active` gauge) exactly once — on the normal teardown
+/// path via `release()`, or on an unwind via `Drop`. Without this, a panic in
+/// the datagram-forward task (the case `panic_guard` exists for) would strand
+/// these counters: `sessions_active` inflates → false `maxSessions` rejections,
+/// and the peer IP stays permanently blocked from reconnecting.
+struct SessionCounters {
+    id: std::sync::Arc<str>,
+    owner_server_id: u64,
+    peer_ip: std::net::IpAddr,
+    metrics: Arc<crate::server_metrics::ServerMetrics>,
+    released: bool,
+}
+
+struct HandshakeAdmission {
+    metrics: Arc<crate::server_metrics::ServerMetrics>,
+}
+
+impl HandshakeAdmission {
+    fn new(metrics: Arc<crate::server_metrics::ServerMetrics>) -> Self {
+        Self { metrics }
+    }
+}
+
+impl Drop for HandshakeAdmission {
+    fn drop(&mut self) {
+        self.metrics.release_handshake();
+    }
+}
+
+impl SessionCounters {
+    fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        session_registry::remove(&self.id);
+        rate_limit::release_per_ip_session(self.owner_server_id, self.peer_ip);
+        self.metrics
+            .sessions_active
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Drop for SessionCounters {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 /// Spawn the wtransport server loop on the dedicated runtime.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_wtransport_server(
@@ -343,8 +843,13 @@ pub(crate) fn spawn_wtransport_server(
     session_tx: Option<tokio::sync::mpsc::Sender<SessionEvent>>,
     log_tx: Option<tokio::sync::mpsc::Sender<LogEvent>>,
     tls_resolver: Arc<server_tls::LiveServerCertResolver>,
+    congestion_control: client::CongestionControlMode,
     debug_logs: bool,
-    startup_tx: std::sync::mpsc::Sender<std::result::Result<(), String>>,
+    enable_0rtt: bool,
+    allow_early_session: bool,
+    qpack_max_table_capacity: u64,
+    bind: server_spawn::BindOptions,
+    startup_tx: std::sync::mpsc::Sender<std::result::Result<u16, String>>,
 ) {
     use std::sync::atomic::Ordering;
     use wtransport::{Endpoint, ServerConfig, VarInt};
@@ -360,16 +865,16 @@ pub(crate) fn spawn_wtransport_server(
     });
 
     RUNTIME.spawn(async move {
-        panic_guard::spawn_quic_task(async move {
+        panic_guard::spawn_quic_task_scoped(panic_guard::PanicScope::Server(owner_server_id), async move {
             let mut startup_tx = Some(startup_tx);
-            let mut report_startup = |res: std::result::Result<(), String>| {
+            let mut report_startup = |res: std::result::Result<u16, String>| {
                 send_startup_result(&mut startup_tx, res);
             };
             let tls_config =
                 match server_tls::build_server_tls_config(Arc::clone(&tls_resolver)) {
                     Ok(config) => config,
                     Err(msg) => {
-                        emit_log(&log_tx, !debug_logs, "error", &msg, None, None, None);
+                        emit_log(&log_tx, !debug_logs, "error", format_args!("{}", msg), None, None, None);
                         report_startup(Err(msg));
                         return;
                     }
@@ -377,60 +882,251 @@ pub(crate) fn spawn_wtransport_server(
             let bind_addr: std::net::SocketAddr = format!("{}:{}", host, port)
                 .parse()
                 .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], port)));
-            let config_builder = ServerConfig::builder()
-                .with_bind_address(bind_addr)
-                .with_custom_tls(tls_config);
+            // Align QUIC transport flow control with the configured app limits so a
+            // peer cannot open QUIC-default concurrency (accept/reset churn) or
+            // buffer more than the advertised byte budgets. Headroom of 16 streams
+            // covers H3 control/QPACK/settings streams outside the app caps.
+            let mut transport = wtransport::config::QuicTransportConfig::default();
+            let memory_policy = transport_memory::TransportMemoryPolicy::from_limits(&limits)
+                .with_h1b_datagram_buffers(&limits);
+            let clamp_varint = |n: u64| -> wtransport::quinn::VarInt {
+                wtransport::quinn::VarInt::from_u64(
+                    n.min(wtransport::quinn::VarInt::MAX.into_inner()),
+                )
+                .unwrap_or(wtransport::quinn::VarInt::MAX)
+            };
+            transport.max_concurrent_bidi_streams(clamp_varint(
+                limits.max_streams_per_session_bidi.saturating_add(16),
+            ));
+            transport.max_concurrent_uni_streams(clamp_varint(
+                limits.max_streams_per_session_uni.saturating_add(16),
+            ));
+            memory_policy.apply_flow_control(&mut transport);
+            memory_policy.apply_datagram_buffers(&mut transport);
+            client::apply_congestion_controller(&mut transport, congestion_control);
+            // ACK cadence is a registered campaign knob
+            // (`WEBTRANSPORT_NATIVE_ACK_CADENCE`); `default` is quinn's stock
+            // cadence, `relaxed` widens `max_ack_delay` and requests
+            // ACK_FREQUENCY from the client. See `ack_cadence` for why this
+            // is active against any quinn peer.
+            ack_cadence::apply(&mut transport, ack_cadence::server_ack_cadence_mode());
+            // reusePort takes over the socket build so SO_REUSEPORT can be set
+            // before bind(); with_bind_socket hands it to quinn untouched.
+            // Steering wiring happens in the gap between bind and handoff —
+            // the only moment the fd is visible to us — and any failure aborts
+            // startup: a steering misconfiguration must never degrade to
+            // silent 4-tuple hashing.
+            let bound = if bind.reuse_port {
+                let bind_socket = if let Some(send_buffer_bytes) = bind.udp_send_buffer_bytes {
+                    server_spawn::bind_socket_with_options(
+                        bind_addr,
+                        true,
+                        Some(send_buffer_bytes),
+                    )
+                } else {
+                    server_spawn::bind_reuse_port_socket(bind_addr)
+                };
+                match bind_socket {
+                    Ok(socket) => {
+                        if let Some(steering) = &bind.steering {
+                            if let Err(msg) = reuseport_steering::install(&socket, steering) {
+                                emit_log(&log_tx, !debug_logs, "error", format_args!("{}", msg), None, None, None);
+                                report_startup(Err(msg));
+                                return;
+                            }
+                        }
+                        ServerConfig::builder().with_bind_socket(socket)
+                    }
+                    Err(e) => {
+                        let msg = format!("failed to bind reusePort socket: {}", e);
+                        emit_log(&log_tx, !debug_logs, "error", format_args!("{}", msg), None, None, None);
+                        report_startup(Err(msg));
+                        return;
+                    }
+                }
+            } else {
+                match bind.udp_send_buffer_bytes {
+                    Some(send_buffer_bytes) => {
+                        match server_spawn::bind_socket_with_options(
+                            bind_addr,
+                            false,
+                            Some(send_buffer_bytes),
+                        ) {
+                            Ok(socket) => ServerConfig::builder().with_bind_socket(socket),
+                            Err(e) => {
+                                let msg = format!("failed to bind socket: {}", e);
+                                emit_log(&log_tx, !debug_logs, "error", format_args!("{}", msg), None, None, None);
+                                report_startup(Err(msg));
+                                return;
+                            }
+                        }
+                    }
+                    None => ServerConfig::builder().with_bind_address(bind_addr),
+                }
+            };
+            let config_builder =
+                bound.with_custom_tls_and_transport(tls_config, transport);
             let config_builder = match config_builder.max_idle_timeout(Some(
                 std::time::Duration::from_millis(limits.idle_timeout_ms),
             )) {
                 Ok(builder) => builder,
                 Err(e) => {
                     let msg = format!("failed to apply idle timeout: {:?}", e);
-                    emit_log(&log_tx, !debug_logs, "error", &msg, None, None, None);
+                    emit_log(&log_tx, !debug_logs, "error", format_args!("{}", msg), None, None, None);
                     report_startup(Err(msg));
                     return;
                 }
             };
-            let config = config_builder.build();
-            let server = match Endpoint::server(config) {
-                Ok(s) => {
-                    emit_log(&log_tx, !debug_logs, "info", &format!("endpoint created for port {}", port), None, None, None);
-                    report_startup(Ok(()));
-                    s
+            let config_builder = config_builder.keep_alive_interval(
+                limits
+                    .effective_keep_alive_interval_ms()
+                    .map(std::time::Duration::from_millis),
+            );
+            // 0-RTT (fork feature): switches rustls to a stateful per-process
+            // session store with take-once semantics (single-process
+            // anti-replay) and allows the CONNECT request to arrive as
+            // replayable early data; sessions report is_0rtt.
+            let config_builder = config_builder.enable_0rtt(enable_0rtt);
+            // Dynamic QPACK (fork feature): advertises SETTINGS_QPACK_MAX_TABLE_CAPACITY.
+            // Zero (the default) keeps static-only, unchanged wire behavior. The
+            // fork always advertises SETTINGS_QPACK_BLOCKED_STREAMS = 0, so there
+            // is no blocked-streams option to thread.
+            let config_builder =
+                config_builder.qpack_max_table_capacity(qpack_max_table_capacity);
+            let mut config = config_builder.build();
+            // QUIC-LB connection IDs (draft-ietf-quic-load-balancers-21, keyless
+            // configuration — see `quic_lb.rs`). The generator lives on the
+            // endpoint config, which the builder does not expose, so it goes on
+            // the built config through the fork's escape hatch before
+            // `Endpoint::server` consumes it. quinn wants a factory, not an
+            // instance, because it may build a generator per endpoint.
+            if let Some(quic_lb) = bind.quic_lb.clone() {
+                config
+                    .quic_endpoint_config_mut()
+                    .cid_generator(quic_lb::QuicLbCidGenerator::factory(quic_lb));
+            }
+            // Endpoint-driver placement is a registered campaign knob
+            // (`WEBTRANSPORT_NATIVE_SERVER_RECV_RUNTIME`); `shared` is today's
+            // `TokioRuntime`, `dedicated` moves quinn's single socket reader to
+            // its own thread. See `quic_runtime` for why the first spawn is
+            // the driver.
+            let recv_mode = quic_runtime::server_recv_runtime_mode();
+            let split_runtime = match recv_mode {
+                quic_runtime::RecvRuntimeMode::Dedicated => {
+                    match quic_runtime::SplitRuntime::new(owner_server_id) {
+                        Ok(rt) => Some(rt),
+                        Err(e) => {
+                            let msg = format!("failed to create the dedicated QUIC receive runtime: {e}");
+                            emit_log(&log_tx, !debug_logs, "error", format_args!("{}", msg), None, None, None);
+                            report_startup(Err(msg));
+                            return;
+                        }
+                    }
                 }
+                quic_runtime::RecvRuntimeMode::Shared => None,
+            };
+            // Cross-connection send batching (`WEBTRANSPORT_NATIVE_UDP_SEND_BATCH`)
+            // wraps the socket either runtime hands quinn; the split runtime
+            // does it in its own `wrap_udp_socket`, the shared Tokio runtime
+            // through `BatchedRuntime`. Off, both are today's sockets.
+            let quinn_runtime: Arc<dyn wtransport::quinn::Runtime> = match &split_runtime {
+                Some(rt) => Arc::clone(rt) as Arc<dyn wtransport::quinn::Runtime>,
+                None => Arc::new(udp_send_batch::BatchedRuntime::new(wtransport::quinn::TokioRuntime)),
+            };
+            let server = match Endpoint::server_with_runtime(config, quinn_runtime) {
+                Ok(s) => match s.local_addr() {
+                    Ok(addr) => {
+                        if let Some(rt) = &split_runtime {
+                            // quinn spawns exactly the endpoint driver while
+                            // building the endpoint; anything else means the
+                            // routing assumption no longer holds.
+                            let spawns = rt.spawn_count();
+                            if spawns != 1 {
+                                let msg = format!(
+                                    "dedicated QUIC receive runtime saw {spawns} spawns during endpoint construction, expected 1"
+                                );
+                                emit_log(&log_tx, !debug_logs, "error", format_args!("{}", msg), None, None, None);
+                                report_startup(Err(msg));
+                                return;
+                            }
+                        }
+                        let bound_port = addr.port();
+                        emit_log(
+                            &log_tx,
+                            !debug_logs,
+                            "info",
+                            format_args!("endpoint created for port {}", bound_port),
+                            None,
+                            None,
+                            None,
+                        );
+                        report_startup(Ok(bound_port));
+                        s
+                    }
+                    Err(e) => {
+                        let msg = format!("failed to read bound address: {:?}", e);
+                        emit_log(&log_tx, !debug_logs, "error", format_args!("{}", msg), None, None, None);
+                        report_startup(Err(msg));
+                        return;
+                    }
+                },
                 Err(e) => {
                     let msg = format!("failed to create endpoint: {:?}", e);
-                    emit_log(&log_tx, !debug_logs, "error", &msg, None, None, None);
+                    emit_log(&log_tx, !debug_logs, "error", format_args!("{}", msg), None, None, None);
                     report_startup(Err(msg));
                     return;
                 }
             };
 
-            loop {
-                let incoming = server.accept();
-                tokio::select! {
-                    _ = shutdown_rx.changed() => {
-                        server.close(VarInt::from_u32(0), b"server closing");
-                        break;
-                    }
-                    incoming_session = incoming => {
-                        let metrics = Arc::clone(&metrics);
-                        let limits = limits.clone();
-                        let rate_limits = rate_limits.clone();
-                        let stx = session_tx.clone();
-                        let ltx = log_tx.clone();
-                        spawn_tracked::spawn_tracked(
-                            metrics.clone(),
-                            spawn_tracked::TaskKind::Session,
-                            async move {
-                                metrics.handshakes_in_flight.fetch_add(1, Ordering::Relaxed);
+            spawn_tracked::spawn_tracked(
+                Arc::clone(&metrics),
+                owner_server_id,
+                spawn_tracked::TaskKind::Accept,
+                panic_guard::PanicScope::Server(owner_server_id),
+                async move {
+                    loop {
+                        let incoming = server.accept();
+                        tokio::select! {
+                            _ = shutdown_rx.changed() => {
+                                server.close(
+                                    VarInt::from_u32(SERVER_CLOSING_CLOSE_CODE),
+                                    SERVER_CLOSING_CLOSE_REASON.as_bytes(),
+                                );
+                                break;
+                            }
+                            incoming_session = incoming => {
+                                let metrics = Arc::clone(&metrics);
+                                let limits = limits.clone();
+                                let rate_limits = rate_limits.clone();
+                                let stx = session_tx.clone();
+                                let ltx = log_tx.clone();
+                                if !metrics.try_acquire_handshake(limits.max_handshakes_in_flight) {
+                                    incoming_session.refuse();
+                                    metrics.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);
+                                    emit_log(&ltx, !debug_logs, "warn", format_args!("limit exceeded: maxHandshakesInFlight"), None, None, None);
+                                    continue;
+                                }
+                                let handshake_admission = HandshakeAdmission::new(Arc::clone(&metrics));
+                                spawn_tracked::spawn_tracked(
+                                    metrics.clone(),
+                                    owner_server_id,
+                                    spawn_tracked::TaskKind::Session,
+                                    panic_guard::PanicScope::Server(owner_server_id),
+                                    async move {
+                                let _handshake_admission = handshake_admission;
+                                // Taken before the await: a handshake that fails or
+                                // stalls is logged with the peer's ip:port, which is
+                                // the generator's endpoint address and the only key
+                                // that pairs the line with the client's own record.
+                                let incoming_peer = incoming_session.remote_address();
+                                let incoming_peer_ip = incoming_peer.ip().to_string();
+                                let incoming_peer_port = u32::from(incoming_peer.port());
                                 let session_request = match incoming_session.await {
                                     Ok(r) => {
-                                        emit_log(&ltx, !debug_logs, "debug", &format!("CONNECT received authority={:?}", r.authority()), None, None, None);
+                                        emit_log(&ltx, !debug_logs, "debug", format_args!("CONNECT received authority={:?}", r.authority()), None, None, None);
                                         r
                                     }
                                     Err(e) => {
-                                        metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
                                         let mut chain = String::new();
                                         let mut src: &dyn std::error::Error = &e;
                                         chain.push_str(&src.to_string());
@@ -439,41 +1135,35 @@ pub(crate) fn spawn_wtransport_server(
                                             chain.push_str(&s.to_string());
                                             src = s;
                                         }
-                                        emit_log(&ltx, !debug_logs, "warn", &format!("handshake failed (incoming_session): {}", chain), None, None, None);
+                                        emit_log(&ltx, !debug_logs, "warn", format_args!("handshake failed (incoming_session): {}", chain), None, Some(&incoming_peer_ip), Some(incoming_peer_port));
                                         return;
                                     }
                                 };
-                                if metrics.handshakes_in_flight.load(Ordering::Relaxed)
-                                    > limits.max_handshakes_in_flight
-                                {
-                                    metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
-                                    metrics.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);
-                                    emit_log(&ltx, !debug_logs, "warn", "limit exceeded: maxHandshakesInFlight", None, None, None);
-                                    return;
-                                }
+                                // Sampled when the request was read: true means the
+                                // CONNECT arrived as replayable 0-RTT early data.
+                                let is_0rtt = session_request.is_0rtt();
                                 let authority = session_request.authority().to_string();
                                 let peer_addr = session_request.remote_address();
-                                let peer_ip = peer_addr.ip().to_string();
+                                let peer_ip_addr = peer_addr.ip();
+                                let peer_ip = peer_ip_addr.to_string();
                                 let peer_port = peer_addr.port() as u32;
-                                if !rate_limit::try_acquire_handshake(
-                                    &peer_ip,
+                                if !rate_limit::try_acquire_handshake(owner_server_id,
+                                    peer_ip_addr,
                                     rate_limits.handshakes_per_sec,
                                     rate_limits.handshakes_burst,
                                 ) {
-                                    metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
                                     metrics.rate_limited_count.fetch_add(1, Ordering::Relaxed);
-                                    emit_log(&ltx, !debug_logs, "warn", "rate limited: handshake token bucket", None, Some(&peer_ip), Some(peer_port));
+                                    emit_log(&ltx, !debug_logs, "warn", format_args!("rate limited: handshake token bucket"), None, Some(&peer_ip), Some(peer_port));
                                     session_request.too_many_requests().await;
                                     return;
                                 }
-                                if !rate_limit::try_acquire_per_ip_session_with_prefix(
-                                    &peer_ip,
+                                if !rate_limit::try_acquire_per_ip_session_with_prefix(owner_server_id,
+                                    peer_ip_addr,
                                     rate_limits.handshakes_burst_per_ip,
                                     rate_limits.handshakes_burst_per_prefix,
                                 ) {
-                                    metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
                                     metrics.rate_limited_count.fetch_add(1, Ordering::Relaxed);
-                                    emit_log(&ltx, !debug_logs, "warn", "rate limited: per-IP handshake burst", None, Some(&peer_ip), Some(peer_port));
+                                    emit_log(&ltx, !debug_logs, "warn", format_args!("rate limited: per-IP handshake burst"), None, Some(&peer_ip), Some(peer_port));
                                     session_request.too_many_requests().await;
                                     return;
                                 }
@@ -481,7 +1171,7 @@ pub(crate) fn spawn_wtransport_server(
                                 if prev_sessions >= limits.max_sessions {
                                     metrics.sessions_active.fetch_sub(1, Ordering::SeqCst);
                                     metrics.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);
-                                    emit_log(&ltx, !debug_logs, "warn", "limit exceeded: maxSessions", None, Some(&peer_ip), Some(peer_port));
+                                    emit_log(&ltx, !debug_logs, "warn", format_args!("limit exceeded: maxSessions"), None, Some(&peer_ip), Some(peer_port));
                                     let reject_timeout = tokio::time::Duration::from_millis(
                                         limits.handshake_timeout_ms,
                                     );
@@ -490,8 +1180,7 @@ pub(crate) fn spawn_wtransport_server(
                                         session_request.accept(),
                                     )
                                     .await;
-                                    metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
-                                    rate_limit::release_per_ip_session(&peer_ip);
+                                    rate_limit::release_per_ip_session(owner_server_id, peer_ip_addr);
                                     match reject_result {
                                         Ok(Ok(connection)) => {
                                             connection.close(
@@ -504,7 +1193,7 @@ pub(crate) fn spawn_wtransport_server(
                                                 &ltx,
                                                 !debug_logs,
                                                 "debug",
-                                                &format!(
+                                                format_args!(
                                                     "maxSessions reject accept failed authority={:?} error={}",
                                                     authority, e
                                                 ),
@@ -518,7 +1207,7 @@ pub(crate) fn spawn_wtransport_server(
                                                 &ltx,
                                                 !debug_logs,
                                                 "warn",
-                                                &format!(
+                                                format_args!(
                                                     "maxSessions reject handshake timed out authority={:?}",
                                                     authority
                                                 ),
@@ -543,46 +1232,97 @@ pub(crate) fn spawn_wtransport_server(
                                     Ok(r) => r,
                                     Err(_elapsed) => {
                                         metrics.sessions_active.fetch_sub(1, Ordering::SeqCst);
-                                        metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
-                                        rate_limit::release_per_ip_session(&peer_ip);
-                                        emit_log(&ltx, !debug_logs, "warn", &format!("handshake timed out authority={:?}", authority), None, None, None);
+                                        rate_limit::release_per_ip_session(owner_server_id, peer_ip_addr);
+                                        emit_log(&ltx, !debug_logs, "warn", format_args!("handshake timed out authority={:?}", authority), None, Some(&incoming_peer_ip), Some(incoming_peer_port));
                                         return;
                                     }
                                 };
                                 match accept_result {
                                     Ok(connection) => {
                                         metrics.handshake_histogram.observe(accept_start.elapsed());
-                                        emit_log(&ltx, !debug_logs, "info", &format!("session accepted peer={}:{} authority={:?}", peer_ip, peer_port, authority), None, Some(&peer_ip), Some(peer_port));
-                                        metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
+                                        emit_log(&ltx, !debug_logs, "info", format_args!("session accepted peer={}:{} authority={:?}", peer_ip, peer_port, authority), None, Some(&peer_ip), Some(peer_port));
+                                        drop(_handshake_admission);
 
-                                        let id = format!(
-                                            "sess-{}",
+                                        let id: std::sync::Arc<str> = format!(
+                                            "sess-{:016x}",
                                             SESSION_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                                        );
+                                                ^ *SESSION_ID_SEED
+                                        )
+                                        .into();
 
                                         // P0-1: Register session BEFORE emitting to JS so acceptBidiStream etc. find it
-                                        let (dgram_tx, bidi_accept_tx, uni_accept_tx, create_bi_rx, create_uni_rx, session_metrics) =
+                                        let (dgram_tx, bidi_accept_tx, uni_accept_tx, create_bi_rx, create_uni_rx, session_metrics, datagram_capacity_notify) =
                                             session_registry::insert(
-                                                id.clone(),
+                                                id.to_string(),
                                                 owner_server_id,
                                                 connection.clone(),
                                                 metrics.clone(),
                                                 limits.clone(),
+                                                is_0rtt,
                                             );
+                                        // Replay-safety gate. The session request is
+                                        // the replayable unit of 0-RTT, so by default
+                                        // the onSession lifecycle event is deferred
+                                        // until the handshake is confirmed (the request
+                                        // is then no longer replayable). allowEarlySession
+                                        // opts out, surfacing the session immediately
+                                        // with is_0rtt observable for apps that only do
+                                        // idempotent work pre-confirmation.
+                                        //
+                                        // Either way the handshake_confirmed flag must
+                                        // flip so the session getter reflects reality;
+                                        // handshake_confirmed() resolves at completion or
+                                        // connection loss (bounded by the idle timeout),
+                                        // so neither path can hang forever.
+                                        if is_0rtt {
+                                            let confirmed_flag = session_registry::zero_rtt_state(&id)
+                                                .map(|(_, flag)| flag);
+                                            if allow_early_session {
+                                                if let Some(flag) = confirmed_flag {
+                                                    let conn_confirm = connection.clone();
+                                                    panic_guard::spawn_quic_task_scoped(
+                                                        panic_guard::PanicScope::Server(owner_server_id),
+                                                        async move {
+                                                            let _ = conn_confirm
+                                                                .handshake_confirmed()
+                                                                .await;
+                                                            flag.store(
+                                                                true,
+                                                                std::sync::atomic::Ordering::Release,
+                                                            );
+                                                        },
+                                                    );
+                                                }
+                                            } else {
+                                                // Deferred default: block this session's
+                                                // setup until confirmation, then flip the
+                                                // flag before the onSession event fires.
+                                                let _ = connection.handshake_confirmed().await;
+                                                if let Some(flag) = confirmed_flag {
+                                                    flag.store(
+                                                        true,
+                                                        std::sync::atomic::Ordering::Release,
+                                                    );
+                                                }
+                                            }
+                                        }
                                         let stream_capacity_notify =
                                             session_registry::get_stream_capacity_notify(&id);
 
                                         if let Some(ref tx) = stx {
+                                            // Lifecycle events must not be lossy: await capacity
+                                            // instead of try_send (bounded by maxSessions churn).
                                             if tx
-                                                .try_send(SessionEvent::Accepted(SessionAccepted {
-                                                    id: id.clone(),
+                                                .send(SessionEvent::Accepted(SessionAccepted {
+                                                    id: id.to_string(),
                                                     peer_ip: peer_ip.clone(),
                                                     peer_port,
                                                 }))
+                                                .await
                                                 .is_err()
                                             {
                                                 eprintln!(
-                                                    "webtransport-native: session accepted event dropped for id={}",
+                                                    "webtransport-native: session accepted event dropped for id={} (listener gone)",
                                                     id
                                                 );
                                             }
@@ -602,59 +1342,117 @@ pub(crate) fn spawn_wtransport_server(
                                         let sm_dgram = Arc::clone(&session_metrics);
 
                                         // Bidi stream accept loop: forward to JS via channel (4.4.2: shed if over limits)
-                                        let peer_ip_bidi = peer_ip.clone();
+                                        let peer_ip_bidi = peer_ip_addr;
                                         let rl_bidi = rate_limits.clone();
                                         let stream_capacity_notify_bidi = stream_capacity_notify.clone();
+                                        // The session can be removed between registry insert and
+                                        // this fetch (deferred 0-RTT handshake_confirmed and the
+                                        // lifecycle send are real await points; session.close()
+                                        // from onSession or server close race them). Treat a
+                                        // missing entry as session-already-gone, never panic:
+                                        // this task runs under PanicScope::Server and a panic
+                                        // here tears down every live session.
+                                        let Some(bidi_discard) = session_registry::bidi_discard_state(&id)
+                                        else {
+                                            return;
+                                        };
+                                        let discard_permits_bidi =
+                                            Arc::new(tokio::sync::Semaphore::new(DISCARD_DRAIN_CONCURRENCY));
+                                        let discard_id_bidi = id.clone();
                                         spawn_tracked::spawn_tracked(
                                             m_bidi.clone(),
+                                            owner_server_id,
                                             spawn_tracked::TaskKind::Stream,
+                                            panic_guard::PanicScope::Session(id.clone()),
                                             async move {
                                                 loop {
                                                     tokio::select! {
                                                         _ = conn_bidi.closed() => break,
                                                         res = conn_bidi.accept_bi() => {
                                                             let Ok((mut send, recv)) = res else { break };
-                                                            if !rate_limit::try_acquire_stream_open(&peer_ip_bidi, rl_bidi.streams_per_sec, rl_bidi.streams_burst) {
+                                                            if !rate_limit::try_acquire_stream_open(owner_server_id, peer_ip_bidi, rl_bidi.streams_per_sec, rl_bidi.streams_burst) {
                                                                 m_bidi.rate_limited_count.fetch_add(1, Ordering::Relaxed);
-                                                                let _ = send.reset(0u32.into());
+                                                                let _ = send.reset(0);
                                                                 continue;
                                                             }
                                                             if m_bidi.streams_active.load(Ordering::Relaxed) >= lim_bidi.max_streams_global {
                                                                 m_bidi.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);
-                                                                let _ = send.reset(0u32.into());
+                                                                let _ = send.reset(0);
                                                                 continue;
                                                             }
                                                             if sm_bidi.streams_bidi_active.load(Ordering::Relaxed) >= lim_bidi.max_streams_per_session_bidi {
                                                                 m_bidi.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);
-                                                                let _ = send.reset(0u32.into());
+                                                                let _ = send.reset(0);
+                                                                continue;
+                                                            }
+                                                            if bidi_discard.is_enabled() {
+                                                                m_bidi.streams_active.fetch_add(1, Ordering::Relaxed);
+                                                                sm_bidi.streams_bidi_active.fetch_add(1, Ordering::Relaxed);
+                                                                let guard = crate::client_stream::StreamGuard::server(
+                                                                    Arc::clone(&m_bidi),
+                                                                    Arc::clone(&sm_bidi),
+                                                                    true,
+                                                                    stream_capacity_notify_bidi.clone(),
+                                                                );
+                                                                let discard = bidi_discard.clone();
+                                                                let permits = Arc::clone(&discard_permits_bidi);
+                                                                let conn = conn_bidi.clone();
+                                                                spawn_tracked::spawn_tracked(
+                                                                    Arc::clone(&m_bidi),
+                                                                    owner_server_id,
+                                                                    spawn_tracked::TaskKind::Stream,
+                                                                    panic_guard::PanicScope::Session(discard_id_bidi.clone()),
+                                                                    async move {
+                                                                        run_bounded_discard(
+                                                                            permits,
+                                                                            discard,
+                                                                            DISCARD_DRAIN_STREAM_TIMEOUT,
+                                                                            async {
+                                                                                tokio::select! {
+                                                                                    result = crate::client_stream::discard_recv_stream_zero_copy(recv) => result,
+                                                                                    _ = conn.closed() => Err("E_SESSION_CLOSED".to_string()),
+                                                                                }
+                                                                            },
+                                                                        )
+                                                                        .await;
+                                                                        drop(send);
+                                                                        drop(guard);
+                                                                    },
+                                                                );
                                                                 continue;
                                                             }
                                                             m_bidi.streams_active.fetch_add(1, Ordering::Relaxed);
                                                             sm_bidi.streams_bidi_active.fetch_add(1, Ordering::Relaxed);
-                                                            let guard_m = Arc::clone(&m_bidi);
-                                                            let guard_sm = Arc::clone(&sm_bidi);
-                                                            let notify = stream_capacity_notify_bidi.clone();
-                                                            let guard = crate::client_stream::StreamGuard::new(move || {
-                                                                guard_m.streams_active.fetch_sub(1, Ordering::Relaxed);
-                                                                guard_sm.streams_bidi_active.fetch_sub(1, Ordering::Relaxed);
-                                                                if let Some(ref n) = notify {
-                                                                    n.notify_waiters();
+                                                            let guard = crate::client_stream::StreamGuard::server(
+                                                                Arc::clone(&m_bidi),
+                                                                Arc::clone(&sm_bidi),
+                                                                true,
+                                                                stream_capacity_notify_bidi.clone(),
+                                                            );
+                                                            let budget = crate::client_stream::DeferredStreamBudgetConfig::new(
+                                                                Arc::clone(&m_bidi),
+                                                                Arc::clone(&sm_bidi),
+                                                                lim_bidi.max_queued_bytes_global,
+                                                                lim_bidi.max_queued_bytes_per_session,
+                                                                lim_bidi.max_queued_bytes_per_stream,
+                                                                lim_bidi.backpressure_timeout_ms,
+                                                            );
+                                                            let handle = crate::client_stream::ClientBidiStreamHandle::new_deferred(
+                                                                recv,
+                                                                send,
+                                                                guard,
+                                                                Some(budget),
+                                                            );
+                                                            let send_handle = bidi_accept_tx.send(Box::new(handle));
+                                                            tokio::pin!(send_handle);
+                                                            tokio::select! {
+                                                                result = &mut send_handle => {
+                                                                    if result.is_err() {
+                                                                        report_channel_closed("bidi accept");
+                                                                        break;
+                                                                    }
                                                                 }
-                                                            });
-                                                            let stream_queued = Arc::new(AtomicU64::new(0));
-                                                            let budget = crate::client_stream::StreamBudget {
-                                                                server_metrics: Arc::clone(&m_bidi),
-                                                                session_metrics: Arc::clone(&sm_bidi),
-                                                                stream_queued: Arc::clone(&stream_queued),
-                                                                max_global: lim_bidi.max_queued_bytes_global,
-                                                                max_session: lim_bidi.max_queued_bytes_per_session,
-                                                                max_stream: lim_bidi.max_queued_bytes_per_stream,
-                                                            };
-                                                            let (read_rx, write_tx, stop_tx, write_err_slot, read_err_slot) = crate::client_stream::spawn_bidi_bridge(send, recv, Some(guard), Some(budget.clone()));
-                                                            let handle = crate::client_stream::ClientBidiStreamHandle::new_with_budget_and_slot(read_rx, write_tx, stop_tx, Some(budget), write_err_slot, read_err_slot);
-                                                            if bidi_accept_tx.send(handle).await.is_err() {
-                                                                report_channel_closed("bidi accept");
-                                                                break;
+                                                                _ = conn_bidi.closed() => break,
                                                             }
                                                         }
                                                     }
@@ -662,59 +1460,109 @@ pub(crate) fn spawn_wtransport_server(
                                             },
                                         );
                                         // Uni stream accept loop: forward to JS via channel (4.4.2; P1-5)
-                                        let peer_ip_uni = peer_ip.clone();
+                                        let peer_ip_uni = peer_ip_addr;
                                         let rl_uni = rate_limits.clone();
                                         let stream_capacity_notify_uni = stream_capacity_notify.clone();
+                                        // Same removal race as the bidi fetch above.
+                                        let Some(uni_discard) = session_registry::uni_discard_state(&id)
+                                        else {
+                                            return;
+                                        };
+                                        let discard_permits_uni =
+                                            Arc::new(tokio::sync::Semaphore::new(DISCARD_DRAIN_CONCURRENCY));
+                                        let discard_id_uni = id.clone();
                                         spawn_tracked::spawn_tracked(
                                             m_uni.clone(),
+                                            owner_server_id,
                                             spawn_tracked::TaskKind::Stream,
+                                            panic_guard::PanicScope::Session(id.clone()),
                                             async move {
                                                 loop {
                                                     tokio::select! {
                                                         _ = conn_uni.closed() => break,
                                                         res = conn_uni.accept_uni() => {
                                                             let Ok(recv) = res else { break };
-                                                            if !rate_limit::try_acquire_stream_open(&peer_ip_uni, rl_uni.streams_per_sec, rl_uni.streams_burst) {
+                                                            if !rate_limit::try_acquire_stream_open(owner_server_id, peer_ip_uni, rl_uni.streams_per_sec, rl_uni.streams_burst) {
                                                                 m_uni.rate_limited_count.fetch_add(1, Ordering::Relaxed);
-                                                                recv.stop(0u32.into());
+                                                                recv.stop(0);
                                                                 continue;
                                                             }
                                                             if m_uni.streams_active.load(Ordering::Relaxed) >= lim_uni.max_streams_global {
                                                                 m_uni.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);
-                                                                recv.stop(0u32.into());
+                                                                recv.stop(0);
                                                                 continue;
                                                             }
                                                             if sm_uni.streams_uni_active.load(Ordering::Relaxed) >= lim_uni.max_streams_per_session_uni {
                                                                 m_uni.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);
-                                                                recv.stop(0u32.into());
+                                                                recv.stop(0);
+                                                                continue;
+                                                            }
+                                                            if uni_discard.is_enabled() {
+                                                                m_uni.streams_active.fetch_add(1, Ordering::Relaxed);
+                                                                sm_uni.streams_uni_active.fetch_add(1, Ordering::Relaxed);
+                                                                let guard = crate::client_stream::StreamGuard::server(
+                                                                    Arc::clone(&m_uni),
+                                                                    Arc::clone(&sm_uni),
+                                                                    false,
+                                                                    stream_capacity_notify_uni.clone(),
+                                                                );
+                                                                let discard = uni_discard.clone();
+                                                                let permits = Arc::clone(&discard_permits_uni);
+                                                                let conn = conn_uni.clone();
+                                                                spawn_tracked::spawn_tracked(
+                                                                    Arc::clone(&m_uni),
+                                                                    owner_server_id,
+                                                                    spawn_tracked::TaskKind::Stream,
+                                                                    panic_guard::PanicScope::Session(discard_id_uni.clone()),
+                                                                    async move {
+                                                                        run_bounded_discard(
+                                                                            permits,
+                                                                            discard,
+                                                                            DISCARD_DRAIN_STREAM_TIMEOUT,
+                                                                            async {
+                                                                                tokio::select! {
+                                                                                    result = crate::client_stream::discard_recv_stream_zero_copy(recv) => result,
+                                                                                    _ = conn.closed() => Err("E_SESSION_CLOSED".to_string()),
+                                                                                }
+                                                                            },
+                                                                        )
+                                                                        .await;
+                                                                        drop(guard);
+                                                                    },
+                                                                );
                                                                 continue;
                                                             }
                                                             m_uni.streams_active.fetch_add(1, Ordering::Relaxed);
                                                             sm_uni.streams_uni_active.fetch_add(1, Ordering::Relaxed);
-                                                            let guard_m = Arc::clone(&m_uni);
-                                                            let guard_sm = Arc::clone(&sm_uni);
-                                                            let notify = stream_capacity_notify_uni.clone();
-                                                            let guard = crate::client_stream::StreamGuard::new(move || {
-                                                                guard_m.streams_active.fetch_sub(1, Ordering::Relaxed);
-                                                                guard_sm.streams_uni_active.fetch_sub(1, Ordering::Relaxed);
-                                                                if let Some(ref n) = notify {
-                                                                    n.notify_waiters();
+                                                            let guard = crate::client_stream::StreamGuard::server(
+                                                                Arc::clone(&m_uni),
+                                                                Arc::clone(&sm_uni),
+                                                                false,
+                                                                stream_capacity_notify_uni.clone(),
+                                                            );
+                                                            let budget = crate::client_stream::DeferredStreamBudgetConfig::new(
+                                                                Arc::clone(&m_uni),
+                                                                Arc::clone(&sm_uni),
+                                                                lim_uni.max_queued_bytes_global,
+                                                                lim_uni.max_queued_bytes_per_session,
+                                                                lim_uni.max_queued_bytes_per_stream,
+                                                                lim_uni.backpressure_timeout_ms,
+                                                            );
+                                                            let handle = crate::client_stream::ClientUniRecvHandle::new_deferred(
+                                                                recv,
+                                                                guard,
+                                                                Some(budget),
+                                                            );
+                                                            let send_handle = uni_accept_tx.send(Box::new(handle));
+                                                            tokio::pin!(send_handle);
+                                                            tokio::select! {
+                                                                result = &mut send_handle => {
+                                                                    if result.is_err() {
+                                                                        report_channel_closed("uni accept");
+                                                                        break;
+                                                                    }
                                                                 }
-                                                            });
-                                                            let stream_queued = Arc::new(AtomicU64::new(0));
-                                                            let budget = crate::client_stream::StreamBudget {
-                                                                server_metrics: Arc::clone(&m_uni),
-                                                                session_metrics: Arc::clone(&sm_uni),
-                                                                stream_queued: Arc::clone(&stream_queued),
-                                                                max_global: lim_uni.max_queued_bytes_global,
-                                                                max_session: lim_uni.max_queued_bytes_per_session,
-                                                                max_stream: lim_uni.max_queued_bytes_per_stream,
-                                                            };
-                                                            let (read_rx, stop_tx, read_err_slot) = crate::client_stream::spawn_uni_recv_bridge(recv, Some(guard), Some(budget.clone()));
-                                                            let handle = crate::client_stream::ClientUniRecvHandle::new_with_budget_and_slot(read_rx, stop_tx, Some(budget), read_err_slot);
-                                                            if uni_accept_tx.send(handle).await.is_err() {
-                                                                report_channel_closed("uni accept");
-                                                                break;
+                                                                _ = conn_uni.closed() => break,
                                                             }
                                                         }
                                                     }
@@ -729,7 +1577,9 @@ pub(crate) fn spawn_wtransport_server(
                                         let stream_capacity_notify_create_bi = stream_capacity_notify.clone();
                                         spawn_tracked::spawn_tracked(
                                             m_create_bi.clone(),
+                                            owner_server_id,
                                             spawn_tracked::TaskKind::Stream,
+                                            panic_guard::PanicScope::Session(id.clone()),
                                             async move {
                                                 let mut rx = create_bi_rx;
                                                 while let Some(resp_tx) = rx.recv().await {
@@ -752,16 +1602,12 @@ pub(crate) fn spawn_wtransport_server(
                                                             Ok((send, recv)) => {
                                                                 m_create_bi.streams_active.fetch_add(1, Ordering::Relaxed);
                                                                 sm_create_bi.streams_bidi_active.fetch_add(1, Ordering::Relaxed);
-                                                                let guard_m = Arc::clone(&m_create_bi);
-                                                                let guard_sm = Arc::clone(&sm_create_bi);
-                                                                let notify = stream_capacity_notify_create_bi.clone();
-                                                                let guard = crate::client_stream::StreamGuard::new(move || {
-                                                                    guard_m.streams_active.fetch_sub(1, Ordering::Relaxed);
-                                                                    guard_sm.streams_bidi_active.fetch_sub(1, Ordering::Relaxed);
-                                                                    if let Some(ref n) = notify {
-                                                                        n.notify_waiters();
-                                                                    }
-                                                                });
+                                                                let guard = crate::client_stream::StreamGuard::server(
+                                                                    Arc::clone(&m_create_bi),
+                                                                    Arc::clone(&sm_create_bi),
+                                                                    true,
+                                                                    stream_capacity_notify_create_bi.clone(),
+                                                                );
                                                                 let stream_queued = Arc::new(AtomicU64::new(0));
                                                                 let budget = crate::client_stream::StreamBudget {
                                                                     server_metrics: Arc::clone(&m_create_bi),
@@ -770,16 +1616,23 @@ pub(crate) fn spawn_wtransport_server(
                                                                     max_global: lim_create_bi.max_queued_bytes_global,
                                                                     max_session: lim_create_bi.max_queued_bytes_per_session,
                                                                     max_stream: lim_create_bi.max_queued_bytes_per_stream,
+                                                                    capacity_notify: crate::client_stream::StreamBudget::new_notify(),
+                                                                    backpressure_timeout_ms: lim_create_bi.backpressure_timeout_ms,
                                                                 };
-                                                                let (read_rx, write_tx, stop_tx, write_err_slot, read_err_slot) =
-                                                                    crate::client_stream::spawn_bidi_bridge(send, recv, Some(guard), Some(budget.clone()));
-                                                                Ok(crate::client_stream::ClientBidiStreamHandle::new_with_budget_and_slot(
-                                                                    read_rx, write_tx, stop_tx, Some(budget), write_err_slot, read_err_slot,
+                                                                // Deferred like accepted streams: no bridge task, channel,
+                                                                // or scratch buffer until JS first reads or writes.
+                                                                Ok(crate::client_stream::ClientBidiStreamHandle::new_deferred_with_budget(
+                                                                    recv, send, guard, budget,
+                                                                    crate::client_stream::BridgeRuntime::Server,
                                                                 ))
                                                             }
-                                                            Err(e) => Err(e.to_string()),
+                                                            Err(e) => {
+                                                                Err(wt_from_upstream_error(e.to_string()).to_string())
+                                                            }
                                                         },
-                                                        Err(e) => Err(e.to_string()),
+                                                        Err(e) => {
+                                                            Err(wt_from_upstream_error(e.to_string()).to_string())
+                                                        }
                                                     };
                                                     if resp_tx.send(r).is_err() {
                                                         report_channel_failure("create_bidi response");
@@ -795,7 +1648,9 @@ pub(crate) fn spawn_wtransport_server(
                                         let stream_capacity_notify_create_uni = stream_capacity_notify.clone();
                                         spawn_tracked::spawn_tracked(
                                             m_create_uni.clone(),
+                                            owner_server_id,
                                             spawn_tracked::TaskKind::Stream,
+                                            panic_guard::PanicScope::Session(id.clone()),
                                             async move {
                                                 let mut rx = create_uni_rx;
                                                 while let Some(resp_tx) = rx.recv().await {
@@ -819,16 +1674,12 @@ pub(crate) fn spawn_wtransport_server(
                                                                 Ok(send) => {
                                                                     m_create_uni.streams_active.fetch_add(1, Ordering::Relaxed);
                                                                     sm_create_uni.streams_uni_active.fetch_add(1, Ordering::Relaxed);
-                                                                    let guard_m = Arc::clone(&m_create_uni);
-                                                                    let guard_sm = Arc::clone(&sm_create_uni);
-                                                                    let notify = stream_capacity_notify_create_uni.clone();
-                                                                    let guard = crate::client_stream::StreamGuard::new(move || {
-                                                                        guard_m.streams_active.fetch_sub(1, Ordering::Relaxed);
-                                                                        guard_sm.streams_uni_active.fetch_sub(1, Ordering::Relaxed);
-                                                                        if let Some(ref n) = notify {
-                                                                            n.notify_waiters();
-                                                                        }
-                                                                    });
+                                                                    let guard = crate::client_stream::StreamGuard::server(
+                                                                        Arc::clone(&m_create_uni),
+                                                                        Arc::clone(&sm_create_uni),
+                                                                        false,
+                                                                        stream_capacity_notify_create_uni.clone(),
+                                                                    );
                                                                     let stream_queued = Arc::new(AtomicU64::new(0));
                                                                     let budget = crate::client_stream::StreamBudget {
                                                                         server_metrics: Arc::clone(&m_create_uni),
@@ -837,6 +1688,8 @@ pub(crate) fn spawn_wtransport_server(
                                                                         max_global: lim_create_uni.max_queued_bytes_global,
                                                                         max_session: lim_create_uni.max_queued_bytes_per_session,
                                                                         max_stream: lim_create_uni.max_queued_bytes_per_stream,
+                                                                        capacity_notify: crate::client_stream::StreamBudget::new_notify(),
+                                                                        backpressure_timeout_ms: lim_create_uni.backpressure_timeout_ms,
                                                                     };
                                                                     let (write_tx, write_err_slot) = crate::client_stream::spawn_uni_send_bridge(send, Some(guard), Some(budget.clone()));
                                                                     let handle = crate::client_stream::ClientUniSendHandle::new_with_budget_and_slot(write_tx, Some(budget), write_err_slot);
@@ -845,14 +1698,22 @@ pub(crate) fn spawn_wtransport_server(
                                                                     }
                                                                 }
                                                                 Err(e) => {
-                                                                    if resp_tx.send(Err(e.to_string())).is_err() {
+                                                                    if resp_tx
+                                                                        .send(Err(
+                                                                            wt_from_upstream_error(e.to_string()).to_string(),
+                                                                        ))
+                                                                        .is_err()
+                                                                    {
                                                                         report_channel_failure("create_uni response");
                                                                     }
                                                                 }
                                                             }
                                                         }
                                                         Err(e) => {
-                                                            if resp_tx.send(Err(e.to_string())).is_err() {
+                                                            if resp_tx
+                                                                .send(Err(wt_from_upstream_error(e.to_string()).to_string()))
+                                                                .is_err()
+                                                            {
                                                                 report_channel_failure("create_uni response");
                                                             }
                                                         }
@@ -863,12 +1724,71 @@ pub(crate) fn spawn_wtransport_server(
                                         // Datagram forward to channel (4.4.3: drop if over max_datagram_size; 4.3.2: budget)
                                         let closed_tx = stx.clone();
                                         let rl_dgram = rate_limits.clone();
-                                        let peer_ip_for_release = peer_ip.clone();
+                                        let peer_ip_for_release = peer_ip_addr;
                                         spawn_tracked::spawn_tracked(
                                             m_dgram.clone(),
+                                            owner_server_id,
                                             spawn_tracked::TaskKind::Stream,
+                                            panic_guard::PanicScope::Session(id.clone()),
                                             async move {
+                                                // Releases session counters on any
+                                                // task exit, including a panic
+                                                // unwind (Drop). Normal paths call
+                                                // `counters.release()` explicitly.
+                                                let mut counters = SessionCounters {
+                                                    id: id.clone(),
+                                                    owner_server_id,
+                                                    peer_ip: peer_ip_for_release,
+                                                    metrics: m_dgram.clone(),
+                                                    released: false,
+                                                };
                                                 loop {
+                                                    if crate::server_metrics::ServerMetrics::session_queue_cannot_fit(
+                                                        &sm_dgram.queued_bytes,
+                                                        lim_dgram.max_queued_bytes_per_session,
+                                                        lim_dgram.max_datagram_size as u64,
+                                                    ) {
+                                                        let session_notified =
+                                                            datagram_capacity_notify.notified();
+                                                        tokio::pin!(session_notified);
+                                                        session_notified.as_mut().enable();
+                                                        let owner_notified =
+                                                            m_dgram.datagram_capacity_notify.notified();
+                                                        tokio::pin!(owner_notified);
+                                                        owner_notified.as_mut().enable();
+                                                        if crate::server_metrics::ServerMetrics::session_queue_cannot_fit(
+                                                            &sm_dgram.queued_bytes,
+                                                            lim_dgram.max_queued_bytes_per_session,
+                                                            lim_dgram.max_datagram_size as u64,
+                                                        ) {
+                                                            m_dgram.record_datagram_skip_queue_full();
+                                                            tokio::select! {
+                                                                biased;
+                                                                _ = session_notified => {}
+                                                                _ = owner_notified => {}
+                                                                close_err = conn_dgram.closed() => {
+                                                                    let (close_code, close_reason) =
+                                                                        resolve_close_info(&conn_dgram, &close_err).await;
+                                                                    m_dgram.record_session_close(close_code);
+                                                                    counters.release();
+                                                                    if let Some(ref tx) = closed_tx {
+                                                                        if tx
+                                                                            .send(SessionEvent::Closed { id: id.to_string(), code: close_code, reason: close_reason })
+                                                                            .await
+                                                                            .is_err()
+                                                                        {
+                                                                            eprintln!(
+                                                                                "webtransport-native: session closed event dropped for id={} (listener gone)",
+                                                                                id
+                                                                            );
+                                                                        }
+                                                                    }
+                                                                    return;
+                                                                }
+                                                            }
+                                                            continue;
+                                                        }
+                                                    }
                                                     tokio::select! {
                                                         biased;
                                                         res = conn_dgram.receive_datagram() => {
@@ -881,16 +1801,16 @@ pub(crate) fn spawn_wtransport_server(
                                                                         close_code = code2;
                                                                         close_reason = reason2;
                                                                     }
-                                                                    session_registry::remove(&id);
-                                                                    rate_limit::release_per_ip_session(&peer_ip_for_release);
-                                                                    m_dgram.sessions_active.fetch_sub(1, Ordering::Relaxed);
+                                                                    m_dgram.record_session_close(close_code);
+                                                                    counters.release();
                                                                     if let Some(ref tx) = closed_tx {
                                                                         if tx
-                                                                            .try_send(SessionEvent::Closed { id: id.clone(), code: close_code, reason: close_reason })
+                                                                            .send(SessionEvent::Closed { id: id.to_string(), code: close_code, reason: close_reason })
+                                                                            .await
                                                                             .is_err()
                                                                         {
                                                                             eprintln!(
-                                                                                "webtransport-native: session closed event dropped for id={}",
+                                                                                "webtransport-native: session closed event dropped for id={} (listener gone)",
                                                                                 id
                                                                             );
                                                                         }
@@ -898,64 +1818,115 @@ pub(crate) fn spawn_wtransport_server(
                                                                     return;
                                                                 }
                                                             };
+                                                            let received_at = std::time::Instant::now();
                                                             m_dgram.datagrams_in.fetch_add(1, Ordering::Relaxed);
                                                             sm_dgram.datagrams_in.fetch_add(1, Ordering::Relaxed);
-                                                            if !rate_limit::try_acquire_datagram_ingress(&peer_ip_for_release, rl_dgram.datagrams_per_sec, rl_dgram.datagrams_burst) {
-                                                                m_dgram.rate_limited_count.fetch_add(1, Ordering::Relaxed);
-                                                                m_dgram.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
+                                                            if !rate_limit::try_acquire_datagram_ingress(owner_server_id, peer_ip_for_release, rl_dgram.datagrams_per_sec, rl_dgram.datagrams_burst) {
+                                                                m_dgram.record_datagram_drop(crate::server_metrics::DatagramDropReason::RateLimited);
                                                                 continue;
                                                             }
                                                             if dgram.len() > lim_dgram.max_datagram_size {
-                                                                m_dgram.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
+                                                                m_dgram.record_datagram_drop(crate::server_metrics::DatagramDropReason::TooLarge);
                                                                 continue;
                                                             }
+                                                            // One relaxed load when no server has a rule, so the
+                                                            // no-reflector path keeps its existing cost.
+                                                            if crate::datagram_reflector::any_installed() {
+                                                            if let Some(rule) = crate::datagram_reflector::rule_for(owner_server_id) {
+                                                                if rule.matches(&dgram) {
+                                                                    m_dgram.datagram_reflect_hits.fetch_add(1, Ordering::Relaxed);
+                                                                    let now_ns = crate::datagram_reflector::monotonic_ns();
+                                                                    // The hold is read before the reply is built, so it
+                                                                    // measures receive -> buffer build (a few hundred ns
+                                                                    // short of receive -> send) and needs no rewrite pass.
+                                                                    let hold = received_at.elapsed();
+                                                                    // TODO(reflector): reuse a per-task reply buffer if profiling shows the Vec per hit
+                                                                    let reply = rule.apply(&dgram, now_ns, hold.as_nanos().min(u64::MAX as u128) as u64);
+                                                                    // The send runs on the reflect sender thread, not here:
+                                                                    // a slow send must not lengthen this read task. Reflected
+                                                                    // sends are counted in datagrams_out but deliberately
+                                                                    // bypass try_reserve_queued_bytes_with_session. They use a
+                                                                    // separate bounded sender queue; JS outbound byte accounting
+                                                                    // excludes that queue, which has its own diagnostic ownership.
+                                                                    let send_conn = conn_dgram.clone();
+                                                                    let send_m = std::sync::Arc::clone(&m_dgram);
+                                                                    let send_sm = std::sync::Arc::clone(&sm_dgram);
+                                                                    // TODO(reflector): the boxed job allocates per hit; pool if profiling shows it
+                                                                    let queued = crate::datagram_reflector::enqueue(Box::new(move || {
+                                                                        crate::datagram_reflector::mark_ring_bypass(peer_addr);
+                                                                        let send_interval = crate::datagram_reflector::send_call_interval();
+                                                                        let send_result = send_conn.send_datagram(&reply);
+                                                                        if let Some(interval) = send_interval { interval.finish(); }
+                                                                        match send_result {
+                                                                            Ok(()) => {
+                                                                                send_m.datagrams_out.fetch_add(1, Ordering::Relaxed);
+                                                                                send_sm.datagrams_out.fetch_add(1, Ordering::Relaxed);
+                                                                                send_m.datagram_reflect_sent.fetch_add(1, Ordering::Relaxed);
+                                                                            }
+                                                                            Err(error) => {
+                                                                                crate::datagram_reflector::cancel_ring_bypass(peer_addr);
+                                                                                send_m.record_reflect_send_error(
+                                                                                    crate::datagram_reflector::reason_for(&error),
+                                                                                );
+                                                                            }
+                                                                        }
+                                                                    }));
+                                                                    // Both refusals mean the reply never left this process, so
+                                                                    // neither is a transport error. Disconnected is counted here
+                                                                    // too rather than growing ReflectSendErrorReason (which would
+                                                                    // add a by-reason field across the N-API and TS surfaces) for
+                                                                    // a case the process-global queue makes unreachable.
+                                                                    if queued.is_err() {
+                                                                        m_dgram.datagram_reflect_queue_full.fetch_add(1, Ordering::Relaxed);
+                                                                    }
+                                                                    m_dgram.datagram_reflect_hold.observe(hold);
+                                                                    continue;
+                                                                }
+                                                            }
+                                                            }
                                                             let sz = dgram.len() as u64;
-                                                            if !m_dgram.try_reserve_queued_bytes_with_session(
+                                                            match m_dgram.try_reserve_queued_bytes_with_session(
                                                                 &sm_dgram.queued_bytes,
                                                                 sz,
                                                                 lim_dgram.max_queued_bytes_global,
                                                                 lim_dgram.max_queued_bytes_per_session,
                                                             ) {
-                                                                m_dgram.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
-                                                                continue;
+                                                                crate::server_metrics::ReserveQueuedBytes::Ok => {}
+                                                                crate::server_metrics::ReserveQueuedBytes::Global => {
+                                                                    m_dgram.record_datagram_drop(crate::server_metrics::DatagramDropReason::QueueGlobal);
+                                                                    continue;
+                                                                }
+                                                                crate::server_metrics::ReserveQueuedBytes::Session => {
+                                                                    m_dgram.record_datagram_drop(crate::server_metrics::DatagramDropReason::QueueSession);
+                                                                    continue;
+                                                                }
                                                             }
-                                                            let payload = dgram.as_ref().to_vec();
-                                                            if dgram_tx.send(payload).await.is_err() {
-                                                                crate::server_metrics::ServerMetrics::release_session_queued_bytes(
-                                                                    &sm_dgram.queued_bytes,
-                                                                    &m_dgram,
-                                                                    sz,
-                                                                );
+                                                            let reservation = crate::session_registry::DatagramReservation::new(
+                                                                std::sync::Arc::clone(&sm_dgram),
+                                                                std::sync::Arc::clone(&m_dgram),
+                                                                datagram_capacity_notify.clone(),
+                                                                sz,
+                                                            );
+                                                            let slot = reservation.into_transport_slot(dgram);
+                                                            // On send failure the slot is dropped here, releasing
+                                                            // its reservation via Drop — no manual release needed.
+                                                            if dgram_tx.send(slot).await.is_err() {
                                                                 break;
                                                             }
                                                         }
                                                         close_err = conn_dgram.closed() => {
-                                                            let (mut close_code, mut close_reason) = extract_close_info(&close_err);
-                                                            // Prefer driver-level close details when available:
-                                                            // conn.closed() can resolve first with transport-level no-error
-                                                            // while receive_datagram() still carries ApplicationClosed(code, reason).
-                                                            if close_code.is_none() && close_reason.is_none() {
-                                                                if let Ok(Err(driver_close_err)) = tokio::time::timeout(
-                                                                    std::time::Duration::from_millis(50),
-                                                                    conn_dgram.receive_datagram(),
-                                                                )
-                                                                .await
-                                                                {
-                                                                    let (code2, reason2) = extract_close_info(&driver_close_err);
-                                                                    close_code = code2;
-                                                                    close_reason = reason2;
-                                                                }
-                                                            }
-                                                            session_registry::remove(&id);
-                                                            rate_limit::release_per_ip_session(&peer_ip_for_release);
-                                                            m_dgram.sessions_active.fetch_sub(1, Ordering::Relaxed);
+                                                            let (close_code, close_reason) =
+                                                                resolve_close_info(&conn_dgram, &close_err).await;
+                                                            m_dgram.record_session_close(close_code);
+                                                            counters.release();
                                                             if let Some(ref tx) = closed_tx {
                                                                 if tx
-                                                                    .try_send(SessionEvent::Closed { id: id.clone(), code: close_code, reason: close_reason })
+                                                                    .send(SessionEvent::Closed { id: id.to_string(), code: close_code, reason: close_reason })
+                                                                    .await
                                                                     .is_err()
                                                                 {
                                                                     eprintln!(
-                                                                        "webtransport-native: session closed event dropped for id={}",
+                                                                        "webtransport-native: session closed event dropped for id={} (listener gone)",
                                                                         id
                                                                     );
                                                                 }
@@ -964,16 +1935,16 @@ pub(crate) fn spawn_wtransport_server(
                                                         }
                                                     }
                                                 }
-                                                session_registry::remove(&id);
-                                                rate_limit::release_per_ip_session(&peer_ip_for_release);
-                                                m_dgram.sessions_active.fetch_sub(1, Ordering::Relaxed);
+                                                m_dgram.record_session_close(None);
+                                                counters.release();
                                                 if let Some(ref tx) = closed_tx {
                                                     if tx
-                                                        .try_send(SessionEvent::Closed { id: id.clone(), code: None, reason: None })
+                                                        .send(SessionEvent::Closed { id: id.to_string(), code: None, reason: None })
+                                                        .await
                                                         .is_err()
                                                     {
                                                         eprintln!(
-                                                            "webtransport-native: terminal session event dropped for id={}",
+                                                            "webtransport-native: terminal session event dropped for id={} (listener gone)",
                                                             id
                                                         );
                                                     }
@@ -983,8 +1954,7 @@ pub(crate) fn spawn_wtransport_server(
                                     }
                                     Err(e) => {
                                         metrics.sessions_active.fetch_sub(1, Ordering::SeqCst);
-                                        metrics.handshakes_in_flight.fetch_sub(1, Ordering::Relaxed);
-                                        rate_limit::release_per_ip_session(&peer_ip);
+                                        rate_limit::release_per_ip_session(owner_server_id, peer_ip_addr);
                                         let mut chain = String::new();
                                         let mut src: &dyn std::error::Error = &e;
                                         chain.push_str(&src.to_string());
@@ -993,14 +1963,16 @@ pub(crate) fn spawn_wtransport_server(
                                             chain.push_str(&s.to_string());
                                             src = s;
                                         }
-                                        emit_log(&ltx, !debug_logs, "error", &format!("session accept failed authority={:?} error={}", authority, chain), None, None, None);
+                                        emit_log(&ltx, !debug_logs, "error", format_args!("session accept failed authority={:?} error={}", authority, chain), None, None, None);
                                     }
                                 }
-                            },
-                        );
+                                    },
+                                );
+                            }
+                        }
                     }
-                }
-            }
+                },
+            );
         });
     });
 }
@@ -1009,7 +1981,71 @@ pub(crate) fn spawn_wtransport_server(
 mod tests {
     use super::{report_channel_failure, send_startup_result, CHANNEL_DELIVERY_FAILURE_COUNT};
     use super::{report_tsfn_status, TSFN_DELIVERY_FAILURE_COUNT};
+    use super::{run_bounded_discard, DISCARD_DRAIN_CONCURRENCY};
+    use super::{CLIENT_RUNTIME, RUNTIME};
+    use crate::session_registry::StreamDiscardState;
+    use std::collections::HashSet;
     use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Semaphore;
+
+    #[test]
+    fn server_runtime_has_two_workers() {
+        assert_eq!(
+            RUNTIME.metrics().num_workers(),
+            2,
+            "server runtime must keep two workers; at one it drops 80-95% of \
+             datagrams under sustained load"
+        );
+        assert_eq!(super::runtime_worker_count(), 2);
+    }
+
+    // num_workers() alone would still pass if the threads never materialised.
+    // A *blocking* rendezvous can only be cleared by two OS threads sitting
+    // inside it at the same moment, so each task reports the worker thread it
+    // actually occupies. On a one-worker runtime the second task is never
+    // polled, nothing is reported, and the recv times out.
+    #[test]
+    fn server_runtime_runs_tasks_on_two_wt_server_threads() {
+        let rendezvous = Arc::new(std::sync::Barrier::new(2));
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        for _ in 0..2 {
+            let rendezvous = Arc::clone(&rendezvous);
+            let tx = tx.clone();
+            RUNTIME.spawn(async move {
+                rendezvous.wait();
+                let thread = std::thread::current();
+                let _ = tx.send((thread.id(), thread.name().unwrap_or_default().to_string()));
+            });
+        }
+        drop(tx);
+
+        let mut observed = Vec::new();
+        for _ in 0..2 {
+            observed.push(
+                rx.recv_timeout(Duration::from_secs(10))
+                    .expect("two worker threads must occupy the rendezvous at once"),
+            );
+        }
+
+        let distinct: HashSet<_> = observed.iter().map(|(id, _)| *id).collect();
+        assert_eq!(distinct.len(), 2, "expected two distinct worker threads");
+        for (_, name) in &observed {
+            assert!(
+                name.starts_with("wt-server"),
+                "worker thread named {name:?} must keep the wt-server name"
+            );
+        }
+    }
+
+    // The starvation evidence covers the server receive path only; the client
+    // runtime stays at one worker until something measures it.
+    #[test]
+    fn client_runtime_stays_single_worker() {
+        assert_eq!(CLIENT_RUNTIME.metrics().num_workers(), 1);
+    }
 
     #[test]
     fn report_tsfn_status_counts_failures_only() {
@@ -1032,11 +2068,160 @@ mod tests {
     #[test]
     fn send_startup_result_handles_disconnected_receiver() {
         CHANNEL_DELIVERY_FAILURE_COUNT.store(0, Ordering::Relaxed);
-        let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
+        let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<u16, String>>();
         drop(rx);
         let mut opt = Some(tx);
         send_startup_result(&mut opt, Err("boom".to_string()));
         assert!(opt.is_none());
         assert_eq!(CHANNEL_DELIVERY_FAILURE_COUNT.load(Ordering::Relaxed), 1);
+    }
+
+    // A stream that never finishes draining must not hold up the streams
+    // accepted after it: that was the head-of-line stall in the inline drain.
+    #[tokio::test(flavor = "current_thread")]
+    async fn bounded_discard_stall_does_not_block_other_streams() {
+        let permits = Arc::new(Semaphore::new(DISCARD_DRAIN_CONCURRENCY));
+        let discard = StreamDiscardState::for_test();
+
+        let stalled = tokio::spawn(run_bounded_discard(
+            Arc::clone(&permits),
+            discard.clone(),
+            Duration::from_secs(60),
+            std::future::pending(),
+        ));
+
+        for _ in 0..8 {
+            run_bounded_discard(
+                Arc::clone(&permits),
+                discard.clone(),
+                Duration::from_secs(60),
+                std::future::ready(Ok(())),
+            )
+            .await;
+        }
+
+        assert_eq!(discard.completed(), 8);
+        assert!(discard.error().is_none());
+        assert!(!stalled.is_finished());
+        stalled.abort();
+    }
+
+    // The per-stream deadline is what returns the permit when a peer opens a
+    // stream and then stops sending; an expired drain stays uncounted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn bounded_discard_timeout_releases_permit_without_counting() {
+        let permits = Arc::new(Semaphore::new(1));
+        let discard = StreamDiscardState::for_test();
+
+        run_bounded_discard(
+            Arc::clone(&permits),
+            discard.clone(),
+            Duration::from_millis(50),
+            std::future::pending(),
+        )
+        .await;
+
+        assert_eq!(discard.completed(), 0);
+        assert!(discard.error().is_none());
+        assert_eq!(permits.available_permits(), 1);
+
+        run_bounded_discard(
+            permits,
+            discard.clone(),
+            Duration::from_millis(50),
+            std::future::ready(Ok(())),
+        )
+        .await;
+        assert_eq!(discard.completed(), 1);
+    }
+
+    // Drain errors still reach the N-API waiter through the shared state.
+    #[tokio::test(flavor = "current_thread")]
+    async fn bounded_discard_records_drain_error() {
+        let permits = Arc::new(Semaphore::new(DISCARD_DRAIN_CONCURRENCY));
+        let discard = StreamDiscardState::for_test();
+
+        run_bounded_discard(
+            permits,
+            discard.clone(),
+            Duration::from_secs(60),
+            std::future::ready(Err("E_STREAM_RESET".to_string())),
+        )
+        .await;
+
+        assert_eq!(discard.completed(), 0);
+        assert_eq!(discard.error().as_deref(), Some("E_STREAM_RESET"));
+    }
+}
+
+#[cfg(test)]
+mod server_worker_threads_tests {
+    use super::{parse_server_worker_threads, DEFAULT_SERVER_WORKER_THREADS};
+
+    #[test]
+    fn unset_is_the_measured_default() {
+        assert_eq!(
+            parse_server_worker_threads(None),
+            Ok(DEFAULT_SERVER_WORKER_THREADS)
+        );
+        assert_eq!(DEFAULT_SERVER_WORKER_THREADS, 2);
+    }
+
+    #[test]
+    fn in_range_values_are_accepted() {
+        assert_eq!(parse_server_worker_threads(Some("1")), Ok(1));
+        assert_eq!(parse_server_worker_threads(Some("3")), Ok(3));
+        assert_eq!(parse_server_worker_threads(Some("8")), Ok(8));
+    }
+
+    #[test]
+    fn out_of_range_values_are_refused() {
+        assert!(parse_server_worker_threads(Some("0")).is_err());
+        assert!(parse_server_worker_threads(Some("9")).is_err());
+    }
+
+    #[test]
+    fn non_decimal_values_are_refused() {
+        assert!(parse_server_worker_threads(Some("abc")).is_err());
+        assert!(parse_server_worker_threads(Some("")).is_err());
+        assert!(parse_server_worker_threads(Some(" 3")).is_err());
+        assert!(parse_server_worker_threads(Some("+3")).is_err());
+        assert!(parse_server_worker_threads(Some("3.0")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod server_udp_send_buffer_bytes_tests {
+    use super::parse_server_udp_send_buffer_bytes;
+
+    #[test]
+    fn unset_empty_and_zero_leave_the_socket_unchanged() {
+        assert_eq!(parse_server_udp_send_buffer_bytes(None), Ok(None));
+        assert_eq!(parse_server_udp_send_buffer_bytes(Some("")), Ok(None));
+        assert_eq!(parse_server_udp_send_buffer_bytes(Some("0")), Ok(None));
+    }
+
+    #[test]
+    fn accepts_in_range_values() {
+        assert_eq!(
+            parse_server_udp_send_buffer_bytes(Some("65536")),
+            Ok(Some(65_536))
+        );
+        assert_eq!(
+            parse_server_udp_send_buffer_bytes(Some("67108864")),
+            Ok(Some(67_108_864))
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_or_non_decimal_values() {
+        for raw in [
+            "1", "65535", "67108865", "abc", " 65536", "+65536", "65536.0",
+        ] {
+            let err = parse_server_udp_send_buffer_bytes(Some(raw))
+                .expect_err("the parser must reject an invalid send-buffer knob");
+            assert!(err.contains("WEBTRANSPORT_NATIVE_SERVER_UDP_SNDBUF_BYTES"));
+            assert!(err.contains(raw));
+        }
     }
 }

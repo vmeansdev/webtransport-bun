@@ -1,9 +1,47 @@
 //! Atomic server metrics for Phase 4.3.1. Updated by wtransport accept/session logic.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use tokio::sync::Notify;
 
 use super::histogram::{self, LatencyHistogram};
 use super::metrics::HistogramSnapshot;
+
+/// Result of a global+session queued-bytes reservation.
+///
+/// Recv ingest maps `Global`/`Session` onto datagram drop reasons. The send
+/// path treats both as “not reserved yet” and waits — it must not count as
+/// `datagrams_dropped`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReserveQueuedBytes {
+    Ok,
+    Global,
+    Session,
+}
+
+impl ReserveQueuedBytes {
+    pub fn is_ok(self) -> bool {
+        matches!(self, Self::Ok)
+    }
+}
+
+/// Why one inbound datagram was dropped at ingest. Handshake/stream rate-limit
+/// rejects use `rate_limited_count` only and must not appear here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatagramDropReason {
+    RateLimited,
+    TooLarge,
+    QueueGlobal,
+    QueueSession,
+}
+
+/// Why one reflected reply was refused by the transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReflectSendErrorReason {
+    NotConnected,
+    UnsupportedByPeer,
+    TooLarge,
+}
 
 #[derive(Default)]
 pub struct ServerMetrics {
@@ -12,35 +50,162 @@ pub struct ServerMetrics {
     pub streams_active: AtomicU64,
     pub session_tasks_active: AtomicU64,
     pub stream_tasks_active: AtomicU64,
+    /// The endpoint accept loop, which lives as long as the server does. Kept
+    /// separate so per-session drain checks are not permanently offset by it.
+    /// Diagnostic-only by design: it is read into drain-timeout error strings
+    /// but deliberately NOT exported on `MetricsSnapshot` — the idle gate is
+    /// `spawn_tracked::server_task_count`, which already counts this task.
+    pub accept_tasks_active: AtomicU64,
     pub datagrams_in: AtomicU64,
     pub datagrams_out: AtomicU64,
     pub datagrams_dropped: AtomicU64,
+    pub datagrams_dropped_rate_limited: AtomicU64,
+    pub datagrams_dropped_too_large: AtomicU64,
+    pub datagrams_dropped_queue_global: AtomicU64,
+    pub datagrams_dropped_queue_session: AtomicU64,
+    pub datagrams_skipped_queue_full: AtomicU64,
     pub queued_bytes_global: AtomicU64,
     pub backpressure_wait_count: AtomicU64,
     pub backpressure_timeout_count: AtomicU64,
+    /// Datagram sends that could not be served synchronously and had to take
+    /// the parking N-API path. Every one of those hands JavaScript a promise
+    /// backed by a ThreadsafeFunction — a host event-loop reference — so this
+    /// counter is how exposed a server is to that class, not a latency metric.
+    pub datagram_sends_async: AtomicU64,
+    /// Mirror (one-payload-to-many-sessions) calls this server has served.
+    ///
+    /// Deliberately not folded into `datagram_sends_async`: the mirror hands
+    /// JavaScript no promise, and that counter's meaning is host-loop exposure.
+    /// A new send path invisible to its own meter is the defect these two exist
+    /// to avoid.
+    pub datagram_mirror_calls: AtomicU64,
+    /// Targets those calls *attempted*. Delivery is per-session `datagrams_out`,
+    /// which the mirror increments exactly as every other send path does, so a
+    /// mirrored datagram is indistinguishable from a looped one there.
+    pub datagram_mirror_targets: AtomicU64,
+    /// `sendDatagramMirrorPaced()` calls this server has served.
+    ///
+    /// Its own meter rather than a share of `datagram_mirror_calls`: the two
+    /// paths report different things — one delivery, one admission — and a
+    /// counter that summed them would name neither.
+    pub datagram_mirror_paced_calls: AtomicU64,
+    /// Targets those calls *offered to admission*, so
+    /// `offered - pacer.admittedTargets` is the pacer's `refusedTargets`.
+    /// Delivery stays per-session `datagrams_out`, as on every other send path.
+    pub datagram_mirror_paced_targets: AtomicU64,
+    /// Datagrams the per-server reflector matched, whatever the send did.
+    pub datagram_reflect_hits: AtomicU64,
+    /// Reflected replies quinn accepted. Delivery stays per-session `datagrams_out`.
+    pub datagram_reflect_sent: AtomicU64,
+    /// Reflected replies dropped because the sender-thread queue was full.
+    pub datagram_reflect_queue_full: AtomicU64,
+    /// Reflected replies quinn refused, total and by reason. Never retried:
+    /// the receive task must not park on a send.
+    pub datagram_reflect_send_errors: AtomicU64,
+    pub datagram_reflect_send_not_connected: AtomicU64,
+    pub datagram_reflect_send_unsupported: AtomicU64,
+    pub datagram_reflect_send_too_large: AtomicU64,
+    /// Receive-to-reflection duration for every match.
+    pub datagram_reflect_hold: LatencyHistogram,
+    /// Wakes datagram senders competing for this server instance's global byte budget.
+    pub(crate) datagram_capacity_notify: Arc<Notify>,
     pub rate_limited_count: AtomicU64,
     pub limit_exceeded_count: AtomicU64,
+    /// Sessions the QUIC idle timeout ended — the peer stopped speaking and
+    /// never came back.
+    pub sessions_closed_by_idle: AtomicU64,
+    /// Sessions this server ended itself on shutdown.
+    pub sessions_closed_by_reap: AtomicU64,
+    /// Sessions that ended with some other application close code — the peer
+    /// closing, or a local close carrying a code. Kept so reaped-vs-lost is
+    /// read against the rest of the classified closes, not against a total.
+    pub sessions_closed_other: AtomicU64,
     pub handshake_histogram: LatencyHistogram,
     pub datagram_enqueue_histogram: LatencyHistogram,
     pub stream_open_histogram: LatencyHistogram,
 }
 
 impl ServerMetrics {
+    /// Classify one session teardown by the close code the server observed.
+    ///
+    /// Reaped-vs-lost is the distinction the session-scale axis needs: a
+    /// session this server ended on shutdown says nothing about delivery,
+    /// while one the idle timeout ended says the peer stopped speaking.
+    ///
+    /// A teardown with no observed code is left unclassified rather than
+    /// bucketed as "other": a locally closed connection carries no code on the
+    /// error, and the reap path counts itself at the point it decides to reap.
+    pub fn record_session_close(&self, code: Option<u32>) {
+        let counter = match code {
+            Some(crate::IDLE_TIMEOUT_CLOSE_CODE) => &self.sessions_closed_by_idle,
+            Some(crate::SERVER_CLOSING_CLOSE_CODE) => &self.sessions_closed_by_reap,
+            Some(_) => &self.sessions_closed_other,
+            None => return,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One session ended because this server is shutting down.
+    pub fn record_session_reaped(&self) {
+        self.sessions_closed_by_reap.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn try_acquire_handshake(&self, max: u64) -> bool {
+        self.handshakes_in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < max).then_some(current + 1)
+            })
+            .is_ok()
+    }
+
+    pub fn release_handshake(&self) {
+        self.handshakes_in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_sub(1))
+            })
+            .ok();
+    }
+
     /// Try to reserve n bytes against global budget using compare-and-swap.
     pub fn try_reserve_queued_bytes(&self, n: u64, max: u64) -> bool {
         self.queued_bytes_global
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                if current + n <= max {
-                    Some(current + n)
-                } else {
-                    None
-                }
+                current
+                    .checked_add(n)
+                    .and_then(|next| (next <= max).then_some(next))
             })
             .is_ok()
     }
 
     pub fn release_queued_bytes(&self, n: u64) {
         self.queued_bytes_global.fetch_sub(n, Ordering::Relaxed);
+    }
+
+    /// Whether the datagram receive loop should park until session capacity
+    /// frees. A park is deferral, not denial: a budget that can NEVER hold a
+    /// `min_next_bytes` datagram (session_max < min_next_bytes) must not park
+    /// — no release could ever satisfy it and ingest would stall forever.
+    /// Such sessions fall through to receive + actual-size reservation, where
+    /// a genuinely oversized payload is rejected per datagram as before.
+    pub fn session_queue_cannot_fit(
+        session_queued: &std::sync::atomic::AtomicU64,
+        session_max: u64,
+        min_next_bytes: u64,
+    ) -> bool {
+        if min_next_bytes > session_max {
+            return false;
+        }
+        session_queued
+            .load(Ordering::Relaxed)
+            .saturating_add(min_next_bytes)
+            > session_max
+    }
+
+    /// Count one park of `receive_datagram` because session slack cannot fit
+    /// `max_datagram_size`. Not a drop: nothing was pulled into the addon.
+    pub fn record_datagram_skip_queue_full(&self) {
+        self.datagrams_skipped_queue_full
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Try to reserve n bytes against both global and per-session budget using CAS.
@@ -50,23 +215,58 @@ impl ServerMetrics {
         n: u64,
         global_max: u64,
         session_max: u64,
-    ) -> bool {
+    ) -> ReserveQueuedBytes {
         if !self.try_reserve_queued_bytes(n, global_max) {
-            return false;
+            return ReserveQueuedBytes::Global;
         }
         let ok = session_queued
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                if current + n <= session_max {
-                    Some(current + n)
-                } else {
-                    None
-                }
+                current
+                    .checked_add(n)
+                    .and_then(|next| (next <= session_max).then_some(next))
             })
             .is_ok();
         if !ok {
             self.release_queued_bytes(n);
+            return ReserveQueuedBytes::Session;
         }
-        ok
+        ReserveQueuedBytes::Ok
+    }
+
+    /// Count one inbound datagram drop. Increments `datagrams_dropped` and the
+    /// matching reason. Datagram rate-limit also bumps `rate_limited_count`.
+    pub fn record_datagram_drop(&self, reason: DatagramDropReason) {
+        self.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
+        match reason {
+            DatagramDropReason::RateLimited => {
+                self.datagrams_dropped_rate_limited
+                    .fetch_add(1, Ordering::Relaxed);
+                self.rate_limited_count.fetch_add(1, Ordering::Relaxed);
+            }
+            DatagramDropReason::TooLarge => {
+                self.datagrams_dropped_too_large
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            DatagramDropReason::QueueGlobal => {
+                self.datagrams_dropped_queue_global
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            DatagramDropReason::QueueSession => {
+                self.datagrams_dropped_queue_session
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn record_reflect_send_error(&self, reason: ReflectSendErrorReason) {
+        self.datagram_reflect_send_errors
+            .fetch_add(1, Ordering::Relaxed);
+        let counter = match reason {
+            ReflectSendErrorReason::NotConnected => &self.datagram_reflect_send_not_connected,
+            ReflectSendErrorReason::UnsupportedByPeer => &self.datagram_reflect_send_unsupported,
+            ReflectSendErrorReason::TooLarge => &self.datagram_reflect_send_too_large,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn release_session_queued_bytes(
@@ -76,6 +276,19 @@ impl ServerMetrics {
     ) {
         session_queued.fetch_sub(n, Ordering::Relaxed);
         metrics.release_queued_bytes(n);
+    }
+
+    /// Release datagram queue credit and wake both the affected session and
+    /// every session competing for this server instance's global budget.
+    pub fn release_datagram_capacity(
+        &self,
+        session_queued: &std::sync::atomic::AtomicU64,
+        session_notify: &Notify,
+        n: u64,
+    ) {
+        Self::release_session_queued_bytes(session_queued, self, n);
+        session_notify.notify_waiters();
+        self.datagram_capacity_notify.notify_waiters();
     }
 
     pub(crate) fn snapshot(
@@ -88,29 +301,133 @@ impl ServerMetrics {
             default_cert_selections: 0,
             unknown_sni_rejected_count: 0,
         });
-        ServerMetricsSnapshot {
+        let ring_bypass = crate::datagram_reflector::ring_bypass_stats();
+        let snap = ServerMetricsSnapshot {
             now_ms: js_sys_timestamp(),
             sessions_active: self.sessions_active.load(Ordering::Relaxed) as u32,
             session_tasks_active: self.session_tasks_active.load(Ordering::Relaxed) as u32,
             stream_tasks_active: self.stream_tasks_active.load(Ordering::Relaxed) as u32,
             handshakes_in_flight: self.handshakes_in_flight.load(Ordering::Relaxed) as u32,
             streams_active: self.streams_active.load(Ordering::Relaxed) as u32,
-            datagrams_in: self.datagrams_in.load(Ordering::Relaxed) as u32,
-            datagrams_out: self.datagrams_out.load(Ordering::Relaxed) as u32,
-            datagrams_dropped: self.datagrams_dropped.load(Ordering::Relaxed) as u32,
-            queued_bytes_global: self.queued_bytes_global.load(Ordering::Relaxed) as u32,
-            backpressure_wait_count: self.backpressure_wait_count.load(Ordering::Relaxed) as u32,
+            datagrams_in: self.datagrams_in.load(Ordering::Relaxed) as f64,
+            datagrams_out: self.datagrams_out.load(Ordering::Relaxed) as f64,
+            datagrams_dropped: self.datagrams_dropped.load(Ordering::Relaxed) as f64,
+            datagrams_dropped_rate_limited: Some(
+                self.datagrams_dropped_rate_limited.load(Ordering::Relaxed) as f64,
+            ),
+            datagrams_dropped_too_large: Some(
+                self.datagrams_dropped_too_large.load(Ordering::Relaxed) as f64,
+            ),
+            datagrams_dropped_queue_global: Some(
+                self.datagrams_dropped_queue_global.load(Ordering::Relaxed) as f64,
+            ),
+            datagrams_dropped_queue_session: Some(
+                self.datagrams_dropped_queue_session.load(Ordering::Relaxed) as f64,
+            ),
+            datagrams_skipped_queue_full: Some(
+                self.datagrams_skipped_queue_full.load(Ordering::Relaxed) as f64,
+            ),
+            queued_bytes_global: self.queued_bytes_global.load(Ordering::Relaxed) as f64,
+            backpressure_wait_count: self.backpressure_wait_count.load(Ordering::Relaxed) as f64,
             backpressure_timeout_count: self.backpressure_timeout_count.load(Ordering::Relaxed)
-                as u32,
-            rate_limited_count: self.rate_limited_count.load(Ordering::Relaxed) as u32,
-            limit_exceeded_count: self.limit_exceeded_count.load(Ordering::Relaxed) as u32,
-            sni_cert_selections: tls_metrics.sni_cert_selections as u32,
-            default_cert_selections: tls_metrics.default_cert_selections as u32,
-            unknown_sni_rejected_count: tls_metrics.unknown_sni_rejected_count as u32,
+                as f64,
+            datagram_sends_async: Some(self.datagram_sends_async.load(Ordering::Relaxed) as f64),
+            datagram_mirror_calls: Some(self.datagram_mirror_calls.load(Ordering::Relaxed) as f64),
+            datagram_mirror_targets: Some(
+                self.datagram_mirror_targets.load(Ordering::Relaxed) as f64
+            ),
+            datagram_mirror_paced_calls: Some(
+                self.datagram_mirror_paced_calls.load(Ordering::Relaxed) as f64,
+            ),
+            datagram_mirror_paced_targets: Some(
+                self.datagram_mirror_paced_targets.load(Ordering::Relaxed) as f64,
+            ),
+            mirror_reports_dropped: Some(crate::egress_pacer::reports_dropped() as f64),
+            datagram_reflect_hits: Some(self.datagram_reflect_hits.load(Ordering::Relaxed) as f64),
+            datagram_reflect_sent: Some(self.datagram_reflect_sent.load(Ordering::Relaxed) as f64),
+            datagram_reflect_queue_full: Some(
+                self.datagram_reflect_queue_full.load(Ordering::Relaxed) as f64,
+            ),
+            datagram_reflect_send_errors: Some(
+                self.datagram_reflect_send_errors.load(Ordering::Relaxed) as f64,
+            ),
+            datagram_reflect_ring_bypass_marked: Some(ring_bypass.marked as f64),
+            datagram_reflect_ring_bypass_refreshed: Some(ring_bypass.refreshed as f64),
+            datagram_reflect_ring_bypass_refused: Some(ring_bypass.refused as f64),
+            datagram_reflect_ring_bypass_expired: Some(ring_bypass.expired as f64),
+            datagram_reflect_ring_bypassed: Some(ring_bypass.bypassed as f64),
+            datagram_reflect_ring_direct_blocked: Some(ring_bypass.direct_blocked as f64),
+            datagram_reflect_ring_direct_errors: Some(ring_bypass.direct_errors as f64),
+            datagram_reflect_ring_gso_fallback: Some(ring_bypass.gso_fallback as f64),
+            udp_send_batch_calls: Some(crate::udp_send_batch::stats().calls as f64),
+            udp_send_batch_messages: Some(crate::udp_send_batch::stats().messages as f64),
+            udp_send_batch_fallback: Some(crate::udp_send_batch::stats().fallback as f64),
+            udp_send_batch_blocked: Some(crate::udp_send_batch::stats().blocked as f64),
+            udp_send_batch_dropped: Some(crate::udp_send_batch::stats().dropped as f64),
+            udp_send_batch_congestion_dropped: Some(
+                crate::udp_send_batch::stats().congestion_dropped as f64,
+            ),
+            udp_send_batch_errors: Some(crate::udp_send_batch::stats().errors as f64),
+            udp_send_batch_max_batch: Some(crate::udp_send_batch::stats().max_batch as f64),
+            datagram_pumps_spawned: Some(wtransport::datagram_driver_stats().pumps_spawned as f64),
+            datagram_pumps_live: Some(wtransport::datagram_driver_stats().pumps_live as f64),
+            datagram_reflect_send_errors_by_reason: Some(
+                super::metrics::ReflectSendErrorsSnapshot {
+                    not_connected: self
+                        .datagram_reflect_send_not_connected
+                        .load(Ordering::Relaxed) as f64,
+                    unsupported_by_peer: self
+                        .datagram_reflect_send_unsupported
+                        .load(Ordering::Relaxed) as f64,
+                    too_large: self.datagram_reflect_send_too_large.load(Ordering::Relaxed) as f64,
+                },
+            ),
+            datagram_reflect_hold: if self.datagram_reflect_hold.count() > 0 {
+                Some(histogram_to_snapshot(&self.datagram_reflect_hold))
+            } else {
+                None
+            },
+            rate_limited_count: self.rate_limited_count.load(Ordering::Relaxed) as f64,
+            limit_exceeded_count: self.limit_exceeded_count.load(Ordering::Relaxed) as f64,
+            sessions_closed_by_idle: Some(
+                self.sessions_closed_by_idle.load(Ordering::Relaxed) as f64
+            ),
+            sessions_closed_by_reap: Some(
+                self.sessions_closed_by_reap.load(Ordering::Relaxed) as f64
+            ),
+            sessions_closed_other: Some(self.sessions_closed_other.load(Ordering::Relaxed) as f64),
+            native_async_ops_pending: 0,
+            sni_cert_selections: tls_metrics.sni_cert_selections as f64,
+            default_cert_selections: tls_metrics.default_cert_selections as f64,
+            unknown_sni_rejected_count: tls_metrics.unknown_sni_rejected_count as f64,
+            native_session_registry_entries: 0,
+            native_tracked_tasks: 0,
+            native_rate_limit_entries: 0,
+            native_bidi_handles_live: 0,
+            native_uni_send_handles_live: 0,
+            native_uni_recv_handles_live: 0,
+            sinks_active: None,
+            sink_dropped_records: None,
             handshake_latency: Some(histogram_to_snapshot(&self.handshake_histogram)),
             datagram_enqueue_latency: Some(histogram_to_snapshot(&self.datagram_enqueue_histogram)),
             stream_open_latency: Some(histogram_to_snapshot(&self.stream_open_histogram)),
-        }
+            quic_sessions: None,
+            quic_udp_datagrams_received: None,
+            quic_udp_datagrams_sent: None,
+            quic_datagram_frames_received: None,
+            quic_datagram_frames_sent: None,
+            quic_packets_sent: None,
+            quic_packets_lost: None,
+        };
+        debug_assert_eq!(
+            self.datagrams_dropped.load(Ordering::Relaxed),
+            self.datagrams_dropped_rate_limited.load(Ordering::Relaxed)
+                + self.datagrams_dropped_too_large.load(Ordering::Relaxed)
+                + self.datagrams_dropped_queue_global.load(Ordering::Relaxed)
+                + self.datagrams_dropped_queue_session.load(Ordering::Relaxed),
+            "native datagram drop identity: total must equal the four ingest reasons",
+        );
+        snap
     }
 }
 
@@ -138,5 +455,266 @@ fn js_sys_timestamp() -> f64 {
     #[cfg(target_arch = "wasm32")]
     {
         0.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServerMetrics;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::thread;
+
+    #[test]
+    fn handshake_admission_allows_exact_limit_and_release_reopens_capacity() {
+        let metrics = ServerMetrics::default();
+
+        assert!(metrics.try_acquire_handshake(2));
+        assert!(metrics.try_acquire_handshake(2));
+        assert!(!metrics.try_acquire_handshake(2));
+        assert_eq!(metrics.handshakes_in_flight.load(Ordering::Acquire), 2);
+
+        metrics.release_handshake();
+        assert!(metrics.try_acquire_handshake(2));
+        metrics.release_handshake();
+        metrics.release_handshake();
+        assert_eq!(metrics.handshakes_in_flight.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn concurrent_handshake_admission_never_exceeds_cap() {
+        let metrics = Arc::new(ServerMetrics::default());
+        let mut threads = Vec::new();
+        for _ in 0..32 {
+            let metrics = Arc::clone(&metrics);
+            threads.push(thread::spawn(move || metrics.try_acquire_handshake(4)));
+        }
+        let admitted = threads
+            .into_iter()
+            .filter_map(|thread| thread.join().ok())
+            .filter(|admitted| *admitted)
+            .count();
+
+        assert_eq!(admitted, 4);
+        assert_eq!(metrics.handshakes_in_flight.load(Ordering::Acquire), 4);
+    }
+
+    fn assert_drop_identity(metrics: &ServerMetrics) {
+        let total = metrics.datagrams_dropped.load(Ordering::Relaxed);
+        let sum = metrics
+            .datagrams_dropped_rate_limited
+            .load(Ordering::Relaxed)
+            + metrics.datagrams_dropped_too_large.load(Ordering::Relaxed)
+            + metrics
+                .datagrams_dropped_queue_global
+                .load(Ordering::Relaxed)
+            + metrics
+                .datagrams_dropped_queue_session
+                .load(Ordering::Relaxed);
+        assert_eq!(total, sum);
+        let snap = metrics.snapshot(None);
+        assert_eq!(snap.datagrams_dropped, total as f64);
+        assert_eq!(
+            snap.datagrams_dropped,
+            snap.datagrams_dropped_rate_limited.unwrap()
+                + snap.datagrams_dropped_too_large.unwrap()
+                + snap.datagrams_dropped_queue_global.unwrap()
+                + snap.datagrams_dropped_queue_session.unwrap()
+        );
+    }
+
+    #[test]
+    fn datagram_drop_reasons_cover_all_four_ingest_paths() {
+        use super::{DatagramDropReason, ReserveQueuedBytes};
+
+        let metrics = ServerMetrics::default();
+        let session = std::sync::atomic::AtomicU64::new(0);
+
+        assert_eq!(
+            metrics.try_reserve_queued_bytes_with_session(&session, 10, 100, 100),
+            ReserveQueuedBytes::Ok
+        );
+        assert_eq!(metrics.queued_bytes_global.load(Ordering::Relaxed), 10);
+        ServerMetrics::release_session_queued_bytes(&session, &metrics, 10);
+
+        metrics.record_datagram_drop(DatagramDropReason::RateLimited);
+        metrics.record_datagram_drop(DatagramDropReason::TooLarge);
+        assert_eq!(
+            metrics.try_reserve_queued_bytes_with_session(&session, 10, 5, 100),
+            ReserveQueuedBytes::Global
+        );
+        metrics.record_datagram_drop(DatagramDropReason::QueueGlobal);
+        assert_eq!(
+            metrics.try_reserve_queued_bytes_with_session(&session, 10, 100, 5),
+            ReserveQueuedBytes::Session
+        );
+        metrics.record_datagram_drop(DatagramDropReason::QueueSession);
+
+        assert_eq!(metrics.datagrams_dropped.load(Ordering::Relaxed), 4);
+        assert_eq!(
+            metrics
+                .datagrams_dropped_rate_limited
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics.datagrams_dropped_too_large.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics
+                .datagrams_dropped_queue_global
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics
+                .datagrams_dropped_queue_session
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(metrics.rate_limited_count.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.queued_bytes_global.load(Ordering::Relaxed), 0);
+        assert_eq!(session.load(Ordering::Relaxed), 0);
+        assert_drop_identity(&metrics);
+    }
+
+    #[test]
+    fn session_queue_cannot_fit_matches_legal_datagram_reserve() {
+        let queued = std::sync::atomic::AtomicU64::new(0);
+        assert!(!ServerMetrics::session_queue_cannot_fit(&queued, 100, 10));
+        queued.store(90, Ordering::Relaxed);
+        assert!(!ServerMetrics::session_queue_cannot_fit(&queued, 100, 10));
+        queued.store(91, Ordering::Relaxed);
+        assert!(ServerMetrics::session_queue_cannot_fit(&queued, 100, 10));
+        queued.store(100, Ordering::Relaxed);
+        assert!(ServerMetrics::session_queue_cannot_fit(&queued, 100, 1));
+
+        // 1150 B into 2 MiB: 1823 packets leave 702 B slack, which cannot fit 1200.
+        const PACKED: u64 = 1823 * 1150;
+        const SESSION_MAX: u64 = 2 * 1024 * 1024;
+        const MAX_DATAGRAM: u64 = 1200;
+        assert_eq!(PACKED, 2_096_450);
+        assert_eq!(SESSION_MAX, 2_097_152);
+        queued.store(PACKED, Ordering::Relaxed);
+        assert!(ServerMetrics::session_queue_cannot_fit(
+            &queued,
+            SESSION_MAX,
+            MAX_DATAGRAM
+        ));
+        assert!(!ServerMetrics::session_queue_cannot_fit(
+            &queued,
+            SESSION_MAX,
+            702
+        ));
+    }
+
+    /// A session budget smaller than max_datagram_size can never satisfy the
+    /// park condition — parking there stalls ingest forever (zero datagrams
+    /// ever delivered, the backpressure-suite regression). Degenerate budgets
+    /// must fall through to receive + actual-size reservation instead.
+    #[test]
+    fn a_budget_below_the_min_datagram_never_parks() {
+        let queued = std::sync::atomic::AtomicU64::new(0);
+        // Empty queue, budget 4 bytes, max datagram 1200: park would wait on a
+        // release that can never come.
+        assert!(!ServerMetrics::session_queue_cannot_fit(&queued, 4, 1200));
+        // Even a partially filled degenerate budget must not park.
+        queued.store(2, Ordering::Relaxed);
+        assert!(!ServerMetrics::session_queue_cannot_fit(&queued, 4, 1200));
+        // Boundary: a budget of exactly one max-size datagram parks normally.
+        queued.store(1, Ordering::Relaxed);
+        assert!(ServerMetrics::session_queue_cannot_fit(&queued, 1200, 1200));
+        queued.store(0, Ordering::Relaxed);
+        assert!(!ServerMetrics::session_queue_cannot_fit(
+            &queued, 1200, 1200
+        ));
+    }
+
+    #[test]
+    fn skip_queue_full_does_not_count_as_datagram_drop() {
+        let metrics = ServerMetrics::default();
+        metrics.record_datagram_skip_queue_full();
+        assert_eq!(
+            metrics.datagrams_skipped_queue_full.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(metrics.datagrams_dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics
+                .datagrams_dropped_queue_session
+                .load(Ordering::Relaxed),
+            0
+        );
+        let snap = metrics.snapshot(None);
+        assert_eq!(snap.datagrams_skipped_queue_full, Some(1.0));
+        assert_drop_identity(&metrics);
+    }
+
+    #[test]
+    fn handshake_rate_limit_does_not_count_as_datagram_drop() {
+        let metrics = ServerMetrics::default();
+        metrics.rate_limited_count.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(metrics.datagrams_dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics
+                .datagrams_dropped_rate_limited
+                .load(Ordering::Relaxed),
+            0
+        );
+        metrics.record_datagram_drop(super::DatagramDropReason::RateLimited);
+        assert_eq!(metrics.datagrams_dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.rate_limited_count.load(Ordering::Relaxed), 2);
+        assert_drop_identity(&metrics);
+    }
+
+    #[test]
+    fn reflector_counters_export_zero_and_no_histogram_until_observed() {
+        use super::ReflectSendErrorReason;
+
+        let metrics = ServerMetrics::default();
+        let snapshot = metrics.snapshot(None);
+        assert_eq!(snapshot.datagram_reflect_hits, Some(0.0));
+        assert_eq!(snapshot.datagram_reflect_sent, Some(0.0));
+        assert_eq!(snapshot.datagram_reflect_send_errors, Some(0.0));
+        assert_eq!(snapshot.datagram_reflect_queue_full, Some(0.0));
+        let by_reason = snapshot
+            .datagram_reflect_send_errors_by_reason
+            .expect("by-reason block");
+        assert_eq!(
+            (
+                by_reason.not_connected,
+                by_reason.unsupported_by_peer,
+                by_reason.too_large
+            ),
+            (0.0, 0.0, 0.0)
+        );
+        assert!(snapshot.datagram_reflect_hold.is_none());
+
+        metrics
+            .datagram_reflect_hits
+            .fetch_add(3, Ordering::Relaxed);
+        metrics
+            .datagram_reflect_sent
+            .fetch_add(2, Ordering::Relaxed);
+        metrics.record_reflect_send_error(ReflectSendErrorReason::TooLarge);
+        metrics
+            .datagram_reflect_hold
+            .observe(std::time::Duration::from_micros(40));
+        let snapshot = metrics.snapshot(None);
+        assert_eq!(snapshot.datagram_reflect_hits, Some(3.0));
+        assert_eq!(snapshot.datagram_reflect_sent, Some(2.0));
+        assert_eq!(snapshot.datagram_reflect_send_errors, Some(1.0));
+        assert_eq!(
+            snapshot
+                .datagram_reflect_send_errors_by_reason
+                .expect("by-reason")
+                .too_large,
+            1.0
+        );
+        let hold = snapshot
+            .datagram_reflect_hold
+            .expect("histogram after one observation");
+        assert_eq!(hold.count, 1.0);
     }
 }

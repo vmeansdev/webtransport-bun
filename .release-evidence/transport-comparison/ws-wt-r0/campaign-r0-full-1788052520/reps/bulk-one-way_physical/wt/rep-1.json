@@ -1,0 +1,119 @@
+{
+  "sampleUnit": "Mbps",
+  "samples": [
+    306.25672,
+    344.44888,
+    318.58272,
+    288.88504,
+    323.0132,
+    331.1576,
+    344.336,
+    280.69536,
+    257.28208,
+    265.31328,
+    296.74128,
+    300.46336,
+    263.70144,
+    267.90064,
+    289.21616,
+    301.59696,
+    304.95888,
+    306.21248,
+    346.9504,
+    317.00288,
+    309.27408,
+    306.89248,
+    318.93488,
+    290.46736,
+    285.91456,
+    293.99056,
+    308.14096,
+    319.247648772203
+  ],
+  "percentiles": {
+    "p1": 259.0153072,
+    "p50": 305.58568,
+    "p95": 344.40937199999996,
+    "p99": 346.2749896
+  },
+  "ledger": {
+    "attempted": 1600,
+    "queued": 1600,
+    "serverObserved": 1600,
+    "acknowledged": 1600,
+    "delivered": 1600,
+    "dropped": 0,
+    "expired": 0,
+    "harnessOverheadBytes": 0,
+    "histogram": {
+      "unit": "Mbps",
+      "boundaries": [
+        0,
+        1,
+        2,
+        5,
+        10,
+        20,
+        50,
+        100,
+        200,
+        500,
+        1000
+      ],
+      "counts": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        28,
+        0,
+        0
+      ]
+    }
+  },
+  "admissionCounters": {
+    "schemaVersion": "v1",
+    "handshakes": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "sessions": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "activePeak": 1
+    },
+    "streams": {
+      "attempted": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "datagrams": {
+      "attempted": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "rateLimited": 0
+    }
+  },
+  "provenance": {
+    "attestation": "dm1-d17d3a72735c3f8123450b7c6f41d5c8",
+    "driverRunId": "ws-wt-r0-campaign-r0-full-1788052520-bulk-one-way_physical-1788101955265-rep-1",
+    "clockMethod": "performance.timeOrigin+performance.now",
+    "sampleCount": 28,
+    "firstSampleAtMs": 1788101976785.5615,
+    "lastSampleAtMs": 1788101979554.5605
+  },
+  "loopUtilization": {
+    "busyMs": 0,
+    "windowMs": 2826.7177734375
+  },
+  "roundTrips": [],
+  "deliveredBytes": 104857600
+}

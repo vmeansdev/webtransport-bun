@@ -1,0 +1,325 @@
+{
+  "schema": "fanout-physical-preflight-receipt/v1",
+  "candidate": "ab6126a3c67b69174a5c5770f1af51484e43f09e",
+  "campaignId": "fanout-pilot-r1",
+  "mode": "physical",
+  "transport": "ws",
+  "cellId": "ticker-fanout/rate-250",
+  "cohortCell": "ticker 250",
+  "pass": "2x",
+  "generatedAtMs": 1788898373952,
+  "topology": {
+    "publisherCount": 1,
+    "workerCount": 8,
+    "subscriberCount": 100,
+    "sessionCount": 101,
+    "windowCount": 10,
+    "measuredDurationMs": 10000,
+    "messageBytes": 100
+  },
+  "offer": {
+    "pacingSource": "preflight-input",
+    "publisherRatePerSecond": 500,
+    "offeredIngressPerSecond": 500,
+    "rowIngressPerWindow": 250,
+    "bindingIngressPerWindow": 250,
+    "requiredAcceptedPerWindow": 500,
+    "acceptedPredicate": "at-least"
+  },
+  "preconditions": {
+    "macLoad1": 1.958984375,
+    "macLoadBound": 4,
+    "rigLoad1": 0.03,
+    "rigLoadBound": 0.5,
+    "rigIsThisHost": false,
+    "enforced": true,
+    "failures": [],
+    "ok": true
+  },
+  "runId": "fanout-pilot-r1/ticker-fanout/rate-250/ws/measured-1",
+  "macClockId": "a860c6101fba540f2b7689bcedc68f8f81dfa67b8b7e349db07a876a6f705f51",
+  "lifecycle": {
+    "completed": false,
+    "dispatchOk": false,
+    "failureCode": "RELAY_DELIVERY",
+    "reason": "cohort executor refused (RELAY_DELIVERY): publisher-child-0: DRAIN_DEADLINE_EXCEEDED: 148 of 5000 offered frames unacknowledged at the drain deadline",
+    "sealedPath": null
+  },
+  "windows": {
+    "note": "origin-window counts: offered from the publisher partials, accepted from the Linux relay observation, delivered from the eight worker partials; never wall-clock samples",
+    "offeredByOriginWindow": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "acceptedByOriginWindow": [
+      500,
+      500,
+      500,
+      500,
+      500,
+      500,
+      500,
+      500,
+      500,
+      352
+    ],
+    "deliveredByOriginWindow": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "relayWritesCompletedByOriginWindow": [
+      50000,
+      50000,
+      50000,
+      50000,
+      50000,
+      50000,
+      50000,
+      50000,
+      50000,
+      35200
+    ]
+  },
+  "totals": {
+    "offered": 0,
+    "accepted": 4852,
+    "delivered": 0,
+    "deliveredBytes": 0,
+    "expectedDelivered": 485200,
+    "ingressRefusals": 0
+  },
+  "warmup": {
+    "epochMs": 5000,
+    "expectedIngress": 10,
+    "expectedDeliveries": 1000,
+    "macOffered": 10,
+    "macDelivered": 1000,
+    "relayIngress": 10,
+    "relayDeliveries": 1000
+  },
+  "faults": {
+    "relayQueueDrops": 0,
+    "relayWriteTimeouts": 0,
+    "relayDisconnectUndelivered": 0,
+    "relayMalformedIngress": 0,
+    "relayDuplicateIngress": 0,
+    "relayReorderedIngress": 0,
+    "workerMalformed": 0,
+    "workerDuplicate": 0,
+    "workerReorder": 0,
+    "workerDisconnect": 0
+  },
+  "queue": {
+    "relayQueueItemsPeak": 100,
+    "relayQueueBytesPeak": 47290,
+    "perSubscriberCap": 64,
+    "note": "relay-wide queued-item peak over the window (an upper bound on any one subscriber's depth); the relay keeps no per-subscriber peak"
+  },
+  "relayBusy": {
+    "instrument": "onRelayWork spans (server child busyMs on server-loop-utilization/v1)",
+    "busyMs": 8973,
+    "windowMs": 10494,
+    "fraction": 0.8550600343053173
+  },
+  "serverChildCpu": {
+    "measured": {
+      "instrument": "rig supervisor serverChildCpu on rig-server-snapshot-receipt/v1: /proc/<pid>/task/<pid>/stat and /proc/<pid>/stat at measure-start ack and capture ack",
+      "processMs": 11040,
+      "mainThreadMs": 9830,
+      "intervalMs": 10503,
+      "processCore": 1.0511282490716938,
+      "mainThreadCore": 0.9359230695991622,
+      "bound": 0.8,
+      "sampleCount": 2,
+      "covered": true
+    },
+    "warmup": {
+      "instrument": "preflight sampler: /proc/<pid>/stat and /proc/<pid>/task/<pid>/stat over ssh to hermes-admin@10.99.0.2",
+      "processMs": 377.5422844530177,
+      "mainThreadMs": 166.74754236249095,
+      "intervalMs": 4779.239167,
+      "processCore": 0.07899631536749534,
+      "mainThreadCore": 0.03488997652887099,
+      "bound": null,
+      "sampleCount": 21,
+      "covered": true
+    },
+    "perSecondNote": "main-thread core per wall-clock second from the barrier's measure start, from the preflight sampler; recorded, not gated",
+    "perSecondMainThreadCore": [
+      0.878665203983976,
+      0.9101759476813349,
+      0.9210651253201768,
+      0.9998400001741365,
+      0.9131275057966668,
+      0.8929765945262379,
+      1.0079047177471239,
+      0.9908820039878665,
+      1.0001639703111722,
+      0.9928196018955204
+    ],
+    "perSecondMainThreadCoreMax": 1.0079047177471239,
+    "sampler": {
+      "instrument": "preflight sampler: /proc/<pid>/stat and /proc/<pid>/task/<pid>/stat over ssh to hermes-admin@10.99.0.2",
+      "cadenceMs": 200,
+      "sampleCount": 112,
+      "stderrTail": "",
+      "pid": 241983,
+      "capturePid": 241983,
+      "pidMatchesCapture": true
+    }
+  },
+  "rig": {
+    "coreMhz": {
+      "warmupStart": [
+        2100,
+        3700.07,
+        3699.752,
+        3701.402,
+        2960.058,
+        3679.598,
+        3699.94,
+        3674.085
+      ],
+      "warmupEnd": [
+        3698.47,
+        2668.555,
+        2466.977,
+        2466.661,
+        2959.293,
+        2100,
+        2961.089,
+        2100
+      ],
+      "measureStart": [
+        2466.736,
+        2466.445,
+        3699.733,
+        3702.039,
+        2466.356,
+        2100,
+        3701.907,
+        2938.181
+      ],
+      "measureStop": [
+        3700.05,
+        3699.964,
+        3700.014,
+        3698.43,
+        2962.398,
+        2100,
+        3698.168,
+        2100
+      ]
+    },
+    "rssKb": {
+      "warmupStart": 126216,
+      "measureStop": 111612,
+      "peak": 126216
+    },
+    "nofile": {
+      "soft": 524288,
+      "hard": 524288
+    }
+  },
+  "mac": {
+    "load1AtStart": 1.958984375,
+    "load1Peak": 2.21728515625,
+    "workers": [
+      {
+        "childId": "subscriber-worker-0",
+        "workerIndex": 0,
+        "pid": 60597,
+        "cpuMsOverMeasuredWindow": 1866.122612812615,
+        "cpuCore": 0.1866122612812615
+      },
+      {
+        "childId": "subscriber-worker-1",
+        "workerIndex": 1,
+        "pid": 60598,
+        "cpuMsOverMeasuredWindow": 1976.122612812615,
+        "cpuCore": 0.1976122612812615
+      },
+      {
+        "childId": "subscriber-worker-2",
+        "workerIndex": 2,
+        "pid": 60599,
+        "cpuMsOverMeasuredWindow": 1966.122612812615,
+        "cpuCore": 0.1966122612812615
+      },
+      {
+        "childId": "subscriber-worker-3",
+        "workerIndex": 3,
+        "pid": 60600,
+        "cpuMsOverMeasuredWindow": 1982.3100561278875,
+        "cpuCore": 0.19823100561278875
+      },
+      {
+        "childId": "subscriber-worker-4",
+        "workerIndex": 4,
+        "pid": 60601,
+        "cpuMsOverMeasuredWindow": 1888.9787317948587,
+        "cpuCore": 0.18889787317948586
+      },
+      {
+        "childId": "subscriber-worker-5",
+        "workerIndex": 5,
+        "pid": 60602,
+        "cpuMsOverMeasuredWindow": 1858.9787317948587,
+        "cpuCore": 0.18589787317948586
+      },
+      {
+        "childId": "subscriber-worker-6",
+        "workerIndex": 6,
+        "pid": 60603,
+        "cpuMsOverMeasuredWindow": 1868.9787317948587,
+        "cpuCore": 0.18689787317948586
+      },
+      {
+        "childId": "subscriber-worker-7",
+        "workerIndex": 7,
+        "pid": 60604,
+        "cpuMsOverMeasuredWindow": 1869.9351694973425,
+        "cpuCore": 0.18699351694973426
+      }
+    ]
+  },
+  "verdict": "FAIL",
+  "failedPredicates": [
+    {
+      "predicate": "LIFECYCLE_COMPLETE",
+      "detail": "RELAY_DELIVERY: cohort executor refused (RELAY_DELIVERY): publisher-child-0: DRAIN_DEADLINE_EXCEEDED: 148 of 5000 offered frames unacknowledged at the drain deadline"
+    },
+    {
+      "predicate": "OFFERED_EQUALS_ACCEPTED",
+      "detail": "no complete origin-window series: offered 0, accepted 10, delivered 0 of 10 windows"
+    },
+    {
+      "predicate": "ACCEPTED_PER_WINDOW",
+      "detail": "no complete origin-window series: offered 0, accepted 10, delivered 0 of 10 windows"
+    },
+    {
+      "predicate": "DELIVERED_EQUALS_ACCEPTED_TIMES_K",
+      "detail": "no complete origin-window series: offered 0, accepted 10, delivered 0 of 10 windows"
+    },
+    {
+      "predicate": "MEASURED_MAIN_THREAD_CPU",
+      "detail": "main thread 0.936 core over the measured window, bound 0.80 at 2x"
+    }
+  ]
+}

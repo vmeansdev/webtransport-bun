@@ -1,0 +1,137 @@
+{
+  "sampleUnit": "count",
+  "samples": [
+    2219,
+    2687,
+    1006,
+    217,
+    128,
+    116,
+    1714,
+    1957,
+    1106,
+    1749,
+    2718,
+    2557,
+    2827,
+    2687,
+    2831,
+    2675,
+    2616,
+    2559,
+    1821,
+    2669,
+    2650,
+    2746,
+    1541,
+    1909,
+    2793,
+    2613,
+    2706,
+    2539,
+    1999,
+    1428,
+    91,
+    1722,
+    2635,
+    2405,
+    2847,
+    2784,
+    2760,
+    2705,
+    2603,
+    2025,
+    1545,
+    2451,
+    2628,
+    2423,
+    2241,
+    2672,
+    2580.6287087293404
+  ],
+  "percentiles": {
+    "p1": 102.5,
+    "p50": 2557,
+    "p95": 2816.8,
+    "p99": 2839.6400000000003
+  },
+  "ledger": {
+    "attempted": 100000,
+    "queued": 100000,
+    "serverObserved": 100000,
+    "acknowledged": 100000,
+    "delivered": 100000,
+    "dropped": 0,
+    "expired": 0,
+    "harnessOverheadBytes": 43200000,
+    "histogram": {
+      "unit": "count",
+      "boundaries": [
+        0,
+        100,
+        200,
+        500,
+        1000,
+        2000,
+        5000,
+        10000,
+        20000,
+        50000,
+        100000
+      ],
+      "counts": [
+        1,
+        2,
+        1,
+        0,
+        12,
+        31,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    }
+  },
+  "admissionCounters": {
+    "schemaVersion": "v1",
+    "handshakes": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "sessions": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "activePeak": 1
+    },
+    "streams": {
+      "attempted": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "datagrams": {
+      "attempted": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "rateLimited": 0
+    }
+  },
+  "provenance": {
+    "attestation": "dm1-398a4fb56f51a942be61a66a7d92e68e",
+    "driverRunId": "ws-wt-r0-campaign-r0-full-1788052520-ticker-fanout_rate-10000-1788052609019-rep-1",
+    "clockMethod": "performance.timeOrigin+performance.now",
+    "sampleCount": 47,
+    "firstSampleAtMs": 1788052615057.8508,
+    "lastSampleAtMs": 1788052661708.855
+  },
+  "loopUtilization": {
+    "busyMs": 0,
+    "windowMs": 46665.50341796875
+  },
+  "roundTrips": []
+}

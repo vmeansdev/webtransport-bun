@@ -1,0 +1,107 @@
+{
+  "sampleUnit": "Mbps",
+  "samples": [
+    461.37344,
+    676.33152,
+    948.96128,
+    912.26112,
+    948.96128,
+    461.37344,
+    99.61472,
+    115.34336,
+    94.37184,
+    560.98816,
+    954.20416,
+    959.44704,
+    639.63136,
+    89.12896,
+    325.05856,
+    377.5242276003516
+  ],
+  "percentiles": {
+    "p1": 89.91539200000001,
+    "p50": 511.1808,
+    "p95": 955.51488,
+    "p99": 958.660608
+  },
+  "ledger": {
+    "attempted": 1600,
+    "queued": 1,
+    "serverObserved": 1602,
+    "acknowledged": 0,
+    "delivered": 1600,
+    "dropped": 0,
+    "expired": 0,
+    "harnessOverheadBytes": 0,
+    "histogram": {
+      "unit": "Mbps",
+      "boundaries": [
+        0,
+        1,
+        2,
+        5,
+        10,
+        20,
+        50,
+        100,
+        200,
+        500,
+        1000
+      ],
+      "counts": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        3,
+        1,
+        4,
+        8,
+        0
+      ]
+    }
+  },
+  "admissionCounters": {
+    "schemaVersion": "v1",
+    "handshakes": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "sessions": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "activePeak": 1
+    },
+    "streams": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "datagrams": {
+      "attempted": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "rateLimited": 0
+    }
+  },
+  "provenance": {
+    "attestation": "dm1-d554e75bce0645fc96bfd7f0aae9aff6",
+    "driverRunId": "ws-wt-r0-campaign-r0-phase4-1788047447928-bulk-one-way_physical-ws-1788047454941-rep-3",
+    "clockMethod": "performance.timeOrigin+performance.now",
+    "sampleCount": 16,
+    "firstSampleAtMs": 1788047473553.9185,
+    "lastSampleAtMs": 1788047475091.4148
+  },
+  "loopUtilization": {
+    "busyMs": 0.153564453125,
+    "windowMs": 1753.64306640625
+  },
+  "roundTrips": [],
+  "deliveredBytes": 104857600
+}

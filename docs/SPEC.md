@@ -12,6 +12,20 @@ The API provides:
 
 All streams must use standard Node stream backpressure semantics (write() returns false + 'drain').
 
+## Protocol posture
+
+Both backends speak the draft-02/07 wire format, because that is what Chromium
+interoperates with and interop is the bar. Elements of draft-16 are adopted
+**additively, where they are free** — a session close now travels as a
+`WT_CLOSE_SESSION` capsule, drains as `WT_DRAIN_SESSION`, and stream error
+codes go through the §4.4 `WT_APPLICATION_ERROR` mapping. None of that changes
+the wire format Chromium sees, and all of it is verified against a real browser
+(`tools/interop/`).
+
+This is **not** a claim of draft-16 conformance. Full conformance is blocked
+upstream on `RESET_STREAM_AT`, which quinn does not implement; see
+`docs/PARITY_MATRIX.md` for what is and is not present on each backend.
+
 ## W3C facade parity status (current)
 Source of truth: `docs/PARITY_MATRIX.md` (W3C snapshot: `docs/w3c/w3c.github.io-2026-02-04.md`).
 
@@ -29,7 +43,7 @@ Source of truth: `docs/PARITY_MATRIX.md` (W3C snapshot: `docs/w3c/w3c.github.io-
   - `datagramsReadableType`: `"bytes"` creates ReadableByteStream with BYOB; `"default"` uses normal ReadableStream
   - `allowPooling`: when true, reuses pooled endpoints for compatible connects; when false, uses dedicated sessions
   - `requireUnreliable`: accepted; satisfied by QUIC/WebTransport transport capabilities
-- Remaining parity tracking and implementation sequencing are in `docs/PARITY_MATRIX.md` (see Priority Execution Order / Remaining Work).
+- Remaining parity tracking is in `docs/PARITY_MATRIX.md`, split into client-facade parity, portable server/session parity, intentional backend-specific extensions, and environment/distribution evidence.
 
 ## Pooling Semantics (allowPooling)
 
@@ -54,6 +68,7 @@ On supported targets (Bun/Node/Deno on macOS/Linux/Windows), the transport backe
 - **strictW3CErrors option:** When `strictW3CErrors: true` is passed to `connect()` or `new WebTransport()`, connect-path, session, and Web Streams facade errors use browser-style DOMException names while retaining `code: E_*`. Default is `false` for backward compatibility. Strict mode affects error surface only, not transport internals.
 - **Mapping rules (when strictW3CErrors):** E_TLS → NetworkError; E_HANDSHAKE_TIMEOUT/E_BACKPRESSURE_TIMEOUT → TimeoutError; E_SESSION_CLOSED/E_SESSION_IDLE_TIMEOUT → InvalidStateError; E_STREAM_RESET/E_STOP_SENDING → AbortError; E_LIMIT_EXCEEDED/E_QUEUE_FULL/E_RATE_LIMITED → QuotaExceededError; invalid option types → TypeError; allowPooling+serverCertificateHashes → NotSupportedError; other E_INTERNAL cases → OperationError.
 - **Unknown errors:** No broad catch-all; unmapped cases keep `name: "WebTransportError"`.
+- **Close-reason-only codes:** `E_SERVER_CLOSING` is in the `ErrorCode` union and exported like its peers, but it is only ever produced as a `CloseInfo.reason` (with close code `3993`), never as a thrown `WebTransportError.code` — so it has no `strictW3CErrors` mapping. See "Server shutdown close semantics".
 
 ## TypeScript API (authoritative)
 
@@ -84,14 +99,24 @@ export type TlsOptions = {
 export type RateLimitOptions = {
   handshakesPerSec: number; handshakesBurst: number;
   handshakesBurstPerPrefix?: number; // per /24 IPv4 or /64 IPv6; default 100
+  // streams/datagrams limits are keyed PER PEER IP, not per session: N
+  // sessions from one address (NAT/CGNAT, proxies, load tests from one
+  // host) share a single budget. Size the limits for the address, not the
+  // session, when many clients can share an IP.
   streamsPerSec: number; streamsBurst: number;
   datagramsPerSec: number; datagramsBurst: number;
 };
 
 export type LimitsOptions = {
-  /** Max concurrent sessions. At limit, next handshake is rejected. */
+  /** Max concurrent sessions. At limit, the next dial is answered with QUIC
+   * CONNECTION_REFUSED — a transient admission signal; clients retry with
+   * jittered backoff (see OPERATIONS.md "Admission control"). */
   maxSessions: number;
-  /** Max handshakes in progress. At limit, next is rejected (inclusive: limit is allowed). */
+  /** Max handshakes in progress (inclusive: limit is allowed). Bounds
+   * instantaneous concurrency, not arrival rate: sustained dial rates far
+   * above the cap establish fine when handshakes are fast; a synchronized
+   * wave deeper than the cap has its overflow answered CONNECTION_REFUSED —
+   * transient, retry with jittered backoff. */
   maxHandshakesInFlight: number;
   /** Max bidi streams per session. At limit, createBidirectionalStream rejects with E_LIMIT_EXCEEDED. */
   maxStreamsPerSessionBidi: number;
@@ -104,6 +129,14 @@ export type LimitsOptions = {
   maxQueuedBytesGlobal: number;
   maxQueuedBytesPerSession: number;
   maxQueuedBytesPerStream: number;
+
+  // QUIC flow-control windows, native backend only. Omitted, each is derived
+  // from a byte governor above (the shipped behaviour); set, it moves the
+  // transport window without moving the governor. See docs/OPERATIONS.md
+  // ("Flow-control windows") for the per-session memory math.
+  streamReceiveWindow?: number;
+  receiveWindow?: number;
+  sendWindow?: number;
 
   backpressureTimeoutMs: number;
   handshakeTimeoutMs: number;
@@ -166,6 +199,22 @@ export interface WebTransportServer {
   setUnknownSniPolicy(policy: "reject" | "default"): Promise<void>;
   /** Inspect active SNI names and policy without exposing key material. */
   tlsSnapshot(): { sniServerNames: string[]; unknownSniPolicy: "reject" | "default" };
+  /**
+   * Send one payload to many of this server's sessions across one Node-API
+   * crossing. Synchronous and non-parking; native-only.
+   * See "One payload to many sessions".
+   */
+  sendDatagramMirror(
+    targets: readonly string[],
+    payload: Uint8Array,
+  ): {
+    sent: number;
+    failures: readonly {
+      target: string;
+      index: number;
+      error: WebTransportError;
+    }[];
+  };
   close(): Promise<void>;
   metricsSnapshot(): MetricsSnapshot;
 }
@@ -176,6 +225,7 @@ export function createServer(opts: ServerOptions): WebTransportServer;
 ### Server TLS / SNI semantics
 
 - `tls.certPem` / `tls.keyPem` are the default server certificate and key.
+- `tls.keyPem` accepts unencrypted PKCS#8 (`BEGIN PRIVATE KEY`), SEC1 ECDSA (`BEGIN EC PRIVATE KEY`), and PKCS#1 RSA (`BEGIN RSA PRIVATE KEY`) PEM. Encrypted keys are not supported. A key that does not match the leaf certificate's public key fails server construction.
 - `tls.sni` adds hostname-specific certificates chosen from the client SNI value.
 - Server names are IDNA-normalized to canonical ASCII after trimming a trailing `.`, so Unicode inputs are matched by their punycode form.
 - Wildcards are supported only in the left-most label, for example `*.example.com`.
@@ -239,6 +289,10 @@ export interface CommonSession {
 
   // Datagrams
   sendDatagram(data: Uint8Array): Promise<void>;
+  // Native-only; see "Outgoing datagram batching".
+  sendDatagramBatch(
+    datagrams: readonly Uint8Array[],
+  ): Promise<{ sent: number; error?: WebTransportError }>;
   incomingDatagrams(): AsyncIterable<Uint8Array>;
 }
 
@@ -307,10 +361,17 @@ export type MetricsSnapshot = {
   datagramsIn: number;
   datagramsOut: number;
   datagramsDropped: number;
+  datagramsDroppedRateLimited?: number;
+  datagramsDroppedTooLarge?: number;
+  datagramsDroppedQueueGlobal?: number;
+  datagramsDroppedQueueSession?: number;
+  datagramsSkippedQueueFull?: number;
 
   queuedBytesGlobal: number;
   backpressureWaitCount: number;
   backpressureTimeoutCount: number;
+  datagramMirrorCalls?: number;
+  datagramMirrorTargets?: number;
 
   rateLimitedCount: number;
   limitExceededCount: number;
@@ -339,12 +400,14 @@ export type SessionMetricsSnapshot = {
 
 ### Semantics (must be implemented)
 - `sendDatagram()` Promise resolves only when accepted into a bounded internal queue (or sent). If queues are full, it must wait (backpressure). If waiting exceeds `backpressureTimeoutMs`, reject with `E_BACKPRESSURE_TIMEOUT`.
-- Incoming datagrams are delivered via AsyncIterable on both server/client sessions.
+- Reliable-stream receive paths apply the same bound: when the byte budget (`maxQueuedBytesPerStream`/`maxQueuedBytesPerSession`) stays exhausted — a reader that consumes nothing for a full `backpressureTimeoutMs` — the stream is stopped and pending reads reject with `E_BACKPRESSURE_TIMEOUT`. A reader that frees any capacity within the window keeps the stream. This bound is load-bearing for memory: an abandoned reader must not pin the stream's native state for the life of the process.
+- Incoming datagrams are delivered via AsyncIterable on both server/client sessions. See "Incoming datagram delivery" below for the delivery contract and the native batching knob.
 - Incoming streams are delivered as ReadableStream properties on `ServerSession` and as AsyncIterable methods on `ClientSession`.
 - On session close, iterators/streams must terminate promptly.
 - Node stream backpressure:
 * writing beyond buffer returns `false`, then `'drain'` fires when writable resumes.
 - Idle timeout: a session with no activity (configurable definition) must close with `E_SESSION_IDLE_TIMEOUT` / close info.
+- Server shutdown: sessions the server ends during `server.close()` close with code `3993` / reason `E_SERVER_CLOSING`. See "Server shutdown close semantics" below.
 - Limits and rate limits must be enforced before allocating unbounded buffers.
 
 Examples (expected to work):
@@ -352,9 +415,489 @@ Examples (expected to work):
 - Bidi stream echo server and client
 - Uni stream upload and download
 
+## Server shutdown close semantics
+
+When `server.close()` ends sessions the server still owns, those sessions close
+with a dedicated, wire-visible code and reason:
+
+| Field | Value |
+|---|---|
+| Close code | `3993` (`SERVER_CLOSING_CLOSE_CODE`) |
+| Close reason | `"E_SERVER_CLOSING"` (`E_SERVER_CLOSING`, exported from the root entrypoint) |
+
+**When it is sent.** Every path by which `server.close()` terminates a session
+uses this pair, so the peer sees one answer regardless of which one ran:
+
+- the accept loop's endpoint close, once the shutdown signal fires;
+- the registry sweep that closes each session this server still owns;
+- the drain watchdog's abort phase, when the grace period expires with sessions
+  still live;
+- the JS-side fallback in `createServerCloseContract`, which resolves the
+  `closed` promise of every still-owned session with the same `{ code, reason }`
+  so an app sees identical values whether the event arrived off the wire or from
+  the local fallback.
+
+**Why it is distinct.** `3993` sits with the other well-known server-originated
+close codes (`3990` idle timeout, `3992` limit exceeded) and answers a question
+the application close code `0` could not: *this session was taken down
+deliberately by its server, it was not lost*. A peer can therefore reconnect
+immediately instead of treating the close as a transport failure, and the server's
+own `sessionsClosedByReap` metric is keyed off the same code.
+
+**`E_SERVER_CLOSING` is a close reason, not a thrown error.** It never appears as
+`WebTransportError.code`, so it is deliberately absent from the native
+error-message parser's code list and from the `strictW3CErrors` mapping table
+above; it is in the `ErrorCode` union and exported alongside its peers because
+the reason string is API and callers compare against it.
+
+**Changed in 1.0.0-pre:** these sessions previously closed with application code
+`0` and the free-text reason `"server closing"`, which was indistinguishable
+from an ordinary application close and carried no stable code. Applications
+matching on the old pair must switch to `3993` / `E_SERVER_CLOSING`.
+
+The wasm backend does not send this pair — its endpoint close is code `0` /
+`"endpoint closed"`, and the peer observes `{ closeCode: 0 }` with no reason. See
+`docs/PARITY_MATRIX.md`, "Session shutdown on the wire", for the recorded
+divergence and why it stands.
+
+## Outgoing datagram batching
+
+`sendDatagramBatch(datagrams)` sends many datagrams across one Node-API
+crossing. It is **native-only**, for the same reason batched receiving is: the
+crossing is what it amortizes, and the wasm backend has none. `/portable` keeps
+`sendDatagram()` as the whole of its sending contract.
+
+It **resolves** rather than rejects for transport conditions, with **prefix**
+semantics:
+
+```ts
+const { sent, error } = await session.sendDatagramBatch(datagrams);
+// datagrams[0 .. sent) went out, in order.
+// error (when present) is why datagrams[sent] failed.
+// datagrams[sent + 1 ..] were not attempted.
+```
+
+A partial send is normal on an unreliable transport, and throwing would discard
+the `sent` count that makes the outcome actionable: the caller drops or retries
+`datagrams[sent]` and re-calls with the remainder. `error` carries the same
+codes the single-datagram path throws — `E_QUEUE_FULL` for an element longer
+than `maxDatagramSize`, `E_BACKPRESSURE_TIMEOUT`, `E_SESSION_CLOSED` — because
+the batch inherits each handle's per-datagram semantics element by element and
+does not invent behavior of its own.
+
+It still **throws** synchronously, before any crossing: `TypeError` for a
+non-array argument or a non-`Uint8Array` element, and `WebTransportError` with
+`E_SESSION_CLOSED` on an already-closed session.
+
+Contract points worth stating:
+
+- **Payloads are copied before the promise is returned.** A caller may reuse or
+  overwrite its arrays immediately.
+- **One backpressure deadline for the whole call.** A caller who made one call
+  waits at most one `backpressureTimeoutMs`, not one per element — and not one
+  per crossing either. An array longer than the 256-element native cap is split
+  into several calls (see "No length limit" below), and each crossing is told
+  how much of the budget the call has already spent, so the deadline is what
+  remains rather than a fresh one. A crossing that begins with the budget spent
+  still sends every element that does not have to wait: the byte reservation is
+  attempted before the deadline is consulted.
+- **The byte reservation is per element**, never `sum(len)` against
+  `maxQueuedBytesPerSession`: a whole-batch reservation larger than the session
+  budget would wait on a release that can never come.
+- **No length limit.** Native carries at most 256 elements per call (the same
+  constant as the receive cap) and the JavaScript layer chunks, so `sent` is
+  always an absolute index into the caller's array. A raw-addon caller that
+  exceeds the cap gets `{sent: ≤256, code: "E_BATCH_TOO_LARGE"}` rather than a
+  silently truncated send.
+- **Send one datagram with `sendDatagram()`.** Array marshalling has a fixed
+  cost that a batch of one has nothing to amortize it over.
+
+The W3C `datagrams.writable` surface has **no** batch API and is not planned to
+grow one. A single `WritableStream` writer structurally cannot present more than
+one chunk to its sink — the microtask that would flush a coalesced batch runs
+between two sink invocations — so a batching sink measures a mean batch size of
+1.00 in practice, and reaching a real batch through one writer would require
+either a timer-based fill or resolving `write()` before delivery. Applications
+that need batched sending must hold the native session handle; the W3C path
+costs roughly one crossing per datagram and that asymmetry is deliberate.
+
+## One payload to many sessions
+
+`server.sendDatagramMirror(targets, payload)` sends the same payload to many of
+that server's sessions across a single Node-API crossing. It is **native-only**,
+for a stronger reason than batched sending: the crossing it amortizes does not
+exist on wasm, and the wasm backend has no session registry to fan out through.
+
+It is the fan-out of the promise-free fast path that `session.sendDatagram()`
+tries first, **not** of its parking fallback: the call is synchronous, hands
+JavaScript no promise, and never waits. (That fast path is the addon's
+internal `trySendDatagram`; it is not a method on the public session.) A promise costs more
+than the whole fan-out below roughly a thousand targets; a serial parking
+fan-out would let one slow subscriber hold every other; a concurrent one would
+allocate a future per target — the allocation the API exists to avoid.
+
+The envelope is a **set, not a prefix**:
+
+```ts
+const { sent, failures } = server.sendDatagramMirror(targets, payload);
+// Every target was attempted, independently and in list order.
+// sent + failures.length === targets.length, always.
+```
+
+A target list has no ordering obligation — subscriber 4 being gone says nothing
+about subscriber 5 — so a dead target never stops the broadcast. This is the
+sharpest difference from `sendDatagramBatch`, whose prefix envelope is correct
+only because element `k+1` of one session's batch genuinely cannot precede
+element `k`.
+
+`failures` is the actionable half, and it names the failing **session id** as
+well as its index:
+
+- `E_SESSION_CLOSED` — unknown, reaped, or owned by another server in this
+  process. At ten thousand subscribers reaping is normal, so this list *is* the
+  reap list.
+- `E_QUEUE_FULL` — the payload is longer than `maxDatagramSize`, or the target
+  had no queued-byte budget at this instant. The mirror never waits, so this is
+  where backpressure lands; the remedy is `session.sendDatagram()` on just those
+  targets, which is the only path allowed to park.
+
+Contract points worth stating:
+
+- **The payload is copied once, before the fan-out**, and shared by reference
+  with every target: `N` copies out of JavaScript become one. A caller may
+  overwrite its array the moment the call returns.
+- **The peak byte reservation is one payload**, never `N × len`. Reserving a
+  whole fan-out against a per-session budget is meaningless (they are different
+  sessions) and against the global budget it would fail broadcasts every
+  individual send would have made.
+- **No deadline, because nothing waits.** The call performs `N`
+  reserve/try-send/release triples and returns.
+- **Targets are owner-scoped.** An id belonging to another server in the same
+  process is reported `E_SESSION_CLOSED` and receives nothing.
+- **Duplicate targets are delivered to twice.** The parameter is a list, not a
+  set; deduplicating would cost a hash set per call to second-guess a caller who
+  may have meant it.
+- **At most 10,000 targets per call**, a JavaScript-thread stall budget
+  expressed in targets. Over-cap throws `RangeError` synchronously, before
+  anything is sent — safe precisely because the call is synchronous, so there is
+  no promise to reject. The JavaScript layer deliberately does **not** chunk:
+  splitting a target list across two calls is observably identical to one call
+  over the union (no deadline to divide, no ordering across targets), so the
+  caller owns the decision of when to yield the loop. That is exactly the
+  property `sendDatagramBatch` lacks, which is why *it* chunks.
+- **It throws only for programming errors**: `TypeError` for a non-array target
+  list, a non-string element or a non-`Uint8Array` payload, and `RangeError`
+  over the cap. Never for a transport condition.
+- **Metrics.** `datagramMirrorCalls` and `datagramMirrorTargets` count the
+  calls and the targets they attempted. `datagramSendsAsync` deliberately does
+  **not** move: the mirror creates no promise, and that counter's meaning is
+  host-loop exposure. Per-session `datagramsOut` increments once per delivered
+  target, so a mirrored datagram is indistinguishable from a looped one in the
+  per-session counters a delivery ratio reads.
+
+### The paced mirror (experimental)
+
+*Experimental: see "Experimental surfaces" below.*
+
+`server.sendDatagramMirrorPaced(targets, payload)` is a **separate** method that
+hands the same fan-out to the native egress pacer's schedule. It exists so that
+the contract above can stay exactly what it says: `sendDatagramMirror` is not
+paced and never will be, whatever the pacer is configured to. Pacing
+changes what a successful count *means* — from "quinn took it" to "a schedule
+accepted it" — and that is the one word the synchronous contract sells, so the
+paced envelope is a different object with a different vocabulary.
+
+- **The envelope is admission, not delivery.** `{ admitted, refused }`. When the
+  call returns, no target has been resolved, owner-checked or budget-checked.
+  `admitted` is targets the schedule took; `refused` names, per index, the ones
+  it would not, always `E_QUEUE_FULL` and always because the queue was already
+  holding its bound of outstanding work (targets or bytes).
+  **Admission is a prefix**, unlike the synchronous envelope: the schedule
+  takes targets in list order until a bound is reached and refuses the rest of
+  the list, so `refused` is always the tail. Under sustained saturation the
+  same trailing positions are refused call after call; a caller that needs
+  fairness must rotate its own target list between calls. Refusals are still
+  reported per index, so the caller never reconstructs the boundary.
+- **No worker, no admission.** If the pacer thread cannot be started (thread
+  exhaustion), nothing is admitted: every in-cap target of that call is
+  refused with `E_QUEUE_FULL`, and any work a dead pacer thread left queued is
+  released and reported as `E_QUEUE_FULL` through `readMirrorReports()`. The
+  call never claims an admission no thread will deliver.
+- **Per-target outcomes are drained out of band.**
+  `server.readMirrorReports(max?)` returns `{ target, error }` entries for
+  **failures only** — synchronous, promise-free, never throwing, `[]` when
+  nothing is pending. A caller counts deliveries as `admitted` minus the
+  failures it drains. `E_SESSION_CLOSED` reports are the reap list and
+  `E_QUEUE_FULL` reports are the retry list, the same two lists the synchronous
+  envelope hands back immediately.
+- **The ring is fixed at 4,096 entries** and drops oldest on overflow, counting
+  every drop in `metricsSnapshot().mirrorReportsDropped`. Bounded by
+  construction: a caller that never polls costs a constant. `drained +
+  mirrorReportsDropped` reconciles against the pacer's own `deferredFailures`,
+  which is the falsifier for the reporting path itself.
+- **Two backpressure signals, separately named.** `refused` at admission means
+  the schedule was full; an `E_QUEUE_FULL` *report* means that target had no
+  byte budget when its turn came. The synchronous API conflates them.
+- **The cap stays 10,000, with a different justification.** On the synchronous
+  path it is a JS-thread stall budget; a paced call's cost on that thread does
+  not grow with the list, so here it is an argument-sanity bound, kept because a
+  `RangeError` is cheaper to debug than a silent mass refusal.
+- **Metrics.** `datagramMirrorPacedCalls` and `datagramMirrorPacedTargets` move;
+  `datagramMirrorCalls`, `datagramMirrorTargets` and `datagramSendsAsync` do
+  not. No promise is created here either.
+- **Turning the pacer on.** `createServer({ egressPacer: { pps, clump?,
+  queueMs? } })` configures it (clump 1–64, default 32; queueMs default 250).
+  The pacer is process-wide: one schedule and one thread. The first
+  configuration a process resolves wins, either this option on the first
+  server that passes it or, failing that, the environment fallback
+  `WEBTRANSPORT_PACER_PPS` / `_CLUMP` / `_QUEUE_MS` on first use. A later server
+  that asks for a different configuration fails with `E_INVALID_ARGUMENT`;
+  the identical one is accepted. The configuration is committed only after
+  the server is created, so a failed `createServer` does not consume it.
+  Bounds: `pps` 1–1,000,000, `queueMs` 1–5000. The queue is capped at
+  `pps × queueMs / 1000` targets and at 64 MiB of queued bytes (payload once
+  per job plus target ids). Admission refuses past either bound.
+- **With the pacer off** it throws a `WebTransportError` with code
+  `E_UNSUPPORTED_ARGUMENT` rather than quietly running the inline loop, with a
+  distinct message from the one an addon built without the pacer produces.
+  Native-only, like the synchronous mirror.
+
+## Incoming datagram delivery
+
+`incomingDatagrams()` is the same public API on both native session classes and
+on `/portable`: an `AsyncIterable<Uint8Array>`, memoized per session, yielding
+one datagram at a time, in the order the backend received them, terminating
+once the session is closed. Datagrams are droppable by contract — nothing below
+turns a lost datagram into an error.
+
+Internally the native backend no longer crosses Node-API once per datagram. The
+generator calls `readDatagramBatch(max)` on the native handle, which resolves
+`Uint8Array[] | null`, and yields the returned items one by one before asking
+for the next batch. `max` is clamped silently to `1..=256` in native; the
+JavaScript layer clamps first, so the native clamp is a backstop. The batch
+methods are reject-free: data, EOF, closure, and an out-of-range `max` all
+resolve rather than throw. Only a runtime panic or an unrecoverable Node-API
+allocation failure can still reject, exactly as on the pre-existing single-read
+path.
+
+### `WEBTRANSPORT_DATAGRAM_BATCH`
+
+| Value | Effect |
+| --- | --- |
+| unset or invalid | `64` (the default) |
+| `0` | legacy path: one `readDatagram()` call per datagram |
+| `1` | the new batch path with degenerate one-item batches |
+| `2`–`256` | batch size |
+| negative | `0` |
+| greater than `256` | `256` |
+
+"Invalid" means empty, non-decimal, non-finite, or non-integer. The variable is
+read **once at module initialization**, so a process cannot change delivery
+shape halfway through a session's lifetime, and it is **native-only** — wasm
+datagram delivery does not go through Node-API and is unaffected.
+
+The knob is a performance dial, but it is not purely one: because batching wins
+the close race by needing one round-trip instead of one per datagram, the batch
+size visibly changes how much tail a consumer receives when the peer ends the
+connection cleanly (see deviation 3 below). Do not treat a change in observed
+tail length as a bug.
+
+### Buffering bounds
+
+Draining moves up to `max` items out of the native channel per acquisition, so
+effective buffering becomes `2048 + max` datagrams per server session and
+`256 + max` per client session, and the per-session byte budget
+(`maxQueuedBytesPerSession` on the server, the client datagram budget) is
+loosened by up to one batch of payload bytes. The pull model still bounds total
+in-flight data: no new batch is requested until the consumer has drained the
+previous one.
+
+### Semantic deviations
+
+Three JS-visible behaviors changed. All three are permitted for an unreliable,
+droppable transport, and all three are stated rather than hidden.
+
+1. **Post-close prefetch.** The generator may yield up to `max` already-
+   delivered datagrams after the session is closed, instead of at most 1.
+2. **Mid-batch abandonment.** Abandoning the iterator mid-batch discards up to
+   `max - 1` already-received datagrams, instead of at most 1.
+3. **Close-time drop-not-drain.** On a sticky close, a parked or newly entered
+   read returns EOF immediately and datagrams still queued natively are
+   discarded. Previously a parked read drained every buffered item before
+   yielding EOF. This applies to **both** handles and **both** lanes — the
+   legacy `WEBTRANSPORT_DATAGRAM_BATCH=0` path shares the same sticky lifecycle
+   wake, so it is not confined to batch mode. It is JS-visible delivery only:
+   reservation accounting for the discarded remainder is settled internally in
+   both directions, so no budget or gauge is stranded, but settlement is
+   bounded rather than instantaneous.
+
+On a clean connection end, how much of the remaining tail a consumer receives
+**depends on the configured batch size, and no count is guaranteed**. In one
+measured run over the same 12-datagram tail: 2 of 12 delivered at
+`WEBTRANSPORT_DATAGRAM_BATCH=0` versus 12 of 12 at `64`. Those counts are an
+illustration of the effect, not a specification of it — the quantity is racy,
+which is why the tests that cover it assert ranges rather than equalities. The forwarder is no longer an independent
+unconditional discarder, but in production forwarder EOF and connection end
+coincide and the terminal drain still discards that remainder — the improvement
+is a **race window that batching is more likely to win, not a delivery
+guarantee**.
+
+### `iter.throw()` mapping
+
+The shared generator now yields outside its `try`, so an error injected with
+`iter.throw()` at a yield point is no longer passed through the error mapper: it
+propagates as the caller's own error. Nothing in this repository calls
+`iter.throw()`, and `AsyncIterator.prototype.throw` is optional in the language
+spec so `AsyncIterable<Uint8Array>` promises nothing about it, but the method is
+reachable from user code because `incomingDatagrams()` returns the generator and
+its `[Symbol.asyncIterator]()` returns itself. The new behavior is strictly
+better than the old: previously an injected error whose message merely resembled
+a session-close error was silently converted into a clean `done: true`, and any
+other injected error was rewrapped as a `WebTransportError` the caller never
+threw.
+
+## Incoming stream chunk delivery
+
+*Chunk batching (`WEBTRANSPORT_STREAM_BATCH_BYTES`) is experimental: see
+"Experimental surfaces" below. The default, unbatched path is stable.*
+
+Receive-side stream data crosses Node-API once per quinn assembler chunk by
+default. `WEBTRANSPORT_STREAM_BATCH_BYTES` turns on a coalescing crossing
+instead: the addon's `readBatch(maxBytes)` parks for the first chunk and then
+takes only what is *already* queued — no timer and no fill wait — and delivers
+the run as one `Uint8Array`, one copy, straight into the engine's allocation.
+
+The knob is **off by default**: unset, invalid, or non-positive means every
+receive path calls the pre-existing `read()` and behaves exactly as before.
+Positive values are the per-crossing byte budget, clamped to `1 MiB` in
+JavaScript and again in native against the per-stream receive window
+(`maxQueuedBytesPerStream`) — a budget above the window can never be filled.
+Like the datagram knob, it is read **once at module initialization**.
+
+Batching changes chunk sizes and nothing else:
+
+- **Terminal events are never merged.** A batch that runs into FIN, RESET or
+  STOP_SENDING delivers its bytes and leaves the terminal event for the next
+  call, which observes it exactly as an unbatched read would. Chunk boundaries
+  were never framing (they are not in QUIC either), so a larger chunk is
+  within the existing contract.
+- **Byte accounting is unchanged.** Each coalesced chunk keeps its three-tier
+  reservation until the payload has been materialized for JavaScript, so
+  reservations are released on consumption, never at coalesce time, and the
+  documented `E_BACKPRESSURE_TIMEOUT` bound above still applies per chunk.
+- **Node `push()` and BYOB are unaffected.** One crossing still produces one
+  `push()`, so `push() === false` stops the reader where it did before, and
+  BYOB readers see a larger view and nothing else.
+
+`WEBTRANSPORT_STREAM_BATCH_DIAGNOSTICS=1` accumulates per-process crossing
+counters — crossings/s, mean bytes per crossing, largest batch — over both the
+batched and the unbatched path, so a comparison between them is measured by one
+instrument. The snapshot is reachable only through the unstable `__TESTING__`
+bag.
+
+### Cross-stream read group
+
+Server-accepted incoming readables (bidi and uni) are fed by one
+process-level native read group **by default**. Each stream gets a native
+feeder that loops the handle's own `read()` (or `readBatch` when
+`WEBTRANSPORT_STREAM_BATCH_BYTES` is set); one `next()` crossing hands
+JavaScript every queued stream's chunks, which are demultiplexed into each
+stream's byte stream. The consumer's `read()` resolves on the JS thread as
+before; only the number of Node-API crossings changes.
+
+- `WEBTRANSPORT_STREAM_READ_GROUP=0` turns it off: every readable then pulls
+  the addon directly, one crossing per read. Unset or any other value leaves
+  it on. Read **once at module initialization**.
+- **No read-ahead.** A feeder makes one read per read the consumer has
+  outstanding, exactly the reads the direct pull would make, and nothing
+  more. Bytes a stalled consumer has not asked for stay in the transport,
+  under QUIC flow control and `maxQueuedBytesGlobal` /
+  `maxQueuedBytesPerSession` / `maxQueuedBytesPerStream`; a crossed chunk goes
+  straight to the read that asked for it. (An earlier read-ahead window,
+  `WEBTRANSPORT_STREAM_READ_GROUP_WINDOW`, let up to 256 KiB per stream sit in
+  JavaScript queues outside those budgets and was removed; the variable is
+  ignored.)
+- A stream's state leaves the group when its owner releases it (dispose,
+  reset, session close), whether or not it was ever read.
+- Feeders start lazily, on a readable's first pull: a stream that is never
+  read holds no read-ahead, and `openReadSink` can still claim it. Once the
+  feeder has started the stream counts as read and `openReadSink` throws
+  `E_SINK_READ_ACTIVE`; a read on a sink-owned stream errors with
+  `E_SINK_ACTIVE`, exactly as on the direct path.
+- Client-side readables always use the direct pull.
+
+## Experimental surfaces
+
+The surfaces below ship in 1.0 but are **experimental**. They are documented,
+tested and supported, but their shape **may change in a 1.x minor release**,
+not only in a major one. Each export is tagged `@experimental` in its TSDoc,
+and `docs/PARITY_MATRIX.md` marks each one. Everything else in this spec is
+stable.
+
+| Surface | What may change | Reference |
+|---|---|---|
+| Stream chunk batching (`WEBTRANSPORT_STREAM_BATCH_BYTES`, off by default) | the knob's name and its byte-budget semantics | "Incoming stream chunk delivery" above |
+| Egress pacer: `ServerOptions.egressPacer`, `sendDatagramMirrorPaced()`, `readMirrorReports()`, `EgressPacerOptions`, `DatagramMirrorAdmission`, `MirrorReport`, and the metrics `datagramMirrorPacedCalls`, `datagramMirrorPacedTargets`, `mirrorReportsDropped` | the option's shape, admission and report semantics, the ring size, and the `WEBTRANSPORT_PACER_*` fallback | "The paced mirror" above; `crates/native/docs/egress-pacer.md` |
+| Multi-process binds: `ServerOptions.reusePort`, `quicLb` (`QuicLbOptions`), `reusePortSteering`, and the decoders `decodeQuicLbServerId`, `decodeQuicLbConfigRotation`, `quicLbCidLength` | option shapes and validation, and the CID layout version (draft-ietf-quic-load-balancers) | `docs/OPERATIONS.md` ("Multi-process binds", "QUIC-LB connection IDs"); `docs/quic-lb.md` |
+| Native stream sink: `openReadSink()` (and the stream methods of the same name), `SinkReader`, `StreamSink*`, `SinkRecord*`, `SinkTaskStateName`, the `./sink-reader` subpath, and the `E_SINK_*` error codes (`ExperimentalSinkErrorCode`) | options, ring layout version, record types, and the set of `E_SINK_*` codes | `docs/RFC_STREAM_SINK.md` |
+
+An experimental surface becomes stable when this table stops listing it.
+Removing one outright still takes a major release.
+
 ## API stability and semver
+
+### The exported surfaces
+
+The package exports exactly **four** entrypoints: the three API surfaces below
+and the experimental `./sink-reader` subpath. They promise different things.
+`packages/webtransport/test/public-surface-contract.test.ts` freezes all four
+export lists at runtime. It also checks the shared session/server contract of
+the three API surfaces at compile time (`tsc --noEmit`) and against a live
+session from each backend.
+
+| Entrypoint | Contract |
+| --- | --- |
+| `@webtransport-bun/webtransport` (root) | Native Node-API server/client API. `createServer()` is **synchronous**. Node streams (`Duplex`/`Writable`) on the session stream constructors. Native-only capabilities live here and only here: `releaseNativeMemory()`, `exportTicketVault`/`importTicketVault`, `connect()`, `metricsToPrometheus()`, `ServerSession.goAway()`, SNI/cert rotation, keep-alive and congestion-control knobs. |
+| `@webtransport-bun/webtransport/wasm` | Async WASM/IWA API. `createServer()` returns a promise. Backend-specific extensions are allowed and documented here: Direct Sockets binding, `UdpTransport` injection, ticket-store hosts, `serveOverUdp`, self-signed cert generation and `certHashBase64` pinning. |
+| `@webtransport-bun/webtransport/sink-reader` (**experimental**) | The Worker-side consumer of the native stream sink: `SinkReader` and its record types, importable without loading any native code. It is the same `SinkReader` the root re-exports, and it may change in a 1.x minor with the rest of the sink (see "Experimental surfaces"). |
+| `@webtransport-bun/webtransport/portable` | The common async subset implemented by *both* backends: one `createServer()` returning `PortableServer`, whose sessions expose `id`, `peer`, `ready`, `closed`, `close()`, `drain()`, `sendDatagram()`, `incomingDatagrams()`, the two incoming-stream `ReadableStream`s, the two stream constructors, and `metricsSnapshot()`. Stream constructors resolve to W3C `{ readable, writable }` pairs on both backends. `incomingDatagrams()` is equal *within the contract*: same item type, memoization, receive order, and bounded termination, but not identical hidden buffering — native batching stays active behind `/portable`, with the bounds in "Incoming datagram delivery" above. |
+
+Capabilities only one backend can honour stay out of `/portable` by design —
+native `goAway()` (the wasm h3 module has no control-stream `GOAWAY` handling),
+native keepalive and ticket-vault APIs, wasm ticket hosts, and IWA Direct
+Sockets. `PortableServer.certHashBase64` is the one deliberately optional field:
+wasm clients pin a hash, native clients chain-validate, so it is present on wasm
+and `undefined` on native.
+
+`/wasm` has a frozen export list but a `candidate` stability label; see
+`docs/release-status.json`. Freezing names is not the same as promising
+behavior under gates that have not passed.
+
+### Semver rules
 
 - **Stable surface**: Types and functions in this spec are the public API.
 - **Semver**: Major (X.0.0) for breaking changes; minor (x.Y.0) for additive changes; patch (x.y.Z) for fixes.
 - **Error codes**: E_* codes are stable; do not remove or change meaning.
+  The stable set is `E_TLS`, `E_HANDSHAKE_TIMEOUT`, `E_SESSION_CLOSED`,
+  `E_SESSION_IDLE_TIMEOUT`, `E_SERVER_CLOSING` (close reason only), `E_STREAM_RESET`,
+  `E_STOP_SENDING`, `E_QUEUE_FULL`, `E_BACKPRESSURE_TIMEOUT`, `E_LIMIT_EXCEEDED`,
+  `E_RATE_LIMITED`, `E_INVALID_ARGUMENT`, `E_UNSUPPORTED_ARGUMENT` and `E_INTERNAL`.
+  The `ErrorCode` union also carries the native stream sink's codes
+  (`ExperimentalSinkErrorCode`: `E_SINK_ACTIVE`, `E_SINK_ALREADY_OPEN`,
+  `E_SINK_BAD_BUFFER`, `E_SINK_BAD_OPTIONS`, `E_SINK_CLOSED`,
+  `E_SINK_FRAME_FAULT`, `E_SINK_INTERNAL`, `E_SINK_LIMIT`, `E_SINK_OVERSIZED`,
+  `E_SINK_READ_ACTIVE`, `E_SINK_STALLED`). Those are **experimental** with the
+  sink and may change in a 1.x minor.
 - **Metrics fields**: ServerMetricsSnapshot and SessionMetricsSnapshot field names are stable; new fields may be added in minor releases.
+- **`__TESTING__` is explicitly unstable**: the root module's `__TESTING__`
+  export is a bag of internal test seams (addon loading, session/stream
+  construction hooks). It is not part of this spec, is excluded from the frozen
+  export list, and may be reshaped or removed in any release without a major
+  bump. Do not depend on it outside this repository's own tests.
+- **Server internals are excluded, not hidden by convention**:
+  `__TESTING__.serverInternals(server)` is the one mechanism for server
+  surfaces kept off the 1.0 contract (the native datagram reflector, the
+  measurement-campaign getters and diagnostics, and campaign-only counters).
+  The public `WebTransportServer` does not carry them and the public
+  `metricsSnapshot()` strips those counters at runtime. Like the rest of
+  `__TESTING__`, it is unstable.

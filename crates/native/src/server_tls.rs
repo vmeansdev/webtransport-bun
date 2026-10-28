@@ -1,9 +1,9 @@
 use std::collections::HashMap;
-use std::io::BufReader;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use idna::AsciiDenyList;
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
@@ -277,8 +277,7 @@ fn wildcard_lookup_key(server_name: &str) -> Option<String> {
 }
 
 fn parse_cert_chain(cert_pem: &str) -> std::result::Result<Vec<CertificateDer<'static>>, String> {
-    let mut reader = BufReader::new(cert_pem.as_bytes());
-    let certs = rustls_pemfile::certs(&mut reader)
+    let certs = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| format!("failed to parse certificate PEM: {}", e))?;
     if certs.is_empty() {
@@ -288,13 +287,12 @@ fn parse_cert_chain(cert_pem: &str) -> std::result::Result<Vec<CertificateDer<'s
 }
 
 fn parse_private_key(key_pem: &str) -> std::result::Result<PrivateKeyDer<'static>, String> {
-    let mut reader = BufReader::new(key_pem.as_bytes());
-    match rustls_pemfile::private_key(&mut reader)
-        .map_err(|e| format!("failed to parse private key PEM: {}", e))?
-    {
-        Some(key) => Ok(key),
-        None => Err("private key PEM contained no private key".to_string()),
-    }
+    PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).map_err(|error| match error {
+        rustls::pki_types::pem::Error::NoItemsFound => {
+            "private key PEM contained no private key".to_string()
+        }
+        _ => format!("failed to parse private key PEM: {}", error),
+    })
 }
 
 pub(crate) fn parse_certified_key(
@@ -384,16 +382,85 @@ pub(crate) fn build_default_dev_resolver(
 mod tests {
     use super::{
         build_default_dev_resolver, build_server_tls_config, normalize_server_name,
-        parse_certified_key, parse_resolver_config, wildcard_lookup_key, LiveServerCertResolver,
-        ResolverConfig, SniCertConfig, UnknownSniPolicy,
+        parse_certified_key, parse_private_key, parse_resolver_config, wildcard_lookup_key,
+        LiveServerCertResolver, ResolverConfig, SniCertConfig, UnknownSniPolicy,
     };
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    const EC_CERT_PEM: &str = include_str!("../tests/fixtures/tls/ec-cert.pem");
+    const EC_SEC1_KEY_PEM: &str = include_str!("../tests/fixtures/tls/ec-sec1.pem");
+    const EC_PKCS8_KEY_PEM: &str = include_str!("../tests/fixtures/tls/ec-pkcs8.pem");
+    const EC_OTHER_SEC1_KEY_PEM: &str = include_str!("../tests/fixtures/tls/ec-other-sec1.pem");
+    const RSA_CERT_PEM: &str = include_str!("../tests/fixtures/tls/rsa-cert.pem");
+    const RSA_KEY_PEM: &str = include_str!("../tests/fixtures/tls/rsa-key.pem");
+    const RSA_PKCS1_KEY_PEM: &str = include_str!("../tests/fixtures/tls/rsa-key-pkcs1.pem");
+
+    #[test]
+    fn parse_certified_key_accepts_sec1_ecdsa_key() {
+        assert!(EC_SEC1_KEY_PEM.starts_with("-----BEGIN EC PRIVATE KEY-----"));
+        parse_certified_key(EC_CERT_PEM, EC_SEC1_KEY_PEM).expect("SEC1 ECDSA identity");
+    }
+
+    #[test]
+    fn parse_certified_key_accepts_pkcs8_ecdsa_key() {
+        assert!(EC_PKCS8_KEY_PEM.starts_with("-----BEGIN PRIVATE KEY-----"));
+        parse_certified_key(EC_CERT_PEM, EC_PKCS8_KEY_PEM).expect("PKCS#8 ECDSA identity");
+    }
+
+    #[test]
+    fn parse_certified_key_accepts_rsa_key() {
+        parse_certified_key(RSA_CERT_PEM, RSA_KEY_PEM).expect("RSA identity");
+    }
+
+    #[test]
+    fn parse_certified_key_accepts_pkcs1_rsa_key() {
+        assert!(RSA_PKCS1_KEY_PEM.starts_with("-----BEGIN RSA PRIVATE KEY-----"));
+        parse_certified_key(RSA_CERT_PEM, RSA_PKCS1_KEY_PEM).expect("PKCS#1 RSA identity");
+    }
+
+    #[test]
+    fn parse_certified_key_rejects_mismatched_cert_and_key() {
+        let err = parse_certified_key(EC_CERT_PEM, EC_OTHER_SEC1_KEY_PEM)
+            .expect_err("expected cert/key mismatch");
+        assert!(
+            err.starts_with("failed to build certified key:"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(!err.contains("BEGIN"), "error leaked key material: {}", err);
+    }
+
+    #[test]
+    fn parse_certified_key_rejects_malformed_key_material() {
+        let malformed =
+            "-----BEGIN EC PRIVATE KEY-----\nbm90IGEga2V5\n-----END EC PRIVATE KEY-----\n";
+        let err =
+            parse_certified_key(EC_CERT_PEM, malformed).expect_err("expected malformed key error");
+        assert!(
+            !err.contains("bm90IGEga2V5"),
+            "error leaked key bytes: {}",
+            err
+        );
+        assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn parse_certified_key_rejects_certificate_used_as_key() {
+        let err = parse_certified_key(EC_CERT_PEM, EC_CERT_PEM).expect_err("expected key error");
+        assert_eq!(err, "private key PEM contained no private key");
+    }
 
     #[test]
     fn parse_certified_key_rejects_missing_certificates() {
         let err = parse_certified_key("", "").expect_err("expected parse error");
         assert!(err.contains("certificate PEM contained no certificates"));
+    }
+
+    #[test]
+    fn parse_private_key_rejects_missing_key_material() {
+        let err = parse_private_key("").expect_err("expected missing private key");
+        assert_eq!(err, "private key PEM contained no private key");
     }
 
     #[test]

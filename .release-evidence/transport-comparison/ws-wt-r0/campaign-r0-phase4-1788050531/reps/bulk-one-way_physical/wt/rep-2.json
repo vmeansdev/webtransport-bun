@@ -1,0 +1,125 @@
+{
+  "sampleUnit": "Mbps",
+  "samples": [
+    259.20072,
+    339.56352,
+    337.8608,
+    341.496,
+    196.35408,
+    9.99664,
+    233.86688,
+    247.61312,
+    165.42768,
+    231.82048,
+    300.20472,
+    305.66712,
+    276.65744,
+    314.60928,
+    304.96288,
+    33.81312,
+    301.09408,
+    355.80736,
+    357.58272,
+    388.32384,
+    333.2024,
+    293.64416,
+    312.91408,
+    346.78192,
+    309.61664,
+    91.83808,
+    4.09072,
+    72.00144,
+    251.02,
+    172.31616,
+    213.80704,
+    304.2072,
+    303.36192,
+    313.7348606046301
+  ],
+  "percentiles": {
+    "p1": 6.0396735999999995,
+    "p50": 300.6494,
+    "p95": 356.428736,
+    "p99": 378.17927040000006
+  },
+  "ledger": {
+    "attempted": 1600,
+    "queued": 1600,
+    "serverObserved": 1600,
+    "acknowledged": 1600,
+    "delivered": 1600,
+    "dropped": 0,
+    "expired": 0,
+    "harnessOverheadBytes": 0,
+    "histogram": {
+      "unit": "Mbps",
+      "boundaries": [
+        0,
+        1,
+        2,
+        5,
+        10,
+        20,
+        50,
+        100,
+        200,
+        500,
+        1000
+      ],
+      "counts": [
+        0,
+        0,
+        1,
+        1,
+        0,
+        1,
+        2,
+        3,
+        26,
+        0,
+        0
+      ]
+    }
+  },
+  "admissionCounters": {
+    "schemaVersion": "v1",
+    "handshakes": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "sessions": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "activePeak": 1
+    },
+    "streams": {
+      "attempted": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "datagrams": {
+      "attempted": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "rateLimited": 0
+    }
+  },
+  "provenance": {
+    "attestation": "dm1-b5ba20784e1950b3c2213c92fcead4a0",
+    "driverRunId": "ws-wt-r0-campaign-r0-phase4-1788050531-bulk-one-way_physical-1788050536184-rep-2-rep-2",
+    "clockMethod": "performance.timeOrigin+performance.now",
+    "sampleCount": 34,
+    "firstSampleAtMs": 1788050564958.8909,
+    "lastSampleAtMs": 1788050568283.7156
+  },
+  "loopUtilization": {
+    "busyMs": 0,
+    "windowMs": 3378.458251953125
+  },
+  "roundTrips": [],
+  "deliveredBytes": 104857600
+}

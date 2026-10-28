@@ -8,12 +8,82 @@ The addon is implemented in Rust using napi-rs. QUIC/HTTP3/WebTransport is imple
 - tests
 
 ## Threading model
-- Two dedicated Tokio runtimes, each with 1 worker thread:
-  - **RUNTIME** (`wt-server`): drives server accept loop, server-side sessions, and stream bridges.
-  - **CLIENT_RUNTIME** (`wt-client`): drives client connections and client-side stream bridges.
+- Two dedicated Tokio runtimes, each with an exact constructor contract:
+  - **RUNTIME** (`wt-server`), `Builder::new_multi_thread().worker_threads(2)`:
+    drives server accept loop, server-side sessions, and stream bridges. The
+    count is resolved by `server_worker_threads()` rather than written as a
+    literal: it is 2 unless `WEBTRANSPORT_NATIVE_SERVER_WORKERS` names another
+    integer in 1..=8; any other value logs one warning and falls back to 2.
+    That override is an unsupported internal knob for measurement-campaign A/B
+    runs only — 2 stays the shipped default, because every alternative
+    measured worse (macOS: 89k/s at two, 82k/s at four, 48k/s at ten). The
+    effective value is readable through the internal
+    `__TESTING__.serverInternals(server).serverWorkerThreads()`.
+  - **CLIENT_RUNTIME** (`wt-client`), `Builder::new_multi_thread().worker_threads(1)`:
+    drives client connections and client-side stream bridges.
+- `new_multi_thread` is required for both. Synchronous N-API entry points call
+  `Runtime::spawn` without a permanently driven `block_on`; replacing these
+  runtimes with `Builder::new_current_thread()` would leave spawned work without
+  a continuously driven executor. The two builders provide separate,
+  independently driven server and client executors.
+- The server runs **two** workers, not for parallelism in the abstract but as
+  independent headroom on top of the delivery-path fix described below. Two is
+  not proven optimal, and higher is not better: on macOS, two workers delivered
+  89,002/s, four delivered 81,682/s, and ten delivered 48,042/s. Nothing here
+  justifies `available_parallelism()`. The only Linux host available has 4 vCPU
+  and only the one- and two-worker arms were testable on it, so the count is not
+  calibrated to production hardware. It is a hardcoded constant with no
+  environment override: every measured alternative was worse, so a knob would
+  only offer ways to regress.
+- The client runtime stays at one worker. Every delivery measurement covers the
+  server receive path only; raising the client for symmetry would be an
+  unmeasured change.
+
+### Datagram delivery must not hop between runtimes
+- `readDatagram`, `readDatagramBatch`, `sendDatagram`, and per-datagram
+  `discardDatagram` run **directly on the N-API runtime** that
+  `Env::spawn_future` provides. They must not be wrapped in `RUNTIME.spawn`,
+  and `scripts/check-doc-truth.ts` pins that.
+- Dispatching it as `env.spawn_future(async { RUNTIME.spawn(...).await })` was a
+  **root-cause availability defect**, not a performance nicety. `RUNTIME.spawn`
+  called from the N-API runtime is a spawn from *outside* the server runtime, so
+  every delivery landed in that runtime's **injection queue**. A worker reaches
+  the injection queue either by running dry — which drains it in bulk — or on a
+  tick that takes **exactly one** task, and tokio time-targets that tick at one
+  check per 200µs of work. Under sustained load the worker's local queue never
+  ran dry, so every delivery trickled through the tick path at ~5,000/s. The
+  server ingested datagrams off the wire normally and then discarded 80-95% of
+  them, a cliff rather than a ceiling: delivered throughput fell about 10x in
+  response to a 2x rise in offered load, with the same floor on macOS and Linux
+  despite a 32x difference in receive-path cost — a scheduler policy constant,
+  which is exactly why a cheaper receive path never moved it.
+- Confirmed by falsifier, not inspection: pinning `global_queue_interval`
+  disables tokio's tuner, and `delivered x interval` held constant at
+  ~93,000 ± 3% across a 64x span of the knob (2 → 47,930/s, 127 → 726/s).
+- Removing the hop is what fixes it: at one worker, 5,266 delivered/s with 95%
+  dropped became 84,823/s with none dropped, a 16.1x improvement; at two workers
+  it is slightly faster on about 10% less CPU. Two workers alone would only have
+  made workers run dry often enough to dodge the tick path, which a busier
+  server or a larger session count could undo.
+- The hop is safe to delete on those four paths: `read_datagram_for_session`
+  and `read_datagram_batch_for_session` only lock a Tokio mutex and receive
+  from a Tokio mpsc; `send_datagram` awaits a Notify plus a timer deadline then
+  makes a synchronous quinn call; per-datagram `discard_datagram` is the read
+  path plus an optional `tokio::time::timeout`. napi-rs's current_thread
+  runtime already has a time driver. Measured at one worker: send
+  5,213 → 55,306/s (echo 15% → 100%); discard 5,374 → 83,479/s (94.5% → 0%
+  dropped). Stream open/accept and the bulk `discard_datagrams` loop **keep**
+  their hops: opens never bound the cadence (~1,530/s either way), and the bulk
+  drain is one spawn then a native loop that must not monopolise the JS thread.
+- `scripts/check-doc-truth.ts` source-policies both runtime declarations, their
+  individual worker counts, and their dedicated thread names, and rejects a
+  worker count derived from the environment or from `available_parallelism()`,
+  so the documented constructors and the implementation cannot drift silently.
 - Isolation prevents same-process deadlock when client and server share a process (e.g. tests).
 - All wtransport objects are owned and driven on these runtimes.
-- JS calls enqueue commands to the runtimes via bounded channels.
+- JS calls enqueue commands to the runtimes via bounded channels. Datagram
+  read, batch read, send, and per-datagram discard are the exception: they run
+  directly on the N-API runtime rather than hopping onto the server runtime first.
 - Runtimes emit events back to JS via ThreadsafeFunction (TSFN) using batching.
 
 ## Object model and lifetimes

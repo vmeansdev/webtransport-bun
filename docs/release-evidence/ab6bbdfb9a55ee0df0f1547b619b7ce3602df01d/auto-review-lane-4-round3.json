@@ -1,0 +1,66 @@
+{
+	"lane": 4,
+	"round": 3,
+	"agent": "b7b85585-d343-4582-a25f-b3012435f27b",
+	"verdict": "READY",
+	"findings": [
+		{
+			"id": "L4-P0-limits-sessionId",
+			"severity": "P0",
+			"status": "fixed",
+			"summary": "wasm-limits sessionId migration"
+		},
+		{
+			"id": "L4-P1-callback-arity",
+			"severity": "P1",
+			"status": "fixed",
+			"summary": "abuse callback arity/sessionId"
+		},
+		{
+			"id": "L4-P1-requireSafe-throw",
+			"severity": "P1",
+			"status": "fixed",
+			"summary": "requireSafeSessionId soft-fail"
+		},
+		{
+			"id": "L4-P1-exports",
+			"severity": "P1",
+			"status": "fixed",
+			"summary": "TicketStore exports"
+		},
+		{
+			"id": "L4-P1-ticketstore-unwired",
+			"severity": "P1",
+			"status": "fixed",
+			"summary": "TicketStoreHost honesty"
+		},
+		{
+			"id": "L4-P2-connect-sharestore-typing",
+			"severity": "P2",
+			"status": "fixed",
+			"summary": "shareProcess0RttTicketStore omitted from WasmConnectOptions",
+			"file": "packages/webtransport/src/backend.ts",
+			"fixedIn": "round3-follow-up"
+		},
+		{
+			"id": "L4-P2-parity-doc-drift",
+			"severity": "P2",
+			"status": "fixed",
+			"summary": "docs synced in L7 follow-up",
+			"fixedIn": "round3-follow-up"
+		},
+		{
+			"id": "L4-P3-unified-client-opts",
+			"severity": "P3",
+			"status": "invalidated",
+			"summary": "WasmClientArgs lacks 0rtt/QPACK; OK while facade pending (deferred / non-blocking)"
+		},
+		{
+			"id": "L4-P3-opensession-f64",
+			"severity": "P3",
+			"status": "invalidated",
+			"summary": "f64 open_session"
+		}
+	],
+	"note": "typing + doc drift fixed"
+}

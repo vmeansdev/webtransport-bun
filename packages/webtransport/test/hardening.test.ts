@@ -3,7 +3,13 @@
  */
 
 import { describe, it, expect, afterEach } from "bun:test";
-import { createHarness } from "./helpers/harness.js";
+import {
+	createHarness,
+	forEachWithTimeout,
+	readWithTimeout,
+	waitFor,
+	withTimeout,
+} from "./helpers/harness.js";
 import { connectWithRetry, nextPort } from "./helpers/network.js";
 import {
 	connect,
@@ -15,6 +21,7 @@ import {
 	E_HANDSHAKE_TIMEOUT,
 	E_INTERNAL,
 	E_LIMIT_EXCEEDED,
+	releaseNativeMemory,
 } from "../src/index.js";
 
 const BASE_PORT = 18500;
@@ -33,19 +40,6 @@ async function trackedConnect(...args: Parameters<typeof connect>) {
 	return harness.track(await connectWithRetry(args[0], args[1]));
 }
 
-async function waitUntil(
-	condition: () => boolean,
-	timeoutMs: number,
-	intervalMs = 25,
-): Promise<boolean> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		if (condition()) return true;
-		await Bun.sleep(intervalMs);
-	}
-	return condition();
-}
-
 describe("error-code mapping", () => {
 	it("client send_datagram after close returns E_SESSION_CLOSED", async () => {
 		const port = nextPort(BASE_PORT, 1000);
@@ -53,8 +47,12 @@ describe("error-code mapping", () => {
 			port,
 			tls: { certPem: "", keyPem: "" },
 			onSession: async (s) => {
-				for await (const _ of s.incomingDatagrams()) {
-				}
+				await forEachWithTimeout(
+					s.incomingDatagrams(),
+					5000,
+					"hardening closed send incoming datagram",
+					async () => undefined,
+				);
 			},
 		});
 
@@ -79,8 +77,12 @@ describe("error-code mapping", () => {
 			port,
 			tls: { certPem: "", keyPem: "" },
 			onSession: async (s) => {
-				for await (const _ of s.incomingDatagrams()) {
-				}
+				await forEachWithTimeout(
+					s.incomingDatagrams(),
+					5000,
+					"hardening oversized datagram incoming datagram",
+					async () => undefined,
+				);
 			},
 		});
 
@@ -126,8 +128,12 @@ describe("close-path promise settlement", () => {
 			tls: { certPem: "", keyPem: "" },
 			onSession: async (s) => {
 				serverSession = s;
-				for await (const _ of s.incomingDatagrams()) {
-				}
+				await forEachWithTimeout(
+					s.incomingDatagrams(),
+					5000,
+					"hardening server close settles incoming datagram",
+					async () => undefined,
+				);
 			},
 		});
 
@@ -152,8 +158,12 @@ describe("close-path promise settlement", () => {
 			port,
 			tls: { certPem: "", keyPem: "" },
 			onSession: async (s) => {
-				for await (const _ of s.incomingDatagrams()) {
-				}
+				await forEachWithTimeout(
+					s.incomingDatagrams(),
+					5000,
+					"hardening client close settles incoming datagram",
+					async () => undefined,
+				);
 			},
 		});
 
@@ -181,9 +191,14 @@ describe("client metricsSnapshot", () => {
 			port,
 			tls: { certPem: "", keyPem: "" },
 			onSession: async (s) => {
-				for await (const dgram of s.incomingDatagrams()) {
-					await s.sendDatagram(dgram);
-				}
+				await forEachWithTimeout(
+					s.incomingDatagrams(),
+					5000,
+					"hardening metrics incoming datagram",
+					async (dgram) => {
+						await s.sendDatagram(dgram);
+					},
+				);
 			},
 		});
 
@@ -192,11 +207,16 @@ describe("client metricsSnapshot", () => {
 		});
 
 		await client.sendDatagram(new Uint8Array([1, 2, 3]));
-		const observed = await waitUntil(() => {
-			const snap = client.metricsSnapshot();
-			return snap.datagramsOut >= 1 && snap.datagramsIn >= 1;
-		}, 1500);
-		expect(observed).toBe(true);
+		await waitFor(
+			() => {
+				const snap = client.metricsSnapshot();
+				return snap.datagramsOut >= 1 && snap.datagramsIn >= 1;
+			},
+			Boolean,
+			1500,
+			25,
+			"client datagram activity metrics",
+		);
 
 		const snap = client.metricsSnapshot();
 		expect(snap.datagramsOut).toBeGreaterThanOrEqual(1);
@@ -212,16 +232,25 @@ describe("client metricsSnapshot", () => {
 			port,
 			tls: { certPem: "", keyPem: "" },
 			onSession: async (s) => {
-				for await (const bidi of s.incomingBidirectionalStreams) {
-					const reader = bidi.readable.getReader();
-					const first = await reader.read();
-					reader.releaseLock();
-					if (!first.done) {
-						const writer = bidi.writable.getWriter();
-						await writer.write(first.value);
-						await writer.close();
-					}
-				}
+				await forEachWithTimeout(
+					s.incomingBidirectionalStreams,
+					5000,
+					"hardening streamsActive incoming bidi",
+					async (bidi) => {
+						const reader = bidi.readable.getReader();
+						const first = await readWithTimeout(
+							reader,
+							5000,
+							"hardening server first bidi chunk",
+						);
+						reader.releaseLock();
+						if (!first.done) {
+							const writer = bidi.writable.getWriter();
+							await writer.write(first.value);
+							await writer.close();
+						}
+					},
+				);
 			},
 		});
 
@@ -230,11 +259,16 @@ describe("client metricsSnapshot", () => {
 		});
 
 		const stream = await client.createBidirectionalStream();
-		const observedActive = await waitUntil(() => {
-			const snap = client.metricsSnapshot();
-			return snap.streamsActive >= 1;
-		}, 1500);
-		expect(observedActive).toBe(true);
+		await waitFor(
+			() => {
+				const snap = client.metricsSnapshot();
+				return snap.streamsActive >= 1;
+			},
+			Boolean,
+			1500,
+			25,
+			"client active stream metric",
+		);
 
 		const replyPromise = new Promise<Buffer>((resolve, reject) => {
 			const timer = setTimeout(
@@ -277,14 +311,25 @@ describe("metrics consistency after stress burst", () => {
 		const NUM_CLIENTS = 3;
 		const DATAGRAMS_PER_CLIENT = 5;
 		let sessionsReceived = 0;
+		const sessionClosed: Promise<unknown>[] = [];
+		const sessionTasks: Promise<unknown>[] = [];
 		const server = trackedCreateServer({
 			port,
 			tls: { certPem: "", keyPem: "" },
-			onSession: async (s) => {
+			onSession: (s) => {
 				sessionsReceived++;
-				for await (const dgram of s.incomingDatagrams()) {
-					await s.sendDatagram(dgram);
-				}
+				sessionClosed.push(s.closed.catch((error) => error));
+				const sessionTask = (async () => {
+					await forEachWithTimeout(
+						s.incomingDatagrams(),
+						1500,
+						"hardening stress burst incoming datagram",
+						async (dgram) => {
+							await s.sendDatagram(dgram);
+						},
+					);
+				})().catch((error) => error);
+				sessionTasks.push(sessionTask);
 			},
 		});
 
@@ -308,20 +353,58 @@ describe("metrics consistency after stress burst", () => {
 		const mDuring = server.metricsSnapshot();
 		expect(mDuring.datagramsIn).toBeGreaterThan(0);
 
+		await waitFor(
+			() => sessionsReceived === NUM_CLIENTS,
+			Boolean,
+			5000,
+			25,
+			"stress burst session accepts",
+		);
+
+		const clientClosed = clients.map((client) =>
+			client.closed.catch((error) => error),
+		);
 		for (const client of clients) {
 			client.close();
 		}
-		const drained = await waitUntil(() => {
-			const m = server.metricsSnapshot();
-			return (
-				m.queuedBytesGlobal <= 1024 &&
-				m.sessionTasksActive === 0 &&
-				m.streamTasksActive === 0
-			);
-		}, 7000);
-		expect(drained).toBe(true);
+
+		await Promise.allSettled(clientClosed);
+		await Promise.allSettled(sessionClosed);
+		await withTimeout(
+			Promise.allSettled(sessionTasks),
+			7000,
+			"stress burst session tasks settle",
+		);
+		await waitFor(
+			() => server.metricsSnapshot().sessionsActive === 0,
+			Boolean,
+			7000,
+			25,
+			"server sessions drain after stress burst",
+		);
+		await waitFor(
+			() => {
+				const m = server.metricsSnapshot();
+				return (
+					m.sessionsActive === 0 &&
+					m.queuedBytesGlobal <= 1024 &&
+					// The listening server retains its top-level accept loop until
+					// server.close() tears it down.
+					m.sessionTasksActive <= 1 &&
+					m.streamTasksActive === 0
+				);
+			},
+			Boolean,
+			7000,
+			25,
+			"server metrics drain after stress burst",
+		);
 
 		await server.close();
+		const postClose = server.metricsSnapshot();
+		expect(postClose.sessionsActive).toBe(0);
+		expect(postClose.sessionTasksActive).toBe(0);
+		expect(postClose.streamTasksActive).toBe(0);
 	}, 20000);
 });
 
@@ -334,49 +417,68 @@ describe("E_BACKPRESSURE_TIMEOUT error coding", () => {
 		expect(err.message).toContain("test");
 	});
 
-	it("client backpressureTimeoutMs option is respected", async () => {
+	it("backpressureTimeoutMs deterministically yields E_BACKPRESSURE_TIMEOUT when stream capacity never frees", async () => {
 		const port = nextPort(BASE_PORT, 1000);
+		const timeoutMs = 200;
+		let serverSession: any = null;
+		let resolveServerReady!: () => void;
+		const serverReady = new Promise<void>((resolve) => {
+			resolveServerReady = resolve;
+		});
 		const server = trackedCreateServer({
 			port,
 			tls: { certPem: "", keyPem: "" },
-			onSession: async () => {},
+			// One bidi stream per session, and a short capacity-wait budget: once the
+			// single slot is taken, any waitUntilAvailable open must time out.
+			limits: {
+				maxStreamsPerSessionBidi: 1,
+				maxStreamsGlobal: 50000,
+				backpressureTimeoutMs: timeoutMs,
+			},
+			onSession: async (s) => {
+				serverSession = s;
+				resolveServerReady();
+				await forEachWithTimeout(
+					s.incomingDatagrams(),
+					5000,
+					"hardening bidi cap incoming datagram",
+					async () => undefined,
+				);
+			},
 		});
 
 		const client = await trackedConnect(`https://127.0.0.1:${port}`, {
 			tls: { insecureSkipVerify: true },
-			limits: { backpressureTimeoutMs: 1 },
 		});
+		await serverReady;
+		expect(serverSession).not.toBeNull();
 
-		const buf = new Uint8Array(100);
-		let anyBackpressureTimeout = false;
-		const SENDS = 500;
+		// Occupy the only bidi slot and hold it open for the whole test.
+		const held = await serverSession.createBidirectionalStream();
+		expect(held).toBeDefined();
 
-		const results = await Promise.allSettled(
-			Array.from({ length: SENDS }, () => client.sendDatagram(buf)),
-		);
-
-		for (const r of results) {
-			if (r.status === "rejected") {
-				const err = r.reason;
-				if (
-					err instanceof WebTransportError &&
-					err.code === E_BACKPRESSURE_TIMEOUT
-				) {
-					anyBackpressureTimeout = true;
-					break;
-				}
-			}
+		// A second open that waits for capacity can never succeed while the slot
+		// stays held, so it must reject with E_BACKPRESSURE_TIMEOUT after the
+		// configured budget elapses — no dependence on host speed.
+		const start = Date.now();
+		let caught: unknown;
+		try {
+			await serverSession.createBidirectionalStream({
+				waitUntilAvailable: true,
+			});
+			expect(true).toBe(false);
+		} catch (e) {
+			caught = e;
 		}
+		const elapsed = Date.now() - start;
 
-		// With a 1ms timeout and 500 parallel sends, backpressure timeouts
-		// may or may not occur depending on machine speed. When they do
-		// occur, they must carry the correct error code (verified above).
-		// The load test suite (backpressure.test.ts) provides additional
-		// probabilistic coverage for this path.
-		if (anyBackpressureTimeout) {
-			expect(anyBackpressureTimeout).toBe(true);
-		}
+		expect(caught).toBeInstanceOf(WebTransportError);
+		expect((caught as WebTransportError).code).toBe(E_BACKPRESSURE_TIMEOUT);
+		// The wait honored the configured budget rather than returning immediately.
+		expect(elapsed).toBeGreaterThanOrEqual(timeoutMs - 50);
 
+		held.destroy();
+		await client.close();
 		await server.close();
 	}, 15000);
 });
@@ -397,8 +499,12 @@ describe("server-created stream cap enforcement", () => {
 			onSession: async (s) => {
 				serverSession = s;
 				resolveServerReady();
-				for await (const _ of s.incomingDatagrams()) {
-				}
+				await forEachWithTimeout(
+					s.incomingDatagrams(),
+					5000,
+					"hardening uni cap incoming datagram",
+					async () => undefined,
+				);
 			},
 		});
 
@@ -441,8 +547,12 @@ describe("server-created stream cap enforcement", () => {
 			onSession: async (s) => {
 				serverSession = s;
 				resolveServerReady();
-				for await (const _ of s.incomingDatagrams()) {
-				}
+				await forEachWithTimeout(
+					s.incomingDatagrams(),
+					5000,
+					"hardening limit exceeded incoming datagram",
+					async () => undefined,
+				);
 			},
 		});
 
@@ -469,4 +579,54 @@ describe("server-created stream cap enforcement", () => {
 		await client.close();
 		await server.close();
 	}, 15000);
+});
+
+describe("native memory release", () => {
+	it("releaseNativeMemory during active sessions does not disturb delivery", async () => {
+		const port = nextPort(BASE_PORT, 1000);
+		let received = 0;
+		const server = trackedCreateServer({
+			port,
+			tls: { certPem: "", keyPem: "" },
+			onSession: async (s) => {
+				await forEachWithTimeout(
+					s.incomingDatagrams(),
+					10000,
+					"release-native-memory incoming datagram",
+					async () => {
+						received += 1;
+					},
+				);
+			},
+		});
+
+		const client = await trackedConnect(`https://127.0.0.1:${port}`, {
+			tls: { insecureSkipVerify: true },
+		});
+
+		for (let batch = 0; batch < 4; batch++) {
+			for (let i = 0; i < 5; i++) {
+				await client.sendDatagram(new Uint8Array([batch, i]));
+			}
+			// Best-effort, bounded, and must not disturb in-flight delivery.
+			expect(releaseNativeMemory()).toBe(true);
+		}
+		await waitFor(
+			() => received,
+			(count) => count >= 20,
+			10000,
+			undefined,
+			"datagram delivery",
+		);
+
+		const stream = await client.createBidirectionalStream();
+		stream.write(new Uint8Array([42]));
+		releaseNativeMemory();
+		stream.write(new Uint8Array([43]));
+		stream.end();
+
+		expect(received).toBeGreaterThanOrEqual(20);
+		await client.close();
+		await server.close();
+	}, 20000);
 });

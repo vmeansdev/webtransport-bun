@@ -1,0 +1,24 @@
+{
+  "schema": "live-trust-bootstrap/v1",
+  "stagedDir": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/.claude/worktrees/ws-scenario-comparison/.release-evidence/transport-comparison/ws-wt-r0/campaign-r0-framework/live-trust-bootstrap",
+  "authoritySha256": "53be3ad24595d38577e0cd7361a2eab82ade3207a9d7eb8dc172a9a919ee3b1e",
+  "lockSha256": "0993035d101e2458fbd4519edcce9369c8c700693fc4d85e05b81ae6c037d4c1",
+  "capabilitySha256": "f40d8c4afb0a756270eb729d2ae4797e2e9d595d1bf2cd28841c41b755310290",
+  "manifestSha256": "0ff71ec783cfcb1b287b31ff8fd61db7908932d992150a0878a12e1434145c0e",
+  "paths": {
+    "stagedDir": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/.claude/worktrees/ws-scenario-comparison/.release-evidence/transport-comparison/ws-wt-r0/campaign-r0-framework/live-trust-bootstrap",
+    "authorityFile": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/.claude/worktrees/ws-scenario-comparison/.release-evidence/transport-comparison/ws-wt-r0/campaign-r0-framework/live-trust-bootstrap/authority.json",
+    "authorityDigestFile": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/.claude/worktrees/ws-scenario-comparison/.release-evidence/transport-comparison/ws-wt-r0/campaign-r0-framework/live-trust-bootstrap/authority-digest.bin",
+    "campaignRootDir": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/.claude/worktrees/ws-scenario-comparison/.release-evidence/transport-comparison/ws-wt-r0/campaign-r0-framework/live-trust-bootstrap/campaign-root",
+    "stagingRootDir": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/.claude/worktrees/ws-scenario-comparison/.release-evidence/transport-comparison/ws-wt-r0/campaign-r0-framework/live-trust-bootstrap/staging-root",
+    "digests": {
+      "authority": "53be3ad24595d38577e0cd7361a2eab82ade3207a9d7eb8dc172a9a919ee3b1e",
+      "lock": "0993035d101e2458fbd4519edcce9369c8c700693fc4d85e05b81ae6c037d4c1",
+      "capability": "f40d8c4afb0a756270eb729d2ae4797e2e9d595d1bf2cd28841c41b755310290",
+      "manifest": "0ff71ec783cfcb1b287b31ff8fd61db7908932d992150a0878a12e1434145c0e"
+    }
+  },
+  "issuedAt": "2026-08-29T22:37:40.082Z",
+  "notAfter": "2026-08-30T10:37:40.082Z",
+  "note": "Promote authoritySha256 into R1_CAMPAIGN_AUTHORITY_ANCHOR_SET before official quarantine release."
+}

@@ -1,0 +1,8 @@
+{
+	"lane": 2,
+	"round": 3,
+	"agent": "c6dea7a7-f117-4fe2-8b62-95ba32e05686",
+	"verdict": "N/A",
+	"findings": [],
+	"note": "crates/native/ untouched in 21ce66c..1d8bd6d (confidence high). Diff is WASM JS/Rust + evidence only. Latent skew (not regressions): native String session handles vs WASM (conn,bigint) demux; close is handle-bound (native) vs closeSession(conn,sid,code,reason) (WASM); shareProcess0RttTicketStore/enable0Rtt/wtMaxSessions/QPACK are WASM-only options."
+}

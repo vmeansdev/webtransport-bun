@@ -1,0 +1,14 @@
+[workspace]
+members = ["wtransport", "wtransport-proto"]
+resolver = "2"
+
+[workspace.lints.rust]
+unfulfilled_lint_expectations = "deny"
+unit_bindings = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+manual_is_variant_and = "warn"
+manual_let_else = "warn"
+unnecessary_cast = "deny"

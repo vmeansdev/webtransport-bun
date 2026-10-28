@@ -1,0 +1,18 @@
+{
+ "commit": "875dfbfe736056326a64532fdfe6ced702a19aa2",
+ "claimId": "package-artifact",
+ "createdAt": "2026-08-08T18:05:23.000Z",
+ "status": "passed",
+ "notes": "Package artifact build + manifest check (89 files) at the rebound candidate; engines.bun floor now >=1.3.14.",
+ "runner": "local-darwin-arm64",
+ "command": [
+  "bash",
+  "-c",
+  "bun scripts/test-package-artifact.ts build && bun scripts/test-package-artifact.ts check"
+ ],
+ "startedAt": "2026-08-08T18:05:16.000Z",
+ "endedAt": "2026-08-08T18:05:23.000Z",
+ "durationMs": 7000,
+ "exitCode": 0,
+ "artifactSha256": "9ddaf5b121e49f2b95d0af20a3a0162f3afd20a47a333855ba0054bb0176a430"
+}

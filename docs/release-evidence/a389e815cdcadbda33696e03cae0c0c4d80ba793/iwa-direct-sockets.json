@@ -1,0 +1,29 @@
+{
+ "commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
+ "claimId": "iwa-direct-sockets",
+ "createdAt": "2026-08-06T15:52:55.916Z",
+ "status": "passed",
+ "notes": "Hosted IWA Direct Sockets proof at the candidate (iwa.yml run 31117263944, candidate_commit-pinned): wasm server AND client inside a signed developer-mode IWA (isolated-app://, crossOriginIsolated, Direct Sockets UDPSocket) on pinned Chromium 145.0.7632.6 and Chrome Beta 152.0.7977.30. datagram/bidi/uni echo, RESET_STREAM 37 via writable.abort, STOP_SENDING 41 via readable.cancel, peer close 4100, 8 reconnects, cert rotation stale-pin-rejected. Ephemeral Ed25519 key. artifactSha256=sha256(evidence.json); chromeBetaEvidenceSha256 covers beta.",
+ "runner": "github-hosted ubuntu-latest (xvfb)",
+ "command": [
+  "gh",
+  "workflow",
+  "iwa.yml",
+  "run-id",
+  "31117263944"
+ ],
+ "startedAt": "2026-08-06T15:52:55.730Z",
+ "endedAt": "2026-08-06T15:52:58.845Z",
+ "durationMs": 0,
+ "exitCode": 0,
+ "artifactSha256": "6bf9be08f2d55e6ad62bbb2659c4df107f3e149889f499a6cc2264748a3746d2",
+ "chromeBetaEvidenceSha256": "2b2f9ec8044d371b230c41b39d443bdd5824d75934037635566712731b88739e",
+ "signedBundleSha256": "cbe0ac37d7904372c9c626201cb26fc01d3751dec74b8b6102a6513a425f2b1c",
+ "unsignedBundleSha256": "e82086fc17bea80fb4c88e45c6a4495e6ba88ec97162bc3e7dbe51cd70ef82f5",
+ "origin": "isolated-app://2efcflvk3fuwrvrosl3s7ngmq4w2dbg6os23rd5khc3jwvdfrvuqaaic",
+ "ciRun": {
+  "id": 31117263944,
+  "url": "https://github.com/vmeansdev/webtransport-bun/actions/runs/31117263944",
+  "conclusion": "success"
+ }
+}

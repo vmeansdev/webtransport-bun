@@ -1,0 +1,47 @@
+# Standalone workspace for the wasm spike so the parent workspace's
+# aws-lc-rs-based native crate features don't leak into the wasm build.
+[workspace]
+
+[package]
+name = "webtransport-wasm"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# Enables the accept-any TLS client path in `wt_new_endpoint` (is_server=false).
+# TEST/DEV ONLY — never enable for a shipped (wasm-dist) artifact. Production
+# clients pin by certificate hash via `wt_new_client`.
+dev-insecure = []
+
+# Dist builds set `RUSTFLAGS=--cfg wt_ship_production` (not a Cargo feature) so
+# `dev-insecure` + ship cfg is a compile error, while `cargo test --all-features`
+# stays inert (it does not set that cfg).
+
+[dependencies]
+quinn-proto = { version = "0.11", default-features = false, features = ["rustls-ring", "log"] }
+bytes = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+rcgen = { version = "0.14", default-features = false, features = ["pem", "crypto", "ring"] }
+getrandom = { version = "0.2", features = ["js"] }
+web-time = "1"
+time = { version = "0.3", default-features = false, features = ["std"] }
+sha2 = "0.10"
+base64 = "0.22"
+serde_json = "1"
+httlib-huffman = "0.3"
+x509-parser = { version = "=0.18.1", default-features = false }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+
+[profile.release]
+opt-level = "s"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(wt_ship_production)'] }

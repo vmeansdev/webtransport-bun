@@ -1,0 +1,987 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import {
+	assertWarmupNotLoaded,
+	awaitWithTimeout,
+	buildArtifactDocument,
+	buildMemoryTelemetry,
+	buildNativeOwnerTelemetry,
+	buildSourceIdentityProof,
+	coldResidencyDeltaCapMb,
+	coldStartDiagnosticThreshold,
+	evaluateOverloadEvidence,
+	evaluateSourceIdentityProof,
+	evaluateWorkloadEvidence,
+	type FinalGauges,
+	isPromotable,
+	nativeTransportPolicySnapshot,
+	plannedWarmupSessions,
+	type RunSummary,
+	runCommandWithBoundedOutput,
+	runScaleCampaign,
+	type ScaleCampaignConfig,
+	toAllocatorReliefTelemetry,
+	validateScaleCampaignConfig,
+	warmupSessionsPerServer,
+	warmupWorkloadPerServer,
+} from "./distributed-scale.ts";
+import {
+	buildIsolatedRssTelemetry,
+	type IsolatedRssSample,
+	parseProcessRssMb,
+} from "./isolated-rss-wrapper.ts";
+import { evaluateCycleRepeat } from "./rss-cycle-repeat.ts";
+
+const TEMP_ROOTS: string[] = [];
+
+afterEach(() => {
+	for (const root of TEMP_ROOTS.splice(0)) {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+const ZERO_GAUGES: FinalGauges = {
+	sessionsActive: 0,
+	sessionTasksActive: 0,
+	streamTasksActive: 0,
+	handshakesInFlight: 0,
+	streamsActive: 0,
+	queuedBytesGlobal: 0,
+	rateLimitedCount: 0,
+	limitExceededCount: 0,
+};
+
+describe("Task 14 distributed scale evidence", () => {
+	test("parses bounded process RSS samples and records exit telemetry", () => {
+		expect(parseProcessRssMb("  61440\n")).toBe(60);
+		expect(parseProcessRssMb("  PID RSS\n")).toBeNull();
+
+		const samples: IsolatedRssSample[] = [
+			{ atMs: 100, rssMb: 42.5 },
+			{ atMs: 250, rssMb: 57.25 },
+			{ atMs: 400, rssMb: 51 },
+		];
+		expect(
+			buildIsolatedRssTelemetry(samples, {
+				exitCode: 0,
+				exitSignal: null,
+				exitedWithinMs: 875,
+			}),
+		).toEqual({
+			lastSampleRssMb: 51,
+			peakRssMb: 57.25,
+			sampleCount: 3,
+			exitCode: 0,
+			exitSignal: null,
+			exitedWithinMs: 875,
+		});
+	});
+
+	test("the live harness uses server observations and an explicit overload phase", () => {
+		const source = readFileSync(
+			new URL("./distributed-scale.ts", import.meta.url),
+			"utf8",
+		);
+		expect(source).toContain("serverObservedPeerIps.add(session.peer.ip)");
+		expect(source).toContain("runOverloadPhase(");
+		expect(source).toContain(
+			"evaluateOverloadEvidence(overloadResult.evidence)",
+		);
+		expect(source).not.toMatch(
+			/clientSummaries\.filter\([\s\S]*?sourceIdentityCount/,
+		);
+	});
+
+	test("records the selected native transport policy for memory evidence", () => {
+		const policy = nativeTransportPolicySnapshot();
+
+		expect(policy.streamReceiveWindowBytes).toBe(262_144);
+		expect(policy.receiveWindowBytes).toBe(2 * 1024 * 1024);
+		expect(policy.sendWindowBytes).toBe(2 * 1024 * 1024);
+		expect(policy.datagramReceiveBufferBytes).toBe(64 * 1024);
+		expect(policy.datagramSendBufferBytes).toBe(64 * 1024);
+		expect(policy.datagramChannelCapacity).toBe(2048);
+		expect(policy.datagramChannelPolicy).toBe("fixed-h2-candidate-disproved");
+	});
+
+	test("records dual RSS baselines and makes service-ready authoritative", () => {
+		const coldStart = {
+			rssMb: 43.3,
+			heapUsedMb: 8,
+			externalMb: 1,
+			arrayBuffersMb: 0.1,
+		};
+		const serviceReady = {
+			rssMb: 54.25,
+			heapUsedMb: 9,
+			externalMb: 1.2,
+			arrayBuffersMb: 0.2,
+		};
+		const peak = {
+			rssMb: 59.4,
+			heapUsedMb: 10,
+			externalMb: 1.4,
+			arrayBuffersMb: 0.3,
+		};
+		const preClose = {
+			rssMb: 59.1,
+			heapUsedMb: 9.8,
+			externalMb: 1.3,
+			arrayBuffersMb: 0.25,
+		};
+		const postClose = {
+			rssMb: 54.3,
+			heapUsedMb: 9.1,
+			externalMb: 1.2,
+			arrayBuffersMb: 0.2,
+		};
+
+		expect(
+			buildMemoryTelemetry({
+				coldStart,
+				serviceReady,
+				peak,
+				preClose,
+				postClose,
+				warmup: {
+					kind: "same-process-native-server-create-close",
+					serverWarmupCycles: 1,
+					serversWarmed: 1,
+					sameProcess: true,
+					streamStackWarmed: false,
+					streamWarmupSessions: 0,
+					streamWarmupStreamsOpened: 0,
+					datagramStackWarmed: false,
+					datagramWarmupSessions: 0,
+					datagramWarmupDatagramsReceived: 0,
+					nativeClientPrewarmed: false,
+					allocatorReliefApplied: false,
+					processRestarted: false,
+				},
+			}),
+		).toEqual({
+			coldStart,
+			serviceReady,
+			recoveryBaseline: serviceReady,
+			peak,
+			preClose,
+			postClose,
+			coldStartRssMb: 43.3,
+			serviceReadyRssMb: 54.25,
+			finalRssMb: 54.3,
+			coldStartRecoveryRatio: 1.254,
+			serviceReadyRecoveryRatio: 1.0009,
+			coldStartRecoveryRatioRss: 1.254,
+			serviceReadyRecoveryRatioRss: 1.0009,
+			chargedMetric: "rss-fallback",
+			coldToServiceReadyDeltaMb: 10.95,
+			serviceReadyToPostCloseDeltaMb: 0.05,
+			allocatorRelief: [],
+			warmup: {
+				kind: "same-process-native-server-create-close",
+				serverWarmupCycles: 1,
+				serversWarmed: 1,
+				sameProcess: true,
+				streamStackWarmed: false,
+				streamWarmupSessions: 0,
+				streamWarmupStreamsOpened: 0,
+				datagramStackWarmed: false,
+				datagramWarmupSessions: 0,
+				datagramWarmupDatagramsReceived: 0,
+				nativeClientPrewarmed: false,
+				allocatorReliefApplied: false,
+				processRestarted: false,
+			},
+			// An 11 MB delta lands under the Linux cap but over the macOS one, so
+			// the verdict this fixture expects is whatever the host platform's
+			// pre-registered cap says.
+			coldStartDiagnostic: {
+				status: coldResidencyDeltaCapMb() >= 11 ? "pass" : "review-required",
+				deltaMb: 11,
+				capMb: coldResidencyDeltaCapMb(),
+				ratio: 1.254,
+				threshold: 1.25,
+				reason:
+					coldResidencyDeltaCapMb() >= 11
+						? "cold-start residency delta stayed within the pre-registered platform-floor cap"
+						: "cold-start residency delta exceeded the pre-registered platform-floor cap and requires explicit release review",
+			},
+		});
+	});
+
+	test("cold diagnostic passes on the delta cap and uses footprint when present", () => {
+		const withFp = (rssMb: number, physFootprintMb: number) => ({
+			rssMb,
+			heapUsedMb: 1,
+			externalMb: 1,
+			arrayBuffersMb: 0,
+			physFootprintMb,
+		});
+		const memory = buildMemoryTelemetry({
+			coldStart: withFp(48, 19),
+			serviceReady: withFp(57, 20.5),
+			peak: withFp(113, 60),
+			preClose: withFp(110, 40),
+			postClose: withFp(114, 24),
+		});
+		// Authoritative ratios use charged memory; rss ratios stay disclosed.
+		expect(memory.chargedMetric).toBe(
+			process.platform === "linux" ? "smaps-lazyfree" : "phys-footprint",
+		);
+		expect(memory.serviceReadyRecoveryRatio).toBe(
+			Number((24 / 20.5).toFixed(4)),
+		);
+		expect(memory.serviceReadyRecoveryRatioRss).toBe(
+			Number((114 / 57).toFixed(4)),
+		);
+		expect(memory.coldStartDiagnostic.status).toBe("pass");
+		expect(memory.coldStartDiagnostic.deltaMb).toBe(5);
+		expect(memory.coldStartDiagnostic.capMb).toBe(coldResidencyDeltaCapMb());
+	});
+
+	test("cold residency cap is pre-registered per platform", () => {
+		expect(coldResidencyDeltaCapMb("darwin")).toBe(6.1);
+		expect(coldResidencyDeltaCapMb("linux")).toBe(13.1);
+		// Unmeasured platforms are judged by the tightest registered cap rather
+		// than inheriting Linux's demand-paged-text allowance.
+		expect(coldResidencyDeltaCapMb("win32")).toBe(6.1);
+		expect(coldResidencyDeltaCapMb("freebsd")).toBe(6.1);
+	});
+
+	test("cold diagnostic flags a delta just over the host platform cap", () => {
+		const cap = coldResidencyDeltaCapMb();
+		const withFp = (physFootprintMb: number) => ({
+			rssMb: physFootprintMb * 2,
+			heapUsedMb: 1,
+			externalMb: 1,
+			arrayBuffersMb: 0,
+			physFootprintMb,
+		});
+		const diagnose = (deltaMb: number) =>
+			buildMemoryTelemetry({
+				coldStart: withFp(20),
+				serviceReady: withFp(21),
+				peak: withFp(60),
+				preClose: withFp(40),
+				postClose: withFp(20 + deltaMb),
+			}).coldStartDiagnostic.status;
+
+		expect(diagnose(cap)).toBe("pass");
+		expect(diagnose(cap + 0.1)).toBe("review-required");
+	});
+
+	test("sizes the RSS warmup independently of the campaign session count", () => {
+		expect(warmupSessionsPerServer()).toBe(1);
+		expect(warmupWorkloadPerServer()).toEqual({
+			sessions: 1,
+			streamsPerSec: 1,
+			datagramsPerSec: 1,
+		});
+		expect(plannedWarmupSessions({ ...validConfig(), sessions: 4 })).toBe(
+			plannedWarmupSessions({ ...validConfig(), sessions: 200 }),
+		);
+		expect(plannedWarmupSessions({ ...validConfig(), sessions: 200 })).toBe(
+			validConfig().serverCount,
+		);
+
+		const source = readFileSync(
+			new URL("./distributed-scale.ts", import.meta.url),
+			"utf8",
+		);
+		expect(source).not.toContain("Math.max(1, serverSessionCaps[i] ?? 1)");
+	});
+
+	test("records real allocator relief diagnostics instead of a hard-coded stub", () => {
+		const sample = {
+			rssMb: 50,
+			heapUsedMb: 1,
+			externalMb: 1,
+			arrayBuffersMb: 0,
+		};
+		const applied = toAllocatorReliefTelemetry("campaign", {
+			allocatorRelief: {
+				platform: "darwin",
+				applied: true,
+				reportedBytesReleased: 1024,
+			},
+		});
+		expect(applied).toEqual({
+			scope: "campaign",
+			platform: "darwin",
+			applied: true,
+			reportedBytesReleased: 1024,
+			refusedReason: null,
+		});
+		expect(toAllocatorReliefTelemetry("warmup", undefined)).toBeNull();
+
+		const memory = buildMemoryTelemetry({
+			coldStart: sample,
+			serviceReady: sample,
+			peak: sample,
+			preClose: sample,
+			postClose: sample,
+			allocatorRelief: applied ? [applied] : [],
+		});
+		expect(memory.warmup.allocatorReliefApplied).toBe(true);
+		expect(memory.allocatorRelief).toEqual([
+			{
+				scope: "campaign",
+				platform: "darwin",
+				applied: true,
+				reportedBytesReleased: 1024,
+				refusedReason: null,
+			},
+		]);
+
+		const refused = buildMemoryTelemetry({
+			coldStart: sample,
+			serviceReady: sample,
+			peak: sample,
+			preClose: sample,
+			postClose: sample,
+			allocatorRelief: [
+				{
+					scope: "campaign",
+					platform: "linux",
+					applied: false,
+					reportedBytesReleased: null,
+					refusedReason: "unsupported-allocator",
+				},
+			],
+		});
+		expect(refused.warmup.allocatorReliefApplied).toBe(false);
+	});
+
+	test("derives the cold-start diagnostic threshold from the configured recovery ratio", () => {
+		const sample = (rssMb: number) => ({
+			rssMb,
+			heapUsedMb: 1,
+			externalMb: 1,
+			arrayBuffersMb: 0,
+		});
+		// Sized off the host platform's cap so the over-cap case stays over it
+		// wherever the suite runs.
+		const overCapDelta = coldResidencyDeltaCapMb() + 1;
+		const input = {
+			coldStart: sample(40),
+			serviceReady: sample(50),
+			peak: sample(60),
+			preClose: sample(58),
+			postClose: sample(40 + overCapDelta),
+		};
+
+		expect(coldStartDiagnosticThreshold({ maxRecoveryRssRatio: 1.4 })).toBe(
+			1.4,
+		);
+		expect(
+			coldStartDiagnosticThreshold({ maxRecoveryRssRatio: Number.NaN }),
+		).toBe(1.25);
+
+		// The recorded informational threshold derives from config; the
+		// pass/review verdict itself is decided by the pre-registered
+		// residency-delta cap, never by the ratio threshold.
+		const strict = buildMemoryTelemetry(input);
+		expect(strict.coldStartDiagnostic.threshold).toBe(1.25);
+		expect(strict.coldStartDiagnostic.deltaMb).toBe(overCapDelta);
+		expect(strict.coldStartDiagnostic.status).toBe("review-required");
+
+		const relaxed = buildMemoryTelemetry({
+			...input,
+			coldStartDiagnosticThreshold: 1.4,
+		});
+		expect(relaxed.coldStartDiagnostic.threshold).toBe(1.4);
+		expect(relaxed.coldStartDiagnostic.status).toBe("review-required");
+
+		const withinCap = buildMemoryTelemetry({
+			...input,
+			postClose: sample(45),
+		});
+		expect(withinCap.coldStartDiagnostic.deltaMb).toBe(5);
+		expect(withinCap.coldStartDiagnostic.status).toBe("pass");
+	});
+
+	test("fails when the warmup baseline grows with campaign session count", () => {
+		expect(
+			assertWarmupNotLoaded([
+				{ sessions: 4, coldToServiceReadyDeltaMb: 2.1 },
+				{ sessions: 4, coldToServiceReadyDeltaMb: 2.5 },
+				{ sessions: 200, coldToServiceReadyDeltaMb: 2.9 },
+				{ sessions: 200, coldToServiceReadyDeltaMb: 3.1 },
+			]),
+		).toEqual([]);
+
+		expect(
+			assertWarmupNotLoaded([
+				{ sessions: 4, coldToServiceReadyDeltaMb: 2.0 },
+				{ sessions: 200, coldToServiceReadyDeltaMb: 10.5 },
+			]),
+		).toEqual([
+			"warmup baseline scales with campaign size: coldToServiceReadyDeltaMb median 2.000MB at 4 sessions vs 10.500MB at 200 sessions (delta 8.500MB exceeds 1.000MB tolerance)",
+		]);
+
+		expect(
+			assertWarmupNotLoaded([{ sessions: 4, coldToServiceReadyDeltaMb: 2 }]),
+		).toEqual([
+			"warmup baseline scaling guard needs coldToServiceReadyDeltaMb samples from at least two session counts",
+		]);
+	});
+
+	test("aggregates owner-scoped native residency counters without hiding availability", () => {
+		expect(
+			buildNativeOwnerTelemetry(
+				[
+					{
+						nativeSessionRegistryEntries: 2,
+						nativeTrackedTasks: 4,
+						nativeRateLimitEntries: 6,
+						nativeBidiHandlesLive: 8,
+						nativeUniSendHandlesLive: 10,
+						nativeUniRecvHandlesLive: 12,
+					},
+					{
+						nativeSessionRegistryEntries: 1,
+						nativeTrackedTasks: 3,
+						nativeRateLimitEntries: 5,
+						nativeBidiHandlesLive: 7,
+						nativeUniSendHandlesLive: 9,
+						nativeUniRecvHandlesLive: 11,
+					},
+				],
+				[
+					{
+						nativeSessionRegistryEntries: 0,
+						nativeTrackedTasks: 0,
+						nativeRateLimitEntries: 0,
+						nativeBidiHandlesLive: 0,
+						nativeUniSendHandlesLive: 0,
+						nativeUniRecvHandlesLive: 0,
+					},
+				],
+			),
+		).toEqual({
+			preClose: {
+				available: true,
+				sessionRegistryEntries: 3,
+				trackedTasks: 7,
+				rateLimitEntries: 11,
+				bidiHandlesLive: 15,
+				uniSendHandlesLive: 19,
+				uniRecvHandlesLive: 23,
+			},
+			postClose: {
+				available: true,
+				sessionRegistryEntries: 0,
+				trackedTasks: 0,
+				rateLimitEntries: 0,
+				bidiHandlesLive: 0,
+				uniSendHandlesLive: 0,
+				uniRecvHandlesLive: 0,
+			},
+		});
+		expect(
+			buildNativeOwnerTelemetry(
+				[
+					{
+						nativeSessionRegistryEntries: 1,
+						nativeTrackedTasks: 1,
+						nativeRateLimitEntries: 1,
+						nativeBidiHandlesLive: 1,
+						nativeUniSendHandlesLive: 1,
+						nativeUniRecvHandlesLive: 1,
+					},
+				],
+				[{}],
+			).postClose.available,
+		).toBe(false);
+	});
+
+	test("actively exercises server datagram and bidi/uni stream opens so server histograms are real", () => {
+		const source = readFileSync(
+			new URL("./distributed-scale.ts", import.meta.url),
+			"utf8",
+		);
+		expect(source).toContain("session.incomingDatagrams()");
+		expect(source).toContain("await session.sendDatagram(data)");
+		expect(source).toContain("await session.createBidirectionalStream()");
+		expect(source).toContain("await session.createUnidirectionalStream()");
+		expect(source).toContain("serverDatagramErrors");
+		expect(source).toContain("serverStreamErrors");
+	});
+
+	test("counts identities only from server-observed peer addresses", () => {
+		const proof = buildSourceIdentityProof([
+			"127.0.0.1",
+			"127.0.0.1",
+			"10.20.30.40",
+		]);
+
+		expect(proof.kind).toBe("server-observed-peer-ip");
+		expect(proof.identities).toEqual(["10.20.30.40", "127.0.0.1"]);
+		expect(proof.prefixes).toEqual(["10.20.30.0/24", "127.0.0.0/24"]);
+		expect(proof.sourceIdentityCount).toBe(2);
+	});
+
+	test("marks loopback-only diversity as requiring an external environment", () => {
+		const proof = buildSourceIdentityProof(["127.0.0.1", "::1"]);
+		const failures = evaluateSourceIdentityProof(proof, 2);
+
+		expect(proof.environment).toBe("loopback-only");
+		expect(failures).toContain(
+			"server observed 2 loopback-only peer identities; external source addresses are required to prove source diversity",
+		);
+	});
+
+	test("requires overload rejection counters and recovery to the steady baseline", () => {
+		const steady = { ...ZERO_GAUGES, sessionsActive: 10 };
+		const recovered = {
+			...steady,
+			limitExceededCount: 3,
+		};
+		const valid = {
+			attemptedSessions: 3,
+			acceptedSessions: 0,
+			rejectedSessions: 3,
+			limitExceededDelta: 3,
+			rateLimitedDelta: 0,
+			admissionShedCount: 3,
+			steadyStateBeforeOverload: steady,
+			postOverloadGauges: recovered,
+			recoveredGauges: recovered,
+			recoveryDurationMs: 10,
+		};
+		expect(evaluateOverloadEvidence(valid)).toEqual([]);
+		expect(
+			evaluateOverloadEvidence({
+				...valid,
+				steadyStateBeforeOverload: {
+					...steady,
+					streamsActive: 3,
+				},
+				postOverloadGauges: {
+					...recovered,
+					streamsActive: 0,
+				},
+				recoveredGauges: {
+					...recovered,
+					streamsActive: 0,
+				},
+			}),
+		).toEqual([]);
+		expect(
+			evaluateOverloadEvidence({
+				...valid,
+				steadyStateBeforeOverload: {
+					...steady,
+					streamsActive: 3,
+				},
+				postOverloadGauges: {
+					...recovered,
+					streamsActive: 4,
+				},
+				recoveredGauges: null,
+			}),
+		).toContain(
+			"overload phase did not recover to its steady-state gauge baseline",
+		);
+		expect(
+			evaluateOverloadEvidence({ ...valid, recoveredGauges: null }),
+		).toContain(
+			"overload phase recorded no gauge sample that met the steady-state baseline",
+		);
+		expect(
+			evaluateOverloadEvidence({
+				...valid,
+				limitExceededDelta: 1,
+				rateLimitedDelta: 0,
+				admissionShedCount: 0,
+			}),
+		).toContain(
+			"overload phase attempted 3 sessions but shed none; quiescence alone is not shed-and-recover evidence",
+		);
+		expect(
+			evaluateOverloadEvidence({
+				...valid,
+				steadyStateBeforeOverload: {
+					...steady,
+					queuedBytesGlobal: 4,
+				},
+				postOverloadGauges: recovered,
+			}),
+		).toEqual([]);
+		expect(
+			evaluateOverloadEvidence({
+				...valid,
+				acceptedSessions: 1,
+				rejectedSessions: 2,
+			}),
+		).toContain("overload phase admitted sessions beyond the configured cap");
+		expect(
+			evaluateOverloadEvidence({
+				...valid,
+				rejectedSessions: 0,
+				limitExceededDelta: 0,
+				admissionShedCount: 0,
+				postOverloadGauges: {
+					...recovered,
+					sessionsActive: 11,
+					streamTasksActive: 1,
+					queuedBytesGlobal: 4,
+				},
+				recoveredGauges: null,
+			}),
+		).toEqual([
+			"overload phase did not reject any admission",
+			"overload phase produced no limit/rate admission-shed evidence",
+			"overload phase attempted 3 sessions but shed none; quiescence alone is not shed-and-recover evidence",
+			"overload phase recorded no gauge sample that met the steady-state baseline",
+			"overload phase did not recover to its steady-state gauge baseline",
+		]);
+	});
+
+	test("fails the 3-cycle repeat when post-close RSS grows across cycles", () => {
+		expect(
+			evaluateCycleRepeat([
+				{ postCloseRssMb: 60 },
+				{ postCloseRssMb: 61 },
+				{ postCloseRssMb: 62 },
+			]),
+		).toEqual({
+			ratioCycle3ToCycle1: 1.0333,
+			failures: [],
+		});
+		expect(
+			evaluateCycleRepeat([
+				{ postCloseRssMb: 60 },
+				{ postCloseRssMb: 66 },
+				{ postCloseRssMb: 70 },
+			]),
+		).toEqual({
+			ratioCycle3ToCycle1: 1.1667,
+			failures: [
+				"cycle-3 post-close RSS 70.000MB exceeded cycle-1 60.000MB * 1.05 (ratio 1.1667)",
+			],
+		});
+		expect(
+			evaluateCycleRepeat([{ postCloseRssMb: 60 }, { postCloseRssMb: 61 }]),
+		).toEqual({
+			ratioCycle3ToCycle1: null,
+			failures: ["cycle repeat recorded 2 cycles; 3 are required"],
+		});
+	});
+
+	test("rejects non-finite scale config values from env-derived input", () => {
+		const failures = validateScaleCampaignConfig({
+			...validConfig(),
+			sessions: Number.NaN,
+			maxRecoveryRssRatio: Number.POSITIVE_INFINITY,
+		});
+
+		expect(failures).toContain(
+			"sessions must be a finite integer greater than 0",
+		);
+		expect(failures).toContain(
+			"maxRecoveryRssRatio must be a finite number greater than 0",
+		);
+	});
+
+	test("allows datagrams-only and streams-only controls but rejects an empty workload", () => {
+		expect(
+			validateScaleCampaignConfig({
+				...validConfig(),
+				streamsPerSec: 0,
+			}),
+		).not.toContain("streamsPerSec must be a finite integer greater than 0");
+		expect(
+			validateScaleCampaignConfig({
+				...validConfig(),
+				datagramsPerSec: 0,
+			}),
+		).not.toContain("datagramsPerSec must be a finite integer greater than 0");
+		const failures = validateScaleCampaignConfig({
+			...validConfig(),
+			datagramsPerSec: 0,
+			streamsPerSec: 0,
+		});
+		expect(failures).toContain(
+			"datagramsPerSec or streamsPerSec must be greater than 0",
+		);
+	});
+
+	test("requires delivery-sensitive drain-all ratios", () => {
+		const input = {
+			datagramsPerSec: 100,
+			streamsPerSec: 0,
+			workloadMode: "drain-all" as const,
+			minDeliveryRatio: 0.95,
+			clientSummaries: [
+				{
+					...validConfigClientSummary(),
+					datagramsSent: 100,
+					serverPort: 4433,
+				},
+			],
+			serverDatagramSends: 1,
+			serverDatagramsReceived: 90,
+			serverDatagramsReceivedByPort: { "4433": 90 },
+			serverBidiStreamsOpened: 0,
+			serverUniStreamsOpened: 0,
+			serverDatagramErrors: 0,
+			serverStreamErrors: 0,
+			p99HandshakeMs: 1,
+			p99DatagramEnqueueMs: 1,
+			p99StreamOpenMs: null,
+		};
+		expect(evaluateWorkloadEvidence(input)).toContain(
+			"server datagram delivery ratio 0.9000 fell below 0.9500",
+		);
+		expect(
+			evaluateWorkloadEvidence({
+				...input,
+				serverDatagramsReceived: 95,
+				serverDatagramsReceivedByPort: { "4433": 95 },
+			}),
+		).not.toContain("server datagram delivery ratio 0.9500 fell below 0.9500");
+	});
+
+	test("requires the workload to populate datagram and stream evidence before trusting p99s", () => {
+		expect(
+			evaluateWorkloadEvidence({
+				datagramsPerSec: 10,
+				streamsPerSec: 1,
+				clientSummaries: [
+					{
+						clientIndex: 0,
+						serverPort: 4433,
+						requestedSessions: 1,
+						okSessions: 1,
+						sessionErrors: 0,
+						datagramsSent: 0,
+						datagramErrors: 0,
+						streamsOpened: 0,
+						streamErrors: 0,
+						successRate: 1,
+						exitCode: 0,
+						exitSignal: null,
+						timedOut: false,
+						forceKilled: false,
+						stdoutDrainTimedOut: false,
+						stderrDrainTimedOut: false,
+						durationMs: 1,
+						stderr: "",
+					},
+				],
+				serverDatagramSends: 0,
+				serverBidiStreamsOpened: 0,
+				serverUniStreamsOpened: 0,
+				serverDatagramErrors: 0,
+				serverStreamErrors: 0,
+				p99HandshakeMs: 1,
+				p99DatagramEnqueueMs: 1,
+				p99StreamOpenMs: 1,
+			}),
+		).toEqual([
+			"workload did not send any datagrams despite a positive datagram rate target",
+			"server workload did not send any datagrams despite a positive datagram rate target",
+			"workload did not open any streams despite a positive stream rate target",
+			"server workload did not open any bidirectional streams despite a positive stream rate target",
+			"server workload did not open any unidirectional streams despite a positive stream rate target",
+		]);
+	});
+
+	test("bounds hung child and close waits with explicit timeouts", async () => {
+		await expect(
+			awaitWithTimeout("child.exited", new Promise<never>(() => {}), 10),
+		).rejects.toThrow("child.exited timed out after 10ms");
+
+		const source = readFileSync(
+			new URL("./distributed-scale.ts", import.meta.url),
+			"utf8",
+		);
+		expect(source).toContain('awaitWithTimeout("child.exited"');
+		expect(source).toContain('awaitWithTimeout("server.close"');
+	});
+
+	test("terminates descendant-held pipes and records timeout and drain metadata", async () => {
+		const tempRoot = mkdtempSync(join(tmpdir(), "wt-distributed-scale-"));
+		TEMP_ROOTS.push(tempRoot);
+		const fixturePath = join(tempRoot, "held-pipe-fixture.mjs");
+		writeFileSync(
+			fixturePath,
+			`
+import { spawn } from "node:child_process";
+import { writeSync } from "node:fs";
+
+if (process.argv[2] === "grandchild") {
+	process.stdout.write("grandchild stdout\\n");
+	process.stderr.write("grandchild stderr\\n");
+	setInterval(() => {}, 1_000);
+} else {
+	const grandchild = spawn(process.execPath, [process.argv[1], "grandchild"], {
+		detached: false,
+		stdio: "inherit",
+	});
+	grandchild.unref();
+	writeSync(1, "sessions ok=0 err=1\\n");
+	writeSync(2, "parent exiting\\n");
+	await new Promise((resolve) => setTimeout(resolve, 25));
+}
+`,
+			"utf8",
+		);
+
+		const result = await runCommandWithBoundedOutput(
+			[process.execPath, fixturePath],
+			{
+				cwd: tempRoot,
+				outerTimeoutMs: 2_000,
+				terminateGraceMs: 500,
+				drainTimeoutMs: 500,
+			},
+		);
+
+		expect(result.stdout).toContain("sessions ok=0 err=1");
+		expect(result.stderr).toContain("parent exiting");
+		expect(result.timedOut).toBe(true);
+		expect(result.forceKilled).toBe(true);
+		expect(result.stdoutDrainTimedOut || result.stderrDrainTimedOut).toBe(true);
+	});
+});
+
+function validConfig(): ScaleCampaignConfig {
+	return {
+		label: "scale",
+		sessions: 4,
+		durationSec: 2,
+		serverCount: 1,
+		clientCount: 1,
+		basePort: 4433,
+		datagramsPerSec: 10,
+		streamsPerSec: 1,
+		workloadMode: "probe",
+		minDeliveryRatio: 0.95,
+		minSuccessRate: 1,
+		maxRssMb: 256,
+		maxRecoveryRssRatio: 1.25,
+		maxFairnessGap: 0.1,
+		maxStreamErrorRate: 0,
+		p99HandshakeMs: 100,
+		p99DatagramEnqueueMs: 10,
+		p99StreamOpenMs: 20,
+		minLiveSessions: 1,
+		minLiveSetHoldMs: 10,
+		minSourceIdentityCount: 1,
+		overloadSessionsPerServer: 1,
+		overloadRecoveryTimeoutMs: 1000,
+		artifactPath: "/tmp/distributed-scale.json",
+		clientTargetHost: "127.0.0.1",
+		clientLaunches: [
+			{
+				label: "default",
+				commandPrefix: [],
+			},
+		],
+	};
+}
+
+function validConfigClientSummary(): {
+	clientIndex: number;
+	serverPort: number;
+	requestedSessions: number;
+	okSessions: number;
+	sessionErrors: number;
+	datagramsSent: number;
+	datagramErrors: number;
+	streamsOpened: number;
+	streamErrors: number;
+	successRate: number;
+	exitCode: number;
+	exitSignal: string | null;
+	timedOut: boolean;
+	forceKilled: boolean;
+	stdoutDrainTimedOut: boolean;
+	stderrDrainTimedOut: boolean;
+	durationMs: number;
+	stderr: string;
+} {
+	return {
+		clientIndex: 0,
+		serverPort: 4433,
+		requestedSessions: 1,
+		okSessions: 1,
+		sessionErrors: 0,
+		datagramsSent: 0,
+		datagramErrors: 0,
+		streamsOpened: 0,
+		streamErrors: 0,
+		successRate: 1,
+		exitCode: 0,
+		exitSignal: null,
+		timedOut: false,
+		forceKilled: false,
+		stdoutDrainTimedOut: false,
+		stderrDrainTimedOut: false,
+		durationMs: 1,
+		stderr: "",
+	};
+}
+
+describe("release promotion gating", () => {
+	test("isPromotable rejects unresolved review-required diagnostics", () => {
+		expect(
+			isPromotable({ failures: [], reviewRequired: ["cold-start review"] }),
+		).toBe(false);
+		expect(isPromotable({ failures: ["boom"], reviewRequired: [] })).toBe(
+			false,
+		);
+		expect(isPromotable({ failures: [], reviewRequired: [] })).toBe(true);
+	});
+
+	test("artifact document embeds promotable=false for review-required summaries", () => {
+		const summary = {
+			failures: [],
+			reviewRequired: ["cold-start RSS diagnostic requires review"],
+		} as unknown as RunSummary;
+		const config = { artifactPath: "/tmp/x.json" } as ScaleCampaignConfig;
+		const doc = buildArtifactDocument(config, summary);
+		expect(doc.promotable).toBe(false);
+		expect(doc.acknowledgedReviewRequired).toBe(false);
+	});
+
+	test("LOAD_SCALE_ACK_REVIEW is refused for release-evidence artifact paths", async () => {
+		const prev = process.env.LOAD_SCALE_ACK_REVIEW;
+		process.env.LOAD_SCALE_ACK_REVIEW = "1";
+		try {
+			await expect(
+				runScaleCampaign({
+					artifactPath: ".release-evidence/load/load-scale-artifact.json",
+				} as ScaleCampaignConfig),
+			).rejects.toThrow(/refused for artifacts under \.release-evidence/);
+		} finally {
+			if (prev === undefined) delete process.env.LOAD_SCALE_ACK_REVIEW;
+			else process.env.LOAD_SCALE_ACK_REVIEW = prev;
+		}
+	});
+
+	test("aborted campaigns never synthesize passing memory ratios", () => {
+		const sample = {
+			rssMb: 50,
+			heapUsedMb: 1,
+			externalMb: 1,
+			arrayBuffersMb: 0,
+		};
+		const memory = buildMemoryTelemetry({
+			coldStart: sample,
+			serviceReady: sample,
+			peak: sample,
+			preClose: sample,
+			postClose: sample,
+			aborted: true,
+		});
+		expect(memory.coldStartRecoveryRatio).toBeNull();
+		expect(memory.serviceReadyRecoveryRatio).toBeNull();
+		expect(memory.coldStartDiagnostic.status).toBe("aborted");
+	});
+});

@@ -1,0 +1,33 @@
+{
+	"schema": "g6-historical-defect-fixture/1",
+	"source": {
+		"runId": 32666697490,
+		"candidateSha": "07472469e90d5c95a9270b3cceef19d0f7b1c95e",
+		"status": "historical-characterization-only"
+	},
+	"defects": {
+		"manifestIncludesGateCsv": false,
+		"floorSessions": 500,
+		"steady5000OfferedRatio": 0.907,
+		"steady5000NegativeScheduleLag": 249000,
+		"hotspotSubscriberOneWay": "missing",
+		"hotspotAdvisoryOneWay": "clean",
+		"hotspotFrameGapFraction": 0,
+		"storm1000ConnectConcurrency": 500,
+		"storm1000PeakAcceptsPerSecond": 10000,
+		"storm1000MeanAcceptLatencyMs": 50
+	},
+	"expected": {
+		"valid": false,
+		"gate": "INVALID",
+		"invalidReasonFragments": [
+			"required nonempty bench-g6 CSV input is missing",
+			"V-G: rung 5000 offered 0.90700",
+			"V-N steady-5000/steady/scheduleLag",
+			"V-D hotspot-5000/oneWay",
+			"floor sessionsRequested 500, expected 20",
+			"V-I cadence-absent"
+		],
+		"characterizationReasonFragments": ["storm-1000: V-L"]
+	}
+}

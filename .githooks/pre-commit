@@ -26,21 +26,32 @@ while IFS= read -r -d '' file; do
 done < <(git diff --cached --name-only --diff-filter=ACMR -z)
 
 if [ "${#rust_files[@]}" -gt 0 ]; then
-  if command -v cargo >/dev/null 2>&1; then
-    cargo_cmd="$(command -v cargo)"
+  if command -v rustup >/dev/null 2>&1 && [ -f ".github/release-toolchain.json" ]; then
+    rust_toolchain="$(sed -nE 's/^[[:space:]]*"rust":[[:space:]]*\["([^"]+)".*$/\1/p' .github/release-toolchain.json)"
+    if [ -z "$rust_toolchain" ]; then
+      echo "pre-commit: release toolchain policy does not declare a Rust version" >&2
+      exit 1
+    fi
+    if ! rustup toolchain list | awk -v version="$rust_toolchain" '$1 == version || index($1, version "-") == 1 { found = 1 } END { exit(found ? 0 : 1) }'; then
+      echo "pre-commit: required Rust toolchain $rust_toolchain is not installed" >&2
+      exit 1
+    fi
+    cargo_cmd=(rustup run "$rust_toolchain" cargo)
+  elif command -v cargo >/dev/null 2>&1; then
+    cargo_cmd=(cargo)
   elif [ -x "${HOME}/.cargo/bin/cargo" ]; then
-    cargo_cmd="${HOME}/.cargo/bin/cargo"
+    cargo_cmd=("${HOME}/.cargo/bin/cargo")
   else
-    echo "pre-commit: cargo is required for staged Rust files" >&2
-    echo "pre-commit: install Rust toolchain (https://rustup.rs) or ensure cargo is on PATH" >&2
+    echo "pre-commit: cargo or rustup is required for staged Rust files" >&2
+    echo "pre-commit: install Rust (https://rustup.rs) or ensure cargo is on PATH" >&2
     exit 1
   fi
 
   echo "pre-commit: formatting Rust files with cargo fmt"
-  "${cargo_cmd}" fmt --all -- "${rust_files[@]}"
+  "${cargo_cmd[@]}" fmt --all -- "${rust_files[@]}"
   git add -- "${rust_files[@]}"
   echo "pre-commit: running clippy"
-  "${cargo_cmd}" clippy --workspace -- -D clippy::all
+  "${cargo_cmd[@]}" clippy --workspace -- -D clippy::all
 fi
 
 if [ "${#tsjs_files[@]}" -gt 0 ]; then

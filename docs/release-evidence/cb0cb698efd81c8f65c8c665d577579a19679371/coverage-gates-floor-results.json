@@ -1,0 +1,45 @@
+{
+	"commit": "cb0cb698efd81c8f65c8c665d577579a19679371",
+	"claimId": "coverage-gates",
+	"createdAt": "2026-07-27T16:27:33.356917Z",
+	"status": "failed",
+	"notes": "llvm-cov --branch after gap-closure: endpoint branch 79.64%, h3 78.85% (floors 90/90/80). Demote claim until recovered.",
+	"runner": "local-darwin-arm64",
+	"command": [
+		"cargo",
+		"llvm-cov",
+		"--lib",
+		"--branch",
+		"--summary-only"
+	],
+	"startedAt": "2026-07-27T16:24:29.405477Z",
+	"finishedAt": "2026-07-27T16:30:00.000000Z",
+	"wasm": [
+		{
+			"module": "crates/wasm/src/endpoint.rs",
+			"line": 92.63,
+			"function": 91.93,
+			"branch": 79.64,
+			"floors": [
+				90,
+				90,
+				80
+			],
+			"pass": false
+		},
+		{
+			"module": "crates/wasm/src/h3.rs",
+			"line": 94.85,
+			"function": 96.26,
+			"branch": 78.85,
+			"floors": [
+				90,
+				90,
+				80
+			],
+			"pass": false
+		}
+	],
+	"exitCode": 0,
+	"artifactSha256": "a80048581d6b1eeae8b3c407a33cbb8023a85b4e59730b68bef9bced3f463396"
+}

@@ -1,0 +1,18 @@
+{
+ "commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
+ "claimId": "supply-chain-provenance",
+ "createdAt": "2026-08-06T15:44:55.471Z",
+ "status": "passed",
+ "notes": "Timed check-actions-pinned at the rebound candidate.",
+ "runner": "local-darwin-arm64",
+ "command": [
+  "bash",
+  "-c",
+  "bun scripts/check-actions-pinned.ts"
+ ],
+ "startedAt": "2026-08-06T15:44:55.435Z",
+ "endedAt": "2026-08-06T15:44:55.471Z",
+ "durationMs": 36,
+ "exitCode": 0,
+ "artifactSha256": "758da99e1d261d17e7f0e83ccd6f9ca30c04a99afe868d640f69f51b0f2a5a31"
+}

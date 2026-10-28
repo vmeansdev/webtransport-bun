@@ -1,6 +1,6 @@
 FROM rust:1.85-bookworm
 
-ARG BUN_VERSION=1.3.9
+ARG BUN_VERSION=1.3.14
 ENV BUN_INSTALL=/root/.bun
 ENV PATH=/root/.bun/bin:/root/.cargo/bin:${PATH}
 

@@ -2,6 +2,10 @@ import { createServer } from "../../packages/webtransport/src/index.js";
 import { X509Certificate, createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import {
+	EXAMPLE_MAX_STREAM_BODY_BYTES,
+	readLimitedChunks,
+} from "../stream-limit.js";
 
 const HTTP_HOST = process.env.HTTP_HOST ?? "127.0.0.1";
 const HTTP_PORT = Number(process.env.HTTP_PORT ?? 3000);
@@ -63,8 +67,10 @@ const wtServer = createServer({
 			try {
 				for await (const duplex of session.incomingBidirectionalStreams) {
 					void (async () => {
-						const chunks: Uint8Array[] = [];
-						for await (const chunk of duplex.readable) chunks.push(chunk);
+						const chunks = await readLimitedChunks(
+							duplex.readable,
+							EXAMPLE_MAX_STREAM_BODY_BYTES,
+						);
 						const writer = duplex.writable.getWriter();
 						if (chunks.length > 0) {
 							await writer.write(toBuffer(chunks));
@@ -81,8 +87,10 @@ const wtServer = createServer({
 			try {
 				for await (const readable of session.incomingUnidirectionalStreams) {
 					void (async () => {
-						const chunks: Uint8Array[] = [];
-						for await (const chunk of readable) chunks.push(chunk);
+						const chunks = await readLimitedChunks(
+							readable,
+							EXAMPLE_MAX_STREAM_BODY_BYTES,
+						);
 						const out = await session.createUnidirectionalStream();
 						if (chunks.length > 0) {
 							out.write(toBuffer(chunks));

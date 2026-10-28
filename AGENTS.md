@@ -1,7 +1,7 @@
 # AGENTS.md
 
 ## Project goal
-Build a production-ready WebTransport implementation with Bun **v1.3.9+** as the primary runtime (plus Node and Deno via Node-API) on **macOS + Linux + Windows**, implemented as a **Node-API (napi-rs) native addon** powered by **wtransport (Rust)**. Must support:
+Build a production-ready WebTransport implementation with Bun **v1.3.14+** as the primary runtime (plus Node and Deno via Node-API) on **macOS + Linux + Windows**, implemented as a **Node-API (napi-rs) native addon** powered by **wtransport (Rust)**. Must support:
 - In-process **server** support (mandatory)
 - In-process **client** support
 - **Datagrams** (message-based) with Promise backpressure
@@ -13,7 +13,7 @@ Build a production-ready WebTransport implementation with Bun **v1.3.9+** as the
 - QUIC implementation from scratch (use wtransport)
 
 ## Supported targets
-- Bun: **>= 1.3.9** (primary target)
+- Bun: **>= 1.3.14** (primary target)
 - Node: supported (Node-API compatible runtime)
 - Deno: supported (npm + Node-API addon support)
 - OS: macOS, Linux, Windows
@@ -62,7 +62,7 @@ Build a production-ready WebTransport implementation with Bun **v1.3.9+** as the
 ## Implementation constraints (must follow)
 1. Node streams for stream surfaces (Readable/Writable/Duplex).
 2. Promise-based datagram sending with bounded in-flight/backpressure.
-3. Two dedicated Tokio runtimes (server + client), each single-threaded and owned by the addon; cross-runtime communication must stay bounded and deterministic.
+3. Two dedicated Tokio runtimes owned by the addon (server: 2 `wt-server` worker threads as a fixed constant, not `available_parallelism()`; client: 1 worker); cross-runtime communication must stay bounded and deterministic. Per-datagram N-API methods (`read_datagram`, `send_datagram`, `discard_datagram`) must not `RUNTIME.spawn`.
 4. Bounded queues for all JS↔Rust crossings; all buffers counted against budgets.
 5. JS callback delivery must be rate-limited/batched to prevent per-packet callback storms.
 6. W3C client-facade divergences MUST be explicit in `docs/PARITY_MATRIX.md`; no silent no-op behavior for declared options.
@@ -83,6 +83,9 @@ These are default values; they must be configurable via server/client options.
 - backpressureTimeoutMs: 5000
 - handshakeTimeoutMs: 10000
 - idleTimeoutMs: 60000
+- streamReceiveWindow / receiveWindow / sendWindow: unset (QUIC windows, native
+  only; derived from maxQueuedBytesPerStream and maxQueuedBytesPerSession unless
+  set — see docs/OPERATIONS.md "Flow-control windows" for the memory math)
 
 Per-IP token buckets (defaults)
 - handshakes: 20/s burst 40
@@ -94,6 +97,7 @@ Per-IP token buckets (defaults)
 - E_HANDSHAKE_TIMEOUT
 - E_SESSION_CLOSED
 - E_SESSION_IDLE_TIMEOUT
+- E_SERVER_CLOSING (close reason only, paired with close code 3993)
 - E_STREAM_RESET
 - E_STOP_SENDING
 - E_QUEUE_FULL
@@ -106,3 +110,42 @@ Per-IP token buckets (defaults)
 - Each logical change must be **one scoped commit**.
 - Commit message format: **Verb + What + Why** (e.g. `Add error codes for stable programmatic handling`).
 - Do not bundle unrelated changes in a single commit.
+
+## Learned User Preferences
+- Prefer `bunx` over `npx` for running package binaries.
+- Use Bun for development scripts, TypeScript checks, and tests (use `bun --bun` or `bunx --bun` where a Node shebang would otherwise select Node). Use Node only for an explicitly requested Node-compatibility check, and then use the bundled Node; never use the mise Node installation.
+- Keep one scoped logical change per commit; do not commit planning/instruction files (`INSTRUCTIONS_CURRENT_PHASE.md`, `Task.md`, `PRODUCTION_PLAN.md`, `PARITY_PLAN.md`, `POOLING_PLAN.md`, and similar plan markdown) unless explicitly asked.
+- When told to continue until all phases or subphases are done, keep going without pausing for per-step confirmation; partial completion is not enough.
+- Prefer project markdown docs under `docs/` rather than the repo root.
+- Prefer local Chrome on this machine for browser/IWA verification when available rather than assuming Chromium/Playwright is missing.
+- When diagnosing a local-verifiable gate (IWA/interop/harness), build and run the proof yourself instead of only explaining missing artifacts or blockers.
+- Rust native code must have its own unit-test coverage, separate from TypeScript tests, during development.
+- After scoped native/coverage refactors, run an auto-review pass and report before continuing related work.
+- For release-gap and transport-comparison closure, prefer hybrid evidence re-runs under live supervisor grant/admission: re-prove what can run locally and demote claims that cannot be honestly sealed (no orphan legs, theater, copied evidence, or admission bypass).
+- Target production-grade 1.0 for both native and WASM; WASM 1.0 requires protocol expansion (multi-session, 0-RTT, dynamic QPACK) plus facade/API parity with native, not evidence-hardening alone.
+- When implementing an attached plan, do not edit the plan file itself; execute the plan as specified. For throughput/ingest and WS/WT campaign comparison work, complete sequential Architect then Critic reviews before executing. The lead agent owns these review gates and follows the user's current choice of reviewer and runtime; this file does not select a model, reasoning effort, or external CLI for the lead agent or subagents. Subagents inherit the lead agent's model unless the user explicitly requests otherwise, and execute their assigned scope without independently launching another planning/review workflow. Bind approving reviews to the final `docs/superpowers/plans/` path (not `/tmp`); any edit after a verdict invalidates it; set Status APPROVED before the approving round so the preserved SHA matches; focused re-approval rounds must not reopen closed design. Then run end-to-end to a full local campaign report of truly measured/sealed pairs; when the user asks for a full WS/WT campaign, do not silently shrink to a Phase-4 subset without explaining the tradeoff and getting confirmation. If a cell lacks a sealable executor, plan and implement it (do not index REFUSED for missing executors; REFUSED is for runtime/env only); prefer fixing honest quarantines by re-proving under live grant when closing the campaign.
+- Measure on the same host/runner before attributing leftover throughput; do not ship measurement flags; keep hop-removal and worker-count as separate commits. Treat near-2x two-worker scaling as the worker-count result; leftover discard versus offered load is a separate ingest question. Keep ingest-gap probes throwaway with no product change on `rebind4-staging`.
+
+## Learned Workspace Facts
+- Active native/throughput work is on `rebind4-staging` at `/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun` (not `feat/wasm-1.0` or `release/1.0-hardening`); the `feat-wasm-1.0` worktree is gone. Hop-removal is landed; leftover work is ingest versus offered load (skip-recv/H7, send_datagram accepted vs UDP written), not worker-count.
+- WS↔WT scenario comparison lives in worktree `ws-scenario-comparison` (`tools/compare/`); evidence under `.release-evidence/transport-comparison/`. Full registry matrix is 112 arms (70 primary ws/wt plus read-path ws-worker/wt-stream-sink and ws-overlay); promote flats only for primary pairs. Honest seals need live Mac comparison-supervisor control-channel grant/admission/toolchain frames then `measuredLegToArm` → `sealRunArtifact`; stage live OS DirectoryIdentity-matched roots (not fixtures); prefer rig-resident supervisor spawn; out-of-process client measure breaks attestation. Seal executors may be single-session minima vs registry campaign topology (e.g. ticker-fanout rate seals are sustained echo rate, not full subscriber fanout)—do not overclaim topology from seals; rate legs admit with `sampleUnit: "count"`. Attested `serverAggregate` busyMs + multi-sub fanout work is planned in `docs/superpowers/plans/2026-08-30-busyMs-attested-fanout.md`; live `compare-controller` still synthesizes `busyMs: 0` despite adapter loopUtilization—plan-approval handoffs live under `.release-evidence/transport-comparison/`.
+- Phase execution is driven by `INSTRUCTIONS_CURRENT_PHASE.md` → infer/update `Task.md`, then execute until all phases are done.
+- Published package entrypoints target compiled JS and `.d.ts` under `dist/` with native addon binaries under `prebuilds/`.
+- Invalid client `caPem` must map to stable `E_TLS` (not `E_INTERNAL`).
+- Recv-full datagrams drop (`E_QUEUE_FULL`); send-full waits then `E_BACKPRESSURE_TIMEOUT`. Do not raise default 2 MiB/session or 512 MiB global budgets to hide leftover discard.
+- Keep floored Rust logic modules (`session.rs`, `server.rs`) free of NAPI Env wrappers; put bindings in `*_napi.rs` / `server_spawn.rs` so llvm-cov floors stay honest. Native llvm-cov floors (90% line / 90% function / 80% branch) apply to floored logic modules only; NAPI binding modules and `server_spawn` are outside those floors.
+- WASM (`crates/wasm/`) is a separate engine from native: sans-IO `quinn-proto` + hand-rolled H3/WT with JS-owned UDP I/O; native is napi + `wtransport` + Tokio.
+- Browser WASM networking for 1.0 is constrained to Chromium IWA + Direct Sockets; general browser-server outside that path is out of scope.
+- IWA Direct Sockets proofs need generated/signed web-bundle assets (`origin.txt`, `.wbn`/`.swbn`; typically gitignored) before `tools/interop/run-iwa.mjs`; packaged artifacts often live under `.release-evidence/iwa/`.
+- WASM soft facade gaps (pooling, `waitUntilAvailable`, real `getStats`/CC, sendOrder/sendGroup, live TLS/SNI, metrics/log, `WasmServerSession`) are largely closed on the candidate; ticket hosts use IndexedDB in IWA and memory/file on Bun; remaining non-parity is product/API (async `/wasm` vs native sync root, session shape, IWA-only browser host, Bun still prefers native).
+- WASM IWA plug-and-play server is async `createServer` / `createIwaServer` from the `/wasm` entrypoint over Direct Sockets; distinct from the root native sync `createServer`.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs live as local markdown under `.scratch/<feature>/`. See `docs/agents/issue-tracker.md`.
+
+### Domain docs
+
+Single-context: one root `CONTEXT.md` + `docs/adr/`. See `docs/agents/domain.md`.

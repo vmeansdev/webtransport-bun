@@ -1,0 +1,15 @@
+{
+  "lane": 5,
+  "agent": "cd2d5833-1ecb-4031-9671-b7e28f98ce71",
+  "verdict": "NOT READY",
+  "findings": [
+    {"id": "L5-P2-qpack-product-tests", "severity": "P2", "summary": "no product tests for dynamic QPACK ACK/opt-in"},
+    {"id": "L5-P2-0rtt-soft-assert", "severity": "P2", "summary": "0-RTT resume only typeof boolean"},
+    {"id": "L5-P2-event-fuzz-stale", "severity": "P2", "summary": "event_encode fuzz pre-session_id wire"},
+    {"id": "L5-P2-chromium-evidence", "severity": "P2", "summary": "Chromium 5/5 overclaim for multi-session"},
+    {"id": "L5-P2-coverage-unrebound", "severity": "P2", "summary": "coverage floors at 2cc0732 after endpoint growth"},
+    {"id": "L5-P3-multisession-edges", "severity": "P3", "summary": "stream isolation / SessionClosed assert gaps"},
+    {"id": "L5-P3-unbounded-awaits", "severity": "P3", "summary": "bare ready/closed awaits in new tests"},
+    {"id": "L5-P3-fault-soak", "severity": "P3", "summary": "fault/soak unrebound for new surfaces"}
+  ]
+}

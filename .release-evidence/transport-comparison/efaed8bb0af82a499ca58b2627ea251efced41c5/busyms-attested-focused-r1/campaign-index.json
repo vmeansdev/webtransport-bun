@@ -1,0 +1,70 @@
+{
+  "schema": "campaign-index/v2",
+  "campaignRunId": "busyms-attested-focused-r1",
+  "stage": "full",
+  "candidate": "efaed8bb0af82a499ca58b2627ea251efced41c5",
+  "campaignId": "busyms-attested-focused-r1",
+  "approvedPlanSha256": "90d469cb0c54e8e4e34a7edb333156b365d73464099e1d7eb49189234a55e7e1",
+  "approvalRecordSha256": "6e66236a9be13405f9060899803ffd004809ac819930664990f959f460b5c391",
+  "stagedCapabilitySha256": "af9df8f7887f0ee877cd123b53c4691e94e2ccf30b557399858e0e7778c091c8",
+  "sourceArchiveSha256": "1f737d6128df7e1b80c36b357b1e49d8af126751e1251bf11b8b2e8a5f984b56",
+  "executionPurpose": "focused",
+  "stagedDir": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/.claude/worktrees/ws-scenario-comparison/.release-evidence/transport-comparison/.trust-staging/efaed8bb0af82a499ca58b2627ea251efced41c5/busyms-attested-focused-r1",
+  "cells": [
+    "bulk-one-way/physical"
+  ],
+  "arms": [
+    "ws",
+    "wt"
+  ],
+  "armKinds": [
+    "primary"
+  ],
+  "warmupRepetitions": 1,
+  "measuredRepetitions": 1,
+  "scheduledMeasuredArms": 2,
+  "entries": [
+    {
+      "schema": "campaign-index-entry/v2",
+      "cellId": "bulk-one-way/physical",
+      "armId": "bulk-one-way/physical/ws",
+      "transport": "ws",
+      "armKind": "primary",
+      "armTransport": "ws",
+      "impairment": "none",
+      "executionPurpose": "focused",
+      "repetitionKind": "measured",
+      "repetitionIndex": 1,
+      "repetitionTotal": 1,
+      "status": "PASS",
+      "promotable": false,
+      "failureCode": null,
+      "refusalCode": null,
+      "sealedPath": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/.claude/worktrees/ws-scenario-comparison/.release-evidence/transport-comparison/efaed8bb0af82a499ca58b2627ea251efced41c5/busyms-attested-focused-r1/reps/bulk-one-way_physical/ws/rep-1.sealed.json",
+      "artifactSha256": "095e85e181c1bb74256609b172e1c07c597d9b436ccf4c1e174b761c17be1f83",
+      "primaryMetricP50": 938.47552,
+      "readPath": null
+    },
+    {
+      "schema": "campaign-index-entry/v2",
+      "cellId": "bulk-one-way/physical",
+      "armId": "bulk-one-way/physical/wt",
+      "transport": "wt",
+      "armKind": "primary",
+      "armTransport": "wt",
+      "impairment": "none",
+      "executionPurpose": "focused",
+      "repetitionKind": "measured",
+      "repetitionIndex": 1,
+      "repetitionTotal": 1,
+      "status": "PASS",
+      "promotable": false,
+      "failureCode": null,
+      "refusalCode": null,
+      "sealedPath": "/Users/vmeansdev/Developer/Codex/Apps/webtransport-bun/.claude/worktrees/ws-scenario-comparison/.release-evidence/transport-comparison/efaed8bb0af82a499ca58b2627ea251efced41c5/busyms-attested-focused-r1/reps/bulk-one-way_physical/wt/rep-1.sealed.json",
+      "artifactSha256": "bdbb9468ca442c8fa8c8d6c6af01dcfddb4dc430b1ec96f15794465c09cf05b9",
+      "primaryMetricP50": 344.97008,
+      "readPath": null
+    }
+  ]
+}

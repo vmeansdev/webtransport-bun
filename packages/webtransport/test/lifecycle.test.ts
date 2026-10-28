@@ -62,12 +62,17 @@ describe("lifecycle", () => {
 				() =>
 					logs.some(
 						(line) =>
-							line.includes("E_INTERNAL: onSession callback threw") &&
+							line.includes("E_INVALID_ARGUMENT: onSession callback threw") &&
 							line.includes("sync boom"),
 					),
 				5000,
 			);
 			expect(saw).toBe(true);
+			const closedResult = await Promise.race([
+				client.closed.then((info) => ({ ok: true, info })),
+				Bun.sleep(5000).then(() => ({ ok: false })),
+			]);
+			expect(closedResult.ok).toBe(true);
 		} finally {
 			client.close();
 			await server.close();
@@ -95,12 +100,18 @@ describe("lifecycle", () => {
 				() =>
 					logs.some(
 						(line) =>
-							line.includes("E_INTERNAL: onSession callback rejected") &&
-							line.includes("async boom"),
+							line.includes(
+								"E_INVALID_ARGUMENT: onSession callback rejected",
+							) && line.includes("async boom"),
 					),
 				5000,
 			);
 			expect(saw).toBe(true);
+			const closedResult = await Promise.race([
+				client.closed.then((info) => ({ ok: true, info })),
+				Bun.sleep(5000).then(() => ({ ok: false })),
+			]);
+			expect(closedResult.ok).toBe(true);
 		} finally {
 			client.close();
 			await server.close();

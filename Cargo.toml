@@ -2,5 +2,21 @@
 members = [
   "crates/native",
   "crates/reference",
+  "crates/adversary",
+  "crates/compare-supervisor",
 ]
 resolver = "2"
+exclude = ["vendor"]
+
+[workspace.dependencies]
+# Fork of BiagioFesta/wtransport carrying 0-RTT support, the WebTransport
+# conformance work, and dynamic QPACK (branch feat/qpack-dynamic, which stacks
+# on feat/track1-conformance), pinned by rev. See docs/FORK_MAINTENANCE.md for
+# the maintenance obligations this git dependency creates (advisory watch,
+# Dependabot blindness, rev reachability).
+wtransport = { git = "https://github.com/vmeansdev/wtransport", rev = "c1888a890525ad79b58a3f1970afcfdec60d46f7", features = ["dangerous-configuration", "quinn"] }
+
+# Reviewed local changes to the pinned fork live in vendor/wtransport-fork
+# (verbatim c1888a89 plus scoped commits); see vendor/wtransport-fork/VENDORED.md.
+[patch."https://github.com/vmeansdev/wtransport"]
+wtransport = { path = "vendor/wtransport-fork/wtransport" }

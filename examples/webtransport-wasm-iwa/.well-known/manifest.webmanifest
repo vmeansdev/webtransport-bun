@@ -1,0 +1,24 @@
+{
+	"name": "WebTransport WASM IWA Demo",
+	"short_name": "WT-WASM",
+	"version": "0.0.1",
+	"id": "/",
+	"scope": "/",
+	"start_url": "/index.html",
+	"display": "standalone",
+	"icons": [
+		{
+			"src": "/icon.svg",
+			"sizes": "512x512",
+			"type": "image/svg+xml",
+			"purpose": "any"
+		}
+	],
+	"permissions_policy": {
+		"direct-sockets": ["self"],
+		"direct-sockets-private": ["self"],
+		"local-network": ["self"],
+		"loopback-network": ["self"],
+		"cross-origin-isolated": ["self"]
+	}
+}

@@ -1,0 +1,18 @@
+{
+ "commit": "875dfbfe736056326a64532fdfe6ced702a19aa2",
+ "claimId": "runtime-consumers",
+ "createdAt": "2026-08-08T18:05:36.000Z",
+ "status": "passed",
+ "notes": "Exact-package consumer suite (internal-package-artifact) at the rebound candidate.",
+ "runner": "local-darwin-arm64",
+ "command": [
+  "bash",
+  "-c",
+  "bun test packages/webtransport/test/internal-package-artifact.test.ts"
+ ],
+ "startedAt": "2026-08-08T18:05:24.000Z",
+ "endedAt": "2026-08-08T18:05:36.000Z",
+ "durationMs": 12000,
+ "exitCode": 0,
+ "artifactSha256": "cf41f9be6b5c16a74fa00bf813bd5d02fda261e69275211fe9826d52e85d233f"
+}

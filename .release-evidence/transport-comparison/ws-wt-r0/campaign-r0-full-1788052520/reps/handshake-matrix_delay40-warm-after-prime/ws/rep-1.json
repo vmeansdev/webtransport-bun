@@ -1,0 +1,102 @@
+{
+  "sampleUnit": "ms",
+  "samples": [
+    44.435302734375
+  ],
+  "percentiles": {
+    "p1": 44.435302734375,
+    "p50": 44.435302734375,
+    "p95": 44.435302734375,
+    "p99": 44.435302734375
+  },
+  "ledger": {
+    "attempted": 1,
+    "queued": 1,
+    "serverObserved": 1,
+    "acknowledged": 1,
+    "delivered": 1,
+    "dropped": 0,
+    "expired": 0,
+    "harnessOverheadBytes": 500,
+    "histogram": {
+      "unit": "ms",
+      "boundaries": [
+        0,
+        0.5,
+        1,
+        2,
+        4,
+        8,
+        16,
+        32,
+        64,
+        128,
+        256,
+        512,
+        1024
+      ],
+      "counts": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    }
+  },
+  "admissionCounters": {
+    "schemaVersion": "v1",
+    "handshakes": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "sessions": {
+      "attempted": 1,
+      "accepted": 1,
+      "rejected": 0,
+      "activePeak": 1
+    },
+    "streams": {
+      "attempted": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "rateLimited": 0
+    },
+    "datagrams": {
+      "attempted": 0,
+      "accepted": 0,
+      "rejected": 0,
+      "rateLimited": 0
+    }
+  },
+  "provenance": {
+    "attestation": "dm1-a18c4527fc5ac051d55b00ff5d0ef1c0",
+    "driverRunId": "ws-wt-r0-campaign-r0-full-1788052520-handshake-matrix_delay40-warm-after-prime-1788101921037-rep-1",
+    "clockMethod": "performance.timeOrigin+performance.now",
+    "sampleCount": 1,
+    "firstSampleAtMs": 1788101927508.331,
+    "lastSampleAtMs": 1788101927552.7664
+  },
+  "loopUtilization": {
+    "busyMs": 0,
+    "windowMs": 212.482666015625
+  },
+  "roundTrips": [
+    {
+      "sequence": 1,
+      "sentAtMs": 1788101927508.331,
+      "receivedAtMs": 1788101927552.7664,
+      "latencyMs": 44.435302734375
+    }
+  ]
+}

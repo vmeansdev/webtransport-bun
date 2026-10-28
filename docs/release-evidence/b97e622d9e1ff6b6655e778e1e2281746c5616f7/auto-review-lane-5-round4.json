@@ -1,0 +1,68 @@
+{
+	"lane": 5,
+	"round": 4,
+	"verdict": "NOT READY",
+	"agent": "96d6377c-4494-44b4-b6df-1604fb3d115e",
+	"findings": [
+		{
+			"id": "L5-P0-shared-artifactSha256",
+			"severity": "P0",
+			"status": "open",
+			"summary": "zero_rtt, dynamic_qpack, and multi_session evidence under b97e622… all claim identical artifactSha256 dbe24977… that matches none of the JSON bodies — copy-pasted/fabricated claim artifacts."
+		},
+		{
+			"id": "L5-P0-iwa-zero-duration",
+			"severity": "P0",
+			"status": "open",
+			"summary": "iwa-direct-sockets.json bound to b97e622 (bundle hashes match on-disk) but startedAt→finishedAt is only ~87ms for full Direct Sockets proof (streams + 8 reconnects + cert rotation); same near-zero pattern as 89b2 (~99ms)."
+		},
+		{
+			"id": "L5-P1-synthetic-143894-stamps",
+			"severity": "P1",
+			"status": "open",
+			"summary": "chromium-*/fault-matrix/runtime-consumers/supply-chain/coverage share fractional stamp .143894; notes still cite round-3 ~Ns walls while recorded deltas disagree (e.g. supply-chain ~1s note vs 52s wall; runtime ~9s vs 45s)."
+		},
+		{
+			"id": "L5-P1-facade-1s-stamp",
+			"severity": "P1",
+			"status": "open",
+			"summary": "facade_parity-unit-evidence claims wasm-facade session-map + parity-{baseline,options,compat} in durationMs=1000 / 1s wall — not credible for the stated command set."
+		},
+		{
+			"id": "L5-P1-auto-review-evidence-stale",
+			"severity": "P1",
+			"status": "open",
+			"summary": "auto-review-zero-p0-p4 cites auto-review-progress.json rebound to b97e622 while headAtReview/productCommit remain ab6bbdf and verification.coverageFloors is still \"failed\"."
+		},
+		{
+			"id": "L5-P2-coverage-stamp-honesty",
+			"severity": "P2",
+			"status": "open",
+			"summary": "coverage-gates endpoint/h3 meet ≥90/90/80 (endpoint branch exactly 80.0; h3 identical to 991fa88) but createdAt rides the same .143894 synthetic batch stamp as cloned gate rebinds."
+		},
+		{
+			"id": "L5-P2-0rtt-warm-OnceLock",
+			"severity": "P2",
+			"status": "open",
+			"summary": "Shared-store test intentionally softens first has0Rtt (typeof boolean) for warm OnceLock; reconnect still hard-asserts has0Rtt===true and pinned TicketStoreHost hydrate path hard-asserts cold→warm — acceptable product fix, not a blocker alone."
+		},
+		{
+			"id": "L5-P3-facade-unbounded-ready",
+			"severity": "P3",
+			"status": "open",
+			"summary": "wasm-facade session-map smoke uses bare await primarySession.ready / secondarySession.ready / transport.ready without timeout guards (AGENTS.md determinism rule)."
+		},
+		{
+			"id": "L5-P3-round3-progress-cloned",
+			"severity": "P3",
+			"status": "open",
+			"summary": "auto-review-progress-round3.json under b97e622… still carries commit ab6bbdf (cloned litter)."
+		},
+		{
+			"id": "L5-OK-check-doc-truth",
+			"severity": "P4",
+			"status": "ok",
+			"summary": "bun scripts/check-doc-truth.ts passes; release-status passed claims point at b97e622 paths/commits that match artifact commit/sourceCommit fields."
+		}
+	]
+}

@@ -1,0 +1,18 @@
+{
+ "commit": "875dfbfe736056326a64532fdfe6ced702a19aa2",
+ "claimId": "chromium-wasm-interop",
+ "createdAt": "2026-08-08T18:05:55.000Z",
+ "status": "passed",
+ "notes": "Playwright Chromium interop against the wasm backend: 7 passed (fresh build:wasm).",
+ "runner": "local-darwin-arm64",
+ "command": [
+  "bash",
+  "-c",
+  "bun run build:wasm && cd tools/interop && WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN=1 bunx playwright test -c playwright.wasm.config.ts"
+ ],
+ "startedAt": "2026-08-08T18:05:49.000Z",
+ "endedAt": "2026-08-08T18:05:55.000Z",
+ "durationMs": 6000,
+ "exitCode": 0,
+ "artifactSha256": "0a1f0c1fb9297be27fbdb2ed3a8347d162eea490daaef9dd79b87c112dc07c5f"
+}

@@ -1,0 +1,18 @@
+{
+ "commit": "875dfbfe736056326a64532fdfe6ced702a19aa2",
+ "claimId": "fault-matrix",
+ "createdAt": "2026-08-08T18:06:00.000Z",
+ "status": "passed",
+ "notes": "Fault-injection matrix via Playwright: 1 passed.",
+ "runner": "local-darwin-arm64",
+ "command": [
+  "bash",
+  "-c",
+  "cd tools/interop && WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN=1 bunx playwright test -c playwright.fault.config.ts"
+ ],
+ "startedAt": "2026-08-08T18:05:55.000Z",
+ "endedAt": "2026-08-08T18:06:00.000Z",
+ "durationMs": 5000,
+ "exitCode": 0,
+ "artifactSha256": "757ab2b7de927038a24b4a65a6064f4baf9d666eaf5963c05dd311cfc4512ace"
+}

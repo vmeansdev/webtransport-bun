@@ -10,17 +10,48 @@ Operational requirements:
 - UDP port must be reachable from the internet (firewall rules).
 - Certificates must be valid for the hostname used by clients/browsers.
 
+Canonical release truth: `docs/release-status.json`. This page describes operational guidance for the current candidate surfaces.
+
 ## Recommended defaults
 - Keep maxSessions conservative initially (e.g., 200–500) until tested.
 - Keep per-session queued bytes low (<= 2 MiB).
 - Prefer backpressure over drops; enable drop policy only for datagrams if you accept loss.
 
+## WASM footguns (multi-session / 0-RTT / QPACK)
+
+- **Primary CONNECT close tears down the whole QUIC connection** (and every
+  extra WT session on it). Close only non-primary sessions when you want
+  siblings to survive (`SessionClosed`).
+- **Inbound host-queue pressure** can also close the entire QUIC connection
+  (budget is keyed by `conn`, not per WT `sessionId`).
+- **`enable0Rtt`**: default false. Ticket stores are **per-endpoint** unless
+  you set `shareProcess0RttTicketStore: true` (loopback / same-process resume
+  only). Optional `ticketStore` (JS `TicketStoreHost`) hydrates opaque client
+  tickets into the Rust store before connect. Manager `close()` auto-dumps when
+  a store is configured; `dumpTicketsToHost(authority)` remains available for
+  explicit dump after NST. Hosts: `MemoryTicketStoreHost`, `FileTicketStoreHost`
+  (Bun/Node), `IndexedDBTicketStoreHost` (IWA/browser).
+- **`enableDynamicQpack`**: default off (SETTINGS capacity 0). Opt-in emits
+  decoder-stream ICI/section-acks, applies peer ICI to encoder KRC, and may
+  index outbound CONNECT/status; expect extra encoder/decoder-stream traffic.
+- **CONNECT admission (wasm)**: concurrent unlatched + active WT sessions are
+  capped by `wtMaxSessions` / peer `SETTINGS_WT_MAX_SESSIONS`; over-cap
+  CONNECTs get early RESET (no MiB HEADERS buffering). Handshake /
+  stream-open **rate-limit buckets are not charged** at CONNECT classify —
+  those buckets still gate UDP handshakes and WT stream opens only. Size
+  `wtMaxSessions` for CONNECT storm resistance; do not assume handshake
+  rate limits alone throttle Extended CONNECT floods.
+
 ## Enforced caps
 - Datagram size: maxDatagramSize (must respect negotiated QUIC max)
 - Stream opens: maxStreamsPerSessionBidi, maxStreamsPerSessionUni, maxStreamsGlobal
+- WT sessions per QUIC connection: `wtMaxSessions` / `SETTINGS_WT_MAX_SESSIONS`
+  (pending client CONNECTs and server unlatched admitted CONNECTs count toward
+  the admission occupied set; see OPERATIONS CONNECT admission note)
 
 ## Metrics to monitor
 - sessionsActive, handshakesInFlight, streamsActive
+- wasm: wtSessionsActive, sessionClosedCount (governor snapshot)
 - queuedBytesGlobal
 - datagramsDropped
 - backpressureTimeoutCount
@@ -87,6 +118,32 @@ Configure Prometheus alerts. Severity: **page** for Sev-2, **ticket** for Sev-3.
 
 Replace `0.8 * maxQueuedBytesGlobal` with your configured value (e.g. `419430400` for 400 MiB of 512 MiB).
 
+## Admission control: refusal is load-shaping, not rejection
+
+At `maxSessions` or `maxHandshakesInFlight`, the server answers a new dial
+with QUIC `CONNECTION_REFUSED` and increments `limitExceededCount`. This is a
+**transient admission signal from a healthy server** — "not right now", never
+"go away". The handshake cap in particular bounds *instantaneous concurrency*
+(how many handshakes are simultaneously incomplete), not arrival rate: a
+server clearing a handshake in ~10 ms sustains hundreds of establishments per
+second under a cap of 200, while a single synchronized wave deeper than the
+cap sees its overflow refused in the first instant, however idle the server
+was a moment earlier.
+
+**Clients must treat refusal as retryable**: retry with **jittered** backoff
+(e.g. 100–300 ms base, ±50% jitter, a handful of attempts), and treat only
+repeated exhaustion as an outage. The jitter is load-bearing — a fleet that
+retries on a fixed timer re-arrives as the same synchronized wave it was just
+refused for. The canonical scenario: a network blip drops 800 long-lived
+clients, all redial in the same second; with jittered retry the event is a
+sub-second hiccup, with single-shot dials it reads as a total outage — same
+server, same event.
+
+Operationally: a `limitExceededCount` burst that coincides with reconnect
+waves and drains within seconds is the admission gate doing its job; sustained
+growth under steady load is the signal to scale out or raise the cap toward
+what the host's handshake memory actually tolerates.
+
 ## Idle timeout behavior
 
 - `idleTimeoutMs` (default 60s): connection closed if no activity for this duration.
@@ -145,6 +202,42 @@ When `queuedBytesGlobal` rises and stays high:
 2. Check `queuedBytesGlobal` in metrics—high queue can inflate RSS.
 3. Run `bun run test:soak-addon` with `SOAK_DURATION=300`; if RSS grows linearly, suspect leak.
 
+**Raw RSS vs charged memory on long-running servers.** The native backend
+uses a whole-program allocator (mimalloc) that keeps freed pages as
+reclaimable `MADV_FREE` arenas rather than returning them to the OS
+immediately. On a many-hour run this makes **raw RSS climb even when the
+process's charged/working-set memory is flat** — harmless with headroom, but
+on a memory-constrained host the kernel OOM-killer counts raw RSS and can
+kill an otherwise-healthy server. Call `releaseNativeMemory()` (which runs
+`mi_collect` and returns those arenas to the OS) **periodically** — e.g. every
+few minutes on a timer — for servers that run for hours on small instances.
+It is safe under live traffic (proven non-disruptive by the RSS soak) and is
+what the soak harness itself does via `SOAK_RELIEF_INTERVAL_MS`. Provision at
+least ~2× the observed steady-state RSS, and always configure swap on small
+instances.
+
+**Committed memory, not RSS, is what the OOM-killer's world bounds.** When
+swap is active the kernel pages out cold anonymous memory, so a leaking
+process can show a flat RSS while `RssAnon + VmSwap` grows without bound.
+The soak harness samples both from `/proc/self/status` (fields `rssAnonMb`,
+`vmSwapMb`, `committedMb` in the samples sidecar) and gates on committed
+drift. Its debug knobs:
+
+- `SOAK_COMMITTED_ABORT_MB` — circuit breaker; the segment aborts with a
+  partial artifact once committed memory crosses this (0 = off). Prefer this
+  on small hosts over letting the kernel SIGKILL with no evidence.
+- `SOAK_HEAP_DEBUG=1` — appends the top JSC object-type counts to a
+  `.heap-types.jsonl` sidecar every `SOAK_HEAP_DEBUG_INTERVAL_MS` (default
+  10 min). Heap scans are stop-the-world: they perturb the measurement, and
+  the knobs are recorded in the segment artifact (`debugKnobs`) so evidence
+  readers can see when they were active.
+
+**Minimum Bun runtime: 1.3.14.** Bun `<= 1.3.13` permanently leaks one
+`WritableStream` + rejection `Error` per stream whose close is rejected
+(peer STOP_SENDING racing a close). The soak harness refuses to record or
+aggregate evidence from older runtimes, and the library warns once at
+startup on them.
+
 ## Troubleshooting
 1) Browser cannot connect
 - Verify UDP port open
@@ -172,12 +265,250 @@ When `queuedBytesGlobal` rises and stays high:
 - **Throughput**: increase per-session limits, larger highWaterMark on streams
 - **queuedBytesGlobal rising**: slow consumers or too many concurrent streams; reduce limits or scale out
 
+### Flow-control windows
+
+Two different things bound memory, and they used to be one knob:
+
+- **Byte governors** (`maxQueuedBytesGlobal` / `PerSession` / `PerStream`) —
+  application-level accounting of bytes queued across the JS boundary. They
+  drive backpressure, `E_QUEUE_FULL`, and the native datagram channel.
+- **QUIC flow-control windows** (`streamReceiveWindow`, `receiveWindow`,
+  `sendWindow`) — what the transport advertises to the peer. They decide how
+  much data can be in flight, and therefore throughput on a path with any
+  meaningful bandwidth-delay product.
+
+Leave the window fields unset and each one is derived from a governor, exactly
+as it always has been: `streamReceiveWindow` from `maxQueuedBytesPerStream`,
+and both connection windows from `maxQueuedBytesPerSession` (raised, if needed,
+to cover one stream window). Set them and only the transport moves — the
+governors, backpressure and the datagram channel stay where you put them.
+Native backend only.
+
+**Budget them explicitly.** Per session, the advertised worst case is
+
+```
+receiveWindow + sendWindow + datagramChannelCapacity × maxDatagramSize
+```
+
+where `datagramChannelCapacity = ceil(maxQueuedBytesPerSession / maxDatagramSize)`
+capped at 2048. `maxQueuedBytesGlobal` does **not** bound this — it is a
+different accounting, so a 512 MiB global governor gives no protection at all
+against the window ceiling.
+
+| config | per session | × 2000 sessions | sessions that fit 8 GB |
+|---|---|---|---|
+| defaults (256 KiB / 2 MiB) | 6.00 MiB | 12.6 GB | 1365 |
+| windows 8 MiB / 32 MiB, governors default | 66.0 MiB | 138 GB | 124 |
+| governor route to the same windows (`maxQueuedBytesPerSession` 64 MiB) | 130.3 MiB | 273 GB | 62 |
+
+Read that table as the reason `maxSessions` and the windows are one decision:
+even the shipped defaults over-commit an 8 GB box at `maxSessions` 2000 by 1.5×.
+Nothing is allocated up front — a window is a ceiling a peer must actually
+drive you to, and a session that reads promptly never approaches it — but it is
+the only bound the transport gives you, so pick `maxSessions` against the
+window you configure rather than against the default.
+
+**What widening buys.** Measured on the 4 vCPU rig over loopback, 4 sessions ×
+4 concurrent uni streams (run 32193538952): 256 KiB → 16 MiB per-stream, a 64×
+memory increase, moved delivered throughput 0.781 → 1.037 Gbps (+33%), with no
+knee below 8 MiB. On loopback the bandwidth-delay product is far below even the
+256 KiB default, so that curve is the *cost* of a window on this rig, not the
+benefit on a real path: over a WAN, where BDP routinely exceeds 256 KiB, the
+default window — not the CPU — is what caps a single stream. Widen when you
+measure a stalled sender on a long path; do not widen speculatively.
+
+## Egress pacer (experimental)
+
+The paced mirror (`sendDatagramMirrorPaced` / `readMirrorReports`) needs the
+native egress pacer. Turn it on with the server option:
+
+```ts
+createServer({ port, tls, onSession, egressPacer: { pps: 30_000, clump: 32, queueMs: 250 } });
+```
+
+The pacer is **process-wide**: one schedule and one OS thread. The first
+configuration a process resolves wins. A later `createServer` asking for a
+different one fails with `E_INVALID_ARGUMENT`; the identical one is accepted.
+`WEBTRANSPORT_PACER_PPS` (with `WEBTRANSPORT_PACER_CLUMP` /
+`WEBTRANSPORT_PACER_QUEUE_MS`) remains a documented fallback for processes
+where no server passes the option. It is read on the pacer's first use, and
+the option takes precedence when it comes first. The configuration is
+committed only once the server that asked for it has been created, so a
+`createServer` that fails (TLS, bind) does not consume it.
+
+**Bounds.** `pps` is 1–1,000,000, `clump` 1–64 and `queueMs` 1–5000. An
+option outside them fails `createServer` with `E_INVALID_ARGUMENT`. A
+malformed or out-of-range `WEBTRANSPORT_PACER_*` value logs one warning and
+falls back to its default: the rate falls back to off, the clump to 32 and the
+window to 250. The schedule holds at most `pps × queueMs / 1000` targets and
+at most **64 MiB** of queued bytes: each job's payload once, plus every
+target id. This is the pacer's own cap, separate from the `maxQueuedBytes*`
+governors, which see a datagram only when the pacer hands it to a session.
+Targets past either bound are refused in the admission envelope
+(`E_QUEUE_FULL`). The whole surface is
+experimental (`docs/SPEC.md`, "Experimental surfaces"). See
+`crates/native/docs/egress-pacer.md` for how the schedule behaves.
+
+## Transport defaults that changed for 1.0
+
+Two native transport defaults changed after `1.0.0-rc.1`. Neither has a
+public knob; both are recorded here so a capacity plan made against the
+release candidate can be redone.
+
+- **Per-connection datagram receive buffer: 256 KiB** (was 64 KiB). This is
+  quinn's cap on inbound datagrams buffered per connection before the oldest
+  are dropped. At 30k sessions the 64 KiB cap dropped datagrams under
+  read-task contention. It is a ceiling, not an allocation: the worst case is
+  256 KiB per connection that is not being read, on top of the flow-control
+  budget in "Flow-control windows" above.
+- **The wtransport fork reads datagrams in a dedicated per-connection pump
+  task** (was: inline in the connection driver's `select!`). A datagram now
+  wakes only that task instead of re-polling the driver's accept and
+  control-stream futures under the connection lock. Same capacity-1
+  backpressure and error path. Costs one extra Tokio task per connection.
+  `WTRANSPORT_DATAGRAM_PUMP=0` restores the inline path. It is an unsupported
+  knob (see below), kept for paired A/B measurement.
+
+## Cross-stream read group
+
+Server-accepted incoming streams (bidi and uni) are read through one
+process-level native **read group by default**. One Node-API crossing hands
+JavaScript every queued stream's chunks. At high stream counts this replaces a
+crossing per stream per read. Native server only: client streams and the wasm
+backend always pull directly. Semantics are in `docs/SPEC.md` ("Cross-stream
+read group").
+
+- **Opt out with `WEBTRANSPORT_STREAM_READ_GROUP=0`.** It is read once at module
+  load, and only the exact value `0` turns the group off. Every readable then
+  pulls the addon directly, one crossing per read. Use it to rule the group in
+  or out of a regression. It is supported and keeps its meaning across 1.x.
+- **Memory is bounded by the same budgets as the direct path.** The group
+  reads nothing ahead: a stream's feeder makes one native read per read its
+  consumer has outstanding. Bytes a stalled reader has not asked for stay in
+  the transport, under QUIC flow control and
+  `maxQueuedBytesGlobal` / `PerSession` / `PerStream`. On top of that, the
+  group holds at most one crossing in flight: up to 4096 entries and 1 MiB of
+  payload. Each entry's native buffer and reservation are released as soon as
+  its JavaScript copy exists. Per-stream state (a key and a feeder) leaves the
+  group when the stream is released (dispose, reset, session close), whether
+  or not it was ever read.
+
+## Escape hatches
+
+Two supported variables put back a pre-1.0 delivery path. Both are read once
+per process (at addon load or module load), default to the shipped path, and
+exist so an operator can rule a regression in or out without a rebuild. They
+are supported: they keep their meaning across 1.x. Use them for diagnosis, not
+as a standing configuration.
+
+- **`WEBTRANSPORT_PAYLOAD_DELIVERY=buffer-copy`** (native addon). By default,
+  payloads of 256 KiB or less reach JavaScript as engine-owned `ArrayBuffer`
+  copies. Their bytes are reported to the engine, so its garbage collector
+  sees the pressure. Measured at 1000 datagrams/s, that keeps RSS flat. The
+  pre-1.0 path, `buffer-copy` (`napi_create_buffer_copy`), never triggered a
+  full collection under the same load and grew about 100 MB/h. Any other value
+  keeps the default. Larger payloads keep the zero-copy handover either way.
+- **`WEBTRANSPORT_DATAGRAM_SEND_SYNC=0`** (JavaScript side). By default,
+  `session.sendDatagram()` first tries a synchronous, promise-free native
+  send. It falls back to the parking Node-API call, which returns a promise,
+  only when the session's byte budget is full. `datagramSendsAsync` in the
+  server snapshot counts those fallbacks. `=0` sends every datagram through
+  the parking call, as before 1.0. Each one hands JavaScript a promise that is
+  a reference on the host event loop, so an echo server under overload can
+  again outlive its own `close()`. Any other value keeps the default.
+
+## Unsupported tuning knobs
+
+The variables below exist for measurement campaigns. They are **not** part
+of the supported surface: they may change meaning or disappear in any
+release, and the getters that report their values back are internal
+(`__TESTING__.serverInternals(server)`; see `docs/SPEC.md`, "Semver rules").
+Leave them unset in production. Each one is read once per process. An invalid
+value logs one `webtransport-native: warning: ...` line on stderr and the knob
+falls back to its default. The process is never aborted.
+
+| Variable | Default | Accepted values |
+|---|---|---|
+| `WEBTRANSPORT_NATIVE_SERVER_WORKERS` | `2` | integer `1..=8` (server Tokio workers) |
+| `WEBTRANSPORT_NATIVE_SERVER_RECV_RUNTIME` | `shared` | `shared` \| `dedicated` (endpoint driver on its own thread) |
+| `WEBTRANSPORT_NATIVE_ACK_CADENCE` | `default` | `default` \| `relaxed` (requests ACK_FREQUENCY from the client) |
+| `WEBTRANSPORT_NATIVE_UDP_SEND_BATCH` | `0` (off) | `0` or `2..=1024` (cross-connection `sendmmsg` batch) |
+| `WEBTRANSPORT_NATIVE_UDP_SEND_BATCH_WAIT_US` | `0` | `0..=5000` |
+| `WEBTRANSPORT_NATIVE_UDP_SEND_EAGAIN_MODE` | `wait` | `wait` \| `drop` |
+| `WEBTRANSPORT_NATIVE_REFLECT_RING_BYPASS` | `0` | `0` \| `1` (internal datagram reflector only) |
+| `WEBTRANSPORT_NATIVE_SEND_PATH_DIAGNOSTICS` | `0` | `0` \| `1` (process-wide send-path phase banks) |
+| `WEBTRANSPORT_NATIVE_SERVER_UDP_SNDBUF_BYTES` | unset | `0` or `65536..=67108864` |
+| `WTRANSPORT_DATAGRAM_PUMP` | pump on | `0` selects the legacy inline datagram read |
+| `WEBTRANSPORT_PACER_NICE`, `WEBTRANSPORT_PACER_SCHED` | unset | thread priority of the (experimental) egress pacer: a nice value, or `rr:<prio>` |
+| `WEBTRANSPORT_DATAGRAM_BATCH_DIAGNOSTICS` | off | `1` arms per-process incoming-datagram batch counters, readable only through `__TESTING__` (JavaScript side, read at module load) |
+
+Two cases are refused at `createServer` rather than replaced by a default,
+because the request itself cannot be honoured. Both fail with a recoverable
+`E_INTERNAL: server startup failed: ...`, never an abort:
+
+- `WEBTRANSPORT_NATIVE_UDP_SEND_EAGAIN_MODE=drop` together with a non-zero
+  `WEBTRANSPORT_NATIVE_UDP_SEND_BATCH` (two valid values that conflict);
+- a well-formed `WEBTRANSPORT_NATIVE_SERVER_UDP_SNDBUF_BYTES` that the OS caps
+  below the requested size at bind.
+
+A *malformed* `WEBTRANSPORT_NATIVE_SERVER_UDP_SNDBUF_BYTES` warns and falls
+back like every other knob.
+
+## Sizing the JS read side (stream tail latency)
+
+Everything a stream delivers to JavaScript is surfaced by **one event loop**,
+and app-observed tail latency is a queueing function of that thread's
+utilization — it degrades *nonlinearly* as the loop approaches saturation. The
+mechanism was measured end-to-end (2026-08-25, T-100 shape: 100 bidi streams,
+3 Mbps each direction, ~26.4k frames/s aggregate): with loop headroom the
+app-level p99 is **2.5 ms**; starving the same workload's CPU produced 5.2 ms
+at ~82 % and 11.5 ms at ~95 % utilization; and a host that held the loop at
+93–95 % of a slower core with unthrottled senders measured **348 ms** — a
+~140× tail inflation with near-identical throughput. Wire-level delivery was
+17 ms p99 throughout: the frames arrive; a saturated loop just doesn't run
+your callback.
+
+The rules that follow from the measurements, in order of leverage:
+
+1. **Keep the reader loop below ~80 % of a core.** On the reference hardware
+   (dedicated Intel vCPU), 100 tunnels of the shape above cost 0.9–1.15
+   cores of loop time — plan roughly **70 such streams per JS process** and
+   shard processes beyond that (`reusePort` + `quicLb` +
+   `reusePortSteering` is the supported multi-process shape). Watch the
+   loop's own utilization, not host CPU: the host can be 90 % idle while the
+   one loop that matters is critical.
+2. **Drain latency-critical streams with a native sink
+   (`openReadSink`).** A native task timestamps stream data into a
+   SharedArrayBuffer ring that a `SinkReader` in a Worker consumes with zero
+   event-loop crossings on the hot path (`docs/RFC_STREAM_SINK.md`). The
+   productized path reproduces the harness result: at 90 % loop saturation
+   the facade read path measured p50 5.2 ms / p99 9.5 ms while the sink held
+   p50 0.7 ms / p99 2.3 ms — flat against its unsaturated numbers
+   (`tools/load/bench-sink.ts`; local macOS run, the authoritative gate is
+   the Linux dedicated runner). Open the sink before consuming the stream's
+   readable, post `handle.buffer`/`handle.descriptor` to your Worker, and
+   size `ringBytes` for your burst tolerance — `overflow: 'block'` (default)
+   throttles the sender losslessly via QUIC flow control when the ring
+   fills; `'drop-newest'` never blocks the wire and discloses counted gaps.
+   The wasm backend exposes the same API as shape parity only: its producer
+   runs on the main loop, so it cannot isolate latency from saturation.
+3. **Worker threads help the processing, not the delivery.** Offloading
+   parse/deframe work to workers reduces loop load, but the read callback
+   itself still lands on the one loop — workers alone cannot fix a saturated
+   reader. (The sink in rule 2 is the exception by construction: delivery
+   itself moves off the loop.)
+4. **`WEBTRANSPORT_STREAM_BATCH_BYTES` is damping, not prevention.** Batching
+   coalesces only what has accumulated: a keeping-up reader measured 1.07
+   frames per crossing (no benefit — 11.0 vs 11.5 ms p99 at 95 %
+   utilization, identical CPU). It softens a backlog once you are already
+   behind; it does not keep you out of the critical region.
+
 ## Known limitations and compatibility
 
-- Client `connect()` fully supported: datagrams, bidi/uni streams, metrics, configurable limits
-- macOS + Linux + Windows (arm64/x64 on macOS, x64 on Linux/Windows)
-- Runtime support: Bun >= 1.3.9, Node, Deno
-- Node-API addon portability applies across supported runtimes
+- Client `connect()` surface: datagrams, bidi/uni streams, metrics, configurable limits
+- Configured target matrix: macOS + Linux + Windows (arm64/x64 on macOS, x64 on Linux/Windows)
+- Configured runtime matrix: Bun >= 1.3.14, Node, Deno
+- Node-API addon portability applies across the configured runtime matrix
 
 ## Public internet deployment
 
@@ -189,6 +520,177 @@ When `queuedBytesGlobal` rises and stays high:
 - Run the runtime process as a dedicated service user.
 - Use systemd on Linux; ensure Restart=on-failure.
 - Collect logs centrally; scrape metrics via exposed endpoint (if you add one) or poll metricsSnapshot.
+
+## Multi-process binds (`reusePort`)
+
+*Experimental: may change in a 1.x minor (`docs/SPEC.md`, "Experimental surfaces").*
+
+`createServer({ reusePort: true })` sets `SO_REUSEPORT` on the bind socket so
+several server processes can listen on one port. It is **native-backend only**
+(the WASM backend has its own options type and owns no socket) and **unix
+only**: on a platform without `SO_REUSEPORT` the call throws
+`E_UNSUPPORTED_ARGUMENT` rather than binding without it. It also requires an
+explicit `port` — `port: 0` throws `E_INVALID_ARGUMENT`, since each instance
+would get its own ephemeral port and share nothing.
+
+**The flag alone is not a load-balancing answer.** Read these two before
+turning it on:
+
+- **4-tuple hashing breaks long-lived sessions.** Plain kernel steering picks a
+  group member by hashing the packet's source/destination address and port. A
+  QUIC connection survives a client address change by design (the connection ID
+  identifies it, not the 4-tuple), but the kernel does not read connection IDs
+  — after a NAT rebind or a client interface change the same connection hashes
+  to a *different* process, which does not recognize it. The connection does not
+  close: it **stalls until the idle timeout expires (60 s by default,
+  `crates/native/src/limits.rs:47`)**, so what the application sees is a hang
+  followed by a timeout, not a clean drop. See §3 of
+  `docs/research/2026-08-21-bare-metal-capacity.md` for the verified mechanism.
+  The same argument applies to plain ECMP.
+- **Group membership changes re-hash the whole group.** Adding or removing a
+  socket changes the hash distribution for every flow, not just new ones.
+  Restarting one instance therefore re-steers surviving connections that belong
+  to its *siblings*, so a routine rolling restart drops sessions fleet-wide.
+
+What the flag is for:
+
+- **eBPF-steered topologies.** An `SK_REUSEPORT` program attached to the group
+  can pick the socket by reading the QUIC connection ID's server-ID bytes
+  instead of the 4-tuple, which is rebind-stable. That requires the server to
+  encode a server ID in the connection IDs it issues.
+- **Benchmarks and load-generation rigs**, where sessions are short and
+  distribution does not have to be stable.
+
+Neither the rebind failure nor the restart re-hash has been measured on this
+project's rigs; both are deductions from RFC 9000 §5.1/§9 and the kernel's
+documented reuseport behavior. Distribution across the group is the kernel's,
+not this library's: Linux hashes across members, BSD/macOS delivers to the last
+binder.
+
+The full argument, the supported deployment pattern, and the sizing figures
+live in
+[docs/research/2026-08-21-bare-metal-capacity.md](research/2026-08-21-bare-metal-capacity.md)
+— sections 3 ("Unsupported: 4-tuple-hash balancers in front of long-lived
+sessions") and 4 ("Four disclosures you must read before deploying any steered
+pattern").
+
+## QUIC-LB connection IDs (`quicLb`)
+
+*Experimental: may change in a 1.x minor (`docs/SPEC.md`, "Experimental surfaces").*
+
+`reusePort` gives you a group of processes on one port; `quicLb` gives the
+thing steering that group something rebind-stable to steer *by*. With
+
+```ts
+createServer({
+  port: 4433,
+  quicLb: { serverId: new Uint8Array([0x00, 0x07]), nonceLen: 8 },
+  tls, onSession,
+});
+```
+
+every connection ID this instance issues carries `00 07` in the clear, so an
+`SK_REUSEPORT` eBPF program or an external L4 balancer can read the backend out
+of the packet header instead of hashing the 4-tuple. That is what makes the
+steering survive a client's NAT rebind: the connection ID is the connection's
+own name and travels with it, while the 4-tuple does not.
+
+**Native backend only** — the WASM backend has its own options type and issues
+no connection IDs of its own. Absent, the option changes nothing: quinn's
+opaque 8-octet connection IDs are the default.
+
+### The layout
+
+Written against **draft-ietf-quic-load-balancers-21**, the **keyless**
+configuration of §5.3:
+
+```text
+first octet   3 config-rotation bits + 5 random bits    §3.1, §3.3
+server ID     serverId.length octets, >= 1              §5.3
+nonce         nonceLen octets, >= 4, random per CID     §5.4
+```
+
+`serverId.length + nonceLen` must be 19 or less, because QUIC v1 caps
+connection IDs at 20 octets and the first one is spent on the first octet. The
+keyed configuration is the same format with the plaintext block encrypted; it
+is a later option, not a different scheme.
+
+### `nonceLen` is required on purpose
+
+Nothing in the connection ID encodes the nonce length or the server-ID length —
+a balancer learns both from its own configuration. A default here would let the
+server write one layout while the balancer decodes another, and the symptom
+would be traffic landing on arbitrary backends, which reads as a flaky network
+rather than as a misconfiguration. So `nonceLen` has no default and an absent
+one throws `E_INVALID_ARGUMENT`. Every other bound is checked the same way, in
+JS, before the addon is touched.
+
+`configRotation` (0–6, default 0) labels which configuration generation issued
+a connection ID, so a fleet can roll to new parameters while connections issued
+under the old ones stay routable. `7` (0b111) is reserved for unroutable
+connection IDs (§3.2) and is rejected.
+
+### Cost 1: the topology is in cleartext
+
+The draft states the tradeoff in its own words (§5.3): "failure to define a key
+means that observers can determine the assigned server of any connection,
+significantly increasing the linkability of QUIC address migration." Anyone on
+the path can tell which backend serves a connection, count your fleet, and link
+a connection across a migration that QUIC otherwise makes unlinkable. That is
+the price of keyless routing; the keyed configuration is what buys it back, and
+it is not built.
+
+### Cost 2: bytes on every packet
+
+A QUIC-LB connection ID is `1 + serverId.length + nonceLen` octets — **11** for
+the example above, **6** at minimum, up to 20 — against quinn's **8**-octet
+default. Once the client adopts a server-issued connection ID, that difference
+is paid on the destination-CID field of **every short-header packet** in both
+directions, for the life of the connection.
+
+Put against this rig's measured egress, that is small but not free. G7's stream
+cell moved **1.2498 Gbps** with byte-exact ledgers (the run's 79.1% host-CPU
+maximum was measured on a *different* cell, B-1k — see the
+[capacity doc](research/2026-08-21-bare-metal-capacity.md), §"Host-level
+envelopes"); at the ~1,400-byte datagrams that path carries, three extra header
+octets is roughly **0.2%** of the wire bytes, and G3's egress cell ran with GSO
+and GRO active at 64 segments, so the added bytes ride the same syscalls rather
+than costing new ones. It has **not been measured** — no gate has run with
+`quicLb` on. Size a minimal `nonceLen` (4) and a minimal `serverId` if your
+fleet is small and the bytes matter; note that a short nonce shrinks the
+unlinkability budget §5.4 asks you to keep.
+
+### Reading connection IDs on the balancer side
+
+The package exports the decoders, pure and addon-free, so an eBPF loader or a
+routing test can read a connection ID without opening a socket:
+
+```ts
+import {
+  decodeQuicLbServerId,
+  decodeQuicLbConfigRotation,
+} from "@webtransport-bun/webtransport";
+
+const serverId = decodeQuicLbServerId(cid, 2); // null if the CID is too short
+const rotation = decodeQuicLbConfigRotation(cid); // 7 means unroutable (§3.2)
+```
+
+`serverIdLen` is yours to supply from configuration; it is never on the wire.
+
+### What it does not do
+
+The first flight is still unrouted by connection ID: the client picks its own
+random destination CID for the Initial, so routing falls back to the 4-tuple
+until the server's CID is adopted, and a rebind inside that window still breaks
+the connection. See disclosure (b) in the capacity document. Rotation, Retry,
+version negotiation, and the unroutable codepoint are all the balancer's
+problem, not this option's.
+
+A worked configuration — how `reusePort` + `quicLb` + an eBPF steering program
+compose on one box, and how `quicLb` composes with an external L4 balancer
+across machines — is in [quic-lb.md](quic-lb.md), with a reference
+`SK_REUSEPORT` program (an example, not a shipped component) in
+[examples/quic-lb/](../examples/quic-lb/README.md).
 
 ---
 

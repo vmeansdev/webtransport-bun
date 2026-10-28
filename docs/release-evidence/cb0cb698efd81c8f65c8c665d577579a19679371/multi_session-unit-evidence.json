@@ -1,0 +1,18 @@
+{
+	"commit": "cb0cb698efd81c8f65c8c665d577579a19679371",
+	"claimId": "wasm-multi-session",
+	"createdAt": "2026-07-27T16:23:54.447870Z",
+	"status": "passed",
+	"notes": "Multi-session product surface on candidate.",
+	"runner": "local-darwin-arm64",
+	"command": [
+		"bun",
+		"test",
+		"packages/webtransport/test/wasm-multi-session.test.ts"
+	],
+	"startedAt": "2026-07-27T16:23:54.323221Z",
+	"endedAt": "2026-07-27T16:23:54.447870Z",
+	"durationMs": 124,
+	"exitCode": 0,
+	"artifactSha256": "827c4ab4cc7695df46ad152f5b65262172b96c4fbab667b4ada302bab5a38013"
+}

@@ -1,0 +1,15 @@
+{
+  "lane": 6,
+  "agent": "9e2f8afa-2b16-4b9f-aac7-14b05592820f",
+  "verdict": "NOT READY",
+  "findings": [
+    {"id": "L6-P0-test-wasm-allowlist", "severity": "P0", "summary": "test:wasm omit wasm-0rtt/multi-session/facade-options"},
+    {"id": "L6-P1-ticketstore-exports", "severity": "P1", "summary": "TicketStoreHost not re-exported from wasm.ts"},
+    {"id": "L6-P1-compat-bigint", "severity": "P1", "summary": "COMPATIBILITY.md denies BigInt/u64 after session_id wire"},
+    {"id": "L6-P2-wire-provenance", "severity": "P2", "summary": "no event-wire schema version in PRODUCTION_BUILD"},
+    {"id": "L6-P2-claim-drift", "severity": "P2", "summary": "release-status/scope claim wording drift"},
+    {"id": "L6-P3-allowlist-floor", "severity": "P3", "summary": "≥9 floor stale vs product suite count"},
+    {"id": "L6-P3-open-session-f64", "severity": "P3", "summary": "wt_open_session returns f64"},
+    {"id": "L6-P4-testplan", "severity": "P4", "summary": "TESTPLAN.md missing new suites"}
+  ]
+}

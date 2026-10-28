@@ -3,6 +3,7 @@
 //! Path B (endpoint-level pooling): Pool Endpoints per compatibility key.
 //! Each connect() creates a new Connection from the pooled Endpoint.
 
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,9 +30,13 @@ pub struct PoolKey {
     pub sni: Option<String>,
     pub insecure_skip_verify: bool,
     pub has_pinned_hashes: bool,
-    pub has_ca_pem: bool,
+    pub ca_pem_fingerprint: Option<[u8; 32]>,
     pub require_unreliable: bool,
     pub congestion: String,
+}
+
+pub fn ca_pem_fingerprint(ca_pem: Option<&str>) -> Option<[u8; 32]> {
+    ca_pem.map(|pem| Sha256::digest(pem.as_bytes()).into())
 }
 
 /// Shared state for a pooled endpoint.
@@ -107,13 +112,26 @@ impl ClientPoolManager {
         let (entry, was_hit) = {
             let mut guard = self.entries.lock().map_err(|_| "pool lock poisoned")?;
             self.evict_idle_under_lock(&mut guard);
-            if guard.len() >= MAX_POOL_ENTRIES {
-                self.evict_one_under_lock(&mut guard);
+            // Only a brand-new key needs headroom. If the pool is full and no
+            // idle entry can be evicted, reject rather than growing past the cap.
+            if !guard.contains_key(&key)
+                && guard.len() >= MAX_POOL_ENTRIES
+                && !self.evict_one_under_lock(&mut guard)
+            {
+                return Err("E_LIMIT_EXCEEDED: connection pool full".into());
             }
             match guard.get(&key) {
                 Some(ent) => {
-                    let refs = ent.active_refs.load(Ordering::Relaxed);
-                    if refs >= MAX_SESSIONS_PER_KEY {
+                    // Reserve a ref atomically under the pool lock: a plain
+                    // load-check then increment-after-unlock let N concurrent
+                    // acquirers each pass the cap and overshoot it by N-1.
+                    if ent
+                        .active_refs
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |r| {
+                            (r < MAX_SESSIONS_PER_KEY).then_some(r + 1)
+                        })
+                        .is_err()
+                    {
                         return Err("E_LIMIT_EXCEEDED: max sessions per pool key".into());
                     }
                     (Arc::clone(ent), true)
@@ -121,8 +139,10 @@ impl ClientPoolManager {
                 None => {
                     let endpoint = create_endpoint()?;
                     let ent = Arc::new(PoolEntry {
+                        // Starts at 1: this caller's reserved ref (no external
+                        // increment below, so the cap is never overshot).
                         endpoint,
-                        active_refs: AtomicU64::new(0),
+                        active_refs: AtomicU64::new(1),
                         last_used_ms: AtomicU64::new(now_ms()),
                     });
                     guard.insert(key.clone(), Arc::clone(&ent));
@@ -136,8 +156,6 @@ impl ClientPoolManager {
         } else {
             POOL_MISSES.fetch_add(1, Ordering::Relaxed);
         }
-
-        entry.active_refs.fetch_add(1, Ordering::Relaxed);
         let connect_result = tokio::time::timeout(
             tokio::time::Duration::from_millis(handshake_timeout_ms),
             entry.endpoint.connect(connect_url),
@@ -200,8 +218,9 @@ impl ClientPoolManager {
         }
     }
 
-    fn evict_one_under_lock(&self, guard: &mut HashMap<PoolKey, Arc<PoolEntry>>) {
-        let _now = now_ms();
+    /// Evict the least-recently-used idle entry. Returns whether an entry was
+    /// evicted (false means every entry is busy, so the pool cannot shrink).
+    fn evict_one_under_lock(&self, guard: &mut HashMap<PoolKey, Arc<PoolEntry>>) -> bool {
         let victim = guard
             .iter()
             .filter(|(_, ent)| ent.active_refs.load(Ordering::Relaxed) == 0)
@@ -210,6 +229,9 @@ impl ClientPoolManager {
         if let Some(k) = victim {
             guard.remove(&k);
             POOL_EVICT_IDLE.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            false
         }
     }
 }
@@ -235,5 +257,39 @@ pub fn pool_metrics_snapshot() -> PoolMetricsSnapshot {
         misses: POOL_MISSES.load(Ordering::Relaxed),
         evict_idle: POOL_EVICT_IDLE.load(Ordering::Relaxed),
         evict_broken: POOL_EVICT_BROKEN.load(Ordering::Relaxed),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ca_pem_fingerprint, PoolKey};
+
+    fn key(ca_pem: Option<&str>, pinned: bool, insecure: bool) -> PoolKey {
+        PoolKey {
+            scheme: "https".to_string(),
+            host: "example.test".to_string(),
+            port: 443,
+            sni: Some("example.test".to_string()),
+            insecure_skip_verify: insecure,
+            has_pinned_hashes: pinned,
+            ca_pem_fingerprint: ca_pem_fingerprint(ca_pem),
+            require_unreliable: false,
+            congestion: "default".to_string(),
+        }
+    }
+
+    #[test]
+    fn pool_key_keeps_trust_domains_separate() {
+        assert_eq!(
+            key(Some("ca-a"), false, false),
+            key(Some("ca-a"), false, false)
+        );
+        assert_ne!(
+            key(Some("ca-a"), false, false),
+            key(Some("ca-b"), false, false)
+        );
+        assert_ne!(key(None, false, false), key(Some("ca-a"), false, false));
+        assert_ne!(key(None, false, false), key(None, true, false));
+        assert_ne!(key(None, false, false), key(None, false, true));
     }
 }

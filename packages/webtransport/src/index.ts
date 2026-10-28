@@ -42,154 +42,284 @@
 
 import type { Duplex, Readable, Writable } from "node:stream";
 
+export type { QuicLbOptions } from "./quic-lb.js";
+// The QUIC-LB decoders are the balancer's half of the `quicLb` server option
+// and belong on the native surface with it. They are pure and load no addon, so
+// an eBPF loader or a routing test can import them on their own.
+// `quicLbCidLength` rides with them: the length is the one number a decoder
+// cannot read off the wire, so a caller of the two decoders needs it to know
+// how many octets a CID of this configuration should be before trusting what
+// it decoded.
+export {
+	decodeQuicLbConfigRotation,
+	decodeQuicLbServerId,
+	quicLbCidLength,
+} from "./quic-lb.js";
+export type { Resettable, StopSendable } from "./streams.js";
 // Re-export stream symbols and helpers
 export { WT_RESET, WT_STOP_SENDING } from "./streams.js";
-export type { Resettable, StopSendable } from "./streams.js";
 
 import {
+	createNativeByteReadable,
+	type NativeReadableOwner,
+} from "./native-readable.js";
+import {
+	type QuicLbOptions,
+	quicLbOptionsError,
+	quicLbOptionsToJson,
+} from "./quic-lb.js";
+import {
+	configureReadGroup,
+	createIncomingReadable,
+	type GroupFeedableHandle,
+	type NativeReadGroup,
+	ReadGroupPump,
+	readGroupConfig,
+	readGroupDiagnosticsSnapshot,
+	readGroupStateSnapshot,
+	resetReadGroupDiagnostics,
+	setReadGroupMaxEntriesForTests,
+} from "./read-group.js";
+import {
 	BidiStream,
+	type DirectReadable,
 	RecvStream,
+	type Resettable,
 	SendStream,
+	type StopSendable,
+	WT_DIRECT_READ_OWNER,
 	WT_RESET,
 	WT_STOP_SENDING,
-	type Resettable,
-	type StopSendable,
 } from "./streams.js";
 
+// Native stream sink (RFC_STREAM_SINK): latency-critical reads drained off
+// the JS event loop into a SharedArrayBuffer ring. Native backend only; the
+// worker-side SinkReader is also importable without native code via the
+// "@webtransport-bun/webtransport/sink-reader" subpath.
+export type {
+	StreamSinkHandle,
+	StreamSinkOptions,
+	StreamSinkStats,
+} from "./sink.js";
+export type {
+	SinkTaskStateName,
+	StreamSinkDescriptor,
+	StreamSinkFraming,
+} from "./sink-layout.js";
+export type { SinkRecord, SinkRecordType } from "./sink-reader.js";
+export { SinkReader } from "./sink-reader.js";
+
+import {
+	openReadSinkOnNativeHandle,
+	type SinkCapableNativeHandle,
+	type StreamSinkHandle as StreamSinkHandleType,
+	type StreamSinkOptions as StreamSinkOptionsType,
+} from "./sink.js";
+
+/**
+ * Open a native read sink on a native-backend stream (RFC_STREAM_SINK):
+ * accepts the Node facade classes (BidiStream / RecvStream) and the W3C
+ * incoming-stream wrappers a server session yields, all of which carry an
+ * `openReadSink` method with the same contract.
+ *
+ * @experimental Native stream sink (RFC_STREAM_SINK); may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
+ */
+export function openReadSink(
+	stream:
+		| BidiStream
+		| RecvStream
+		| { openReadSink(opts?: StreamSinkOptionsType): StreamSinkHandleType },
+	opts?: StreamSinkOptionsType,
+): StreamSinkHandleType {
+	if (
+		typeof (stream as { openReadSink?: unknown }).openReadSink === "function"
+	) {
+		return (
+			stream as {
+				openReadSink(opts?: StreamSinkOptionsType): StreamSinkHandleType;
+			}
+		).openReadSink(opts);
+	}
+	throw new Error(
+		"E_SINK_BAD_OPTIONS: openReadSink requires a native readable stream",
+	);
+}
+
+export type {
+	WebTransportErrorOptions,
+	WebTransportErrorSource,
+} from "./errors.js";
 /**
  * Stable error codes. Use with {@link WebTransportError.code} for programmatic handling.
  * @see WebTransportError
  */
 export {
-	E_TLS,
+	E_BACKPRESSURE_TIMEOUT,
 	E_HANDSHAKE_TIMEOUT,
+	E_INTERNAL,
+	E_INVALID_ARGUMENT,
+	E_LIMIT_EXCEEDED,
+	E_QUEUE_FULL,
+	E_RATE_LIMITED,
+	E_SERVER_CLOSING,
 	E_SESSION_CLOSED,
 	E_SESSION_IDLE_TIMEOUT,
-	E_STREAM_RESET,
 	E_STOP_SENDING,
-	E_QUEUE_FULL,
-	E_BACKPRESSURE_TIMEOUT,
-	E_LIMIT_EXCEEDED,
-	E_RATE_LIMITED,
-	E_INTERNAL,
+	E_STREAM_RESET,
+	E_TLS,
+	E_UNSUPPORTED_ARGUMENT,
 	WebTransportError,
 } from "./errors.js";
-export type {
-	ErrorCode,
-	WebTransportErrorOptions,
-	WebTransportErrorSource,
-} from "./errors.js";
+export type { ErrorCode, ExperimentalSinkErrorCode } from "./types.js";
 
 import {
-	E_TLS,
-	E_INTERNAL,
+	DATAGRAM_BATCH_MAX,
+	type NativeDatagramBatchResult,
+	sendDatagramBatchChunked,
+} from "./datagram-batch.js";
+import {
+	type DatagramMirrorAdmission,
+	type DatagramMirrorResult,
+	decodeMirrorReports,
+	type MirrorReport,
+	type NativeDatagramMirrorAdmission,
+	type NativeDatagramMirrorResult,
+	type NativeMirrorReport,
+	normalizeMirrorReportsMax,
+	sendDatagramMirrorChecked,
+	sendDatagramMirrorPacedChecked,
+} from "./datagram-mirror.js";
+import { datagramReflectorRuleChecked } from "./datagram-reflector.js";
+import { createMonotonicDeadline, sleep, withDeadline } from "./deadline.js";
+import {
+	E_BACKPRESSURE_TIMEOUT,
 	E_HANDSHAKE_TIMEOUT,
+	E_INTERNAL,
+	E_INVALID_ARGUMENT,
 	E_LIMIT_EXCEEDED,
 	E_QUEUE_FULL,
-	E_BACKPRESSURE_TIMEOUT,
+	E_RATE_LIMITED,
 	E_SESSION_CLOSED,
 	E_SESSION_IDLE_TIMEOUT,
-	E_STREAM_RESET,
 	E_STOP_SENDING,
-	E_RATE_LIMITED,
+	E_STREAM_RESET,
+	E_TLS,
+	E_UNSUPPORTED_ARGUMENT,
+	extractStreamErrorCode,
+	unwrapNativeValue,
+	unwrapNativeVoid,
 	WebTransportError,
 } from "./errors.js";
-import type { ErrorCode } from "./errors.js";
+import { isPlainOptionsObject } from "./options.js";
+import {
+	createServerCloseContract,
+	SERVER_CLOSING_CLOSE_CODE,
+	SERVER_CLOSING_CLOSE_REASON,
+} from "./server-close.js";
+import {
+	type InternalMetricsSnapshot,
+	registerServerInternals,
+	type ServerInternals,
+	serverInternals,
+	withoutInternalMetrics,
+} from "./server-internals.js";
+import {
+	parseStreamBatchBytes,
+	readStreamChunk,
+	resetStreamBatchDiagnostics,
+	streamBatchConfig,
+	streamBatchDiagnosticsSnapshot,
+} from "./stream-chunk-batch.js";
+import type {
+	CloseInfo,
+	ErrorCode,
+	RateLimitOptions,
+	WebTransportCloseInfo,
+} from "./types.js";
+import {
+	createW3CMappedError as createMappedError,
+	normalizeW3CBrowserName as normalizeToBrowserName,
+} from "./w3c-client-options.js";
 
 /** Web IDL BufferSource (ArrayBuffer | ArrayBufferView) for spec alignment */
 type BufferSource = ArrayBuffer | ArrayBufferView;
 type StreamOpenOptions = { waitUntilAvailable?: boolean };
 
-const E_CODE_RE = /E_[A-Z_]+/g;
+const E_CODE_RE = /^(E_[A-Z_]+)(?::|$)/;
+/** Bun/Node often stringify napi errors as `GenericFailure, E_CODE: …`. */
+const NAPI_STATUS_PREFIX_RE =
+	/^(?:GenericFailure|Cancelled|InvalidArg|ObjectExpected|StringExpected|FunctionExpected|NumberExpected|BooleanExpected|ArrayExpected|Unknown|PendingException|EscapeCalledTwice|HandleScopeMismatch|CallbackScopeMismatch|QueueFull|Closing|BigintExpected|DateExpected|ArrayBufferExpected|DetachableArraybufferExpected|WouldDeadlock),\s*/u;
+const E_CODE_TOKEN_RE = /\b(E_[A-Z_]+)\b/gu;
+const KNOWN_ERROR_CODES = [
+	E_TLS,
+	E_HANDSHAKE_TIMEOUT,
+	E_SESSION_CLOSED,
+	E_SESSION_IDLE_TIMEOUT,
+	E_STREAM_RESET,
+	E_STOP_SENDING,
+	E_QUEUE_FULL,
+	E_BACKPRESSURE_TIMEOUT,
+	E_LIMIT_EXCEEDED,
+	E_RATE_LIMITED,
+	E_INVALID_ARGUMENT,
+	E_UNSUPPORTED_ARGUMENT,
+	E_INTERNAL,
+] as const satisfies readonly ErrorCode[];
+const KNOWN_ERROR_CODE_SET = new Set<ErrorCode>(KNOWN_ERROR_CODES);
+/** Wrapper codes that may nest a more specific causal E_* in the same message. */
+const WRAPPER_ERROR_CODES = new Set<ErrorCode>([E_SESSION_CLOSED, E_INTERNAL]);
 const SUPPRESS_LOG_CALLBACK_WARN =
 	process.env.WEBTRANSPORT_SUPPRESS_LOG_CALLBACK_WARN === "1";
 const SUPPRESS_READY_REJECTION_WARN =
 	process.env.WEBTRANSPORT_SUPPRESS_READY_REJECTION_WARN === "1";
 
-/**
- * Maps known validation/connect failures to browser-style DOMException names.
- * Returns undefined for unknown cases; E_* code is always preserved.
- * No broad catch-all: unknown errors remain explicit.
- */
-function normalizeToBrowserName(
-	code: ErrorCode,
-	message: string,
-): string | undefined {
-	if (
-		message.includes(
-			"serverCertificateHashes cannot be used with allowPooling=true",
-		)
-	) {
-		return "NotSupportedError";
-	}
-	if (message.includes("serverCertificateHashes must be an array")) {
-		return "TypeError";
-	}
-	if (
-		message.includes("serverCertificateHashes entry value must be") ||
-		message.includes("invalid base64 in serverCertificateHashes")
-	) {
-		return "TypeError";
-	}
-	if (
-		message.includes("allowPooling must be a boolean") ||
-		message.includes("requireUnreliable must be a boolean")
-	) {
-		return "TypeError";
-	}
-	if (
-		message.includes("congestionControl must be") ||
-		message.includes("datagramsReadableType must be") ||
-		message.includes("waitUntilAvailable must be a boolean")
-	) {
-		return "TypeError";
-	}
-	switch (code) {
-		case E_TLS:
-			return "NetworkError";
-		case E_HANDSHAKE_TIMEOUT:
-		case E_BACKPRESSURE_TIMEOUT:
-			return "TimeoutError";
-		case E_SESSION_CLOSED:
-		case E_SESSION_IDLE_TIMEOUT:
-			return "InvalidStateError";
-		case E_STREAM_RESET:
-		case E_STOP_SENDING:
-			return "AbortError";
-		case E_LIMIT_EXCEEDED:
-		case E_QUEUE_FULL:
-		case E_RATE_LIMITED:
-			return "QuotaExceededError";
-		case E_INTERNAL:
-			return "OperationError";
-	}
-	return undefined;
+function knownCodeOrUndefined(
+	value: string | undefined,
+): ErrorCode | undefined {
+	return value && KNOWN_ERROR_CODE_SET.has(value as ErrorCode)
+		? (value as ErrorCode)
+		: undefined;
 }
 
-function createMappedError(
-	code: ErrorCode,
-	message: string,
-	strictW3CErrors?: boolean,
-): WebTransportError {
-	const browserName =
-		strictW3CErrors === true
-			? normalizeToBrowserName(code, message)
-			: undefined;
-	return new WebTransportError(
-		code,
-		message,
-		browserName ? { browserName } : undefined,
-	);
+/**
+ * Extract a stable E_* from native/Bun error text. Prefers a causal code when a
+ * wrapper like E_SESSION_CLOSED nests `connection closed by peer: E_LIMIT_EXCEEDED`.
+ */
+function extractMessageErrorCode(msg: string): ErrorCode | undefined {
+	const withoutStatus = msg.replace(NAPI_STATUS_PREFIX_RE, "");
+	const startCode = knownCodeOrUndefined(withoutStatus.match(E_CODE_RE)?.[1]);
+	const tokens = [...withoutStatus.matchAll(E_CODE_TOKEN_RE)]
+		.map((m) => knownCodeOrUndefined(m[1]))
+		.filter((c): c is ErrorCode => c != null);
+	const causal = [...tokens].reverse().find((c) => !WRAPPER_ERROR_CODES.has(c));
+	if (startCode && WRAPPER_ERROR_CODES.has(startCode) && causal) {
+		return causal;
+	}
+	return startCode ?? causal ?? tokens[0];
 }
 
 function toWebTransportError(
 	err: unknown,
 	strictW3CErrors?: boolean,
 ): WebTransportError {
+	const explicitCode =
+		err && typeof err === "object"
+			? (err as { code?: unknown }).code
+			: undefined;
+	const knownExplicitCode =
+		typeof explicitCode === "string" &&
+		KNOWN_ERROR_CODE_SET.has(explicitCode as ErrorCode)
+			? (explicitCode as ErrorCode)
+			: undefined;
 	const msg = err instanceof Error ? err.message : String(err);
-	const match = msg.match(E_CODE_RE);
-	const code = match ? (match[0] as ErrorCode) : (E_INTERNAL as ErrorCode);
-	return createMappedError(code, msg, strictW3CErrors);
+	if (knownExplicitCode) {
+		return createMappedError(knownExplicitCode, msg, strictW3CErrors);
+	}
+	return createMappedError(
+		extractMessageErrorCode(msg) ?? (E_INTERNAL as ErrorCode),
+		msg,
+		strictW3CErrors,
+	);
 }
 
 function isSessionCloseError(err: unknown): boolean {
@@ -218,13 +348,44 @@ function shouldRetryStreamOpen(err: unknown): boolean {
 	);
 }
 
-function parseWaitUntilAvailable(options?: StreamOpenOptions): boolean {
+function parseWaitUntilAvailable(
+	options?: StreamOpenOptions,
+	strictW3CErrors?: boolean,
+): boolean {
 	const value = options?.waitUntilAvailable;
 	if (value === undefined) return false;
 	if (typeof value !== "boolean") {
-		throw new TypeError("waitUntilAvailable must be a boolean");
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			"E_INVALID_ARGUMENT: waitUntilAvailable must be a boolean",
+			strictW3CErrors,
+		);
 	}
 	return value;
+}
+
+function boundNativeCapacityWait(
+	handle: {
+		waitBidiCapacity?: (remainingMs: number) => Promise<void>;
+		waitUniCapacity?: (remainingMs: number) => Promise<void>;
+	},
+	kind: "bidi" | "uni",
+): ((remainingMs: number) => Promise<void>) | undefined {
+	let fn: ((remainingMs: number) => Promise<void>) | undefined;
+	switch (kind) {
+		case "bidi":
+			fn = handle.waitBidiCapacity;
+			break;
+		case "uni":
+			fn = handle.waitUniCapacity;
+			break;
+		default: {
+			const _exhaustive: never = kind;
+			return _exhaustive;
+		}
+	}
+	if (typeof fn !== "function") return undefined;
+	return (remainingMs) => fn.call(handle, remainingMs);
 }
 
 async function openStreamWithWait<T>(
@@ -235,13 +396,14 @@ async function openStreamWithWait<T>(
 	waitForCapacity?: (remainingMs: number) => Promise<void>,
 	strictW3CErrors?: boolean,
 ): Promise<T> {
-	const waitUntilAvailable = parseWaitUntilAvailable(options);
+	const waitUntilAvailable = parseWaitUntilAvailable(options, strictW3CErrors);
 	if (!waitUntilAvailable) {
 		return openFn();
 	}
-	const timeoutMs = Math.max(1, backpressureTimeoutMs);
-	const deadline = Date.now() + timeoutMs;
-	let backoffMs = 2;
+	const waitForCapacityWithFallback =
+		waitForCapacity ?? createPollingCapacityWaiter(isClosed);
+	const deadline = createMonotonicDeadline(backpressureTimeoutMs);
+	const timeoutMs = deadline.timeoutMs;
 	while (true) {
 		if (isClosed()) {
 			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
@@ -252,22 +414,36 @@ async function openStreamWithWait<T>(
 			if (!shouldRetryStreamOpen(err)) {
 				throw toWebTransportError(err, strictW3CErrors);
 			}
-			if (Date.now() >= deadline) {
+			if (deadline.expired()) {
 				throw new WebTransportError(
 					E_BACKPRESSURE_TIMEOUT as ErrorCode,
 					`E_BACKPRESSURE_TIMEOUT: waitUntilAvailable timed out after ${timeoutMs}ms`,
 				);
 			}
-			const remaining = Math.max(0, deadline - Date.now());
-			if (waitForCapacity) {
-				await waitForCapacity(Math.max(1, remaining));
-			} else {
-				const sleepMs = Math.max(1, Math.min(backoffMs, remaining));
-				await Bun.sleep(sleepMs);
-				backoffMs = Math.min(backoffMs * 2, 64);
-			}
+			const remaining = deadline.remainingMs();
+			await withDeadline(
+				waitForCapacityWithFallback(Math.max(1, remaining)),
+				Math.max(1, remaining),
+				{
+					timeoutMessage: `E_BACKPRESSURE_TIMEOUT: waitUntilAvailable timed out after ${timeoutMs}ms`,
+				},
+			);
 		}
 	}
+}
+
+function createPollingCapacityWaiter(
+	isClosed: () => boolean,
+): (remainingMs: number) => Promise<void> {
+	let backoffMs = 2;
+	return async (remainingMs: number): Promise<void> => {
+		if (isClosed()) {
+			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
+		}
+		const sleepMs = Math.max(1, Math.min(backoffMs, remainingMs));
+		backoffMs = Math.min(backoffMs * 2, 64);
+		await sleep(sleepMs);
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -291,7 +467,11 @@ export type ServerTlsSnapshot = {
 export type TlsOptions = {
 	/** PEM-encoded certificate (server) or CA (client). */
 	certPem: string | Uint8Array;
-	/** PEM-encoded private key (server only). */
+	/**
+	 * PEM-encoded private key (server only). Unencrypted PKCS#8
+	 * (`BEGIN PRIVATE KEY`), SEC1 ECDSA (`BEGIN EC PRIVATE KEY`), and PKCS#1 RSA
+	 * (`BEGIN RSA PRIVATE KEY`) are accepted; encrypted keys are not.
+	 */
 	keyPem: string | Uint8Array;
 	/** Optional CA PEM for client verification. */
 	caPem?: string | Uint8Array;
@@ -309,16 +489,7 @@ export type TlsOptions = {
 // Rate-limit options
 // ---------------------------------------------------------------------------
 
-export type RateLimitOptions = {
-	handshakesPerSec: number;
-	handshakesBurst: number;
-	/** Per /24 (IPv4) or /64 (IPv6) prefix; defaults 100 */
-	handshakesBurstPerPrefix?: number;
-	streamsPerSec: number;
-	streamsBurst: number;
-	datagramsPerSec: number;
-	datagramsBurst: number;
-};
+export type { RateLimitOptions } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Limits
@@ -344,10 +515,55 @@ export type LimitsOptions = {
 	maxQueuedBytesGlobal: number;
 	maxQueuedBytesPerSession: number;
 	maxQueuedBytesPerStream: number;
+	/**
+	 * QUIC per-stream receive window in bytes — how much a peer may have
+	 * outstanding on one incoming stream. Omitted (the default), it is derived
+	 * from `maxQueuedBytesPerStream`, so raising the application byte governor
+	 * also widens the transport window. Set it to move the window on its own
+	 * and leave the governor (and with it backpressure and the datagram
+	 * channel) where it is.
+	 *
+	 * Memory: windows are advertised limits, not allocations, but they are the
+	 * ceiling a peer can drive you to. Worst case per session is
+	 * `receiveWindow + sendWindow + datagramChannel × maxDatagramSize`, and
+	 * `maxQueuedBytesGlobal` does **not** bound it — budget it against
+	 * `maxSessions` yourself. See `docs/OPERATIONS.md` ("Flow-control windows").
+	 *
+	 * Native backend only; the wasm backend has no QUIC transport config.
+	 */
+	streamReceiveWindow?: number;
+	/**
+	 * QUIC connection receive window in bytes, across all incoming streams of
+	 * one session. Omitted, it is derived from `maxQueuedBytesPerSession`
+	 * (raised to cover one stream window). Native backend only.
+	 */
+	receiveWindow?: number;
+	/**
+	 * QUIC connection send window in bytes — outgoing stream bytes that may be
+	 * unacknowledged at once. Omitted, it is derived from
+	 * `maxQueuedBytesPerSession` (raised to cover one stream window). Native
+	 * backend only.
+	 */
+	sendWindow?: number;
 	backpressureTimeoutMs: number;
 	/** Connect handshake timeout. Default 10000. */
 	handshakeTimeoutMs: number;
+	/**
+	 * Max idle time before a connection is considered dead and closed. Applies
+	 * to both the server and the client: on the client it guarantees `closed`
+	 * resolves on a dead path (NAT rebind, network drop, server power loss)
+	 * instead of hanging forever. Default 60000.
+	 */
 	idleTimeoutMs: number;
+	/**
+	 * Keep-alive ping interval in ms. Keeps a live-but-quiet connection from
+	 * being idle-closed, and is always clamped to stay safely below
+	 * `idleTimeoutMs`. On the client it defaults to `idleTimeoutMs / 3` when
+	 * omitted; on the server keep-alive is off unless set, and the effective
+	 * interval is `min(keepAliveIntervalMs, idleTimeoutMs / 3)`. Set 0 to
+	 * disable.
+	 */
+	keepAliveIntervalMs?: number;
 };
 
 /** Default limit values from AGENTS.md */
@@ -396,6 +612,25 @@ export type LogEvent = {
 // Server options & interface
 // ---------------------------------------------------------------------------
 
+/**
+ * Configuration of the process-wide egress pacer ({@link ServerOptions.egressPacer}).
+ *
+ * @experimental Egress pacer surface; may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
+ */
+export type EgressPacerOptions = {
+	/** Datagrams per second, an integer 1–1,000,000. */
+	pps: number;
+	/** Datagrams per burst unit, 1–64. Default 32. */
+	clump?: number;
+	/**
+	 * Admission bound in milliseconds of work at the configured rate, 1–5000.
+	 * Default 250. Independently of it, everything queued (each job's payload
+	 * once plus every target id) is capped at 64 MiB; targets past either bound
+	 * are refused with `E_QUEUE_FULL` in the admission envelope.
+	 */
+	queueMs?: number;
+};
+
 /** Options for {@link createServer}. Limits/rateLimits merge with defaults. */
 export type ServerOptions = {
 	host?: string /** @default "0.0.0.0" */;
@@ -403,6 +638,158 @@ export type ServerOptions = {
 	tls: TlsOptions;
 	limits?: Partial<LimitsOptions>;
 	rateLimits?: Partial<RateLimitOptions>;
+
+	/** Congestion controller for all server connections: cubic (default), BBR (throughput), or NewReno (low-latency). */
+	congestionControl?: "default" | "throughput" | "low-latency";
+
+	/**
+	 * Accept QUIC 0-RTT session establishment from resuming clients.
+	 * Off by default. When enabled, a returning client's CONNECT can arrive
+	 * as replayable early data; such sessions report `has0Rtt` and resumption
+	 * state is per-process (restarts/load balancing fall back to 1-RTT).
+	 */
+	enable0Rtt?: boolean;
+
+	/**
+	 * Deliver 0-RTT sessions to `onSession` before the handshake is confirmed.
+	 * Off by default: session establishment is the replayable unit of 0-RTT,
+	 * so by default `onSession` is deferred until the request is no longer
+	 * replayable. Opt in only when the callback's pre-confirmation work is
+	 * strictly idempotent; it can still gate side effects on
+	 * `session.handshakeConfirmed`. No effect unless `enable0Rtt` is set.
+	 */
+	allowEarlySession?: boolean;
+
+	/**
+	 * Advertise a QPACK dynamic-table capacity (`SETTINGS_QPACK_MAX_TABLE_CAPACITY`)
+	 * to peers, in bytes. `0` (the default) advertises no table and keeps header
+	 * compression to the static table alone — unchanged wire behavior. A non-zero
+	 * value both offers a table to the peer and bounds the table this endpoint will
+	 * mirror; values above 65536 (64 KiB) are rejected. This is an interop/completeness
+	 * setting, not a throughput one: WebTransport carries headers only on the
+	 * CONNECT exchange. `SETTINGS_QPACK_BLOCKED_STREAMS` is always advertised as 0
+	 * and is not configurable. Prefer {@link enableDynamicQpack} for the preset.
+	 */
+	qpackMaxTableCapacity?: number;
+
+	/**
+	 * Convenience preset for {@link qpackMaxTableCapacity}: `true` advertises a
+	 * 4096-byte dynamic table (blocked-streams still 0). Off by default. An
+	 * explicit `qpackMaxTableCapacity` takes precedence over this flag.
+	 */
+	enableDynamicQpack?: boolean;
+
+	/**
+	 * Set `SO_REUSEPORT` on the bind socket so several processes can listen on
+	 * the same port. Off by default. Native backend only (the WASM backend has
+	 * its own options type and no socket of its own), unix only — on a platform
+	 * without `SO_REUSEPORT` this throws `E_UNSUPPORTED_ARGUMENT` rather than
+	 * binding without it. Requires an explicit `port`; `port: 0` throws
+	 * `E_INVALID_ARGUMENT` because each instance would get its own ephemeral
+	 * port and share nothing.
+	 *
+	 * This is not a load-balancing answer on its own. Plain kernel steering
+	 * hashes the 4-tuple, so a client's NAT rebind re-hashes to a different
+	 * process and the session dies; and group membership changes re-hash the
+	 * whole group, so restarting one instance re-steers flows that belonged to
+	 * its siblings. Use it for eBPF-steered (`SK_REUSEPORT`) topologies, where
+	 * steering follows the connection ID, and for benchmarks. See
+	 * docs/OPERATIONS.md ("Multi-process binds (reusePort)").
+	 *
+	 * @experimental QUIC-LB / multi-process steering surface; may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
+	 */
+	reusePort?: boolean;
+
+	/**
+	 * Issue QUIC-LB connection IDs carrying this instance's server ID in the
+	 * clear, so a CID-aware L4 or eBPF balancer can route by connection ID
+	 * instead of by 4-tuple — which is what makes steering survive a client's
+	 * NAT rebind. Absent (the default) leaves quinn's opaque 8-octet CIDs.
+	 * Native backend only; the WASM backend has its own options type and issues
+	 * no connection IDs of its own.
+	 *
+	 * The layout is the **keyless configuration** of
+	 * draft-ietf-quic-load-balancers-21 (§5.3): a first octet of 3
+	 * config-rotation bits plus 5 random bits, then `serverId`, then a
+	 * cryptographically random nonce of `nonceLen` octets. Both lengths are part
+	 * of the balancer's configuration and neither is encoded on the wire, which
+	 * is why {@link QuicLbOptions.nonceLen} has no default.
+	 *
+	 * Two costs to weigh, both stated in docs/OPERATIONS.md ("QUIC-LB connection
+	 * IDs (`quicLb`)"): the server ID is **cleartext**, so an observer can tell
+	 * which backend serves a connection and link its migrations (§5.3 says so in
+	 * those words); and the connection ID grows to `1 + serverId.length +
+	 * nonceLen` octets — 11 for a typical configuration, 6 at minimum — against
+	 * quinn's 8-octet default, on every short-header packet in both directions.
+	 *
+	 * Bounds, rejected here with `E_INVALID_ARGUMENT` before the addon is
+	 * touched: `serverId.length >= 1`, `nonceLen >= 4`, their sum `<= 19`, and
+	 * `configRotation` in 0–6 (7 is reserved for unroutable CIDs).
+	 *
+	 * @example
+	 * ```ts
+	 * createServer({
+	 *   port: 4433,
+	 *   quicLb: { serverId: new Uint8Array([0x00, 0x07]), nonceLen: 8 },
+	 *   tls, onSession,
+	 * });
+	 * ```
+	 *
+	 * @experimental QUIC-LB / multi-process steering surface; may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
+	 */
+	quicLb?: QuicLbOptions;
+
+	/**
+	 * Wire this instance's bind socket into a CID-steered `SO_REUSEPORT` group:
+	 * insert the socket at `key` in a pinned BPF `REUSEPORT_SOCKARRAY`
+	 * (`sockArrayPinPath`), and — when `attachProgPinPath` is set — attach the
+	 * pinned `sk_reuseport` steering program to the group (exactly one instance
+	 * per group passes it; the program lives on the group afterwards and covers
+	 * later joiners). By convention `key` equals this instance's numeric QUIC-LB
+	 * server id, matching what the steering program's `slot_by_server_id` map
+	 * resolves. See examples/quic-lb for the program and the load recipe.
+	 *
+	 * Requires `reusePort: true` (there is no group to steer otherwise) and
+	 * `quicLb` (without QUIC-LB CIDs every packet takes the hash fallback while
+	 * the group looks steered) — both rejected with `E_INVALID_ARGUMENT`.
+	 * Linux only (`E_UNSUPPORTED_ARGUMENT` elsewhere); typically needs
+	 * `CAP_BPF` to open the pins. Fail-closed: any steering failure fails
+	 * `createServer` rather than silently degrading to 4-tuple hashing. The
+	 * kernel drops the sockarray entry when the socket closes; a fast
+	 * close-and-rebind can transiently see the slot still occupied, which is
+	 * retryable exactly like `AddrInUse`.
+	 *
+	 * @experimental QUIC-LB / multi-process steering surface; may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
+	 */
+	reusePortSteering?: {
+		/** Absolute bpffs path of the pinned `REUSEPORT_SOCKARRAY`. */
+		sockArrayPinPath: string;
+		/** This instance's slot in the sockarray (its QUIC-LB server id). */
+		key: number;
+		/** Absolute bpffs path of the pinned `sk_reuseport` program to attach. */
+		attachProgPinPath?: string;
+	};
+
+	/**
+	 * Turn on the native egress pacer that
+	 * {@link WebTransportServer.sendDatagramMirrorPaced} schedules onto:
+	 * `pps` datagrams per second, released in clumps of `clump` (1–64, default
+	 * 32), admitting at most `queueMs` milliseconds of work at the configured
+	 * rate (default 250). Absent (the default), the pacer stays off unless the
+	 * `WEBTRANSPORT_PACER_PPS` environment variable (with
+	 * `WEBTRANSPORT_PACER_CLUMP` / `WEBTRANSPORT_PACER_QUEUE_MS`) is set. That
+	 * variable is kept as a documented fallback.
+	 *
+	 * The pacer is **process-wide**: one schedule and one thread per process.
+	 * The first configuration a process resolves wins: this option on the
+	 * first server that passes it, otherwise the environment on first use. A
+	 * later server that asks for a different configuration fails with
+	 * `E_INVALID_ARGUMENT`. Passing the identical configuration again is fine.
+	 * Native backend only.
+	 *
+	 * @experimental Egress pacer surface; may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
+	 */
+	egressPacer?: EgressPacerOptions;
 
 	/** Called on each accepted session (must not block; long work should be async) */
 	onSession: (session: ServerSession) => void | Promise<void>;
@@ -417,6 +804,8 @@ export type ServerOptions = {
 /** Returned by {@link createServer}. Use address, close(), and metricsSnapshot(). */
 export interface WebTransportServer {
 	readonly address: { host: string; port: number };
+	/** Effective congestion-control mode applied to all server connections. */
+	readonly congestionControl: "default" | "throughput" | "low-latency";
 	/** Rotate only the default server TLS certificate/key at runtime. Existing sessions stay alive. */
 	updateCert(tls: {
 		certPem: string | Uint8Array;
@@ -434,19 +823,101 @@ export interface WebTransportServer {
 	setUnknownSniPolicy(policy: UnknownSniPolicy): Promise<void>;
 	/** Introspect the active server TLS SNI state without exposing key material. */
 	tlsSnapshot(): ServerTlsSnapshot;
+	/**
+	 * Send one payload to many of this server's sessions across a single native
+	 * crossing.
+	 *
+	 * Synchronous and non-parking — the fan-out of the promise-free fast path
+	 * `session.sendDatagram()` tries first, not of its parking fallback. Every target is attempted independently:
+	 * a subscriber that left between the caller's snapshot and this call lands
+	 * in `failures` and the rest still receive. Duplicated ids are delivered to
+	 * twice, and ids belonging to another server in this process are reported as
+	 * `E_SESSION_CLOSED` and receive nothing.
+	 *
+	 * `failures` is the actionable half: `E_SESSION_CLOSED` entries are the reap
+	 * list, `E_QUEUE_FULL` entries are the ones to retry on the parking path
+	 * (`session.sendDatagram()`), which is the only path allowed to wait.
+	 *
+	 * Throws `TypeError` for a malformed argument and `RangeError` for more than
+	 * 10,000 targets — programming errors, checked before anything is sent.
+	 * Never throws for a transport condition. Native-only; see
+	 * `docs/PARITY_MATRIX.md` section 3.
+	 */
+	sendDatagramMirror(
+		targets: readonly string[],
+		payload: Uint8Array,
+	): DatagramMirrorResult;
+	/**
+	 * Hand one payload and many targets to the native egress pacer's schedule.
+	 *
+	 * The sibling of {@link sendDatagramMirror}, and a separate method rather
+	 * than a mode of it because the envelope means something else. `admitted`
+	 * counts targets the schedule accepted: nothing has been resolved,
+	 * owner-checked or budget-checked when this returns, so this envelope
+	 * carries no delivery count and deliberately offers nothing that could be
+	 * read as one — delivery is `admitted` minus the failures that later arrive
+	 * through {@link readMirrorReports}.
+	 *
+	 * Synchronous and promise-free, exactly as the mirror is. Throws `TypeError`
+	 * for a malformed argument and `RangeError` past 10,000 targets — the same
+	 * programming errors, checked before anything crosses — and never throws for
+	 * a transport condition.
+	 *
+	 * Throws a `WebTransportError` with code `E_UNSUPPORTED_ARGUMENT` when the
+	 * pacer is unavailable, with two distinguishable messages: the addon was
+	 * built without the pacer, or the pacer is off (no
+	 * {@link ServerOptions.egressPacer} and no `WEBTRANSPORT_PACER_PPS`).
+	 * Native-only.
+	 *
+	 * @experimental Egress pacer surface; may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
+	 */
+	sendDatagramMirrorPaced(
+		targets: readonly string[],
+		payload: Uint8Array,
+	): DatagramMirrorAdmission;
+	/**
+	 * Drain up to `max` deferred failures from paced broadcasts, oldest first.
+	 *
+	 * **Failures only.** Targets that took the payload are never reported, so a
+	 * healthy paced broadcast to 10,000 subscribers drains nothing; the caller
+	 * counts deliveries as `admitted` minus the failures it sees here.
+	 *
+	 * Synchronous, promise-free and never throwing — `[]` means nothing is
+	 * pending, including on an addon with no pacer at all. (Whether the pacer
+	 * exists is told by `sendDatagramMirrorPaced` throwing, and by
+	 * `mirrorReportsDropped` being present in `metricsSnapshot()`.)
+	 *
+	 * The backing ring is fixed at 4,096 entries and drops oldest on overflow,
+	 * counting every drop in `metricsSnapshot().mirrorReportsDropped`. So
+	 * polling too slowly loses reports *visibly*, and a caller that never polls
+	 * costs a constant rather than a growth path. `drained + mirrorReportsDropped`
+	 * reconciles against the pacer's own `deferredFailures`.
+	 *
+	 * Omitting `max` (or passing `Infinity`) drains everything pending. Any
+	 * other `max` is normalized, never rejected: fractions floor, `NaN` and
+	 * values at or below zero read nothing, and values above the ring's 4,096
+	 * entries are clamped. Native-only.
+	 *
+	 * @experimental Egress pacer surface; may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
+	 */
+	readMirrorReports(max?: number): readonly MirrorReport[];
 	close(): Promise<void>;
 	metricsSnapshot(): MetricsSnapshot;
 }
+
+export type {
+	DatagramMirrorAdmission,
+	DatagramMirrorFailure,
+	DatagramMirrorResult,
+	MirrorReport,
+} from "./datagram-mirror.js";
 
 // ---------------------------------------------------------------------------
 // Browser-style facade types (RFC_CLIENT_FACADE, PARITY_MATRIX)
 // ---------------------------------------------------------------------------
 
 /** Browser-style close info (W3C alignment). Used by {@link WebTransport.close} and {@link WebTransport.closed}. */
-export type WebTransportCloseInfo = {
-	closeCode?: number;
-	reason?: string;
-};
+export type { WebTransportCloseInfo } from "./types.js";
 
 /**
  * Options for `new WebTransport(url, options)`.
@@ -490,10 +961,10 @@ export type ClientOptions = {
 	};
 	limits?: Partial<LimitsOptions>;
 	log?: (event: LogEvent) => void;
-	/** Internal/advanced: cert pinning list serialized as base64. */
+	/** Cert pinning list; values are raw SHA-256 digests (BufferSource). */
 	serverCertificateHashes?: Array<{
 		algorithm: "sha-256";
-		valueBase64: string;
+		value: BufferSource;
 	}>;
 	/** Internal/advanced: congestion hint passed to native runtime. */
 	congestionControl?: "default" | "throughput" | "low-latency";
@@ -503,13 +974,35 @@ export type ClientOptions = {
 	requireUnreliable?: boolean;
 	/** When true, errors use browser-style DOMException names. Default false. */
 	strictW3CErrors?: boolean;
+	/**
+	 * Offer QUIC 0-RTT on reconnects to servers seen before by this process.
+	 * Off by default. Requires the server to enable 0-RTT too; incompatible
+	 * with `allowPooling`. Sessions report `has0Rtt`/`accepted0Rtt`.
+	 */
+	enable0Rtt?: boolean;
+	/**
+	 * Advertise a QPACK dynamic-table capacity (`SETTINGS_QPACK_MAX_TABLE_CAPACITY`)
+	 * to the server, in bytes. `0` (the default) keeps header compression to the
+	 * static table alone. Values above 65536 are rejected.
+	 * `SETTINGS_QPACK_BLOCKED_STREAMS` is
+	 * always 0 and not configurable. Interop/completeness, not throughput —
+	 * WebTransport carries headers only on the CONNECT exchange. Prefer
+	 * {@link enableDynamicQpack} for the preset.
+	 */
+	qpackMaxTableCapacity?: number;
+	/**
+	 * Convenience preset for {@link qpackMaxTableCapacity}: `true` advertises a
+	 * 4096-byte dynamic table (blocked-streams still 0). Off by default. An
+	 * explicit `qpackMaxTableCapacity` takes precedence.
+	 */
+	enableDynamicQpack?: boolean;
 };
 
 // ---------------------------------------------------------------------------
 // Session types
 // ---------------------------------------------------------------------------
 
-export type CloseInfo = { code?: number; reason?: string };
+export type { CloseInfo } from "./types.js";
 
 function normalizeCloseInfo(
 	info: CloseInfo | undefined,
@@ -546,9 +1039,11 @@ export class WebTransportSendGroup {
 		this.#transport = transport;
 		this.#id = id;
 	}
+	/** @internal */
 	_getTransport(): WebTransport {
 		return this.#transport;
 	}
+	/** @internal */
 	_getId(): number {
 		return this.#id;
 	}
@@ -567,13 +1062,66 @@ interface CommonSession {
 	readonly id: string;
 	readonly peer: { ip: string; port: number };
 
+	/**
+	 * Whether this session involved 0-RTT early data. Client side: this
+	 * connect offered early data; server side: the CONNECT arrived as
+	 * replayable early data. Always false unless 0-RTT was enabled.
+	 */
+	readonly has0Rtt: boolean;
+	/** Whether the peer accepted the early data (false until known / when refused). */
+	readonly accepted0Rtt: boolean;
+	/** Whether the TLS handshake has completed (always true for non-0-RTT sessions). */
+	readonly handshakeConfirmed: boolean;
+
 	readonly ready: Promise<void>;
 	readonly closed: Promise<CloseInfo>;
 
+	/**
+	 * Resolves when the peer says this session is going away — a received
+	 * `WT_DRAIN_SESSION` capsule or `GOAWAY`. The session stays usable: streams
+	 * already open keep working and new ones can still be opened. This is a
+	 * warning, not an ending; await `closed` for the ending.
+	 */
+	readonly draining: Promise<void>;
+
 	close(info?: CloseInfo): void;
+
+	/**
+	 * Tell the peer this session is going away soon, without ending it. Sends a
+	 * `WT_DRAIN_SESSION` capsule and returns immediately.
+	 */
+	drain(): void;
 
 	// Datagrams
 	sendDatagram(data: Uint8Array): Promise<void>;
+
+	/**
+	 * Send many datagrams across one native crossing.
+	 *
+	 * Native-only, like batched receiving: the wasm backend has no crossing to
+	 * amortize, so `/portable` keeps `sendDatagram` as the portable contract.
+	 *
+	 * Resolves rather than rejects for transport conditions, because a partial
+	 * send is normal on an unreliable transport and throwing would discard the
+	 * `sent` count that makes the result actionable. The result has **prefix**
+	 * semantics: `sent = k` means elements `0..k` went out, in order; `error`
+	 * (when present) is why element `k` failed; elements after `k` were not
+	 * attempted. So the caller drops `datagrams[sent]`, or retries it, and
+	 * re-calls with the remainder.
+	 *
+	 * There is no length limit — arrays longer than the native cap are chunked
+	 * — but it does throw synchronously: a `TypeError` for a non-array argument
+	 * or a non-`Uint8Array` element, and a `WebTransportError` with
+	 * `E_SESSION_CLOSED` on an already-closed session.
+	 *
+	 * A single datagram should still go through {@link sendDatagram}: array
+	 * marshalling has a fixed cost that a batch of one has nothing to amortize
+	 * it over.
+	 */
+	sendDatagramBatch(
+		datagrams: readonly Uint8Array[],
+	): Promise<{ sent: number; error?: WebTransportError }>;
+
 	incomingDatagrams(): AsyncIterable<Uint8Array>;
 }
 
@@ -585,6 +1133,19 @@ export interface ServerSession extends CommonSession {
 	createBidirectionalStream(options?: StreamOpenOptions): Promise<Duplex>;
 	createUnidirectionalStream(options?: StreamOpenOptions): Promise<Writable>;
 	metricsSnapshot(): SessionMetricsSnapshot;
+
+	/**
+	 * Tell the peer not to open any further session on this connection. Sends an
+	 * H3 `GOAWAY` and returns immediately.
+	 *
+	 * `GOAWAY` is connection-scoped, so this is a server-initiated
+	 * graceful-shutdown signal ("I'm going away, don't start new sessions"). The
+	 * peer observes it as its `draining` settling, and the current session stays
+	 * usable. Native is single-session-per-connection, so the "refuse a second
+	 * session" enforcement is not reachable through this API — the observable
+	 * effect is the drain signal on the peer.
+	 */
+	goAway(): void;
 }
 
 /** Node client API session surface returned by connect(). */
@@ -624,17 +1185,100 @@ export type MetricsSnapshot = {
 	datagramsIn: number;
 	datagramsOut: number;
 	datagramsDropped: number;
+	/** Native ingest only. Present when the snapshot includes reason counters. */
+	datagramsDroppedRateLimited?: number;
+	datagramsDroppedTooLarge?: number;
+	datagramsDroppedQueueGlobal?: number;
+	datagramsDroppedQueueSession?: number;
+	/** Native ingest only. Park events when session slack cannot fit maxDatagramSize. */
+	datagramsSkippedQueueFull?: number;
 
 	queuedBytesGlobal: number;
 	backpressureWaitCount: number;
 	backpressureTimeoutCount: number;
+	/**
+	 * Native only. Datagram sends that had to fall back to the parking N-API
+	 * call. Each one hands JavaScript a promise backed by a ThreadsafeFunction,
+	 * which is a reference on the host event loop, so this is the exposure
+	 * meter for that class — not a latency signal.
+	 */
+	datagramSendsAsync?: number;
+	/**
+	 * Native only. `sendDatagramMirror()` calls served. Deliberately separate
+	 * from {@link datagramSendsAsync}: the mirror hands JavaScript no promise,
+	 * so folding it in would misreport host-loop exposure.
+	 */
+	datagramMirrorCalls?: number;
+	/**
+	 * Native only. Targets those mirror calls attempted. Delivery is counted per
+	 * session in `datagramsOut`, exactly as for every other send path, so a
+	 * mirrored datagram is indistinguishable from a looped one there.
+	 */
+	datagramMirrorTargets?: number;
+	/**
+	 * Native only. `sendDatagramMirrorPaced()` calls served. Its own meter
+	 * rather than a share of {@link datagramMirrorCalls}: the two envelopes
+	 * report different things — delivery and admission — and a counter that
+	 * summed them would name neither.
+	 *
+	 * @experimental Egress pacer surface; may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
+	 */
+	datagramMirrorPacedCalls?: number;
+	/**
+	 * Native only. Targets those paced calls offered to the schedule.
+	 *
+	 * @experimental Egress pacer surface; may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
+	 */
+	datagramMirrorPacedTargets?: number;
+	/**
+	 * Native only. Deferred mirror reports lost to ring overflow — the visible
+	 * cost of polling `readMirrorReports()` too slowly. Process-wide, like the
+	 * pacer's schedule, so a second server in this process reads the same
+	 * number. Absent entirely on an addon built without the pacer.
+	 *
+	 * @experimental Egress pacer surface; may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
+	 */
+	mirrorReportsDropped?: number;
 
 	rateLimitedCount: number;
 	limitExceededCount: number;
 	sniCertSelections: number;
 	defaultCertSelections: number;
 	unknownSniRejectedCount: number;
-
+	nativeSessionRegistryEntries?: number;
+	nativeTrackedTasks?: number;
+	nativeRateLimitEntries?: number;
+	nativeBidiHandlesLive?: number;
+	nativeUniSendHandlesLive?: number;
+	nativeUniRecvHandlesLive?: number;
+	/**
+	 * Native only. Unsettled N-API async operations this server still owns.
+	 * Non-zero after `close()` resolves means the addon is still holding the
+	 * host event loop open.
+	 */
+	nativeAsyncOpsPending?: number;
+	/**
+	 * Native only, process-wide. Stream sinks (`openReadSink`) currently
+	 * running in this process, client and server streams alike; returns to 0
+	 * once every sink has ended.
+	 *
+	 * @experimental Native stream sink (RFC_STREAM_SINK); may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
+	 */
+	sinksActive?: number;
+	/**
+	 * Native only, process-wide and cumulative. Records sinks dropped in
+	 * `overflow: "drop-newest"` mode (each sink also discloses its own drops
+	 * in-band as `drops` records).
+	 *
+	 * @experimental Native stream sink (RFC_STREAM_SINK); may change in a 1.x minor (docs/SPEC.md, "Experimental surfaces").
+	 */
+	sinkDroppedRecords?: number;
+	/** Native only. Sessions the QUIC idle timeout ended (peer went away). */
+	sessionsClosedByIdle?: number;
+	/** Native only. Sessions this server ended itself while shutting down. */
+	sessionsClosedByReap?: number;
+	/** Native only. Every other way a session ended (peer close, transport error). */
+	sessionsClosedOther?: number;
 	/** Handshake latency (accept start to completion). P99 target &lt;300ms. */
 	handshakeLatency?: HistogramSnapshot | null;
 	/** Datagram send enqueue latency. P99 target &lt;10ms. */
@@ -680,6 +1324,38 @@ export const METRICS_PREFIX =
 function shouldSuppressInsecureSkipVerifyWarning(): boolean {
 	const v = process.env.WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN;
 	return v === "1" || v === "true" || v === "yes";
+}
+
+// Bun <=1.3.13 permanently retains one WritableStream + one rejection Error
+// for every stream whose close() rejects — e.g. any peer that drops its
+// receive half, which quinn surfaces as STOP_SENDING racing the close. A
+// long-running server on such a runtime leaks until the OOM-killer fires.
+// engines.bun is advisory (npm does not enforce the "bun" key), so the only
+// reliable disclosure is at runtime.
+const LEAKY_BUN_CEILING = "1.3.14";
+let warnedLeakyBunRuntime = false;
+function warnIfLeakyBunRuntime(): void {
+	if (warnedLeakyBunRuntime) return;
+	warnedLeakyBunRuntime = true;
+	const v = process.env.WEBTRANSPORT_SUPPRESS_RUNTIME_VERSION_WARN;
+	if (v === "1" || v === "true" || v === "yes") return;
+	if (typeof Bun === "undefined" || typeof Bun.version !== "string") return;
+	const parse = (s: string): number[] | null => {
+		const parts = s.split(".").slice(0, 3);
+		if (parts.length < 3 || parts.some((p) => !/^\d+$/.test(p))) return null;
+		return parts.map(Number);
+	};
+	const actual = parse(Bun.version);
+	const floor = parse(LEAKY_BUN_CEILING);
+	if (!actual || !floor) return;
+	const cmp =
+		(actual[0] ?? 0) - (floor[0] ?? 0) ||
+		(actual[1] ?? 0) - (floor[1] ?? 0) ||
+		(actual[2] ?? 0) - (floor[2] ?? 0);
+	if (cmp >= 0) return;
+	console.warn(
+		`[webtransport] warn: Bun ${Bun.version} leaks one WritableStream per stream whose close is rejected (fixed in Bun ${LEAKY_BUN_CEILING}); long-running servers will exhaust memory — upgrade the runtime`,
+	);
 }
 
 function escapePromLabelValue(v: unknown): string {
@@ -839,6 +1515,7 @@ import { createRequire } from "node:module";
 const _require = createRequire(import.meta.url);
 const PLATFORM = process.platform;
 const ARCH = process.arch;
+const NATIVE_ADDON_OVERRIDE_ENV = "WEBTRANSPORT_NATIVE_ADDON_PATH";
 const binaryCandidates = [
 	`webtransport-native.${PLATFORM}-${ARCH}.node`,
 	`webtransport-native.${PLATFORM}-${ARCH}-msvc.node`,
@@ -848,18 +1525,299 @@ const binaryCandidates = [
 const basePaths = ["../../../crates/native", "../prebuilds"];
 type RequireLike = (id: string) => unknown;
 type NativeLoadFailure = { request: string; message: string };
+type NativeLoadResult = {
+	addon: NativeAddon | undefined;
+	failures: NativeLoadFailure[];
+};
+type NativeLogEvent = {
+	level?: "debug" | "info" | "warn" | "error";
+	msg?: string;
+	sessionId?: string;
+	peerIp?: string;
+	peerPort?: number;
+};
+type NativeServerSessionEvent =
+	| {
+			name: "session";
+			id: string;
+			peerIp: string;
+			peerPort: number;
+	  }
+	| {
+			name: "session_closed";
+			id: string;
+			code: number;
+			reason: string;
+	  };
+type NativeClientSessionEvent = {
+	name: "session_closed";
+	id: string;
+	code: number;
+	reason: string;
+};
+type NativeBidiStreamHandle = {
+	readonly id: number;
+	// Never-reject sentinels: string results are error codes (see
+	// unwrapNativeValue) — rejected async napi calls leak handle refs.
+	read(): Promise<Uint8Array | string | null>;
+	/** Coalescing read (see stream-chunk-batch.ts). Optional so an override
+	 * addon without it degrades to `read` instead of throwing. */
+	readBatch?: (maxBytes: number) => Promise<Uint8Array | string | null>;
+	/** Cross-stream delivery feeder (read-group.ts); optional like readBatch. */
+	feedReadGroup?: GroupFeedableHandle["feedReadGroup"];
+	write(chunk: Buffer | Uint8Array): Promise<string | null>;
+	finish(): Promise<string | null> | void;
+	finishWait?: () => Promise<string | null> | void;
+	reset?: (code?: number) => void;
+	stopSending?: (code?: number) => void;
+	dispose?: () => void;
+};
+type NativeSendStreamHandle = {
+	readonly id: number;
+	write(chunk: Buffer | Uint8Array): Promise<string | null>;
+	finish?: () => Promise<string | null> | void;
+	finishWait?: () => Promise<string | null> | void;
+	reset?: (code?: number) => void;
+	stopSending?: (code?: number) => void;
+	dispose?: () => void;
+};
+type NativeRecvStreamHandle = {
+	readonly id: number;
+	read(): Promise<Uint8Array | string | null>;
+	readBatch?: (maxBytes: number) => Promise<Uint8Array | string | null>;
+	feedReadGroup?: GroupFeedableHandle["feedReadGroup"];
+	reset?: (code?: number) => void;
+	stopSending?: (code?: number) => void;
+	dispose?: () => void;
+};
+interface NativeSessionHandle {
+	id: string;
+	peerIp: string;
+	peerPort: number;
+	close(code: number | null, reason: string | null): void;
+	sendDatagram(data: Buffer | Uint8Array): Promise<string | null>;
+	/** Non-parking send. Returns null when queued, `E_WOULD_BLOCK` when the
+	 * caller must fall back to {@link sendDatagram}, or an error code. Optional
+	 * so an older override addon still works — it just keeps paying a promise
+	 * (and a host event-loop reference) per datagram. */
+	trySendDatagram?: (data: Buffer | Uint8Array) => string | null;
+	/** Batched datagram send. Resolves `{sent, code?}` with prefix semantics —
+	 * it never rejects, for the same reason `readDatagramBatch` does not.
+	 * Required rather than optional-with-fallback: it is version-bound with the
+	 * bundled prebuild, so a caller that drops it must fail to compile rather
+	 * than silently degrade. */
+	sendDatagramBatch: (
+		datagrams: Uint8Array[],
+		/** Milliseconds the caller-visible call has already spent, so a chunked
+		 * array shares one backpressure deadline instead of one per crossing. */
+		elapsedMs?: number,
+	) => Promise<NativeDatagramBatchResult>;
+	readDatagram(): Promise<Uint8Array | null>;
+	/** Batched datagram read. Resolves a non-empty array, or `null` at
+	 * EOF/close — it never rejects. Required, not optional-with-fallback: it is
+	 * version-bound with the bundled prebuild, so a caller that drops it must
+	 * fail to compile rather than silently degrade to the legacy path. A
+	 * mismatched *override* addon is still caught at runtime by the first-pull
+	 * guard in {@link iterateIncomingDatagrams}. */
+	readDatagramBatch: (max: number) => Promise<Uint8Array[] | null>;
+	discardDatagram?: (timeoutMs?: number) => Promise<boolean | null>;
+	discardDatagrams?: (timeoutMs?: number) => Promise<number | null>;
+	discardBidiStreams?: (timeoutMs?: number) => Promise<number | null>;
+	discardUniStreams?: (timeoutMs?: number) => Promise<number | null>;
+	enableBidiDiscard?: () => void;
+	enableUniDiscard?: () => void;
+	createBidiStream(): Promise<NativeBidiStreamHandle | string>;
+	createUniStream(): Promise<NativeSendStreamHandle | string>;
+	waitBidiCapacity?: (remainingMs: number) => Promise<void>;
+	waitUniCapacity?: (remainingMs: number) => Promise<void>;
+	acceptBidiStream(): Promise<NativeBidiStreamHandle | null>;
+	acceptUniStream(): Promise<NativeRecvStreamHandle | null>;
+	handleBidiProbe?: () => Promise<boolean>;
+	handleUniProbe?: () => Promise<number>;
+	metricsSnapshot(): SessionMetricsSnapshot;
+	connectionStats?(): QuicConnectionStats | null;
+	pathMaxDatagramSize?: () => number | null;
+	/** 0-RTT getters (absent on older prebuilt addons). */
+	has0Rtt?: boolean;
+	accepted0Rtt?: boolean;
+	handshakeConfirmed?: boolean;
+	/** Session drain (absent on older prebuilt addons). */
+	drain?: () => void;
+	waitDraining?: () => Promise<void>;
+	/** Connection-scoped H3 GOAWAY send (absent on older prebuilt addons). */
+	goAway?: () => void;
+}
+type NativeConnectSessionHandle = {
+	id: string;
+	close(code: number | null, reason: string | null): void;
+	peerIp?: string;
+	peerPort?: number;
+} & Partial<NativeSessionHandle>;
+interface NativeServerHandle {
+	port: number;
+	/** Diagnostic, unstable (egress pacer); may be absent on older addons. */
+	__pacerStatsSnapshot?(): number;
+	__pacerStatsJson?(token?: number): string;
+	close(): Promise<void>;
+	updateCert(certPem: string, keyPem: string): Promise<void>;
+	updateTls(configJson: string): Promise<void>;
+	replaceSniCerts(json: string): Promise<void>;
+	upsertSniCert(
+		serverName: string,
+		certPem: string,
+		keyPem: string,
+	): Promise<void>;
+	removeSniCert(serverName: string): Promise<void>;
+	setUnknownSniPolicy(policy: string): Promise<void>;
+	tlsSnapshot(): ServerTlsSnapshot;
+	/** Synchronous one-payload-to-many-sessions send. Returns the failures-only
+	 * envelope; never rejects and never throws for a transport condition.
+	 * Required rather than optional-with-fallback: it is version-bound with the
+	 * bundled prebuild, so a caller that drops it must fail to compile rather
+	 * than silently degrade to a per-target loop. */
+	sendDatagramMirror(
+		targets: string[],
+		payload: Uint8Array,
+	): NativeDatagramMirrorResult;
+	/** Paced sibling of the above. Optional-with-fallback rather than required:
+	 * unlike `sendDatagramMirror` this one has a meaningful "not on this addon"
+	 * answer, and conflating it with "the knob is off" is the defect `5443704`
+	 * fixed for the stats accessors. The facade turns absence into its own
+	 * message. */
+	sendDatagramMirrorPaced?(
+		targets: string[],
+		payload: Uint8Array,
+	): NativeDatagramMirrorAdmission;
+	/** Drain-on-poll reader for deferred paced failures. Absent on addons
+	 * without the pacer, where the facade answers with an empty batch. */
+	readMirrorReports?(max?: number): NativeMirrorReport[];
+	/** Absent on addons built without the reflector; feature detection is
+	 * method presence (spec §3), as for `sendDatagramMirrorPaced`. */
+	setDatagramReflector?(rule: unknown): void;
+	/** Effective server-runtime worker count; version-bound with the prebuild. */
+	serverWorkerThreads(): number;
+	/** Endpoint-driver placement ("shared" | "dedicated"); version-bound with the prebuild. */
+	serverRecvRuntime(): string;
+	/** ACK cadence requested of the client ("default" | "relaxed"); version-bound with the prebuild. */
+	serverAckCadence(): string;
+	/** UDP server send buffer bytes (0 = upstream default bind path); version-bound with the prebuild. */
+	serverUdpSendBufferBytes(): number;
+	/** UDP send batch size (0 = off); version-bound with the prebuild. */
+	serverUdpSendBatch(): number;
+	/** Datagram driver read path; version-bound with the prebuild. */
+	serverDatagramDriver(): string;
+	/** Linux sendmmsg EAGAIN policy; version-bound with the prebuild. */
+	serverUdpSendEagainMode(): string;
+	serverReflectRingBypass(): string;
+	metricsSnapshot(): InternalMetricsSnapshot;
+	__sendPathDiagnostics?(phase?: string): string;
+}
+interface NativeAddon {
+	ServerHandle: new (
+		port: number,
+		host: string,
+		debug: boolean,
+		tlsConfigJson: string,
+		limitsJson: string,
+		rateLimitsJson: string,
+		serverOptsJson: string,
+		onSessionEvents: (events: NativeServerSessionEvent[]) => void,
+		onLog?: (events: NativeLogEvent[]) => void,
+	) => NativeServerHandle;
+	SessionHandle: new (
+		id: string,
+		peerIp: string,
+		peerPort: number,
+	) => NativeSessionHandle;
+	ClientSessionHandle: new (
+		id: string,
+		peerIp: string,
+		peerPort: number,
+	) => NativeSessionHandle;
+	connect(
+		url: string,
+		optsJson: string,
+		onClosed: (events: NativeClientSessionEvent[]) => void,
+		cb: (err: unknown, handleId?: string) => void,
+	): void;
+	takeClientSession(handleId: string): NativeSessionHandle | undefined;
+	clientPoolMetricsSnapshot(): {
+		hits: number;
+		misses: number;
+		evictIdle?: number;
+		evictBroken?: number;
+	};
+	nativeStreamHandlesSnapshot?: () => {
+		bidiHandlesLive: number;
+		uniSendHandlesLive: number;
+		uniRecvHandlesLive: number;
+	};
+	/** Leak-forensics: futures currently parked per instrumented await
+	 * (absent on older prebuilt addons). Diagnostic only. */
+	nativeAwaitProbeSnapshot?: () => Record<string, number>;
+	/** Which payload delivery path this process resolved: exactly
+	 * `"arraybuffer"` or `"buffer-copy"` (absent on older prebuilt addons). */
+	nativePayloadDeliveryMode?: () => string;
+	/** Inclusive payload size at or below which delivery stays engine-owned
+	 * (absent on older prebuilt addons). Diagnostic only. */
+	nativePayloadEngineOwnedMaxBytes?: () => number;
+	/** The QUIC flow-control config a limits JSON resolves to (absent on older
+	 * prebuilt addons). Pure function of its argument; diagnostic only. */
+	nativeTransportWindows?: (limitsJson: string) => {
+		streamReceiveWindow: number;
+		receiveWindow: number;
+		sendWindow: number;
+		datagramChannelCapacity: number;
+	};
+	/** Test seam: runs payloads through napi-rs's real per-element array
+	 * conversion (absent on older prebuilt addons). Never used in production. */
+	materializePayloadBatchForTests?: (
+		payloads: (Buffer | Uint8Array)[],
+	) => Uint8Array[];
+	/** Force-return freed native allocator memory to the OS (absent on older prebuilt addons). */
+	releaseNativeMemory?: () => boolean;
+	/** 0-RTT vault (absent on older prebuilt addons). */
+	exportZeroRttVault?(
+		optsJson: string,
+		serverName?: string | null,
+	): string | null;
+	importZeroRttVault?(optsJson: string, token: string): boolean;
+}
+interface NativeConnectOnlyAddon {
+	connect(
+		url: string,
+		optsJson: string,
+		onClosed: (events: NativeClientSessionEvent[]) => void,
+		cb: (err: unknown, handleId?: string) => void,
+	): void;
+	takeClientSession(handleId: string): NativeConnectSessionHandle | undefined;
+}
 
 function tryLoadNativeAddon(
 	requireFn: RequireLike,
 	bases = basePaths,
 	candidates = binaryCandidates,
-): { addon: any; failures: NativeLoadFailure[] } {
+	explicitRequests: string[] = [],
+): NativeLoadResult {
 	const failures: NativeLoadFailure[] = [];
+	for (const request of explicitRequests) {
+		try {
+			return { addon: requireFn(request) as NativeAddon, failures };
+		} catch (err) {
+			failures.push({
+				request,
+				message: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
+	if (explicitRequests.length > 0) {
+		return { addon: undefined, failures };
+	}
 	for (const base of bases) {
 		for (const candidate of candidates) {
 			const request = `${base}/${candidate}`;
 			try {
-				return { addon: requireFn(request), failures };
+				return { addon: requireFn(request) as NativeAddon, failures };
 			} catch (err) {
 				failures.push({
 					request,
@@ -869,6 +1827,13 @@ function tryLoadNativeAddon(
 		}
 	}
 	return { addon: undefined, failures };
+}
+
+function nativeAddonOverrideRequestsFromEnv(
+	envValue = process.env[NATIVE_ADDON_OVERRIDE_ENV],
+): string[] {
+	const trimmed = envValue?.trim();
+	return trimmed ? [trimmed] : [];
 }
 
 function buildNativeAddonLoadErrorMessage(
@@ -885,36 +1850,304 @@ function buildNativeAddonLoadErrorMessage(
 	return `Native addon not loaded. Candidate load errors:\n${details}${suffix}`;
 }
 
-const nativeLoad = tryLoadNativeAddon(_require);
-const native = nativeLoad.addon;
+const nativeLoad = tryLoadNativeAddon(
+	_require,
+	basePaths,
+	binaryCandidates,
+	nativeAddonOverrideRequestsFromEnv(),
+);
+const native = nativeLoad.addon as NativeAddon | undefined;
 const nativeLoadFailures = nativeLoad.failures;
+{
+	// Cross-stream delivery (read-group.ts), on unless
+	// WEBTRANSPORT_STREAM_READ_GROUP=0; an addon without the
+	// class leaves every readable on the direct pull.
+	const ReadGroup = (
+		native as { StreamReadGroup?: new () => NativeReadGroup } | undefined
+	)?.StreamReadGroup;
+	configureReadGroup(ReadGroup ? () => new ReadGroup() : null);
+}
 
-function getNativeOrThrow(): any {
+function getNativeOrThrow(): NativeAddon {
 	if (native) return native;
 	throw new Error(buildNativeAddonLoadErrorMessage(nativeLoadFailures));
 }
+
+// ---------------------------------------------------------------------------
+// Incoming-datagram delivery
+// ---------------------------------------------------------------------------
+
+const DATAGRAM_BATCH_ENV = "WEBTRANSPORT_DATAGRAM_BATCH";
+/**
+ * Unsupported internal knob, not public API (docs/OPERATIONS.md,
+ * "Unsupported tuning knobs"): it only arms the counters, and the counters are
+ * readable through `__TESTING__.datagramBatchDiagnosticsSnapshotForTests()`
+ * alone — the same unstable seam every excluded surface uses.
+ */
+const DATAGRAM_BATCH_DIAGNOSTICS_ENV =
+	"WEBTRANSPORT_DATAGRAM_BATCH_DIAGNOSTICS";
+const DEFAULT_DATAGRAM_BATCH = 64;
+const MAX_DATAGRAM_BATCH = DATAGRAM_BATCH_MAX;
+const DATAGRAM_BATCH_MISMATCH_MESSAGE =
+	"E_INTERNAL: native addon/JavaScript version mismatch; rebuild the matching prebuild";
+
+/**
+ * Resolve the datagram batch size from its raw environment value.
+ *
+ * Anything that is not a plain decimal integer — empty, non-numeric,
+ * fractional, exponential, hex, Infinity — is "invalid" and falls back to the
+ * default. Values that *are* decimal integers are clamped into `0..256`, so a
+ * negative request means 0 (the legacy one-at-a-time path) rather than the
+ * default.
+ */
+function parseDatagramBatchSize(raw: string | undefined): number {
+	if (raw === undefined) return DEFAULT_DATAGRAM_BATCH;
+	const trimmed = raw.trim();
+	if (!/^[+-]?\d+$/.test(trimmed)) return DEFAULT_DATAGRAM_BATCH;
+	const value = Number(trimmed);
+	// Not redundant with the regex: a decimal-integer string long enough to
+	// overflow a double (309+ digits) matches it and still converts to
+	// Infinity, which the spec classifies as invalid rather than as a clamp.
+	if (!Number.isFinite(value)) return DEFAULT_DATAGRAM_BATCH;
+	if (value <= 0) return 0;
+	return value > MAX_DATAGRAM_BATCH ? MAX_DATAGRAM_BATCH : value;
+}
+
+// Both knobs are read exactly once, here, so a process cannot change delivery
+// shape halfway through a session's lifetime.
+const datagramBatchSize = parseDatagramBatchSize(
+	process.env[DATAGRAM_BATCH_ENV],
+);
+const datagramBatchDiagnosticsEnabled =
+	process.env[DATAGRAM_BATCH_DIAGNOSTICS_ENV] === "1";
+
+type DatagramBatchDiagnostics = {
+	legacyReadCalls: number;
+	batchReadCalls: number;
+	materializedItems: number;
+	yieldedItems: number;
+	maxBatchSize: number;
+	meanBatchSize: number;
+	abandonedItems: number;
+};
+
+const datagramBatchCounters = {
+	legacyReadCalls: 0,
+	batchReadCalls: 0,
+	materializedItems: 0,
+	yieldedItems: 0,
+	maxBatchSize: 0,
+	abandonedItems: 0,
+};
+
+function datagramBatchDiagnosticsSnapshot(): DatagramBatchDiagnostics {
+	const c = datagramBatchCounters;
+	return {
+		legacyReadCalls: c.legacyReadCalls,
+		batchReadCalls: c.batchReadCalls,
+		materializedItems: c.materializedItems,
+		yieldedItems: c.yieldedItems,
+		maxBatchSize: c.maxBatchSize,
+		meanBatchSize:
+			c.batchReadCalls > 0 ? c.materializedItems / c.batchReadCalls : 0,
+		abandonedItems: c.abandonedItems,
+	};
+}
+
+/** What the native non-parking send returns when the byte budget is full. */
+const DATAGRAM_SEND_WOULD_BLOCK = "E_WOULD_BLOCK";
+
+/**
+ * Escape hatch back to a native promise per datagram
+ * (`WEBTRANSPORT_DATAGRAM_SEND_SYNC=0`), read once at module load like the
+ * other native-path knobs. It exists to make the host-loop reference class
+ * reproducible on demand: with the promise-free send off, an echo server under
+ * overload can again outlive its own `close()`.
+ */
+const datagramSyncSendEnabled =
+	process.env.WEBTRANSPORT_DATAGRAM_SEND_SYNC !== "0";
+
+/**
+ * Send without handing JavaScript a native promise.
+ *
+ * An async N-API call is not free on the host side: napi-rs backs every promise
+ * it returns with a ThreadsafeFunction, and a live TSFN is a reference on the
+ * event loop that the addon cannot see or count — the Rust future finishing and
+ * that reference being released are two different events. A datagram that has
+ * queue budget does not need any of it, so it takes the synchronous call and
+ * never creates the reference; only a send that must wait falls back.
+ *
+ * Returns true when the datagram is queued and the caller is done, false when
+ * the caller must fall back to the parking send. A real failure throws, exactly
+ * as the parking path's error envelope does.
+ */
+function sendDatagramWithoutPromise(
+	handle: Pick<NativeSessionHandle, "trySendDatagram">,
+	payload: Buffer | Uint8Array,
+): boolean {
+	if (!datagramSyncSendEnabled) return false;
+	const trySend = handle.trySendDatagram;
+	if (typeof trySend !== "function") return false;
+	const code = trySend.call(handle, payload);
+	if (code === DATAGRAM_SEND_WOULD_BLOCK) return false;
+	unwrapNativeVoid(code);
+	return true;
+}
+
+type DatagramSource = Pick<NativeSessionHandle, "readDatagram"> & {
+	readDatagramBatch?: (max: number) => Promise<Uint8Array[] | null>;
+};
+
+type DatagramIterator = (
+	handle: DatagramSource,
+	isClosed: () => boolean,
+	batchSize: number,
+	mapError: (err: unknown) => unknown,
+) => AsyncGenerator<Uint8Array, void, undefined>;
+
+function datagramBatchMismatchError(): WebTransportError {
+	return new WebTransportError(
+		E_INTERNAL as ErrorCode,
+		DATAGRAM_BATCH_MISMATCH_MESSAGE,
+	);
+}
+
+/**
+ * The production incoming-datagram loop for both native session classes.
+ *
+ * `batchSize === 0` keeps the legacy one-call-per-datagram path; anything else
+ * uses the batched N-API call and drains the returned array fully before asking
+ * for the next one. Session-close failures end the iteration like an EOF, which
+ * is what both callers did before batching existed.
+ */
+const iterateIncomingDatagrams: DatagramIterator = async function* (
+	handle,
+	isClosed,
+	batchSize,
+	mapError,
+) {
+	if (batchSize === 0) {
+		while (!isClosed()) {
+			let datagram: Uint8Array | null;
+			try {
+				datagram = await handle.readDatagram();
+			} catch (err) {
+				if (isSessionCloseError(err)) return;
+				throw mapError(err);
+			}
+			if (!datagram) return;
+			yield datagram;
+		}
+		return;
+	}
+	const readBatch = handle.readDatagramBatch;
+	if (typeof readBatch !== "function") throw datagramBatchMismatchError();
+	while (!isClosed()) {
+		let batch: Uint8Array[] | null;
+		try {
+			batch = await readBatch.call(handle, batchSize);
+		} catch (err) {
+			if (isSessionCloseError(err)) return;
+			throw mapError(err);
+		}
+		if (!batch || batch.length === 0) return;
+		for (const datagram of batch) yield datagram;
+	}
+};
+
+/**
+ * Counter-carrying twin of {@link iterateIncomingDatagrams}. It is a separate
+ * generator rather than a flag inside the production one so that the disabled
+ * case has no diagnostic branch at all in its per-item path.
+ */
+const iterateIncomingDatagramsInstrumented: DatagramIterator = async function* (
+	handle,
+	isClosed,
+	batchSize,
+	mapError,
+) {
+	const counters = datagramBatchCounters;
+	if (batchSize === 0) {
+		while (!isClosed()) {
+			let datagram: Uint8Array | null;
+			try {
+				counters.legacyReadCalls++;
+				datagram = await handle.readDatagram();
+			} catch (err) {
+				if (isSessionCloseError(err)) return;
+				throw mapError(err);
+			}
+			if (!datagram) return;
+			counters.materializedItems++;
+			counters.yieldedItems++;
+			yield datagram;
+		}
+		return;
+	}
+	const readBatch = handle.readDatagramBatch;
+	if (typeof readBatch !== "function") throw datagramBatchMismatchError();
+	while (!isClosed()) {
+		let batch: Uint8Array[] | null;
+		try {
+			counters.batchReadCalls++;
+			batch = await readBatch.call(handle, batchSize);
+		} catch (err) {
+			if (isSessionCloseError(err)) return;
+			throw mapError(err);
+		}
+		if (!batch || batch.length === 0) return;
+		counters.materializedItems += batch.length;
+		if (batch.length > counters.maxBatchSize)
+			counters.maxBatchSize = batch.length;
+		let delivered = 0;
+		try {
+			for (const datagram of batch) {
+				delivered++;
+				counters.yieldedItems++;
+				yield datagram;
+			}
+		} finally {
+			counters.abandonedItems += batch.length - delivered;
+		}
+	}
+};
+
+// Selected once, at module initialization — never per generator and never per
+// item. Task 7's floor benchmark imports this same binding.
+const createIncomingDatagramIterator: DatagramIterator =
+	datagramBatchDiagnosticsEnabled
+		? iterateIncomingDatagramsInstrumented
+		: iterateIncomingDatagrams;
 
 // ---------------------------------------------------------------------------
 // Server session implementation
 // ---------------------------------------------------------------------------
 
 class NativeServerSession implements ServerSession {
-	#nativeHandle: any;
+	#nativeHandle: NativeSessionHandle;
 	#closedPromise: Promise<CloseInfo>;
 	#closed = false;
 	#requestedCloseInfo: CloseInfo | null = null;
 	#streamOpenWaitTimeoutMs: number;
+	#incomingDatagramsCache: AsyncIterable<Uint8Array> | null = null;
+	#drainingPromise: Promise<void> | null = null;
 	#incomingBidiCache: ReadableStream<WebTransportBidirectionalStream> | null =
 		null;
 	#incomingUniCache: ReadableStream<WebTransportReceiveStream> | null = null;
 
+	#has0Rtt: boolean;
+	#handshakeConfirmedLatch = false;
+
 	constructor(
-		nativeHandle: any,
+		nativeHandle: NativeSessionHandle,
 		closedPromise: Promise<CloseInfo>,
 		streamOpenWaitTimeoutMs: number,
 	) {
 		this.#nativeHandle = nativeHandle;
 		this.#streamOpenWaitTimeoutMs = streamOpenWaitTimeoutMs;
+		// Snapshot: fixed for the session's lifetime, and must survive the
+		// native registry entry being removed at close.
+		this.#has0Rtt = nativeHandle.has0Rtt ?? false;
 		this.#closedPromise = closedPromise.then((info) =>
 			normalizeCloseInfo(info, this.#requestedCloseInfo ?? undefined),
 		);
@@ -934,6 +2167,23 @@ class NativeServerSession implements ServerSession {
 		};
 	}
 
+	get has0Rtt(): boolean {
+		return this.#has0Rtt;
+	}
+
+	get accepted0Rtt(): boolean {
+		// Server side: a request readable from early data was accepted.
+		return this.#has0Rtt;
+	}
+
+	get handshakeConfirmed(): boolean {
+		if (!this.#handshakeConfirmedLatch) {
+			this.#handshakeConfirmedLatch =
+				this.#nativeHandle.handshakeConfirmed ?? true;
+		}
+		return this.#handshakeConfirmedLatch;
+	}
+
 	get ready(): Promise<void> {
 		// Server sessions are already handshake-complete when onSession fires
 		return Promise.resolve();
@@ -941,6 +2191,22 @@ class NativeServerSession implements ServerSession {
 
 	get closed(): Promise<CloseInfo> {
 		return this.#closedPromise;
+	}
+
+	get draining(): Promise<void> {
+		// Raced against `closed` so a session that ends without the peer ever
+		// draining does not leave this pending forever. An older prebuilt addon
+		// has no waitDraining, in which case close is the only signal available.
+		this.#drainingPromise ??= Promise.race(
+			[
+				this.#nativeHandle.waitDraining?.(),
+				this.#closedPromise.then(
+					() => undefined,
+					() => undefined,
+				),
+			].filter((p): p is Promise<void> => p !== undefined),
+		);
+		return this.#drainingPromise;
 	}
 
 	close(info?: CloseInfo): void {
@@ -951,28 +2217,140 @@ class NativeServerSession implements ServerSession {
 		}
 	}
 
+	drain(): void {
+		if (!this.#closed) this.#nativeHandle.drain?.();
+	}
+
+	goAway(): void {
+		if (!this.#closed) this.#nativeHandle.goAway?.();
+	}
+
 	async sendDatagram(data: Uint8Array): Promise<void> {
 		if (this.#closed)
 			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
 		try {
 			const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-			await this.#nativeHandle.sendDatagram(buf);
+			if (sendDatagramWithoutPromise(this.#nativeHandle, buf)) return;
+			unwrapNativeVoid(await this.#nativeHandle.sendDatagram(buf));
 		} catch (err) {
 			throw toWebTransportError(err);
 		}
 	}
 
-	async *incomingDatagrams(): AsyncIterable<Uint8Array> {
-		while (!this.#closed) {
-			try {
-				const datagram = await this.#nativeHandle.readDatagram();
-				if (!datagram) break;
-				yield datagram;
-			} catch (err) {
-				if (isSessionCloseError(err)) break;
-				throw toWebTransportError(err);
-			}
+	sendDatagramBatch(
+		datagrams: readonly Uint8Array[],
+	): Promise<{ sent: number; error?: WebTransportError }> {
+		if (this.#closed)
+			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
+		const handle = this.#nativeHandle;
+		return sendDatagramBatchChunked(
+			(chunk, elapsedMs) => handle.sendDatagramBatch(chunk, elapsedMs),
+			datagrams,
+		).then(({ sent, code }) =>
+			code === undefined
+				? { sent }
+				: { sent, error: toWebTransportError(new Error(code)) },
+		);
+	}
+
+	incomingDatagrams(): AsyncIterable<Uint8Array> {
+		if (!this.#incomingDatagramsCache) {
+			this.#incomingDatagramsCache = createIncomingDatagramIterator(
+				this.#nativeHandle,
+				() => this.#closed,
+				datagramBatchSize,
+				(err) => toWebTransportError(err),
+			);
 		}
+		return this.#incomingDatagramsCache;
+	}
+
+	/** @internal Consume one queued datagram without materializing its payload. */
+	async discardIncomingDatagram(
+		timeoutMs?: number,
+	): Promise<boolean | null | undefined> {
+		if (!this.#nativeHandle.discardDatagram) return undefined;
+		if (this.#closed) return null;
+		try {
+			return await this.#nativeHandle.discardDatagram(timeoutMs);
+		} catch (err) {
+			if (isSessionCloseError(err)) return null;
+			throw toWebTransportError(err);
+		}
+	}
+
+	/** @internal Consume queued datagrams without materializing payloads. */
+	async discardIncomingDatagrams(
+		timeoutMs?: number,
+	): Promise<number | null | undefined> {
+		if (!this.#nativeHandle.discardDatagrams) return undefined;
+		if (this.#closed) return null;
+		try {
+			return await this.#nativeHandle.discardDatagrams(timeoutMs);
+		} catch (err) {
+			if (isSessionCloseError(err)) return null;
+			throw toWebTransportError(err);
+		}
+	}
+
+	/** @internal Consume accepted bidi streams without materializing wrappers. */
+	async discardIncomingBidiStreams(
+		timeoutMs?: number,
+	): Promise<number | null | undefined> {
+		if (!this.#nativeHandle.discardBidiStreams) return undefined;
+		if (this.#closed) return null;
+		try {
+			return await this.#nativeHandle.discardBidiStreams(timeoutMs);
+		} catch (err) {
+			if (isSessionCloseError(err)) return null;
+			throw toWebTransportError(err);
+		}
+	}
+
+	/** @internal Consume accepted uni streams without materializing wrappers. */
+	async discardIncomingUniStreams(
+		timeoutMs?: number,
+	): Promise<number | null | undefined> {
+		if (!this.#nativeHandle.discardUniStreams) return undefined;
+		if (this.#closed) return null;
+		try {
+			return await this.#nativeHandle.discardUniStreams(timeoutMs);
+		} catch (err) {
+			if (isSessionCloseError(err)) return null;
+			throw toWebTransportError(err);
+		}
+	}
+
+	/** @internal Load/evidence path: handle one ordered bidi probe in Rust. */
+	async __handleIncomingBidiProbe(): Promise<boolean> {
+		if (this.#closed) return false;
+		try {
+			return (await this.#nativeHandle.handleBidiProbe?.()) ?? false;
+		} catch (err) {
+			if (isSessionCloseError(err)) return false;
+			throw toWebTransportError(err);
+		}
+	}
+
+	/** @internal Load/evidence path: handle one ordered uni probe in Rust. */
+	async __handleIncomingUniProbe(): Promise<number> {
+		if (this.#closed) return 0;
+		try {
+			return (await this.#nativeHandle.handleUniProbe?.()) ?? 0;
+		} catch (err) {
+			if (isSessionCloseError(err)) return 0;
+			throw toWebTransportError(err);
+		}
+	}
+
+	/** @internal Switch subsequent load streams to the native discard path. */
+	__enableIncomingBidiDiscard(): void {
+		this.#nativeHandle.enableBidiDiscard?.();
+	}
+
+	/** @internal Switch subsequent load streams to the native discard path. */
+	__enableIncomingUniDiscard(): void {
+		this.#nativeHandle.enableUniDiscard?.();
 	}
 
 	async createBidirectionalStream(
@@ -982,13 +2360,11 @@ class NativeServerSession implements ServerSession {
 			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
 		try {
 			const nativeStream = (await openStreamWithWait(
-				() => this.#nativeHandle.createBidiStream(),
+				() => this.#nativeHandle.createBidiStream().then(unwrapNativeValue),
 				options,
 				this.#streamOpenWaitTimeoutMs,
 				() => this.#closed,
-				typeof this.#nativeHandle.waitBidiCapacity === "function"
-					? (remainingMs) => this.#nativeHandle.waitBidiCapacity(remainingMs)
-					: undefined,
+				boundNativeCapacityWait(this.#nativeHandle, "bidi"),
 			)) as any;
 			return new BidiStream({
 				handleId: nativeStream?.id ?? 0,
@@ -1004,6 +2380,7 @@ class NativeServerSession implements ServerSession {
 			this.#incomingBidiCache = createServerIncomingBidiStreams(
 				this.#nativeHandle,
 				() => this.#closed,
+				this.#closedPromise,
 			);
 		}
 		return this.#incomingBidiCache;
@@ -1016,13 +2393,11 @@ class NativeServerSession implements ServerSession {
 			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
 		try {
 			const nativeStream = (await openStreamWithWait(
-				() => this.#nativeHandle.createUniStream(),
+				() => this.#nativeHandle.createUniStream().then(unwrapNativeValue),
 				options,
 				this.#streamOpenWaitTimeoutMs,
 				() => this.#closed,
-				typeof this.#nativeHandle.waitUniCapacity === "function"
-					? (remainingMs) => this.#nativeHandle.waitUniCapacity(remainingMs)
-					: undefined,
+				boundNativeCapacityWait(this.#nativeHandle, "uni"),
 			)) as any;
 			return new SendStream({
 				handleId: nativeStream?.id ?? 0,
@@ -1038,6 +2413,7 @@ class NativeServerSession implements ServerSession {
 			this.#incomingUniCache = createServerIncomingUniStreams(
 				this.#nativeHandle,
 				() => this.#closed,
+				this.#closedPromise,
 			);
 		}
 		return this.#incomingUniCache;
@@ -1046,11 +2422,84 @@ class NativeServerSession implements ServerSession {
 	metricsSnapshot(): SessionMetricsSnapshot {
 		return this.#nativeHandle.metricsSnapshot();
 	}
+
+	/** Wire-level QUIC stats from the native layer, or null when unavailable. */
+	/** @internal */
+	_connectionStats(): QuicConnectionStats | null {
+		return typeof this.#nativeHandle.connectionStats === "function"
+			? (this.#nativeHandle.connectionStats() ?? null)
+			: null;
+	}
 }
 
 // ---------------------------------------------------------------------------
 // createServer
 // ---------------------------------------------------------------------------
+
+/** Registered maxima, mirrored from egress_pacer.rs (`PPS_MAX`, `QUEUE_MS_MAX`). */
+const EGRESS_PACER_PPS_MAX = 1_000_000;
+const EGRESS_PACER_QUEUE_MS_MAX = 5_000;
+
+/** Why an `egressPacer` option is malformed, or `null` when it is not. */
+function egressPacerOptionsError(value: unknown): string | null {
+	if (!isPlainOptionsObject(value)) return "egressPacer must be an object";
+	const { pps, clump, queueMs } = value as Record<string, unknown>;
+	if (
+		typeof pps !== "number" ||
+		!Number.isInteger(pps) ||
+		pps < 1 ||
+		pps > EGRESS_PACER_PPS_MAX
+	)
+		return `egressPacer.pps must be an integer 1..${EGRESS_PACER_PPS_MAX}`;
+	if (
+		clump !== undefined &&
+		(typeof clump !== "number" ||
+			!Number.isInteger(clump) ||
+			clump < 1 ||
+			clump > 64)
+	)
+		return "egressPacer.clump must be an integer 1..64";
+	if (
+		queueMs !== undefined &&
+		(typeof queueMs !== "number" ||
+			!Number.isInteger(queueMs) ||
+			queueMs < 1 ||
+			queueMs > EGRESS_PACER_QUEUE_MS_MAX)
+	)
+		return `egressPacer.queueMs must be an integer 1..${EGRESS_PACER_QUEUE_MS_MAX}`;
+	return null;
+}
+
+/**
+ * Forward the pacer's diagnostic accessors, or forward nothing.
+ *
+ * The facade closes over the native handle, so without these the pacer's own
+ * counters are unreachable from bench code. Pure accessors — they cannot
+ * influence pacing or any measured path.
+ *
+ * The absence is the point. A current addon answers `"{}"` when the pacer knob
+ * is off, so a forward that substituted `"{}"` for a method the addon does not
+ * have would make a stale addon read as a deliberate unpaced run: a paced bench
+ * cell would then produce an artifact with no pacer stats and nothing saying
+ * why. Callers that need the pacer must check `typeof
+ * __TESTING__.serverInternals(server).__pacerStatsJson === "function"` and
+ * refuse when it is not.
+ */
+function pacerStatsForwards(handle: {
+	__pacerStatsSnapshot?(): number;
+	__pacerStatsJson?(token?: number): string;
+}): Pick<ServerInternals, "__pacerStatsSnapshot" | "__pacerStatsJson"> {
+	const snapshot = handle.__pacerStatsSnapshot;
+	const json = handle.__pacerStatsJson;
+	return {
+		...(typeof snapshot === "function"
+			? { __pacerStatsSnapshot: () => snapshot.call(handle) }
+			: {}),
+		...(typeof json === "function"
+			? { __pacerStatsJson: (token?: number) => json.call(handle, token) }
+			: {}),
+	};
+}
 
 /**
  * Create an in-process WebTransport server.
@@ -1075,6 +2524,7 @@ class NativeServerSession implements ServerSession {
  * ```
  */
 export function createServer(opts: ServerOptions): WebTransportServer {
+	warnIfLeakyBunRuntime();
 	const native = getNativeOrThrow();
 
 	const decodePem = (value: string | Uint8Array | undefined): string =>
@@ -1110,8 +2560,135 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 				})) ?? [],
 		});
 
+	if (
+		opts.congestionControl !== undefined &&
+		!VALID_CONGESTION.has(opts.congestionControl)
+	) {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			`E_INVALID_ARGUMENT: congestionControl must be "default", "throughput", or "low-latency", got "${opts.congestionControl}"`,
+		);
+	}
+
+	validateQpackOptions(opts);
+
+	if (opts.reusePort !== undefined && typeof opts.reusePort !== "boolean") {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			"E_INVALID_ARGUMENT: reusePort must be a boolean",
+		);
+	}
+
+	if (opts.reusePort === true && opts.port === 0) {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			"E_INVALID_ARGUMENT: reusePort requires an explicit port; port 0 asks the OS for a fresh ephemeral port per instance, so nothing shares a port",
+		);
+	}
+
+	// Only an absent option means "default": an explicit `null` (or any other
+	// wrong type) is rejected by the validators below, never read as omitted.
+	if (opts.quicLb !== undefined) {
+		const quicLbError = quicLbOptionsError(opts.quicLb);
+		if (quicLbError !== null) {
+			throw createMappedError(
+				E_INVALID_ARGUMENT as ErrorCode,
+				`E_INVALID_ARGUMENT: ${quicLbError}`,
+			);
+		}
+	}
+
+	if (opts.reusePortSteering !== undefined) {
+		const steering = opts.reusePortSteering;
+		const steeringError = (() => {
+			if (!isPlainOptionsObject(steering)) {
+				return "reusePortSteering must be an object";
+			}
+			if (
+				typeof steering.sockArrayPinPath !== "string" ||
+				!steering.sockArrayPinPath.startsWith("/")
+			) {
+				return "reusePortSteering.sockArrayPinPath must be an absolute bpffs path";
+			}
+			if (
+				!Number.isInteger(steering.key) ||
+				steering.key < 0 ||
+				steering.key > 0xffffffff
+			) {
+				return "reusePortSteering.key must be a non-negative 32-bit integer";
+			}
+			if (
+				steering.attachProgPinPath !== undefined &&
+				(typeof steering.attachProgPinPath !== "string" ||
+					!steering.attachProgPinPath.startsWith("/"))
+			) {
+				return "reusePortSteering.attachProgPinPath must be an absolute bpffs path";
+			}
+			if (opts.reusePort !== true) {
+				return "reusePortSteering requires reusePort: true";
+			}
+			if (opts.quicLb === undefined) {
+				return (
+					"reusePortSteering requires quicLb — without QUIC-LB CIDs every " +
+					"packet falls back to the kernel hash and the steering program " +
+					"steers nothing"
+				);
+			}
+			return null;
+		})();
+		if (steeringError !== null) {
+			throw createMappedError(
+				E_INVALID_ARGUMENT as ErrorCode,
+				`E_INVALID_ARGUMENT: ${steeringError}`,
+			);
+		}
+	}
+
+	if (opts.egressPacer !== undefined) {
+		const pacerError = egressPacerOptionsError(opts.egressPacer);
+		if (pacerError !== null) {
+			throw createMappedError(
+				E_INVALID_ARGUMENT as ErrorCode,
+				`E_INVALID_ARGUMENT: ${pacerError}`,
+			);
+		}
+	}
+
+	validateLimitsShape(opts.limits);
+	validateLimitsShape(opts.rateLimits, undefined, "rateLimits");
 	const mergedLimits = { ...DEFAULT_LIMITS, ...opts.limits };
 	const limitsJson = JSON.stringify(mergedLimits);
+	const serverOptsJson = JSON.stringify({
+		congestionControl: opts.congestionControl ?? "default",
+		enable0Rtt: opts.enable0Rtt === true,
+		allowEarlySession: opts.allowEarlySession === true,
+		reusePort: opts.reusePort === true,
+		...(opts.quicLb === undefined
+			? {}
+			: { quicLb: quicLbOptionsToJson(opts.quicLb) }),
+		...(opts.reusePortSteering === undefined
+			? {}
+			: { reusePortSteering: opts.reusePortSteering }),
+		...(opts.egressPacer === undefined
+			? {}
+			: {
+					egressPacer: {
+						pps: opts.egressPacer.pps,
+						...(opts.egressPacer.clump === undefined
+							? {}
+							: { clump: opts.egressPacer.clump }),
+						...(opts.egressPacer.queueMs === undefined
+							? {}
+							: { queueMs: opts.egressPacer.queueMs }),
+					},
+				}),
+		...(opts.qpackMaxTableCapacity === undefined
+			? {}
+			: { qpackMaxTableCapacity: opts.qpackMaxTableCapacity }),
+		...(opts.enableDynamicQpack === undefined
+			? {}
+			: { enableDynamicQpack: opts.enableDynamicQpack }),
+	});
 	const rateLimitsJson = JSON.stringify({
 		...DEFAULT_RATE_LIMITS,
 		...opts.rateLimits,
@@ -1133,7 +2710,7 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		}
 	};
 
-	const logCallback = (logEvents: any[]) => {
+	const logCallback = (logEvents: NativeLogEvent[]) => {
 		for (const le of logEvents) {
 			emitUserLog({
 				level: le.level ?? "info",
@@ -1145,6 +2722,104 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		}
 	};
 
+	// Set the moment close() starts (before the native close), so a session
+	// event that is already queued in the TSFN batcher cannot reach user code.
+	let closing = false;
+	const closeLateAcceptedSession = (
+		id: string,
+		peerIp: string,
+		peerPort: number,
+	): void => {
+		try {
+			new native.SessionHandle(id, peerIp, peerPort).close(
+				SERVER_CLOSING_CLOSE_CODE,
+				SERVER_CLOSING_CLOSE_REASON,
+			);
+		} catch {
+			// The native close already tore this session down; nothing is
+			// owed to anyone.
+		}
+	};
+	const onSessionEvents = (events: NativeServerSessionEvent[]): void => {
+		for (const evt of events) {
+			if (
+				evt.name === "session" &&
+				evt.id != null &&
+				evt.peerIp != null &&
+				evt.peerPort != null
+			) {
+				if (closing) {
+					// Accepted natively but delivered after close() began: the
+					// TSFN batcher can flush an accept queued before the close.
+					// It must not reach onSession (no callback after close) and
+					// must not register a `closed` resolver the close sweep has
+					// already run past. Close it on the wire with the same pair
+					// every other session of a closing server gets.
+					closeLateAcceptedSession(evt.id, evt.peerIp, evt.peerPort);
+					continue;
+				}
+				let closedResolve!: (info: CloseInfo) => void;
+				const closedPromise = new Promise<CloseInfo>((resolve) => {
+					closedResolve = resolve;
+				});
+				closedResolvers.set(evt.id, closedResolve);
+				const nativeSession = new native.SessionHandle(
+					evt.id,
+					evt.peerIp,
+					evt.peerPort,
+				);
+				const session = new NativeServerSession(
+					nativeSession,
+					closedPromise,
+					mergedLimits.backpressureTimeoutMs,
+				);
+				activeOnSessionCallbacks++;
+				let maybePromise: void | Promise<void>;
+				try {
+					maybePromise = opts.onSession(session);
+				} catch (err) {
+					const msg = err instanceof Error ? err.message : String(err);
+					session.close({
+						code: 0,
+						reason: `onSession callback threw: ${msg}`,
+					});
+					emitUserLog({
+						level: "error",
+						msg: `E_INVALID_ARGUMENT: onSession callback threw: ${msg}`,
+						sessionId: evt.id,
+						peerIp: evt.peerIp,
+						peerPort: evt.peerPort,
+					});
+					onSessionCallbackDone();
+					continue;
+				}
+				if (maybePromise && typeof maybePromise.then === "function") {
+					maybePromise.then(onSessionCallbackDone, (err) => {
+						const msg = err instanceof Error ? err.message : String(err);
+						session.close({
+							code: 0,
+							reason: `onSession callback rejected: ${msg}`,
+						});
+						emitUserLog({
+							level: "error",
+							msg: `E_INVALID_ARGUMENT: onSession callback rejected: ${msg}`,
+							sessionId: evt.id,
+							peerIp: evt.peerIp,
+							peerPort: evt.peerPort,
+						});
+						onSessionCallbackDone();
+					});
+				} else {
+					onSessionCallbackDone();
+				}
+			} else if (evt.name === "session_closed" && evt.id != null) {
+				const resolve = closedResolvers.get(evt.id);
+				closedResolvers.delete(evt.id);
+				if (resolve) resolve({ code: evt.code, reason: evt.reason });
+			}
+		}
+	};
+
 	const handle = new native.ServerHandle(
 		opts.port,
 		opts.host ?? "0.0.0.0",
@@ -1152,67 +2827,8 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		tlsConfigToJson(opts.tls),
 		limitsJson,
 		rateLimitsJson,
-		(events: any[]) => {
-			for (const evt of events) {
-				if (
-					evt.name === "session" &&
-					evt.id != null &&
-					evt.peerIp != null &&
-					evt.peerPort != null
-				) {
-					let closedResolve!: (info: CloseInfo) => void;
-					const closedPromise = new Promise<CloseInfo>((resolve) => {
-						closedResolve = resolve;
-					});
-					closedResolvers.set(evt.id, closedResolve);
-					const nativeSession = new native.SessionHandle(
-						evt.id,
-						evt.peerIp,
-						evt.peerPort,
-					);
-					const session = new NativeServerSession(
-						nativeSession,
-						closedPromise,
-						mergedLimits.backpressureTimeoutMs,
-					);
-					activeOnSessionCallbacks++;
-					let maybePromise: void | Promise<void>;
-					try {
-						maybePromise = opts.onSession(session);
-					} catch (err) {
-						const msg = err instanceof Error ? err.message : String(err);
-						emitUserLog({
-							level: "error",
-							msg: `E_INTERNAL: onSession callback threw: ${msg}`,
-							sessionId: evt.id,
-							peerIp: evt.peerIp,
-							peerPort: evt.peerPort,
-						});
-						onSessionCallbackDone();
-						continue;
-					}
-					if (maybePromise && typeof maybePromise.then === "function") {
-						maybePromise.then(onSessionCallbackDone, (err) => {
-							const msg = err instanceof Error ? err.message : String(err);
-							emitUserLog({
-								level: "error",
-								msg: `E_INTERNAL: onSession callback rejected: ${msg}`,
-								sessionId: evt.id,
-								peerIp: evt.peerIp,
-								peerPort: evt.peerPort,
-							});
-							onSessionCallbackDone();
-						});
-					} else {
-						onSessionCallbackDone();
-					}
-				} else if (evt.name === "session_closed" && evt.id != null) {
-					const resolve = closedResolvers.get(evt.id);
-					closedResolvers.delete(evt.id);
-					if (resolve) resolve({ code: evt.code, reason: evt.reason });
-				}
-			}
-		},
+		serverOptsJson,
+		onSessionEvents,
 		logCallback,
 	);
 
@@ -1224,8 +2840,9 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		}
 	}
 
-	return {
+	const server: WebTransportServer = {
 		address: { host: opts.host ?? "0.0.0.0", port: handle.port },
+		congestionControl: opts.congestionControl ?? "default",
 		updateCert: async (tls) => {
 			const nextCertPem = decodePem(tls.certPem);
 			const nextKeyPem = decodePem(tls.keyPem);
@@ -1259,23 +2876,102 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 			await handle.setUnknownSniPolicy(policy);
 		},
 		tlsSnapshot: () => handle.tlsSnapshot(),
-		close: async () => {
-			await handle.close();
-			for (const [id, resolve] of closedResolvers) {
-				closedResolvers.delete(id);
-				resolve({ code: 0, reason: "server closed" });
-			}
-			if (activeOnSessionCallbacks > 0) {
-				await Promise.race([
-					new Promise<void>((r) => {
-						onSessionDrainResolve = r;
-					}),
-					new Promise<void>((r) => setTimeout(r, 5000)),
-				]);
-			}
+		sendDatagramMirror: (targets, payload) =>
+			sendDatagramMirrorChecked(
+				(ids, bytes) => handle.sendDatagramMirror(ids, bytes),
+				targets,
+				payload,
+			),
+		sendDatagramMirrorPaced: (targets, payload) =>
+			sendDatagramMirrorPacedChecked(
+				(ids, bytes) => {
+					const paced = handle.sendDatagramMirrorPaced;
+					if (typeof paced !== "function") {
+						// Distinct from the knob-off message native raises, for the
+						// reason 5443704 recorded: a composition whose addon predates
+						// the pacer must not read as a deliberately unpaced run.
+						throw new WebTransportError(
+							E_UNSUPPORTED_ARGUMENT,
+							"E_UNSUPPORTED_ARGUMENT: this addon was built without the egress pacer, so sendDatagramMirrorPaced has nothing to schedule onto",
+						);
+					}
+					const admission = paced.call(handle, ids, bytes);
+					if (!admission.paced) {
+						// The knob is off. Raised here rather than in native because
+						// Bun hands a synchronous N-API `Err` back as the return
+						// value instead of throwing it, so a native throw would be
+						// decoded as an envelope by the very caller it is meant to
+						// stop.
+						throw new WebTransportError(
+							E_UNSUPPORTED_ARGUMENT,
+							"E_UNSUPPORTED_ARGUMENT: sendDatagramMirrorPaced needs the egress pacer; pass createServer({ egressPacer: { pps } }) or set WEBTRANSPORT_PACER_PPS before creating the server",
+						);
+					}
+					return admission;
+				},
+				targets,
+				payload,
+			),
+		readMirrorReports: (max) => {
+			const bounded = normalizeMirrorReportsMax(max);
+			if (bounded === 0) return decodeMirrorReports([]);
+			return decodeMirrorReports(handle.readMirrorReports?.(bounded) ?? []);
 		},
-		metricsSnapshot: () => handle.metricsSnapshot(),
+		close: createServerCloseContract({
+			closeNative: () => {
+				closing = true;
+				return handle.close();
+			},
+			resolveOwnedSessions: (info) => {
+				for (const [id, resolve] of closedResolvers) {
+					closedResolvers.delete(id);
+					resolve(info);
+				}
+			},
+			pendingOnSessionCallbacks: () => activeOnSessionCallbacks,
+			awaitOnSessionDrain: () =>
+				new Promise<void>((resolve) => {
+					onSessionDrainResolve = resolve;
+				}),
+		}),
+		metricsSnapshot: () => withoutInternalMetrics(handle.metricsSnapshot()),
 	};
+	// Surfaces excluded from the 1.0 contract stay reachable for tests and
+	// tools/ harnesses through `__TESTING__.serverInternals(server)` only; see
+	// server-internals.ts for the one mechanism every excluded surface uses.
+	registerServerInternals(server, {
+		setDatagramReflector: (rule) =>
+			datagramReflectorRuleChecked((native) => {
+				const install = handle.setDatagramReflector;
+				if (typeof install !== "function") {
+					throw new WebTransportError(
+						E_UNSUPPORTED_ARGUMENT,
+						"E_UNSUPPORTED_ARGUMENT: this addon was built without the datagram reflector, so setDatagramReflector has nothing to install",
+					);
+				}
+				install.call(handle, native as never);
+			}, rule),
+		serverReflectRingBypass: () => handle.serverReflectRingBypass(),
+		serverWorkerThreads: () => handle.serverWorkerThreads(),
+		serverRecvRuntime: () => handle.serverRecvRuntime(),
+		serverAckCadence: () => handle.serverAckCadence(),
+		serverUdpSendBufferBytes: () => handle.serverUdpSendBufferBytes(),
+		serverUdpSendBatch: () => handle.serverUdpSendBatch(),
+		serverDatagramDriver: () => handle.serverDatagramDriver(),
+		serverUdpSendEagainMode: () => handle.serverUdpSendEagainMode(),
+		...pacerStatsForwards(handle),
+		...(typeof handle.__sendPathDiagnostics === "function"
+			? {
+					__sendPathDiagnostics: (phase?: string) =>
+						handle.__sendPathDiagnostics!(phase),
+				}
+			: {}),
+		metricsSnapshot: () => handle.metricsSnapshot(),
+		deliverSessionEventsForTests: (events) =>
+			onSessionEvents(events as NativeServerSessionEvent[]),
+		ownedSessionCountForTests: () => closedResolvers.size,
+	});
+	return server;
 }
 
 // ---------------------------------------------------------------------------
@@ -1283,16 +2979,18 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 // ---------------------------------------------------------------------------
 
 class NativeClientSession implements ClientSession {
-	#nativeHandle: any;
+	#nativeHandle: NativeSessionHandle;
 	#readyPromise: Promise<void>;
 	#closedPromise: Promise<CloseInfo>;
 	#closed = false;
 	#requestedCloseInfo: CloseInfo | null = null;
 	#strictW3CErrors: boolean;
 	#streamOpenWaitTimeoutMs: number;
+	#incomingDatagramsCache: AsyncIterable<Uint8Array> | null = null;
+	#drainingPromise: Promise<void> | null = null;
 
 	constructor(
-		nativeHandle: any,
+		nativeHandle: NativeSessionHandle,
 		readyPromise: Promise<void>,
 		closedPromise: Promise<CloseInfo>,
 		strictW3CErrors = false,
@@ -1321,12 +3019,40 @@ class NativeClientSession implements ClientSession {
 		};
 	}
 
+	get has0Rtt(): boolean {
+		return this.#nativeHandle.has0Rtt ?? false;
+	}
+
+	get accepted0Rtt(): boolean {
+		return this.#nativeHandle.accepted0Rtt ?? false;
+	}
+
+	get handshakeConfirmed(): boolean {
+		return this.#nativeHandle.handshakeConfirmed ?? true;
+	}
+
 	get ready(): Promise<void> {
 		return this.#readyPromise;
 	}
 
 	get closed(): Promise<CloseInfo> {
 		return this.#closedPromise;
+	}
+
+	get draining(): Promise<void> {
+		// Raced against `closed` so a session that ends without the peer ever
+		// draining does not leave this pending forever. An older prebuilt addon
+		// has no waitDraining, in which case close is the only signal available.
+		this.#drainingPromise ??= Promise.race(
+			[
+				this.#nativeHandle.waitDraining?.(),
+				this.#closedPromise.then(
+					() => undefined,
+					() => undefined,
+				),
+			].filter((p): p is Promise<void> => p !== undefined),
+		);
+		return this.#drainingPromise;
 	}
 
 	close(info?: CloseInfo): void {
@@ -1337,28 +3063,49 @@ class NativeClientSession implements ClientSession {
 		}
 	}
 
+	drain(): void {
+		if (!this.#closed) this.#nativeHandle.drain?.();
+	}
+
 	async sendDatagram(data: Uint8Array): Promise<void> {
 		if (this.#closed)
 			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
 		try {
 			const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-			await this.#nativeHandle.sendDatagram(buf);
+			if (sendDatagramWithoutPromise(this.#nativeHandle, buf)) return;
+			unwrapNativeVoid(await this.#nativeHandle.sendDatagram(buf));
 		} catch (err) {
 			throw toWebTransportError(err, this.#strictW3CErrors);
 		}
 	}
 
-	async *incomingDatagrams(): AsyncIterable<Uint8Array> {
-		while (!this.#closed) {
-			try {
-				const dgram = await this.#nativeHandle.readDatagram();
-				if (!dgram) break;
-				yield dgram;
-			} catch (err) {
-				if (isSessionCloseError(err)) break;
-				throw toWebTransportError(err, this.#strictW3CErrors);
-			}
+	sendDatagramBatch(
+		datagrams: readonly Uint8Array[],
+	): Promise<{ sent: number; error?: WebTransportError }> {
+		if (this.#closed)
+			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
+		const handle = this.#nativeHandle;
+		const strict = this.#strictW3CErrors;
+		return sendDatagramBatchChunked(
+			(chunk, elapsedMs) => handle.sendDatagramBatch(chunk, elapsedMs),
+			datagrams,
+		).then(({ sent, code }) =>
+			code === undefined
+				? { sent }
+				: { sent, error: toWebTransportError(new Error(code), strict) },
+		);
+	}
+
+	incomingDatagrams(): AsyncIterable<Uint8Array> {
+		if (!this.#incomingDatagramsCache) {
+			this.#incomingDatagramsCache = createIncomingDatagramIterator(
+				this.#nativeHandle,
+				() => this.#closed,
+				datagramBatchSize,
+				(err) => toWebTransportError(err, this.#strictW3CErrors),
+			);
 		}
+		return this.#incomingDatagramsCache;
 	}
 
 	async createBidirectionalStream(
@@ -1368,11 +3115,12 @@ class NativeClientSession implements ClientSession {
 			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
 		try {
 			const nativeStream = (await openStreamWithWait(
-				() => this.#nativeHandle.createBidiStream(),
+				() => this.#nativeHandle.createBidiStream().then(unwrapNativeValue),
 				options,
 				this.#streamOpenWaitTimeoutMs,
 				() => this.#closed,
-				undefined,
+				boundNativeCapacityWait(this.#nativeHandle, "bidi") ??
+					createPollingCapacityWaiter(() => this.#closed),
 				this.#strictW3CErrors,
 			)) as any;
 			return new BidiStream({
@@ -1407,11 +3155,12 @@ class NativeClientSession implements ClientSession {
 			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
 		try {
 			const nativeStream = (await openStreamWithWait(
-				() => this.#nativeHandle.createUniStream(),
+				() => this.#nativeHandle.createUniStream().then(unwrapNativeValue),
 				options,
 				this.#streamOpenWaitTimeoutMs,
 				() => this.#closed,
-				undefined,
+				boundNativeCapacityWait(this.#nativeHandle, "uni") ??
+					createPollingCapacityWaiter(() => this.#closed),
 				this.#strictW3CErrors,
 			)) as any;
 			return new SendStream({
@@ -1442,14 +3191,85 @@ class NativeClientSession implements ClientSession {
 	metricsSnapshot(): SessionMetricsSnapshot {
 		return this.#nativeHandle.metricsSnapshot();
 	}
+
+	/** Wire-level QUIC stats from the native layer, or null when unavailable. */
+	/** @internal */
+	_connectionStats(): QuicConnectionStats | null {
+		return typeof this.#nativeHandle.connectionStats === "function"
+			? (this.#nativeHandle.connectionStats() ?? null)
+			: null;
+	}
+
+	/** Current path MTU-derived max datagram payload size, or null when unknown. */
+	/** @internal */
+	_pathMaxDatagramSize(): number | null {
+		return typeof this.#nativeHandle.pathMaxDatagramSize === "function"
+			? (this.#nativeHandle.pathMaxDatagramSize() ?? null)
+			: null;
+	}
+}
+
+/**
+ * Wire-level QUIC connection stats reported by the native layer.
+ *
+ * @internal Unstable diagnostic surface for source-bound evidence. It is not
+ * part of the supported W3C or Node client contract. `packetsReceived` is a
+ * legacy alias of `udpDatagramsReceived` because the pinned Quinn version does
+ * not expose a distinct received QUIC-packet total.
+ */
+export interface QuicConnectionStats {
+	rttMs: number;
+	bytesSent: number;
+	bytesReceived: number;
+	packetsSent: number;
+	packetsReceived: number;
+	packetsLost: number;
+	/** @internal Application DATAGRAM frames emitted/consumed by QUIC. */
+	datagramFramesSent?: number | null;
+	/** @internal Application DATAGRAM frames emitted/consumed by QUIC. */
+	datagramFramesReceived?: number | null;
+	/** @internal UDP datagrams emitted/consumed by QUIC. */
+	udpDatagramsSent?: number | null;
+	/** @internal UDP datagrams emitted/consumed by QUIC. */
+	udpDatagramsReceived?: number | null;
+	maxDatagramSize?: number | null;
 }
 
 // ---------------------------------------------------------------------------
 // connect
 // ---------------------------------------------------------------------------
 
+function validateConnectUrl(url: string, strictW3CErrors?: boolean): void {
+	let parsed: URL;
+	try {
+		parsed = new URL(url);
+	} catch (err) {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			`E_INVALID_ARGUMENT: connect URL is invalid: ${
+				err instanceof Error ? err.message : String(err)
+			}`,
+			strictW3CErrors,
+		);
+	}
+	if (parsed.protocol !== "https:") {
+		throw createMappedError(
+			E_UNSUPPORTED_ARGUMENT as ErrorCode,
+			`E_UNSUPPORTED_ARGUMENT: connect only supports https URLs, got ${parsed.protocol}`,
+			strictW3CErrors,
+		);
+	}
+	if (!parsed.hostname) {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			"E_INVALID_ARGUMENT: connect URL must include a host",
+			strictW3CErrors,
+		);
+	}
+}
+
 function connectWithNative(
-	native: any,
+	native: NativeConnectOnlyAddon,
 	url: string,
 	optsJson: string,
 	handshakeTimeout: number,
@@ -1478,7 +3298,7 @@ function connectWithNative(
 			reject(err);
 		};
 
-		const onClosed = (events: any[]) => {
+		const onClosed = (events: NativeClientSessionEvent[]) => {
 			for (const evt of events) {
 				if (evt.name === "session_closed" && evt.id != null) {
 					const resolveClosed = closedResolvers.get(evt.id);
@@ -1493,7 +3313,7 @@ function connectWithNative(
 			const msg = `E_HANDSHAKE_TIMEOUT: connect timed out after ${handshakeTimeout}ms`;
 			const browserName =
 				strictW3CErrors === true
-					? (normalizeToBrowserName(E_HANDSHAKE_TIMEOUT as ErrorCode, msg) ??
+					? (normalizeToBrowserName(E_HANDSHAKE_TIMEOUT as ErrorCode) ??
 						undefined)
 					: undefined;
 			settleReject(
@@ -1505,47 +3325,52 @@ function connectWithNative(
 			);
 		}, handshakeTimeout);
 
-		native.connect(url, optsJson, onClosed, (err: any, handleId?: string) => {
-			if (err) {
-				settleReject(toWebTransportError(err, strictW3CErrors));
-				return;
-			}
-			if (handleId == null) {
-				settleReject(new Error("connect succeeded but no handle id"));
-				return;
-			}
-			const handle = native.takeClientSession(handleId);
-			if (!handle) {
-				settleReject(new Error("connect: handle not found in registry"));
-				return;
-			}
-			if (settled) {
-				try {
-					handle.close?.(0, "late connect completion after timeout");
-				} catch (closeErr) {
-					const msg =
-						closeErr instanceof Error ? closeErr.message : String(closeErr);
-					console.warn(
-						`[webtransport] late connect orphan cleanup failed: ${msg}`,
-					);
+		native.connect(
+			url,
+			optsJson,
+			onClosed,
+			(err: unknown, handleId?: string) => {
+				if (err) {
+					settleReject(toWebTransportError(err, strictW3CErrors));
+					return;
 				}
-				return;
-			}
-			let closedResolve!: (info: CloseInfo) => void;
-			const closedPromise = new Promise<CloseInfo>((r) => {
-				closedResolve = r;
-			});
-			closedResolvers.set(handle.id, closedResolve);
-			settleResolve(
-				new NativeClientSession(
-					handle,
-					Promise.resolve(),
-					closedPromise,
-					strictW3CErrors,
-					streamOpenWaitTimeoutMs,
-				),
-			);
-		});
+				if (handleId == null) {
+					settleReject(new Error("connect succeeded but no handle id"));
+					return;
+				}
+				const handle = native.takeClientSession(handleId);
+				if (!handle) {
+					settleReject(new Error("connect: handle not found in registry"));
+					return;
+				}
+				if (settled) {
+					try {
+						handle.close?.(0, "late connect completion after timeout");
+					} catch (closeErr) {
+						const msg =
+							closeErr instanceof Error ? closeErr.message : String(closeErr);
+						console.warn(
+							`[webtransport] late connect orphan cleanup failed: ${msg}`,
+						);
+					}
+					return;
+				}
+				let closedResolve!: (info: CloseInfo) => void;
+				const closedPromise = new Promise<CloseInfo>((r) => {
+					closedResolve = r;
+				});
+				closedResolvers.set(handle.id, closedResolve);
+				settleResolve(
+					new NativeClientSession(
+						handle as NativeSessionHandle,
+						Promise.resolve(),
+						closedPromise,
+						strictW3CErrors,
+						streamOpenWaitTimeoutMs,
+					),
+				);
+			},
+		);
 	});
 }
 
@@ -1570,11 +3395,78 @@ function connectWithNative(
  * session.close({ code: 1000, reason: "done" });
  * ```
  */
+function mapClientTlsOptions(tls: ClientOptions["tls"]):
+	| {
+			insecureSkipVerify: boolean;
+			caPem: string | undefined;
+			serverName: string | undefined;
+	  }
+	| undefined {
+	if (!tls) return undefined;
+	return {
+		insecureSkipVerify: tls.insecureSkipVerify ?? false,
+		caPem: tls.caPem
+			? typeof tls.caPem === "string"
+				? tls.caPem
+				: new TextDecoder().decode(tls.caPem)
+			: undefined,
+		serverName: tls.serverName,
+	};
+}
+
+/** JSON identity payload the native 0-RTT vault keys client state by. */
+function clientIdentityOptsJson(opts?: ClientOptions): string {
+	return JSON.stringify({
+		tls: mapClientTlsOptions(opts?.tls),
+		serverCertificateHashes: mapServerCertificateHashes(
+			opts?.serverCertificateHashes,
+		),
+	});
+}
+
+/**
+ * Drain this process's in-memory 0-RTT tickets for a client identity
+ * (optionally scoped to one server name) into an opaque vault. Returns a
+ * token to pass to {@link importTicketVault}, or null when there is nothing
+ * to export. Tokens reference live in-process state only — they are NOT
+ * durable and mean nothing after a process restart.
+ */
+export function exportTicketVault(
+	opts?: ClientOptions,
+	serverName?: string,
+): string | null {
+	const native = getNativeOrThrow();
+	if (typeof native.exportZeroRttVault !== "function") return null;
+	return native.exportZeroRttVault(
+		clientIdentityOptsJson(opts),
+		serverName ?? null,
+	);
+}
+
+/**
+ * Import a vault previously produced by {@link exportTicketVault} into a
+ * client identity's ticket store. Consumes the token; returns false when the
+ * token is unknown or already used.
+ */
+export function importTicketVault(
+	token: string,
+	opts?: ClientOptions,
+): boolean {
+	const native = getNativeOrThrow();
+	if (typeof native.importZeroRttVault !== "function") return false;
+	return native.importZeroRttVault(clientIdentityOptsJson(opts), token);
+}
+
 export async function connect(
 	url: string,
 	opts?: ClientOptions,
 ): Promise<ClientSession> {
+	warnIfLeakyBunRuntime();
 	const native = getNativeOrThrow();
+	validateConnectUrl(url, opts?.strictW3CErrors);
+	const serverCertificateHashes = mapServerCertificateHashes(
+		opts?.serverCertificateHashes,
+	);
 	if (
 		opts?.tls?.insecureSkipVerify === true &&
 		(opts.log !== undefined || !shouldSuppressInsecureSkipVerifyWarning())
@@ -1588,25 +3480,28 @@ export async function connect(
 		});
 	}
 
+	if (opts?.serverCertificateHashes !== undefined) {
+		validateServerCertificateHashes(
+			opts.serverCertificateHashes,
+			opts?.strictW3CErrors,
+		);
+	}
+	if (opts !== undefined) {
+		validateQpackOptions(opts, opts.strictW3CErrors);
+	}
+	validateLimitsShape(opts?.limits, opts?.strictW3CErrors);
 	const mergedLimits = { ...DEFAULT_LIMITS, ...opts?.limits };
-	const tlsOpts = opts?.tls
-		? {
-				insecureSkipVerify: opts.tls.insecureSkipVerify ?? false,
-				caPem: opts.tls.caPem
-					? typeof opts.tls.caPem === "string"
-						? opts.tls.caPem
-						: new TextDecoder().decode(opts.tls.caPem)
-					: undefined,
-				serverName: opts.tls.serverName,
-			}
-		: undefined;
+	const tlsOpts = mapClientTlsOptions(opts?.tls);
 	const optsJson = JSON.stringify({
 		limits: mergedLimits,
 		tls: tlsOpts,
 		congestionControl: opts?.congestionControl,
-		serverCertificateHashes: opts?.serverCertificateHashes,
+		serverCertificateHashes: serverCertificateHashes,
 		allowPooling: opts?.allowPooling,
 		requireUnreliable: opts?.requireUnreliable,
+		enable0Rtt: opts?.enable0Rtt,
+		qpackMaxTableCapacity: opts?.qpackMaxTableCapacity,
+		enableDynamicQpack: opts?.enableDynamicQpack,
 	});
 
 	const handshakeTimeout = mergedLimits.handshakeTimeoutMs;
@@ -1637,19 +3532,47 @@ export function clientPoolMetricsSnapshot(): {
 	};
 }
 
+/**
+ * Force-return freed native allocator memory to the OS.
+ *
+ * Never required for correctness. Useful for long-lived servers after load
+ * spikes and for memory evidence: the native allocator (mimalloc) retains
+ * freed pages briefly for reuse, and this purges them immediately across the
+ * native runtime threads. Returns false when the loaded addon predates the
+ * capability.
+ */
+export function releaseNativeMemory(): boolean {
+	const native = getNativeOrThrow();
+	return native.releaseNativeMemory?.() ?? false;
+}
+
 // ---------------------------------------------------------------------------
 // Browser-style WebTransport facade (Phase P1)
 // ---------------------------------------------------------------------------
 
 function validateServerCertificateHashes(
-	arr: Array<{ algorithm: string; value: BufferSource }>,
+	arr: unknown,
 	strictW3CErrors?: boolean,
 ): void {
+	if (!Array.isArray(arr)) {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			"E_INVALID_ARGUMENT: serverCertificateHashes must be an array",
+			strictW3CErrors,
+		);
+	}
+	if (arr.length === 0) {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			"E_INVALID_ARGUMENT: serverCertificateHashes must be a non-empty array",
+			strictW3CErrors,
+		);
+	}
 	for (const entry of arr) {
 		if (entry.algorithm !== "sha-256") {
 			throw createMappedError(
-				E_INTERNAL as ErrorCode,
-				`E_INTERNAL: serverCertificateHashes only supports algorithm "sha-256", got "${entry.algorithm}"`,
+				E_UNSUPPORTED_ARGUMENT as ErrorCode,
+				`E_UNSUPPORTED_ARGUMENT: serverCertificateHashes only supports algorithm "sha-256", got "${entry.algorithm}"`,
 				strictW3CErrors,
 			);
 		}
@@ -1658,20 +3581,18 @@ function validateServerCertificateHashes(
 			!ArrayBuffer.isView(entry.value)
 		) {
 			throw createMappedError(
-				E_INTERNAL as ErrorCode,
-				"E_INTERNAL: serverCertificateHashes entry value must be BufferSource",
+				E_INVALID_ARGUMENT as ErrorCode,
+				"E_INVALID_ARGUMENT: serverCertificateHashes entry value must be BufferSource",
 				strictW3CErrors,
 			);
 		}
-		if (
-			entry.value == null ||
-			(typeof entry.value === "object" &&
-				"byteLength" in entry &&
-				entry.byteLength === 0)
-		) {
+		// A SHA-256 digest is exactly 32 bytes. The previous check inspected
+		// `entry` (the wrapper) for a `byteLength` it never has, so empty or
+		// malformed hashes passed straight through to the native pin path.
+		if (entry.value.byteLength !== 32) {
 			throw createMappedError(
-				E_INTERNAL as ErrorCode,
-				"E_INTERNAL: serverCertificateHashes entry value must be non-empty BufferSource",
+				E_INVALID_ARGUMENT as ErrorCode,
+				`E_INVALID_ARGUMENT: serverCertificateHashes sha-256 value must be exactly 32 bytes, got ${entry.value.byteLength}`,
 				strictW3CErrors,
 			);
 		}
@@ -1684,17 +3605,138 @@ function bufferSourceToUint8(value: BufferSource): Uint8Array {
 		return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
 	}
 	throw new WebTransportError(
-		E_INTERNAL as ErrorCode,
-		"E_INTERNAL: serverCertificateHashes entry value must be BufferSource",
+		E_INVALID_ARGUMENT as ErrorCode,
+		"E_INVALID_ARGUMENT: serverCertificateHashes entry value must be BufferSource",
 	);
 }
 
-function bufferSourceToBase64(value: BufferSource): string {
-	return Buffer.from(bufferSourceToUint8(value)).toString("base64");
+function mapServerCertificateHashes(
+	hashes?: Array<{ algorithm: "sha-256"; value: BufferSource }>,
+): Array<{ algorithm: "sha-256"; value: number[] }> | undefined {
+	if (hashes === undefined) return;
+	return hashes.map((entry) => ({
+		algorithm: entry.algorithm,
+		value: Array.from(bufferSourceToUint8(entry.value)),
+	}));
 }
 
 const VALID_CONGESTION = new Set(["default", "throughput", "low-latency"]);
+/** Hard cap on advertised QPACK dynamic-table capacity (mirrors the native `MAX_QPACK_TABLE_CAPACITY`, 64 KiB). */
+const MAX_QPACK_TABLE_CAPACITY = 65536;
 const VALID_DATAGRAMS_READABLE_TYPE = new Set(["bytes", "default"]);
+
+/**
+ * Both QPACK options, validated the same way on the server and the client.
+ * A capacity above the cap is rejected rather than clamped: silently
+ * advertising something other than what was asked for would be a worse answer
+ * than saying no.
+ */
+/** Every numeric `limits` field native reads (the windows are checked below). */
+const NUMERIC_LIMIT_KEYS = [
+	...Object.keys(DEFAULT_LIMITS),
+	"keepAliveIntervalMs",
+] as const;
+
+/**
+ * Reject a malformed `limits` object instead of letting native silently fall
+ * back to defaults: native reads `null`, a non-number or (for the explicit
+ * QUIC windows) anything but a positive integer as "unset". Only an absent
+ * field means default; `limits: null` itself is rejected too.
+ */
+function validateLimitsShape(
+	limits: unknown,
+	strictW3CErrors?: boolean,
+	field = "limits",
+): void {
+	if (limits === undefined) return;
+	const fail = (msg: string): never => {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			`E_INVALID_ARGUMENT: ${msg}`,
+			strictW3CErrors,
+		);
+	};
+	if (!isPlainOptionsObject(limits)) fail(`${field} must be an object`);
+	const record = limits as Record<string, unknown>;
+	const numericKeys =
+		field === "limits" ? NUMERIC_LIMIT_KEYS : NUMERIC_RATE_LIMIT_KEYS;
+	for (const key of numericKeys) {
+		const value = record[key];
+		if (
+			value !== undefined &&
+			(typeof value !== "number" || !Number.isFinite(value))
+		)
+			fail(`${field}.${key} must be a finite number, got ${String(value)}`);
+	}
+	if (field === "limits") validateQuicWindows(record, strictW3CErrors);
+}
+
+/** Every numeric `rateLimits` field native reads. */
+const NUMERIC_RATE_LIMIT_KEYS = [
+	...Object.keys(DEFAULT_RATE_LIMITS),
+	"handshakesBurstPerPrefix",
+] as const;
+
+/**
+ * Reject a malformed explicit QUIC window instead of letting native silently
+ * fall back to the governor-derived one (it reads anything but a positive
+ * integer as "unset"). Omitted stays omitted; set means a positive safe
+ * integer.
+ */
+function validateQuicWindows(
+	limits: Record<string, unknown>,
+	strictW3CErrors?: boolean,
+): void {
+	for (const key of [
+		"streamReceiveWindow",
+		"receiveWindow",
+		"sendWindow",
+	] as const) {
+		const value = (limits as Record<string, unknown>)[key];
+		if (value === undefined) continue;
+		if (
+			typeof value !== "number" ||
+			!Number.isSafeInteger(value) ||
+			value < 1
+		) {
+			throw createMappedError(
+				E_INVALID_ARGUMENT as ErrorCode,
+				`E_INVALID_ARGUMENT: limits.${key} must be a positive integer (bytes), got ${String(value)}`,
+				strictW3CErrors,
+			);
+		}
+	}
+}
+
+function validateQpackOptions(
+	opts: {
+		qpackMaxTableCapacity?: number;
+		enableDynamicQpack?: boolean;
+	},
+	strictW3CErrors?: boolean,
+): void {
+	if (
+		opts.enableDynamicQpack !== undefined &&
+		typeof opts.enableDynamicQpack !== "boolean"
+	) {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			"E_INVALID_ARGUMENT: enableDynamicQpack must be a boolean",
+			strictW3CErrors,
+		);
+	}
+	const cap = opts.qpackMaxTableCapacity;
+	if (
+		cap !== undefined &&
+		(!Number.isInteger(cap) || cap < 0 || cap > MAX_QPACK_TABLE_CAPACITY)
+	) {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			`E_INVALID_ARGUMENT: qpackMaxTableCapacity must be an integer between 0 and ${MAX_QPACK_TABLE_CAPACITY}, got ${cap}`,
+			strictW3CErrors,
+		);
+	}
+}
 
 function validateClientOptions(
 	opts?: WebTransportClientOptions,
@@ -1706,8 +3748,8 @@ function validateClientOptions(
 		typeof opts.allowPooling !== "boolean"
 	) {
 		throw createMappedError(
-			E_INTERNAL as ErrorCode,
-			"E_INTERNAL: allowPooling must be a boolean",
+			E_INVALID_ARGUMENT as ErrorCode,
+			"E_INVALID_ARGUMENT: allowPooling must be a boolean",
 			strictW3CErrors,
 		);
 	}
@@ -1716,8 +3758,8 @@ function validateClientOptions(
 		typeof opts.requireUnreliable !== "boolean"
 	) {
 		throw createMappedError(
-			E_INTERNAL as ErrorCode,
-			"E_INTERNAL: requireUnreliable must be a boolean",
+			E_INVALID_ARGUMENT as ErrorCode,
+			"E_INVALID_ARGUMENT: requireUnreliable must be a boolean",
 			strictW3CErrors,
 		);
 	}
@@ -1726,8 +3768,8 @@ function validateClientOptions(
 		!VALID_CONGESTION.has(opts.congestionControl)
 	) {
 		throw createMappedError(
-			E_INTERNAL as ErrorCode,
-			`E_INTERNAL: congestionControl must be "default", "throughput", or "low-latency", got "${opts.congestionControl}"`,
+			E_INVALID_ARGUMENT as ErrorCode,
+			`E_INVALID_ARGUMENT: congestionControl must be "default", "throughput", or "low-latency", got "${opts.congestionControl}"`,
 			strictW3CErrors,
 		);
 	}
@@ -1736,24 +3778,37 @@ function validateClientOptions(
 		!VALID_DATAGRAMS_READABLE_TYPE.has(opts.datagramsReadableType)
 	) {
 		throw createMappedError(
-			E_INTERNAL as ErrorCode,
-			`E_INTERNAL: datagramsReadableType must be "bytes" or "default", got "${opts.datagramsReadableType}"`,
+			E_INVALID_ARGUMENT as ErrorCode,
+			`E_INVALID_ARGUMENT: datagramsReadableType must be "bytes" or "default", got "${opts.datagramsReadableType}"`,
 			strictW3CErrors,
 		);
 	}
 	if (opts.serverCertificateHashes !== undefined) {
 		if (!Array.isArray(opts.serverCertificateHashes)) {
 			throw createMappedError(
-				E_INTERNAL as ErrorCode,
-				"E_INTERNAL: serverCertificateHashes must be an array",
+				E_INVALID_ARGUMENT as ErrorCode,
+				"E_INVALID_ARGUMENT: serverCertificateHashes must be an array",
+				strictW3CErrors,
+			);
+		}
+		// An empty array is a silent pinning downgrade: the consumer asked for
+		// cert pinning but supplied no hashes. Reject rather than fall back to
+		// accept-any.
+		if (opts.serverCertificateHashes.length === 0) {
+			throw createMappedError(
+				E_INVALID_ARGUMENT as ErrorCode,
+				"E_INVALID_ARGUMENT: serverCertificateHashes must be a non-empty array",
 				strictW3CErrors,
 			);
 		}
 		if (opts.allowPooling === true) {
-			throw new WebTransportError(
-				E_INTERNAL as ErrorCode,
-				"E_INTERNAL: serverCertificateHashes cannot be used with allowPooling=true",
-				{ browserName: "NotSupportedError" },
+			// W3C mandates NotSupportedError for this combination regardless of
+			// the strict flag (asserted by parity-compat) — intentionally not
+			// gated on strictW3CErrors.
+			throw createMappedError(
+				E_UNSUPPORTED_ARGUMENT as ErrorCode,
+				"E_UNSUPPORTED_ARGUMENT: serverCertificateHashes cannot be used with allowPooling=true",
+				true,
 			);
 		}
 		validateServerCertificateHashes(
@@ -1771,10 +3826,7 @@ function mapToClientOptions(opts?: WebTransportClientOptions): ClientOptions {
 		limits: opts.limits,
 		congestionControl: opts.congestionControl,
 		strictW3CErrors: opts.strictW3CErrors,
-		serverCertificateHashes: opts.serverCertificateHashes?.map((entry) => ({
-			algorithm: entry.algorithm,
-			valueBase64: bufferSourceToBase64(entry.value),
-		})),
+		serverCertificateHashes: opts.serverCertificateHashes,
 		allowPooling: opts.allowPooling,
 		requireUnreliable: opts.requireUnreliable,
 	};
@@ -1842,6 +3894,9 @@ class SendScheduler {
 		if (this.#running) return;
 		this.#running = true;
 		try {
+			// Yield one microtask so writes enqueued in the same tick are all
+			// visible and can be dispatched in sendOrder-priority order.
+			await Promise.resolve();
 			while (this.#groupOrder.length > 0) {
 				const groupId = this.#nextGroup();
 				if (groupId == null) break;
@@ -1852,12 +3907,14 @@ class SendScheduler {
 				}
 				const task = q.shift()!;
 				if (q.length === 0) this.#removeGroup(groupId);
-				try {
-					await task.run();
-					task.resolve();
-				} catch (err) {
-					task.reject(err);
-				}
+				// Dispatch WITHOUT awaiting completion: QUIC streams are
+				// independent, and per-stream write ordering is already
+				// guaranteed by the WritableStream sink contract (the next
+				// sink write starts only after this task's promise settles).
+				// Awaiting here would head-of-line-block every other stream
+				// and all datagrams behind one backpressured peer stream.
+				// Backpressure is enforced per stream by the native layer.
+				task.run().then(task.resolve, task.reject);
 			}
 		} finally {
 			this.#running = false;
@@ -1912,6 +3969,8 @@ export class WebTransport {
 	#drainingResolve!: () => void;
 	#session: ClientSession | null = null;
 	#state: WebTransportState;
+	/** Close info captured when close() races an in-flight connect. */
+	#pendingCloseInfo: WebTransportCloseInfo | null = null;
 	#datagramsCache: WebTransportDatagramDuplexStream | null = null;
 	readonly #datagramsReadableType: "bytes" | "default";
 	#incomingBidiCache: ReadableStream<{
@@ -1946,25 +4005,54 @@ export class WebTransport {
 			this.#ready = this.#sessionPromise.then(
 				(s) => {
 					this.#session = s;
-					if (this.#state !== "draining") this.#state = "connected";
+					if (this.#state === "draining") {
+						// close() was called while connecting: the session must not
+						// outlive the transport. Close it now so `closed` settles and
+						// the QUIC connection is released instead of leaking until
+						// idle timeout.
+						s.close({
+							code: this.#pendingCloseInfo?.closeCode,
+							reason: this.#pendingCloseInfo?.reason,
+						});
+					} else {
+						this.#state = "connected";
+					}
 				},
 				(err) => {
 					this.#state = "failed";
 					throw err;
 				},
 			);
+			// Symmetric to `#closed` below: a consumer may observe only `closed`
+			// (e.g. via nativeToWebTransportLike, which forwards `ready`
+			// untouched) and never await `ready`. Attach a no-op handler so a
+			// connect-failure rejection on `ready` does not surface as an
+			// unhandled rejection (which aborts under
+			// --unhandled-rejections=strict). The getter returns this same
+			// rejecting promise, so awaiters still see the error.
+			this.#ready.catch(() => {});
 			this.#closed = this.#sessionPromise.then(
 				(s) =>
 					s.closed.then((info) => {
 						this.#state = "closed";
 						return toCloseInfo(info);
 					}),
-				() => {
-					// Connect failed: closed never rejects (PARITY_MATRIX).
-					this.#state = "closed";
-					return toCloseInfo({ code: 0, reason: "" });
+				(err) => {
+					// Connect failed: per W3C, `closed` rejects with the same
+					// error as `ready` (a resolved {closeCode:0} was
+					// indistinguishable from a clean close). Keep the "failed"
+					// state that the `ready` handler set — don't mask it as a
+					// clean "closed", which callers like getStats() guard on.
+					if (this.#state !== "failed") {
+						this.#state = "closed";
+					}
+					throw err;
 				},
 			);
+			// A consumer may await only `ready` (which also rejects on connect
+			// failure); attach a no-op handler so the spec-correct `closed`
+			// rejection does not surface as an unhandled rejection.
+			this.#closed.catch(() => {});
 		} else {
 			this.#datagramsReadableType = options?.datagramsReadableType ?? "default";
 			this.#congestionControl = options?.congestionControl ?? "default";
@@ -1983,6 +4071,29 @@ export class WebTransport {
 		this.#draining = new Promise<void>((r) => {
 			this.#drainingResolve = r;
 		});
+		// `draining` also resolves when the session enters its closing phase via a
+		// remote/server-initiated close (not just local close()). Without this, a
+		// consumer awaiting `draining` to detect server shutdown would hang
+		// forever. `#drainingResolve` is idempotent, so a later local close() is
+		// harmless. (Both settle paths handled so a connect-failure rejection
+		// doesn't leave draining pending or surface unhandled.)
+		this.#closed.then(
+			() => this.#drainingResolve?.(),
+			() => this.#drainingResolve?.(),
+		);
+		// And it resolves on the real wire signal: a peer that sends
+		// WT_DRAIN_SESSION is saying the session is going away while leaving it
+		// usable, which is the case the two paths above cannot see. The close
+		// fallbacks stay — a peer that never drains must not hang consumers.
+		this.#sessionPromise.then(
+			(s) => {
+				s.draining.then(
+					() => this.#drainingResolve?.(),
+					() => this.#drainingResolve?.(),
+				);
+			},
+			() => {},
+		);
 	}
 
 	/** Resolves when handshake completes. Rejects with WebTransportError on connect failure. */
@@ -1990,7 +4101,11 @@ export class WebTransport {
 		return this.#ready;
 	}
 
-	/** Resolves with close info when session closes. Never rejects. */
+	/**
+	 * Resolves with close info when the session closes cleanly, and rejects
+	 * with a `WebTransportError` when the connection fails to establish (same
+	 * error as `ready`), per the W3C WebTransport spec.
+	 */
 	get closed(): Promise<WebTransportCloseInfo> {
 		return this.#closed;
 	}
@@ -2010,7 +4125,7 @@ export class WebTransport {
 		return new WebTransportSendGroup(this, this.#nextSendGroupId++);
 	}
 
-	/** Datagram duplex stream (W3C WebTransportDatagramDuplexStream). Throws E_SESSION_CLOSED after close. */
+	/** Datagram duplex stream (W3C WebTransportDatagramDuplexStream). Lazily initialized and cached. */
 	get datagrams(): WebTransportDatagramDuplexStream {
 		if (!this.#datagramsCache) {
 			this.#datagramsCache = createDatagramStreams(
@@ -2119,7 +4234,17 @@ export class WebTransport {
 		if (this.#state === "failed") {
 			throw new DOMException("Transport has failed", "InvalidStateError");
 		}
-		await this.#sessionPromise; // Ensure session resolved (throws if failed)
+		// If getStats() is called while still connecting and the connect then
+		// fails, awaiting #sessionPromise rejects with the raw connect error;
+		// surface the consistent InvalidStateError instead.
+		const s = await this.#sessionPromise.catch(() => {
+			throw new DOMException("Transport has failed", "InvalidStateError");
+		});
+		// Prefer wire-level QUIC stats from the native layer; fall back to
+		// facade byte tallies only when the native call is unavailable.
+		const quic = (
+			s as unknown as { _connectionStats?: () => QuicConnectionStats | null }
+		)._connectionStats?.();
 		return {
 			datagrams: {
 				droppedIncoming: 0,
@@ -2127,10 +4252,12 @@ export class WebTransport {
 				expiredOutgoing: 0,
 				lostOutgoing: 0,
 			},
-			bytesSent: this.#connStats.bytesSent,
-			bytesReceived: this.#connStats.bytesReceived,
-			packetsSent: this.#connStats.datagramsOut,
-			packetsReceived: this.#connStats.datagramsIn,
+			bytesSent: quic ? quic.bytesSent : this.#connStats.bytesSent,
+			bytesReceived: quic ? quic.bytesReceived : this.#connStats.bytesReceived,
+			packetsSent: quic ? quic.packetsSent : 0,
+			packetsReceived: quic ? quic.packetsReceived : 0,
+			smoothedRtt: quic ? quic.rttMs : undefined,
+			packetsLost: quic ? quic.packetsLost : undefined,
 			estimatedSendRate: null,
 		};
 	}
@@ -2141,6 +4268,7 @@ export class WebTransport {
 		if (this.#state === "connected" || this.#state === "connecting") {
 			this.#state = "draining";
 		}
+		if (info) this.#pendingCloseInfo = info;
 		if (this.#session) {
 			this.#session.close({
 				code: info?.closeCode,
@@ -2159,20 +4287,32 @@ export class WebTransport {
 		}
 	}
 
-	/** Internal: session for adapters (not part of spec) */
+	/** @internal */
 	async _getSession(): Promise<ClientSession> {
 		return this.#sessionPromise;
 	}
 
+	/** Internal: MTU-derived datagram size from the live session, if connected */
+	/** @internal */
+	_getPathMaxDatagramSize(): number | null {
+		const s = this.#session as unknown as {
+			_pathMaxDatagramSize?: () => number | null;
+		} | null;
+		return s?._pathMaxDatagramSize?.() ?? null;
+	}
+
 	/** Internal: state for createWritable guard (not part of spec) */
+	/** @internal */
 	_getState(): WebTransportState {
 		return this.#state;
 	}
 
+	/** @internal */
 	_isStrictW3CErrors(): boolean {
 		return this.#strictW3CErrors;
 	}
 
+	/** @internal */
 	_resolveSendPolicy(options?: {
 		sendOrder?: number;
 		sendGroup?: WebTransportSendGroup | null;
@@ -2201,6 +4341,7 @@ export class WebTransport {
 		return { groupId, sendOrder };
 	}
 
+	/** @internal */
 	_recordSendGroupBytes(groupId: number, bytes: number): void {
 		this.#sendGroupBytesSent.set(
 			groupId,
@@ -2208,6 +4349,7 @@ export class WebTransport {
 		);
 	}
 
+	/** @internal */
 	async _getSendGroupStats(groupId: number): Promise<{
 		bytesSent?: number;
 		bytesAcknowledged?: number;
@@ -2217,6 +4359,7 @@ export class WebTransport {
 		};
 	}
 
+	/** @internal */
 	async _sendDatagramWithPolicy(
 		chunk: Uint8Array,
 		policy: SendPolicy,
@@ -2230,11 +4373,13 @@ export class WebTransport {
 		});
 	}
 
+	/** @internal */
 	_recordIncomingDatagram(chunk: Uint8Array): void {
 		this.#connStats.bytesReceived += chunk.byteLength;
 		this.#connStats.datagramsIn += 1;
 	}
 
+	/** @internal */
 	_recordIncomingStreamBytes(bytes: number): void {
 		this.#connStats.bytesReceived += bytes;
 	}
@@ -2321,7 +4466,9 @@ function createDatagramStreams(
 			return createDatagramWritable(wt, wt._resolveSendPolicy(options));
 		},
 		get maxDatagramSize(): number {
-			return DEFAULT_LIMITS.maxDatagramSize;
+			// Path-MTU-derived value from QUIC when connected; configured
+			// default until the handshake completes.
+			return wt._getPathMaxDatagramSize() ?? DEFAULT_LIMITS.maxDatagramSize;
 		},
 	};
 }
@@ -2363,30 +4510,383 @@ function attachServerRecvControls(
 	return withControls;
 }
 
+type ServerIncomingStreamResource = {
+	dispose(): void;
+	reset(code?: number): void;
+	stopSending(code?: number): void;
+};
+
+class ServerIncomingBidiResource implements ServerIncomingStreamResource {
+	handle: NativeBidiStreamHandle | null;
+	disposed = false;
+	readableDone = false;
+	writableDone = false;
+	/** True once the W3C readable began reading the handle (its first direct
+	 * pull, or its read-group feeder starting) — a sink cannot open after that. */
+	didRead = false;
+	private writableStream: WritableStream<Uint8Array> | null = null;
+	readonly onDisposed: (resource: ServerIncomingStreamResource) => void;
+
+	constructor(
+		nativeStream: NativeBidiStreamHandle,
+		onDisposed: (resource: ServerIncomingStreamResource) => void,
+	) {
+		this.handle = nativeStream;
+		this.onDisposed = onDisposed;
+	}
+
+	getWritable(): WritableStream<Uint8Array> {
+		return (this.writableStream ??= new WritableStream<Uint8Array>(this));
+	}
+
+	release(abort: boolean, code = 0): void {
+		if (this.disposed) return;
+		this.disposed = true;
+		const current = this.handle;
+		this.handle = null;
+		if (current) {
+			if (abort) {
+				try {
+					current.stopSending?.(code);
+				} catch {
+					// Session teardown may already have closed the stream.
+				}
+				try {
+					current.reset?.(code);
+				} catch {
+					// Session teardown may already have closed the stream.
+				}
+			}
+			try {
+				current.dispose?.();
+			} catch {
+				// Resource disposal is best-effort during stream teardown.
+			}
+		}
+		this.onDisposed(this);
+		// A group-fed readable detaches from the pump and settles.
+		this.readOwner.released?.();
+	}
+
+	dispose(): void {
+		this.release(true);
+	}
+
+	reset(code = 0): void {
+		this.release(true, code);
+	}
+
+	stopSending(code = 0): void {
+		try {
+			this.handle?.stopSending?.(code);
+		} catch {
+			// Session teardown may already have closed the stream.
+		}
+	}
+
+	/** The readable half's view of this resource (see native-readable.ts). */
+	readonly readOwner: NativeReadableOwner = {
+		current: () => (this.disposed ? null : this.handle),
+		onRead: () => {
+			this.didRead = true;
+		},
+		onEnd: () => {
+			this.readableDone = true;
+			this.maybeRelease();
+		},
+		onError: (err) => {
+			this.readableDone = true;
+			this.release(true);
+			return toWebTransportError(err);
+		},
+		onCancel: (reason) => this.cancel(reason),
+	};
+
+	/** See BidiStream.openReadSink — same contract on the W3C wrapper. */
+	openReadSink(opts?: StreamSinkOptionsType): StreamSinkHandleType {
+		const current = this.handle;
+		if (!current || this.disposed) throw new Error("E_STREAM_RESET");
+		if (this.didRead) throw new Error("E_SINK_READ_ACTIVE");
+		return openReadSinkOnNativeHandle(
+			current as unknown as SinkCapableNativeHandle,
+			opts,
+		);
+	}
+
+	cancel(reason: unknown): void {
+		if (this.disposed) return;
+		this.readableDone = true;
+		// W3C half-close: canceling the readable stops only the peer's sending
+		// half. The writable half must stay usable for a response.
+		this.stopSending(extractStreamErrorCode(reason));
+		this.maybeRelease();
+	}
+
+	async write(chunk: Uint8Array): Promise<void> {
+		const current = this.handle;
+		if (!current || this.disposed) {
+			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
+		}
+		try {
+			unwrapNativeVoid(await current.write(Buffer.from(chunk)));
+		} catch (err) {
+			this.writableDone = true;
+			try {
+				current.reset?.(0);
+			} catch {
+				// Session teardown may already have closed the stream.
+			}
+			this.maybeRelease();
+			throw toWebTransportError(err);
+		}
+	}
+
+	async close(): Promise<void> {
+		const current = this.handle;
+		if (!current || this.disposed) {
+			throw new WebTransportError(E_SESSION_CLOSED as ErrorCode);
+		}
+		try {
+			const finish = current.finishWait ?? current.finish;
+			if (finish) unwrapNativeVoid((await finish.call(current)) ?? null);
+			this.writableDone = true;
+			this.maybeRelease();
+		} catch (err) {
+			this.writableDone = true;
+			try {
+				current.reset?.(0);
+			} catch {
+				// Session teardown may already have closed the stream.
+			}
+			this.maybeRelease();
+			throw toWebTransportError(err);
+		}
+	}
+
+	abort(reason: unknown): void {
+		if (this.disposed) return;
+		this.writableDone = true;
+		// W3C half-close: aborting the writable resets only our sending half;
+		// the readable half keeps delivering peer data.
+		try {
+			this.handle?.reset?.(extractStreamErrorCode(reason));
+		} catch {
+			// Session teardown may already have closed the stream.
+		}
+		this.maybeRelease();
+	}
+
+	private maybeRelease(): void {
+		if (this.readableDone && this.writableDone) this.release(false);
+	}
+}
+
+/**
+ * Keep the writable half allocation lazy for read-only consumers. The W3C
+ * surface still exposes the same stable writable stream once it is requested,
+ * but high-volume receive paths no longer allocate a sink they never use.
+ */
+function createServerIncomingBidiWebStreams(
+	nativeStream: NativeBidiStreamHandle,
+	onDisposed: (resource: ServerIncomingStreamResource) => void,
+): {
+	resource: ServerIncomingStreamResource;
+	stream: WebTransportBidirectionalStream;
+} {
+	const resource = new ServerIncomingBidiResource(nativeStream, onDisposed);
+	const readable = createIncomingReadable(nativeStream, resource.readOwner);
+	const stream = {
+		readable,
+		get writable(): WritableStream<Uint8Array> {
+			return resource.getWritable();
+		},
+	} as WebTransportBidirectionalStream;
+	return {
+		resource,
+		stream: attachServerBidiResourceControls(stream, resource),
+	};
+}
+
+function attachServerBidiResourceControls(
+	stream: {
+		readable: ReadableStream<Uint8Array>;
+		writable: WritableStream<Uint8Array>;
+	},
+	resource: ServerIncomingStreamResource,
+): WebTransportBidirectionalStream {
+	const withControls = stream as WebTransportBidirectionalStream;
+	withControls[WT_RESET] = (code?: number) => resource.reset(code);
+	withControls[WT_STOP_SENDING] = (code?: number) => resource.stopSending(code);
+	(
+		withControls as unknown as {
+			openReadSink(opts?: StreamSinkOptionsType): StreamSinkHandleType;
+		}
+	).openReadSink = (opts?: StreamSinkOptionsType) =>
+		(resource as ServerIncomingBidiResource).openReadSink(opts);
+	return withControls;
+}
+
+class ServerIncomingUniResource implements ServerIncomingStreamResource {
+	handle: NativeRecvStreamHandle | null;
+	disposed = false;
+	/** True once the W3C readable began reading the handle (its first direct
+	 * pull, or its read-group feeder starting) — a sink cannot open after that. */
+	didRead = false;
+	readonly onDisposed: (resource: ServerIncomingStreamResource) => void;
+
+	constructor(
+		nativeStream: NativeRecvStreamHandle,
+		onDisposed: (resource: ServerIncomingStreamResource) => void,
+	) {
+		this.handle = nativeStream;
+		this.onDisposed = onDisposed;
+	}
+
+	release(abort: boolean, code = 0): void {
+		if (this.disposed) return;
+		this.disposed = true;
+		const current = this.handle;
+		this.handle = null;
+		if (current) {
+			if (abort) {
+				try {
+					current.stopSending?.(code);
+				} catch {
+					// Session teardown may already have closed the stream.
+				}
+			}
+			try {
+				current.dispose?.();
+			} catch {
+				// Resource disposal is best-effort during stream teardown.
+			}
+		}
+		this.onDisposed(this);
+		// A group-fed readable detaches from the pump and settles.
+		this.readOwner.released?.();
+	}
+
+	dispose(): void {
+		this.release(true);
+	}
+
+	reset(code = 0): void {
+		this.release(true, code);
+	}
+
+	stopSending(code = 0): void {
+		try {
+			this.handle?.stopSending?.(code);
+		} catch {
+			// Session teardown may already have closed the stream.
+		}
+	}
+
+	/** The readable's view of this resource (see native-readable.ts). */
+	readonly readOwner: NativeReadableOwner = {
+		current: () => (this.disposed ? null : this.handle),
+		onRead: () => {
+			this.didRead = true;
+		},
+		onEnd: () => this.release(false),
+		onError: (err) => {
+			this.release(true);
+			return toWebTransportError(err);
+		},
+		onCancel: (reason) => this.cancel(reason),
+	};
+
+	cancel(reason: unknown): void {
+		this.release(true, extractStreamErrorCode(reason));
+	}
+
+	/** See RecvStream.openReadSink — same contract on the W3C wrapper. */
+	openReadSink(opts?: StreamSinkOptionsType): StreamSinkHandleType {
+		const current = this.handle;
+		if (!current || this.disposed) throw new Error("E_STREAM_RESET");
+		if (this.didRead) throw new Error("E_SINK_READ_ACTIVE");
+		return openReadSinkOnNativeHandle(
+			current as unknown as SinkCapableNativeHandle,
+			opts,
+		);
+	}
+}
+
+function createServerIncomingUniWebReadable(
+	nativeStream: NativeRecvStreamHandle,
+	onDisposed: (resource: ServerIncomingStreamResource) => void,
+): {
+	resource: ServerIncomingStreamResource;
+	readable: WebTransportReceiveStream;
+} {
+	const resource = new ServerIncomingUniResource(nativeStream, onDisposed);
+	const readable = createIncomingReadable(nativeStream, resource.readOwner);
+	const withControls = readable as WebTransportReceiveStream;
+	withControls[WT_STOP_SENDING] = (code?: number) => resource.stopSending(code);
+	(
+		withControls as unknown as {
+			openReadSink(opts?: StreamSinkOptionsType): StreamSinkHandleType;
+		}
+	).openReadSink = (opts?: StreamSinkOptionsType) =>
+		resource.openReadSink(opts);
+	return { resource, readable: withControls };
+}
+
 function createServerIncomingBidiStreams(
 	nativeHandle: any,
 	isClosed: () => boolean,
+	closedPromise?: Promise<unknown>,
 ): ReadableStream<WebTransportBidirectionalStream> {
+	// Pull-based: streams are accepted from native only as fast as the
+	// consumer reads them, so a slow/stalled consumer cannot pile up
+	// unbounded native handles in the queue.
+	let cancelled = false;
+	const activeStreams = new Set<ServerIncomingStreamResource>();
+	const removeActiveStream = (resource: ServerIncomingStreamResource) =>
+		activeStreams.delete(resource);
+	const disposeActiveStreams = () => {
+		for (const stream of activeStreams) stream.dispose();
+		activeStreams.clear();
+	};
+	void closedPromise?.then(disposeActiveStreams, disposeActiveStreams);
 	return new ReadableStream({
-		async start(controller) {
-			while (!isClosed()) {
-				try {
-					const nativeStream = await nativeHandle.acceptBidiStream();
-					if (!nativeStream) break;
-					const duplex = new BidiStream({
-						handleId: nativeStream?.id ?? 0,
-						nativeHandle: nativeStream,
-					});
-					controller.enqueue(
-						attachServerBidiControls(duplex, await nodeDuplexToWebBidi(duplex)),
-					);
-				} catch (err) {
-					if (isClosed() || isSessionCloseError(err)) break;
-					controller.error(toWebTransportError(err));
+		async pull(controller) {
+			if (cancelled) return;
+			if (isClosed()) {
+				disposeActiveStreams();
+				controller.close();
+				return;
+			}
+			try {
+				const nativeStream = await nativeHandle.acceptBidiStream();
+				if (cancelled) {
+					nativeStream?.reset?.(0);
 					return;
 				}
+				if (!nativeStream) {
+					controller.close();
+					return;
+				}
+				const direct = createServerIncomingBidiWebStreams(
+					nativeStream,
+					removeActiveStream,
+				);
+				activeStreams.add(direct.resource);
+				controller.enqueue(direct.stream);
+			} catch (err) {
+				if (isClosed() || isSessionCloseError(err)) {
+					disposeActiveStreams();
+					controller.close();
+					return;
+				}
+				controller.error(toWebTransportError(err));
 			}
-			controller.close();
+		},
+		cancel() {
+			// Only stop accepting new streams. Streams already handed to the
+			// application stay owned by it and are released by their own
+			// lifecycle or by session close.
+			cancelled = true;
 		},
 	});
 }
@@ -2394,30 +4894,56 @@ function createServerIncomingBidiStreams(
 function createServerIncomingUniStreams(
 	nativeHandle: any,
 	isClosed: () => boolean,
+	closedPromise?: Promise<unknown>,
 ): ReadableStream<WebTransportReceiveStream> {
+	// Pull-based for the same backpressure reasons as the bidi variant.
+	let cancelled = false;
+	const activeStreams = new Set<ServerIncomingStreamResource>();
+	const removeActiveStream = (resource: ServerIncomingStreamResource) =>
+		activeStreams.delete(resource);
+	const disposeActiveStreams = () => {
+		for (const stream of activeStreams) stream.dispose();
+		activeStreams.clear();
+	};
+	void closedPromise?.then(disposeActiveStreams, disposeActiveStreams);
 	return new ReadableStream({
-		async start(controller) {
-			while (!isClosed()) {
-				try {
-					const nativeStream = await nativeHandle.acceptUniStream();
-					if (!nativeStream) break;
-					const readable = new RecvStream({
-						handleId: nativeStream?.id ?? 0,
-						nativeHandle: nativeStream,
-					});
-					controller.enqueue(
-						attachServerRecvControls(
-							readable,
-							nodeReadableToWebReadable(readable),
-						),
-					);
-				} catch (err) {
-					if (isClosed() || isSessionCloseError(err)) break;
-					controller.error(toWebTransportError(err));
+		async pull(controller) {
+			if (cancelled) return;
+			if (isClosed()) {
+				disposeActiveStreams();
+				controller.close();
+				return;
+			}
+			try {
+				const nativeStream = await nativeHandle.acceptUniStream();
+				if (cancelled) {
+					nativeStream?.stopSending?.(0);
 					return;
 				}
+				if (!nativeStream) {
+					controller.close();
+					return;
+				}
+				const direct = createServerIncomingUniWebReadable(
+					nativeStream,
+					removeActiveStream,
+				);
+				activeStreams.add(direct.resource);
+				controller.enqueue(direct.readable);
+			} catch (err) {
+				if (isClosed() || isSessionCloseError(err)) {
+					disposeActiveStreams();
+					controller.close();
+					return;
+				}
+				controller.error(toWebTransportError(err));
 			}
-			controller.close();
+		},
+		cancel() {
+			// Only stop accepting new streams. Streams already handed to the
+			// application stay owned by it and are released by their own
+			// lifecycle or by session close.
+			cancelled = true;
 		},
 	});
 }
@@ -2426,24 +4952,34 @@ function createIncomingBidiStreams(wt: WebTransport): ReadableStream<{
 	readable: ReadableStream<Uint8Array>;
 	writable: WritableStream<Uint8Array>;
 }> {
+	// Pull-based: accept from the session only as fast as the consumer reads.
+	let iter: AsyncIterator<Duplex> | null = null;
 	return new ReadableStream({
-		async start(controller) {
-			const s = await wt._getSession();
-			for await (const duplex of s.incomingBidirectionalStreams()) {
-				controller.enqueue(
-					await nodeDuplexToWebBidi(
-						duplex,
-						undefined,
-						undefined,
-						undefined,
-						(bytes) => {
-							wt._recordIncomingStreamBytes(bytes);
-						},
-						wt._isStrictW3CErrors(),
-					),
-				);
+		async pull(controller) {
+			if (!iter) {
+				const s = await wt._getSession();
+				iter = s.incomingBidirectionalStreams()[Symbol.asyncIterator]();
 			}
-			controller.close();
+			const { value: duplex, done } = await iter.next();
+			if (done) {
+				controller.close();
+				return;
+			}
+			controller.enqueue(
+				await nodeDuplexToWebBidi(
+					duplex,
+					undefined,
+					undefined,
+					undefined,
+					(bytes) => {
+						wt._recordIncomingStreamBytes(bytes);
+					},
+					wt._isStrictW3CErrors(),
+				),
+			);
+		},
+		cancel() {
+			void iter?.return?.();
 		},
 	});
 }
@@ -2451,21 +4987,31 @@ function createIncomingBidiStreams(wt: WebTransport): ReadableStream<{
 function createIncomingUniStreams(
 	wt: WebTransport,
 ): ReadableStream<ReadableStream<Uint8Array>> {
+	// Pull-based: accept from the session only as fast as the consumer reads.
+	let iter: AsyncIterator<Readable> | null = null;
 	return new ReadableStream({
-		async start(controller) {
-			const s = await wt._getSession();
-			for await (const readable of s.incomingUnidirectionalStreams()) {
-				controller.enqueue(
-					nodeReadableToWebReadable(
-						readable,
-						(bytes) => {
-							wt._recordIncomingStreamBytes(bytes);
-						},
-						wt._isStrictW3CErrors(),
-					),
-				);
+		async pull(controller) {
+			if (!iter) {
+				const s = await wt._getSession();
+				iter = s.incomingUnidirectionalStreams()[Symbol.asyncIterator]();
 			}
-			controller.close();
+			const { value: readable, done } = await iter.next();
+			if (done) {
+				controller.close();
+				return;
+			}
+			controller.enqueue(
+				nodeReadableToWebReadable(
+					readable,
+					(bytes) => {
+						wt._recordIncomingStreamBytes(bytes);
+					},
+					wt._isStrictW3CErrors(),
+				),
+			);
+		},
+		cancel() {
+			void iter?.return?.();
 		},
 	});
 }
@@ -2477,6 +5023,7 @@ function nodeDuplexToWebBidi(
 	onWriteBytes?: (bytes: number) => void,
 	onReadBytes?: (bytes: number) => void,
 	strictW3CErrors = false,
+	destroyOnReadableCancel = false,
 ): Promise<{
 	readable: ReadableStream<Uint8Array>;
 	writable: WritableStream<Uint8Array>;
@@ -2485,6 +5032,7 @@ function nodeDuplexToWebBidi(
 		duplex,
 		onReadBytes,
 		strictW3CErrors,
+		destroyOnReadableCancel,
 	);
 	const writable = nodeWritableToWebWritable(
 		duplex,
@@ -2496,43 +5044,74 @@ function nodeDuplexToWebBidi(
 	return Promise.resolve({ readable, writable });
 }
 
-/** Extract QUIC application error code from abort/cancel reason. */
-function extractStreamErrorCode(reason: unknown): number {
-	if (typeof reason === "number" && Number.isInteger(reason)) return reason;
-	const o =
-		reason && typeof reason === "object"
-			? (reason as Record<string, unknown>)
-			: null;
-	if (o) {
-		const c = (o.streamErrorCode ?? o.code) as unknown;
-		if (typeof c === "number" && Number.isInteger(c)) return c;
-	}
-	return 0;
+/**
+ * The native-backed client streams' readable: a byte stream pulling the addon
+ * directly, with the Node stream kept only as the owner of the handle's
+ * lifecycle (see `directReadOwner` in streams.ts). Null for anything without
+ * a native handle, which keeps the Node adapter below.
+ */
+function directNativeReadable(
+	r: Readable,
+	onReadBytes: ((bytes: number) => void) | undefined,
+	strictW3CErrors: boolean,
+	destroyOnCancel: boolean,
+): ReadableStream<Uint8Array> | null {
+	const owner = (r as unknown as Partial<DirectReadable>)[WT_DIRECT_READ_OWNER];
+	if (typeof owner !== "function") return null;
+	const direct = owner.call(r, {
+		toError: (err: unknown) => toWebTransportError(err, strictW3CErrors),
+		cancelCode: extractStreamErrorCode,
+		destroyOnCancel,
+	});
+	if (!direct) return null;
+	if (onReadBytes) direct.onBytes = onReadBytes;
+	return createNativeByteReadable(direct);
 }
 
 function nodeReadableToWebReadable(
 	r: Readable,
 	onReadBytes?: (bytes: number) => void,
 	strictW3CErrors = false,
+	destroyOnCancel = true,
 ): ReadableStream<Uint8Array> {
+	const direct = directNativeReadable(
+		r,
+		onReadBytes,
+		strictW3CErrors,
+		destroyOnCancel,
+	);
+	if (direct) return direct;
 	const stopSendable = r as unknown as Partial<StopSendable>;
+	// Pull-based so the web stream's highWaterMark actually bounds buffering:
+	// a slow consumer stops pulls, which stops draining the native channel,
+	// which lets QUIC flow control push back on the peer. The previous eager
+	// start() loop buffered a fast sender unboundedly.
+	const iter = r[Symbol.asyncIterator]();
 	return new ReadableStream<Uint8Array>({
-		async start(controller) {
+		async pull(controller) {
 			try {
-				for await (const chunk of r) {
-					const bytes =
-						chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
-					if (onReadBytes) onReadBytes(bytes.byteLength);
-					controller.enqueue(bytes);
+				const { value: chunk, done } = await iter.next();
+				if (done) {
+					controller.close();
+					return;
 				}
-				controller.close();
+				const bytes =
+					chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+				if (onReadBytes) onReadBytes(bytes.byteLength);
+				controller.enqueue(bytes);
 			} catch (err) {
 				controller.error(toWebTransportError(err, strictW3CErrors));
 			}
 		},
-		cancel(reason) {
+		async cancel(reason) {
 			const fn = stopSendable[WT_STOP_SENDING];
 			if (typeof fn === "function") fn.call(r, extractStreamErrorCode(reason));
+			// Abort the Node/native stream before asking its async iterator to
+			// return. A pending iterator.next() owns the N-API stream handle; if
+			// return() runs first, cancellation can wait on that read while the
+			// native stop/reset signal is still queued behind it.
+			if (destroyOnCancel && !r.destroyed) r.destroy();
+			await iter.return?.();
 		},
 	});
 }
@@ -2602,14 +5181,83 @@ function createNativeServerSessionForTests(nativeHandle: any): ServerSession {
 	);
 }
 
+/** @internal */
 export const __TESTING__ = {
+	/**
+	 * Server surfaces excluded from the 1.0 contract (reflector, campaign
+	 * getters and diagnostics, campaign counters). Unstable; see
+	 * server-internals.ts.
+	 */
+	serverInternals,
 	createNativeClientSessionForTests,
 	createNativeServerSessionForTests,
 	createServerIncomingBidiStreamsForTests: createServerIncomingBidiStreams,
 	createServerIncomingUniStreamsForTests: createServerIncomingUniStreams,
 	tryLoadNativeAddonForTests: tryLoadNativeAddon,
 	buildNativeAddonLoadErrorMessageForTests: buildNativeAddonLoadErrorMessage,
+	nativeAddonOverrideRequestsFromEnvForTests:
+		nativeAddonOverrideRequestsFromEnv,
 	connectWithNativeForTests: connectWithNative,
+	nativeStreamHandlesSnapshotForTests: () =>
+		native?.nativeStreamHandlesSnapshot?.(),
+	nativeAwaitProbeSnapshotForTests: () => native?.nativeAwaitProbeSnapshot?.(),
+	pacerStatsForwardsForTests: pacerStatsForwards,
+	nativeErrorCodes: KNOWN_ERROR_CODES,
+	extractMessageErrorCodeForTests: extractMessageErrorCode,
+	parseDatagramBatchSizeForTests: parseDatagramBatchSize,
+	/** Frozen snapshot of what this process resolved at module init. */
+	datagramBatchConfigForTests: (): Readonly<{
+		batchSize: number;
+		diagnosticsEnabled: boolean;
+		defaultBatchSize: number;
+		maxBatchSize: number;
+	}> =>
+		Object.freeze({
+			batchSize: datagramBatchSize,
+			diagnosticsEnabled: datagramBatchDiagnosticsEnabled,
+			defaultBatchSize: DEFAULT_DATAGRAM_BATCH,
+			maxBatchSize: MAX_DATAGRAM_BATCH,
+		}),
+	/** The exact generator both native session classes run. */
+	createIncomingDatagramIteratorForTests: createIncomingDatagramIterator,
+	datagramBatchDiagnosticsSnapshotForTests: datagramBatchDiagnosticsSnapshot,
+	datagramBatchMismatchMessageForTests: DATAGRAM_BATCH_MISMATCH_MESSAGE,
+	parseStreamBatchBytesForTests: parseStreamBatchBytes,
+	/** Frozen snapshot of what this process resolved at module init. */
+	streamBatchConfigForTests: streamBatchConfig,
+	/** G5's crossing instrument: crossings/s, mean bytes/crossing, max batch. */
+	streamBatchDiagnosticsSnapshotForTests: streamBatchDiagnosticsSnapshot,
+	resetStreamBatchDiagnosticsForTests: resetStreamBatchDiagnostics,
+	/** The exact receive-side crossing both incoming-stream readables run. */
+	readStreamChunkForTests: readStreamChunk,
+	/** The direct byte-stream readable every native incoming stream uses. */
+	createNativeByteReadableForTests: createNativeByteReadable,
+	/** The cross-stream delivery pump (read-group.ts), driven by a fake group. */
+	ReadGroupPumpForTests: ReadGroupPump,
+	readGroupConfigForTests: readGroupConfig,
+	readGroupStateSnapshotForTests: readGroupStateSnapshot,
+	setReadGroupMaxEntriesForTests,
+	readGroupDiagnosticsSnapshotForTests: readGroupDiagnosticsSnapshot,
+	resetReadGroupDiagnosticsForTests: resetReadGroupDiagnostics,
+	/** The addon's group constructor, when this addon has one. */
+	createNativeReadGroupForTests: (): NativeReadGroup | null => {
+		const ReadGroup = (
+			native as { StreamReadGroup?: new () => NativeReadGroup } | undefined
+		)?.StreamReadGroup;
+		return ReadGroup ? new ReadGroup() : null;
+	},
+	nativePayloadDeliveryModeForTests: () =>
+		native?.nativePayloadDeliveryMode?.(),
+	nativePayloadEngineOwnedMaxBytesForTests: () =>
+		native?.nativePayloadEngineOwnedMaxBytes?.(),
+	/** What the addon would configure for a given limits object — the same
+	 * merge `createServer` performs, so a test sees the production JSON. */
+	transportWindowsForLimitsForTests: (limits?: Partial<LimitsOptions>) =>
+		native?.nativeTransportWindows?.(
+			JSON.stringify({ ...DEFAULT_LIMITS, ...limits }),
+		),
+	materializePayloadBatchForTests: (payloads: (Buffer | Uint8Array)[]) =>
+		native?.materializePayloadBatchForTests?.(payloads),
 };
 
 /**
@@ -2634,3 +5282,9 @@ export const __TESTING__ = {
 export function toWebTransport(session: ClientSession): WebTransport {
 	return new WebTransport(session);
 }
+
+// Backend-agnostic facade: the same contract is implemented by the wasm
+// backend (`@webtransport-bun/webtransport/wasm`), letting application code
+// run unchanged against either backend.
+export type { WebTransportLike, WtBidiStream, WtCloseInfo } from "./shared.js";
+export { nativeToWebTransportLike } from "./webtransport-like-native.js";

@@ -17,15 +17,63 @@ Use `metricsToPrometheus(snapshot, labels?)` to produce Prometheus exposition fo
 | streamTasksActive | number | Internal stream tasks |
 | datagramsIn | number | Datagrams received |
 | datagramsOut | number | Datagrams sent |
-| datagramsDropped | number | Datagrams dropped (oversize, rate limit, or budget) |
+| datagramsDropped | number | Inbound datagrams dropped at ingest (oversize, datagram rate-limit, or queued-bytes budget). Native identity: this equals the four reason fields below when those fields are present. |
+| datagramsDroppedTooLarge | number? | Native ingest: datagram larger than `maxDatagramSize`. Omitted on WASM. |
+| datagramsDroppedQueueSession | number? | Native ingest: per-session queued-bytes budget. Omitted on WASM. |
+| datagramsSkippedQueueFull | number? | Native ingest: times the session task parked `receive_datagram` because remaining session slack could not fit `maxDatagramSize`. Park events, not datagrams. Not part of the drop-reason identity. Omitted on WASM. |
+| datagramsDroppedQueueGlobal | number? | Native ingest: global queued-bytes budget. Omitted on WASM. |
+| datagramsDroppedRateLimited | number? | Native ingest: per-IP datagram ingress rate limit. Also counted in `rateLimitedCount`. Omitted on WASM. |
 | queuedBytesGlobal | number | Bytes queued globally |
 | backpressureWaitCount | number | Times server session send waited on backpressure (incremented on timeout) |
 | backpressureTimeoutCount | number | Times server session send_datagram timed out (E_BACKPRESSURE_TIMEOUT) |
+| datagramMirrorCalls | number? | Native only: `server.sendDatagramMirror()` calls served. Never counted in `datagramSendsAsync` — the mirror hands JavaScript no promise, so it creates none of the host-loop exposure that counter names. Omitted on WASM. |
+| datagramMirrorTargets | number? | Native only: targets those mirror calls **attempted** (an over-cap tail is reported, never attempted, and is not counted here). Delivery is per-session `datagramsOut`, which the mirror increments exactly as every other send path does, so a mirrored datagram is indistinguishable from a looped one there. Omitted on WASM. |
+| datagramMirrorPacedCalls | number? | Native only: `server.sendDatagramMirrorPaced()` calls served. Its own meter rather than a share of `datagramMirrorCalls`, because the two envelopes report different things — delivery and admission to the egress pacer's schedule — and a counter that summed them would name neither. Omitted on WASM. |
+| datagramMirrorPacedTargets | number? | Native only: targets those paced calls **offered to admission**. `offered − admitted` is the pacer's own `refusedTargets`; delivery stays per-session `datagramsOut`. Omitted on WASM. |
+| mirrorReportsDropped | number? | Native only: deferred mirror reports lost to overflow of the fixed 4,096-entry ring `server.readMirrorReports()` drains — the visible cost of polling too slowly. Process-wide, like the pacer's schedule, so a second server in the process reads the same number. `drained + this` reconciles against the pacer's `deferredFailures`. Omitted on WASM. |
+| datagramSendsAsync | number? | Native only: datagram sends that fell back to the parking Node-API call. Each one hands JavaScript a promise backed by a ThreadsafeFunction, a reference on the host event loop, so this meters exposure to that class. It is not a latency signal. Omitted on WASM. |
+| sessionsClosedByIdle | number? | Native only: sessions the QUIC idle timeout ended (peer went away). Omitted on WASM. |
+| sessionsClosedByReap | number? | Native only: sessions this server ended itself while shutting down. Omitted on WASM. |
+| sessionsClosedOther | number? | Native only: every other way a session ended (peer close, transport error). Omitted on WASM. |
+| nativeAsyncOpsPending | number? | Native only: unsettled Node-API async operations this server still owns. Non-zero after `close()` resolves means the addon still holds the host event loop open. Omitted on WASM. |
+| sinksActive | number? | **Experimental.** Native only, process-wide: stream sinks (`openReadSink`) currently running in this process, on client and server streams alike. Returns to 0 once every sink has ended; a sink leak gauge. Omitted on WASM. |
+| sinkDroppedRecords | number? | **Experimental.** Native only, process-wide and cumulative: records dropped by sinks in `overflow: "drop-newest"` mode. Each sink also discloses its drops in-band as `drops` records. Omitted on WASM. |
+| nativeSessionRegistryEntries, nativeTrackedTasks, nativeRateLimitEntries, nativeBidiHandlesLive, nativeUniSendHandlesLive, nativeUniRecvHandlesLive | number? | Native only: live sizes of the addon's registries and handle tables. Use them as leak gauges: after load stops they should return to their idle values. Omitted on WASM. |
 | rateLimitedCount | number | Sessions rejected by per-IP/per-prefix rate limit |
 | limitExceededCount | number | Sessions rejected (maxSessions, maxHandshakesInFlight) |
 | sniCertSelections | number | Handshakes served by hostname-specific SNI certificates |
 | defaultCertSelections | number | Handshakes served by the default certificate |
 | unknownSniRejectedCount | number | Handshakes rejected because SNI did not match a configured hostname |
+
+## Internal counters (not public)
+
+The native addon also counts things that only a measurement campaign can
+interpret. Before 1.0 some of them sat on `MetricsSnapshot`; they are **not**
+part of the public snapshot. The public `metricsSnapshot()` strips them at
+runtime, and `metricsToPrometheus()` never emitted them. Harnesses read them
+through the unstable `__TESTING__.serverInternals(server).metricsSnapshot()`
+(see `docs/SPEC.md`, "Semver rules"). No compatibility promise applies:
+
+- `datagramReflect*` (14 fields): the internal datagram reflector.
+- `udpSendBatch*` (8 fields): the unsupported
+  `WEBTRANSPORT_NATIVE_UDP_SEND_BATCH` path; all zero while it is off.
+- `datagramPumpsSpawned`, `datagramPumpsLive`: the wtransport fork's
+  per-connection datagram pump tasks.
+- `quicSessions`, `quicUdpDatagramsReceived`, `quicUdpDatagramsSent`,
+  `quicDatagramFramesReceived`, `quicDatagramFramesSent`, `quicPacketsSent`,
+  `quicPacketsLost`: quinn counters summed over live connections. They are a
+  boundary sample for loss attribution, not lifetime totals.
+
+## WASM governor snapshot (`governor_snapshot_json`)
+
+In addition to the shared governor fields (`sessionsActive`, queued bytes, rate-limit counters), the wasm endpoint snapshot includes:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| wtSessionsActive | number | Live primary/extra WT sessions + client pending CONNECTs (excludes server unlatched admitted CONNECTs that still count toward admission occupied) |
+| sessionClosedCount | number | Cumulative `SessionClosed` events (extra-session / timed-out CONNECT) |
+
+Per-connection `has0Rtt` / `accepted0Rtt` remain on connection getters (not rolled into this snapshot).
 
 ## Latency histograms (P3.1)
 
@@ -41,13 +89,27 @@ Use `histogram_quantile(0.99, rate(webtransport_handshake_latency_seconds_bucket
 
 ## Drop reasons (datagramsDropped)
 
-The single `datagramsDropped` counter aggregates:
+Native snapshots expose four optional ingest-reason fields. When they are
+present:
 
-- **Oversize**: Datagram > maxDatagramSize
-- **Budget**: Global or per-session queued-bytes budget exceeded
-- **Rate limit**: Per-IP datagram rate exceeded (future)
+`datagramsDropped == datagramsDroppedTooLarge + datagramsDroppedQueueSession + datagramsDroppedQueueGlobal + datagramsDroppedRateLimited`
 
-For finer-grained attribution, monitor `rateLimitedCount` and `limitExceededCount` alongside `datagramsDropped`.
+- **datagramsDroppedTooLarge**: datagram larger than `maxDatagramSize`
+- **datagramsDroppedQueueSession**: per-session queued-bytes budget
+- **datagramsDroppedQueueGlobal**: global queued-bytes budget
+- **datagramsDroppedRateLimited**: per-IP datagram ingress rate limit (also counted in `rateLimitedCount`)
+
+WASM omits the reason fields. Do not treat omitted-or-undefined reasons as
+zero, and do not use mixed `rateLimitedCount` (handshakes + streams + datagrams)
+to attribute datagram drops. Prometheus `datagrams_dropped` remains the sum.
+
+`datagramsSkippedQueueFull` is a separate native counter of **park events**
+(ingest did not call `receive_datagram` because remaining per-session slack
+could not fit `maxDatagramSize`). It is not a fifth drop reason and is omitted
+on WASM. Do not treat omit as zero.
+
+Send-path queued-bytes waits time out as `E_BACKPRESSURE_TIMEOUT` and do **not**
+increment `datagramsDropped`.
 
 ## Structured logs
 

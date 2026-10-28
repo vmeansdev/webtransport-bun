@@ -1,25 +1,31 @@
-import { describe, it, expect } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import {
 	createServer,
 	DEFAULT_LIMITS,
 	DEFAULT_RATE_LIMITS,
-	E_TLS,
+	E_BACKPRESSURE_TIMEOUT,
 	E_HANDSHAKE_TIMEOUT,
+	E_INTERNAL,
+	E_INVALID_ARGUMENT,
+	E_LIMIT_EXCEEDED,
+	E_QUEUE_FULL,
+	E_RATE_LIMITED,
 	E_SESSION_CLOSED,
 	E_SESSION_IDLE_TIMEOUT,
-	E_STREAM_RESET,
 	E_STOP_SENDING,
-	E_QUEUE_FULL,
-	E_BACKPRESSURE_TIMEOUT,
-	E_LIMIT_EXCEEDED,
-	E_RATE_LIMITED,
-	E_INTERNAL,
+	E_STREAM_RESET,
+	E_TLS,
+	E_UNSUPPORTED_ARGUMENT,
 	WebTransportError,
 	WT_RESET,
 	WT_STOP_SENDING,
 } from "../src/index.js";
 import { generateLocalhostCert } from "./helpers/certs.js";
-import { nextPort } from "./helpers/network.js";
+import { forEachWithTimeout, nextWithTimeout } from "./helpers/harness.js";
+import { connectWithRetry, nextPort } from "./helpers/network.js";
+
+const DATAGRAM_TIMEOUT_MS = 5000;
+const KEEPALIVE_DATAGRAM_TIMEOUT_MS = 15000;
 
 describe("webtransport package exports", () => {
 	it("exports createServer function", () => {
@@ -37,6 +43,8 @@ describe("webtransport package exports", () => {
 		expect(E_BACKPRESSURE_TIMEOUT).toBe("E_BACKPRESSURE_TIMEOUT");
 		expect(E_LIMIT_EXCEEDED).toBe("E_LIMIT_EXCEEDED");
 		expect(E_RATE_LIMITED).toBe("E_RATE_LIMITED");
+		expect(E_INVALID_ARGUMENT).toBe("E_INVALID_ARGUMENT");
+		expect(E_UNSUPPORTED_ARGUMENT).toBe("E_UNSUPPORTED_ARGUMENT");
 		expect(E_INTERNAL).toBe("E_INTERNAL");
 	});
 
@@ -193,4 +201,157 @@ describe("webtransport package exports", () => {
 			cert.cleanup();
 		}
 	}, 15000);
+});
+
+describe("server congestionControl (parity backport B1)", () => {
+	it("rejects invalid congestionControl as a bad argument", () => {
+		expect(() =>
+			createServer({
+				port: nextPort(27400, 500),
+				tls: { certPem: "", keyPem: "" },
+				// @ts-expect-error invalid mode on purpose
+				congestionControl: "warp-speed",
+				onSession: () => {},
+			}),
+		).toThrow(/E_INVALID_ARGUMENT: congestionControl must be/);
+	});
+
+	it("defaults to cubic and exposes the effective mode", async () => {
+		const server = createServer({
+			port: nextPort(27400, 500),
+			tls: { certPem: "", keyPem: "" },
+			onSession: () => {},
+		});
+		try {
+			expect(server.congestionControl).toBe("default");
+		} finally {
+			await server.close();
+		}
+	});
+
+	for (const mode of ["throughput", "low-latency"] as const) {
+		it(`accepts sessions and echoes traffic with congestionControl=${mode}`, async () => {
+			const port = nextPort(27400, 500);
+			const server = createServer({
+				port,
+				tls: { certPem: "", keyPem: "" },
+				congestionControl: mode,
+				onSession: async (s) => {
+					await forEachWithTimeout(
+						s.incomingDatagrams(),
+						DATAGRAM_TIMEOUT_MS,
+						`congestionControl=${mode} server datagram echo`,
+						async (d) => {
+							await s.sendDatagram(d);
+						},
+					).catch(() => {});
+				},
+			});
+			expect(server.congestionControl).toBe(mode);
+			const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
+				tls: { insecureSkipVerify: true },
+			});
+			try {
+				await client.sendDatagram(new Uint8Array([7, 8, 9]));
+				const iter = client.incomingDatagrams()[Symbol.asyncIterator]();
+				const echoed = await nextWithTimeout(
+					iter,
+					DATAGRAM_TIMEOUT_MS,
+					`congestionControl=${mode} client echo datagram`,
+				);
+				expect(echoed.done).toBe(false);
+				expect(Array.from(echoed.value as Uint8Array)).toEqual([7, 8, 9]);
+			} finally {
+				client.close();
+				await server.close();
+			}
+		}, 20000);
+	}
+});
+
+describe("server keepalive (parity backport B2)", () => {
+	it("session with limits.keepAliveIntervalMs survives past the idle timeout without traffic", async () => {
+		const port = nextPort(27900, 500);
+		let serverSession: any = null;
+		const server = createServer({
+			port,
+			tls: { certPem: "", keyPem: "" },
+			limits: { idleTimeoutMs: 1200, keepAliveIntervalMs: 300 },
+			onSession: async (s) => {
+				serverSession = s;
+				// Wider than DATAGRAM_TIMEOUT_MS: this test deliberately stays quiet
+				// for 3x the idle timeout before echoing anything.
+				await forEachWithTimeout(
+					s.incomingDatagrams(),
+					KEEPALIVE_DATAGRAM_TIMEOUT_MS,
+					"keepalive server datagram echo",
+					async (d) => {
+						await s.sendDatagram(d);
+					},
+				).catch(() => {});
+			},
+		});
+		const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
+			tls: { insecureSkipVerify: true },
+		});
+		try {
+			const deadline = Date.now() + 5000;
+			while (serverSession == null && Date.now() < deadline) {
+				await Bun.sleep(50);
+			}
+			expect(serverSession).not.toBeNull();
+
+			let sessionClosed = false;
+			serverSession.closed.then(() => {
+				sessionClosed = true;
+			});
+
+			// 3x the idle timeout with zero application traffic.
+			await Bun.sleep(3600);
+			expect(sessionClosed).toBe(false);
+
+			// Session must still be fully functional after the quiet period.
+			await client.sendDatagram(new Uint8Array([42]));
+			const iter = client.incomingDatagrams()[Symbol.asyncIterator]();
+			const echoed = await nextWithTimeout(
+				iter,
+				DATAGRAM_TIMEOUT_MS,
+				"keepalive client echo datagram",
+			);
+			expect(echoed.done).toBe(false);
+			expect(Array.from(echoed.value as Uint8Array)).toEqual([42]);
+		} finally {
+			client.close();
+			await server.close();
+		}
+	}, 20000);
+
+	it("control: without keepalive the same quiet session hits E_SESSION_IDLE_TIMEOUT", async () => {
+		const port = nextPort(27900, 500);
+		let serverSession: any = null;
+		const server = createServer({
+			port,
+			tls: { certPem: "", keyPem: "" },
+			limits: { idleTimeoutMs: 1200 },
+			onSession: (s) => {
+				serverSession = s;
+			},
+		});
+		const client = await connectWithRetry(`https://127.0.0.1:${port}`, {
+			tls: { insecureSkipVerify: true },
+		});
+		try {
+			const deadline = Date.now() + 5000;
+			while (serverSession == null && Date.now() < deadline) {
+				await Bun.sleep(50);
+			}
+			expect(serverSession).not.toBeNull();
+
+			const info = await serverSession.closed;
+			expect(String(info?.reason ?? "")).toContain("E_SESSION_IDLE_TIMEOUT");
+		} finally {
+			client.close();
+			await server.close();
+		}
+	}, 20000);
 });

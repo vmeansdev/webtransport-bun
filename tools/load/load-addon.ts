@@ -7,10 +7,104 @@
 import {
 	createServer,
 	DEFAULT_LIMITS,
+	WT_RESET,
+	WT_STOP_SENDING,
 } from "../../packages/webtransport/src/index.ts";
+import type { ServerSession } from "../../packages/webtransport/src/index.ts";
 import { $ } from "bun";
 import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+
+/**
+ * Echo handler the reference load-client's operation-class probes require:
+ * datagram-echo, uni-echo, bidi-echo, stream-reset (probe:bidi-reset:), and
+ * stop-sending (probe:uni-stop:). Load-phase traffic is drained/echoed the
+ * same way. Without this the server accepts sessions but never responds, so
+ * every probe times out and the client fails — the long-standing load-addon
+ * defect. Failures are swallowed: this is a memory/leak gate, and the client
+ * side is what asserts protocol correctness.
+ */
+function attachProbeEcho(session: ServerSession): void {
+	void (async () => {
+		for await (const datagram of session.incomingDatagrams()) {
+			await session.sendDatagram(datagram).catch(() => {});
+		}
+	})().catch(() => {});
+
+	void (async () => {
+		for await (const stream of session.incomingBidirectionalStreams) {
+			void (async () => {
+				const reader = stream.readable.getReader();
+				const first = await reader.read().catch(() => ({
+					done: true,
+					value: undefined,
+				}));
+				const text = first.value
+					? Buffer.from(first.value).toString("utf8")
+					: "";
+				if (text.startsWith("probe:bidi-reset:")) {
+					reader.releaseLock();
+					stream[WT_RESET]?.(42);
+					return;
+				}
+				if (first.value) {
+					const writer = stream.writable.getWriter();
+					await writer.write(first.value).catch(() => {});
+					await writer.close().catch(() => {});
+				}
+				// Drain to EOF: abandoning the readable after one chunk leaves an
+				// unclaimed stream — the same class that broke load-profiles and
+				// surfaces as stream errors once the send rate rises.
+				try {
+					while (!(await reader.read()).done) {
+						// discard
+					}
+				} catch {
+					// Peer reset/close while draining is fine.
+				} finally {
+					reader.releaseLock();
+				}
+			})().catch(() => {});
+		}
+	})().catch(() => {});
+
+	void (async () => {
+		for await (const stream of session.incomingUnidirectionalStreams) {
+			void (async () => {
+				const reader = stream.getReader();
+				const first = await reader.read().catch(() => ({
+					done: true,
+					value: undefined,
+				}));
+				const text = first.value
+					? Buffer.from(first.value).toString("utf8")
+					: "";
+				if (text.startsWith("probe:uni-stop:")) {
+					reader.releaseLock();
+					stream[WT_STOP_SENDING]?.(0);
+					return;
+				}
+				if (first.value) {
+					const out = await session.createUnidirectionalStream();
+					await new Promise<void>((res) => {
+						out.write(Buffer.from(first.value as Uint8Array), () => res());
+					}).catch(() => {});
+					out.end();
+				}
+				// Drain to EOF — see the bidi handler above.
+				try {
+					while (!(await reader.read()).done) {
+						// discard
+					}
+				} catch {
+					// Peer reset/close while draining is fine.
+				} finally {
+					reader.releaseLock();
+				}
+			})().catch(() => {});
+		}
+	})().catch(() => {});
+}
 
 const ROOT = process.cwd();
 const RSS_TREND_OUT =
@@ -65,14 +159,18 @@ async function main() {
 	}
 	await Bun.sleep(1000);
 
-	console.log("load-addon: Building load-client...");
-	await $`cd ${ROOT} && CARGO_TARGET_DIR=${ROOT}/target cargo build -p reference --bin load-client`.quiet();
+	if (existsSync(CLIENT_BIN)) {
+		console.log("load-addon: Using existing load-client binary");
+	} else {
+		console.log("load-addon: Building load-client...");
+		await $`cd ${ROOT} && CARGO_TARGET_DIR=${ROOT}/target cargo build -p reference --bin load-client`.quiet();
+	}
 
 	console.log("load-addon: Starting addon server (createServer)...");
 	const server = createServer({
 		port: 4433,
 		tls: { certPem: "", keyPem: "" },
-		onSession: () => {},
+		onSession: attachProbeEcho,
 	});
 	const initialFd = await getFdCount(process.pid);
 	await Bun.sleep(8000); // Allow addon server to bind (Tokio + wtransport startup)

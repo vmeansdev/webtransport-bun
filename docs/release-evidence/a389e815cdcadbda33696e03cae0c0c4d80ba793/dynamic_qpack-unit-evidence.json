@@ -1,0 +1,18 @@
+{
+ "commit": "a389e815cdcadbda33696e03cae0c0c4d80ba793",
+ "claimId": "dynamic-qpack",
+ "createdAt": "2026-08-06T15:44:37.485Z",
+ "status": "passed",
+ "notes": "Timed bun test wasm-qpack-options against the wasm dist at the rebound candidate.",
+ "runner": "local-darwin-arm64",
+ "command": [
+  "bash",
+  "-c",
+  "WEBTRANSPORT_REQUIRE_WASM=1 WEBTRANSPORT_REQUIRE_WASM_DIST=1 bun test packages/webtransport/test/wasm-qpack-options.test.ts"
+ ],
+ "startedAt": "2026-08-06T15:44:37.350Z",
+ "endedAt": "2026-08-06T15:44:37.485Z",
+ "durationMs": 136,
+ "exitCode": 0,
+ "artifactSha256": "1737cd1aa43c9e490096dba33c0dae2920fc2b59d61f8e505c745c7ba70cfa82"
+}
