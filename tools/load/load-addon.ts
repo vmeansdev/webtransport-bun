@@ -275,6 +275,9 @@ async function main() {
 	}
 
 	if (exitCode !== 0) {
+		// The client names each failed probe on stderr; without it a red run
+		// only says which operation class was missing, not why.
+		if (stderrText.trim()) console.error(stderrText.trimEnd());
 		console.error("load-addon: FAIL (load-client exited with", exitCode, ")");
 		process.exit(1);
 	}
