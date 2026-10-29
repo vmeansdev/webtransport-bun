@@ -422,7 +422,7 @@ fn apply_priority(request: &PriorityRequest) -> PriorityAchieved {
             // nice is a per-thread attribute there, which is the whole reason
             // this knob is Linux-only.
             *libc::__errno_location() = 0;
-            if libc::setpriority(libc::PRIO_PROCESS as u32, 0, nice) != 0 && errno() != 0 {
+            if libc::setpriority(libc::PRIO_PROCESS as _, 0, nice) != 0 && errno() != 0 {
                 achieved.nice_errno = Some(errno());
             }
         }
@@ -441,7 +441,7 @@ fn apply_priority(request: &PriorityRequest) -> PriorityAchieved {
         // `-1` is a legal nice level, so errno is the only way to tell a real
         // answer from a failure.
         *libc::__errno_location() = 0;
-        let nice = libc::getpriority(libc::PRIO_PROCESS as u32, 0);
+        let nice = libc::getpriority(libc::PRIO_PROCESS as _, 0);
         achieved.nice = if nice == -1 && errno() != 0 {
             None
         } else {
