@@ -6,7 +6,7 @@ This is the operator's note. The option reference lives in
 [`OPERATIONS.md`](OPERATIONS.md) — "Multi-process binds (`reusePort`)" and
 "QUIC-LB connection IDs (`quicLb`)" — the capacity and sizing argument was recorded in the bare-metal capacity
 chapter (a measurement-campaign record kept outside this repository), and the reference eBPF program lives in
-[`examples/quic-lb/`](../examples/quic-lb/README.md).
+[`examples/quic-lb/`](https://github.com/vmeansdev/webtransport-bun/blob/main/examples/quic-lb/README.md).
 
 Everything here is pinned to **draft-ietf-quic-load-balancers-21**, the same
 revision as `crates/native/src/quic_lb.rs` and
@@ -55,7 +55,7 @@ Three pieces, and each is inert without the others:
    delivery: it only gives a steering layer something stable to read.
 3. **An `SK_REUSEPORT` eBPF program** attached to the group reads the server-ID
    bytes and selects the matching socket, instead of hashing.
-   [`examples/quic-lb/steer_by_cid.bpf.c`](../examples/quic-lb/steer_by_cid.bpf.c)
+   [`examples/quic-lb/steer_by_cid.bpf.c`](https://github.com/vmeansdev/webtransport-bun/blob/main/examples/quic-lb/steer_by_cid.bpf.c)
    is a reference for writing one — it compiles, but it has never been loaded,
    attached, or tested, and it is not shipped.
 

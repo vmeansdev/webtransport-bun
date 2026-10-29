@@ -690,7 +690,7 @@ A worked configuration — how `reusePort` + `quicLb` + an eBPF steering program
 compose on one box, and how `quicLb` composes with an external L4 balancer
 across machines — is in [quic-lb.md](quic-lb.md), with a reference
 `SK_REUSEPORT` program (an example, not a shipped component) in
-[examples/quic-lb/](../examples/quic-lb/README.md).
+[examples/quic-lb/](https://github.com/vmeansdev/webtransport-bun/blob/main/examples/quic-lb/README.md).
 
 ---
 
