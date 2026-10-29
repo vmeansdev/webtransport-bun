@@ -92,7 +92,13 @@ describe("native reusePortSteering option", () => {
 					quicLb: QUIC_LB,
 					reusePortSteering: STEERING,
 				}),
-			).toThrow(/E_UNSUPPORTED_ARGUMENT: reusePortSteering requires Linux/);
+			).toThrow(
+				// Windows refuses the reusePort half first (no SO_REUSEPORT); either
+				// way the option is refused rather than bound unsteered.
+				process.platform === "win32"
+					? /E_UNSUPPORTED_ARGUMENT: reusePort requires SO_REUSEPORT/
+					: /E_UNSUPPORTED_ARGUMENT: reusePortSteering requires Linux/,
+			);
 		},
 	);
 

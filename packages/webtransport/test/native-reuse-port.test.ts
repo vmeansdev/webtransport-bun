@@ -20,6 +20,9 @@ import { nextPort } from "./helpers/network.js";
 
 const DATAGRAM_TIMEOUT_MS = 5000;
 const isLinux = process.platform === "linux";
+// Windows has no SO_REUSEPORT; the native layer refuses the option there
+// (asserted below) instead of binding without it.
+const hasReusePort = process.platform !== "win32";
 
 function echoServer(port: number, extra: Record<string, unknown> = {}) {
 	const sessions: ServerSession[] = [];
@@ -43,52 +46,74 @@ function echoServer(port: number, extra: Record<string, unknown> = {}) {
 }
 
 describe("native reusePort option", () => {
-	it("lets a second server bind a port the first one already holds", async () => {
-		const port = nextPort(24810, 2000);
-		const first = createServer({
-			port,
-			reusePort: true,
-			tls: { certPem: "", keyPem: "" },
-			onSession: () => {},
-		});
-		try {
-			expect(first.address.port).toBe(port);
-			const second = createServer({
+	it.skipIf(!hasReusePort)(
+		"lets a second server bind a port the first one already holds",
+		async () => {
+			const port = nextPort(24810, 2000);
+			const first = createServer({
 				port,
 				reusePort: true,
 				tls: { certPem: "", keyPem: "" },
 				onSession: () => {},
 			});
 			try {
-				expect(second.address.port).toBe(port);
+				expect(first.address.port).toBe(port);
+				const second = createServer({
+					port,
+					reusePort: true,
+					tls: { certPem: "", keyPem: "" },
+					onSession: () => {},
+				});
+				try {
+					expect(second.address.port).toBe(port);
+				} finally {
+					await second.close();
+				}
 			} finally {
-				await second.close();
+				await first.close();
 			}
-		} finally {
-			await first.close();
-		}
-	});
+		},
+	);
 
-	it("still rejects a second bind without the flag", async () => {
-		const port = nextPort(24815, 2000);
-		const first = createServer({
-			port,
-			reusePort: true,
-			tls: { certPem: "", keyPem: "" },
-			onSession: () => {},
-		});
-		try {
+	it.skipIf(!hasReusePort)(
+		"still rejects a second bind without the flag",
+		async () => {
+			const port = nextPort(24815, 2000);
+			const first = createServer({
+				port,
+				reusePort: true,
+				tls: { certPem: "", keyPem: "" },
+				onSession: () => {},
+			});
+			try {
+				expect(() =>
+					createServer({
+						port,
+						tls: { certPem: "", keyPem: "" },
+						onSession: () => {},
+					}),
+				).toThrow(
+					/address already in use|AddrInUse|failed to create endpoint/i,
+				);
+			} finally {
+				await first.close();
+			}
+		},
+	);
+
+	it.skipIf(hasReusePort)(
+		"refuses reusePort where the platform has no SO_REUSEPORT",
+		() => {
 			expect(() =>
 				createServer({
-					port,
+					port: nextPort(24812, 2000),
+					reusePort: true,
 					tls: { certPem: "", keyPem: "" },
 					onSession: () => {},
 				}),
-			).toThrow(/address already in use|AddrInUse|failed to create endpoint/i);
-		} finally {
-			await first.close();
-		}
-	});
+			).toThrow(/E_UNSUPPORTED_ARGUMENT: reusePort requires SO_REUSEPORT/);
+		},
+	);
 
 	// Linux hashes arriving 4-tuples across the reuseport group, so whichever
 	// member the kernel picks must be able to serve the session. On BSD/macOS
