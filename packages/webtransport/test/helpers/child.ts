@@ -9,6 +9,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export type ChildRun = {
 	exitCode: number | null;
@@ -26,9 +27,12 @@ export async function runChild(
 ): Promise<ChildRun> {
 	const dir = mkdtempSync(join(tmpdir(), "wt-child-"));
 	const script = join(dir, "child.ts");
-	const internalModule = new URL("../../src/internal.ts", import.meta.url)
-		.pathname;
-	const publicModule = new URL("../../src/index.ts", import.meta.url).pathname;
+	const internalModule = fileURLToPath(
+		new URL("../../src/internal.ts", import.meta.url),
+	);
+	const publicModule = fileURLToPath(
+		new URL("../../src/index.ts", import.meta.url),
+	);
 	const preamble =
 		`const INTERNAL_MODULE = ${JSON.stringify(internalModule)};\n` +
 		`const PUBLIC_MODULE = ${JSON.stringify(publicModule)};\n` +
@@ -45,7 +49,7 @@ export async function runChild(
 		env: childEnv,
 		stdout: "pipe",
 		stderr: "pipe",
-		cwd: new URL("../../../..", import.meta.url).pathname,
+		cwd: fileURLToPath(new URL("../../../..", import.meta.url)),
 	});
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {

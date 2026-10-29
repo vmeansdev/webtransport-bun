@@ -11,6 +11,7 @@
 
 import { describe, expect, it } from "bun:test";
 import { nextPort } from "./helpers/network.js";
+import { fileURLToPath } from "node:url";
 
 const BASE_PORT = 26_900;
 const PORT_SPREAD = 60;
@@ -66,7 +67,7 @@ async function child(
 	else env.WTRANSPORT_DATAGRAM_PUMP = pump;
 	const proc = Bun.spawn(["bun", "-e", CHILD], {
 		env,
-		cwd: new URL("../../..", import.meta.url).pathname,
+		cwd: fileURLToPath(new URL("../../..", import.meta.url)),
 		stdout: "pipe",
 		stderr: "pipe",
 	});

@@ -13,6 +13,7 @@
 import { describe, expect, it } from "bun:test";
 import { __TESTING__, createServer } from "../src/index.js";
 import { nextPort } from "./helpers/network.js";
+import { fileURLToPath } from "node:url";
 
 const BASE_PORT = 26_700;
 const PORT_SPREAD = 60;
@@ -53,7 +54,7 @@ async function child(
 	else env.WEBTRANSPORT_NATIVE_ACK_CADENCE = value;
 	const proc = Bun.spawn(["bun", "-e", CHILD], {
 		env,
-		cwd: new URL("../../..", import.meta.url).pathname,
+		cwd: fileURLToPath(new URL("../../..", import.meta.url)),
 		stdout: "pipe",
 		stderr: "pipe",
 	});

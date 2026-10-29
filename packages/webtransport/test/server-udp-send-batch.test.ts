@@ -15,6 +15,7 @@
 import { describe, expect, it } from "bun:test";
 import { __TESTING__, createServer } from "../src/index.js";
 import { nextPort } from "./helpers/network.js";
+import { fileURLToPath } from "node:url";
 
 const BASE_PORT = 26_800;
 const PORT_SPREAD = 60;
@@ -96,7 +97,7 @@ async function child(
 	else env.WEBTRANSPORT_NATIVE_REFLECT_RING_BYPASS = reflectRingBypass;
 	const proc = Bun.spawn(["bun", "-e", source], {
 		env,
-		cwd: new URL("../../..", import.meta.url).pathname,
+		cwd: fileURLToPath(new URL("../../..", import.meta.url)),
 		stdout: "pipe",
 		stderr: "pipe",
 	});

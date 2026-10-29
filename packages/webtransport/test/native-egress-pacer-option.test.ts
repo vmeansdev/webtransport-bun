@@ -8,6 +8,7 @@
 import { describe, expect, it } from "bun:test";
 import { createServer, E_INVALID_ARGUMENT } from "../src/index.js";
 import { nextPort } from "./helpers/network.js";
+import { fileURLToPath } from "node:url";
 
 const BASE_PORT = 27_400;
 const PORT_SPREAD = 60;
@@ -95,7 +96,7 @@ async function child(
 	});
 	const proc = Bun.spawn(["bun", "-e", CHILD], {
 		env: merged,
-		cwd: new URL("../../..", import.meta.url).pathname,
+		cwd: fileURLToPath(new URL("../../..", import.meta.url)),
 		stdout: "pipe",
 		stderr: "pipe",
 	});

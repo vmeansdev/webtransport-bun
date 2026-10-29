@@ -22,6 +22,7 @@ import {
 } from "../src/index.js";
 import { __TESTING__ } from "../src/internal.js";
 import { nextWithTimeout, readWithTimeout } from "./helpers/harness.js";
+import { fileURLToPath } from "node:url";
 
 describe("internal TS error propagation", () => {
 	it("native error parser only recognizes enumerated stable codes", async () => {
@@ -200,8 +201,9 @@ describe("internal TS error propagation", () => {
 		// so the legacy path can only be asserted in a fresh process.
 		const dir = mkdtempSync(join(tmpdir(), "wt-h7-legacy-"));
 		const script = join(dir, "child.ts");
-		const internalModule = new URL("../src/internal.ts", import.meta.url)
-			.pathname;
+		const internalModule = fileURLToPath(
+			new URL("../src/internal.ts", import.meta.url),
+		);
 		await Bun.write(
 			script,
 			`

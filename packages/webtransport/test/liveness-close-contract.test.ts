@@ -13,6 +13,7 @@ import { describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { connect, createServer, E_SERVER_CLOSING } from "../src/index.js";
 import {
 	createServerCloseContract,
@@ -22,9 +23,13 @@ import {
 import type { CloseInfo } from "../src/types.js";
 import { generateCertForNames } from "./helpers/certs.js";
 
-const ROOT = new URL("../../..", import.meta.url).pathname;
-const PUBLIC_MODULE = new URL("../src/index.ts", import.meta.url).pathname;
-const CERTS_MODULE = new URL("./helpers/certs.ts", import.meta.url).pathname;
+const ROOT = fileURLToPath(new URL("../../..", import.meta.url));
+const PUBLIC_MODULE = fileURLToPath(
+	new URL("../src/index.ts", import.meta.url),
+);
+const CERTS_MODULE = fileURLToPath(
+	new URL("./helpers/certs.ts", import.meta.url),
+);
 // Native close spends at most 5s draining plus 5s aborting; the JS callback
 // drain adds at most 5s. A process that has not exited well past that is
 // pinned, not slow.

@@ -16,12 +16,17 @@ import { E_INTERNAL, WebTransportError, createServer } from "../src/index.js";
 import { __TESTING__ } from "../src/internal.js";
 import { nextWithTimeout, withHarness } from "./helpers/harness.js";
 import { connectWithRetry, nextPort } from "./helpers/network.js";
+import { fileURLToPath } from "node:url";
 
 const BASE_PORT = 19600;
 const CHILD_TIMEOUT_MS = 60_000;
 
-const INTERNAL_MODULE = new URL("../src/internal.ts", import.meta.url).pathname;
-const PUBLIC_MODULE = new URL("../src/index.ts", import.meta.url).pathname;
+const INTERNAL_MODULE = fileURLToPath(
+	new URL("../src/internal.ts", import.meta.url),
+);
+const PUBLIC_MODULE = fileURLToPath(
+	new URL("../src/index.ts", import.meta.url),
+);
 
 type ChildRun = {
 	exitCode: number | null;
@@ -59,7 +64,7 @@ async function runChild(
 		env: childEnv,
 		stdout: "pipe",
 		stderr: "pipe",
-		cwd: new URL("../../..", import.meta.url).pathname,
+		cwd: fileURLToPath(new URL("../../..", import.meta.url)),
 	});
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
