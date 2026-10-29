@@ -27,6 +27,7 @@ Deterministic suites only; the heavy load/stress campaigns live in the
 dedicated `load` job below so shared-runner UDP contention cannot fail the
 six-way matrix.
 
+0. Repository hygiene: `scripts/check-tracked-hygiene.sh` fails if any tracked path is under `.release-evidence/`, `.bench-evidence/`, `.scratch/` or `docs/superpowers/`, or is a `*.jsonl` outside a test-fixture directory (the same check runs in `.githooks/pre-commit`)
 1. Rust quality gates: `cargo fmt --check`, `cargo audit`, `cargo clippy -- -D clippy::all`, `cargo test --workspace`
 2. Build native addon + install deps
 3. Typecheck (`bun run typecheck`)

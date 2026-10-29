@@ -10,6 +10,9 @@ if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   exit 0
 fi
 
+repo_root="$(git rev-parse --show-toplevel)"
+bash "$repo_root/scripts/check-tracked-hygiene.sh"
+
 declare -a rust_files=()
 declare -a tsjs_files=()
 cargo_cmd=""
