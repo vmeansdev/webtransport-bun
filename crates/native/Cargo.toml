@@ -33,7 +33,7 @@ socket2 = { version = "0.6.5", features = ["all"] }
 # type `InvalidCid` quinn does not re-export. Pinned to the exact version quinn
 # 0.11 locks: a second quinn-proto in the tree would make the trait we implement
 # a different trait than `EndpointConfig::cid_generator` accepts.
-quinn-proto = { version = "=0.11.16", default-features = false }
+quinn-proto = { version = "=0.11.19", default-features = false }
 idna = "1"
 x509-parser = "0.18.1"
 # Global allocator for this dylib's Rust allocations. The macOS system malloc
