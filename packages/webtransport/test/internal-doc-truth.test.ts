@@ -76,24 +76,35 @@ function getAt<T>(items: T[], index: number): T {
 	return item;
 }
 
+function manifestEntry(id: string, claimId: string) {
+	return {
+		id,
+		claimIds: [claimId],
+		asset: `evidence-${id}.json`,
+		size: 64,
+		sha256: "a".repeat(64),
+		commit: COMMIT,
+		status: "passed",
+		producer: { kind: "local", description: "doc-truth fixture" },
+		createdAt: "2026-10-29T00:00:00.000Z",
+		files: [{ name: `${id}.json`, size: 64, sha256: "a".repeat(64) }],
+	};
+}
+
 function validStatus() {
 	return {
-		schemaVersion: 1,
+		schemaVersion: 2,
 		candidate: { commit: COMMIT, readiness: "pending" },
-		evidence: [
-			{
-				id: "native-bun-linux",
-				path: ".release-evidence/native-bun-linux.json",
-				commit: COMMIT,
-				status: "passed",
-			},
-			{
-				id: "wasm-iwa",
-				path: ".release-evidence/wasm-iwa.json",
-				commit: COMMIT,
-				status: "passed",
-			},
-		],
+		manifest: {
+			schemaVersion: 1,
+			repository: "example/webtransport-bun",
+			packageVersion: "1.0.0-rc.2",
+			candidate: { commit: COMMIT, tag: "v1.0.0-rc.2" },
+			entries: [
+				manifestEntry("native-bun-linux", "native-local"),
+				manifestEntry("wasm-iwa", "wasm-browser"),
+			],
+		},
 		claims: [
 			{
 				id: "native-local",
@@ -131,7 +142,6 @@ function runPolicy(mutate?: (fixture: Fixture, root: string) => void) {
 	roots.push(root);
 	mkdirSync(join(root, "docs"), { recursive: true });
 	mkdirSync(join(root, "crates", "native", "src"), { recursive: true });
-	mkdirSync(join(root, ".release-evidence"), { recursive: true });
 	mkdirSync(join(root, "packages", "webtransport"), { recursive: true });
 	mkdirSync(join(root, "tools", "load"), { recursive: true });
 
@@ -262,16 +272,15 @@ pub(crate) static CLIENT_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
     .build().unwrap()
 });`,
 	);
-	for (const evidence of fixture.evidence) {
-		writeFileSync(
-			join(root, evidence.path),
-			JSON.stringify({ commit: COMMIT }),
-		);
-	}
 	mutate?.(fixture, root);
+	const { manifest, ...status } = fixture;
 	writeFileSync(
 		join(root, "docs", "release-status.json"),
-		JSON.stringify(fixture),
+		JSON.stringify(status),
+	);
+	writeFileSync(
+		join(root, "docs", "release-evidence-manifest.json"),
+		JSON.stringify(manifest),
 	);
 
 	return spawnSync(process.execPath, ["scripts/check-doc-truth.ts"], {
@@ -301,16 +310,42 @@ describe("documentation truth policy", () => {
 	});
 
 	it("rejects evidence recorded for a different candidate commit", () => {
-		const result = runPolicy((fixture, root) => {
-			const evidence = getAt(fixture.evidence, 0);
-			evidence.commit = "abcdef0123456789abcdef0123456789abcdef01";
-			writeFileSync(
-				join(root, evidence.path),
-				JSON.stringify({ commit: evidence.commit }),
-			);
+		const result = runPolicy((fixture) => {
+			const other = "abcdef0123456789abcdef0123456789abcdef01";
+			fixture.manifest.candidate.commit = other;
+			for (const entry of fixture.manifest.entries) entry.commit = other;
 		});
 		expect(result.status).toBe(1);
+		expect(result.stderr).toContain(
+			"differs from the evidence manifest candidate",
+		);
 		expect(result.stderr).toContain("differs from candidate commit");
+	});
+
+	it("rejects a manifest entry that breaks the manifest contract", () => {
+		const result = runPolicy((fixture) => {
+			getAt(fixture.manifest.entries, 0).sha256 = "not-a-digest";
+		});
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain("sha256: must be lowercase hex sha256");
+	});
+
+	it("rejects a claim citing evidence recorded for a different claim", () => {
+		const result = runPolicy((fixture) => {
+			getAt(fixture.claims, 0).evidenceIds = ["wasm-iwa"];
+		});
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain(
+			"evidence wasm-iwa is not recorded as evidence for native-local",
+		);
+	});
+
+	it("rejects the retired in-status evidence list", () => {
+		const result = runPolicy((fixture) => {
+			Object.assign(fixture, { evidence: [] });
+		});
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain("release-status.evidence: is retired");
 	});
 
 	it("rejects calling the wasm surface stable before every required gate passes", () => {

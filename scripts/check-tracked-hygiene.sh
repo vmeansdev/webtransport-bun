@@ -39,7 +39,7 @@ if [ -n "$offending" ]; then
   if [ "$count" -gt 50 ]; then
     echo "  ... ($((count - 50)) more)" >&2
   fi
-  echo "Store evidence outside the repo (see docs/RELEASE_1.0_STATUS.md) and remove these with 'git rm --cached'." >&2
+  echo "Attach evidence to the candidate pre-release with scripts/release-evidence.ts (see docs/RELEASE_CHECKLIST.md) and remove these with 'git rm --cached'." >&2
   exit 1
 fi
 echo "check-tracked-hygiene: ok"

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -21,6 +21,8 @@ describe("check-tracked-hygiene", () => {
 			"packages/webtransport/src/index.ts",
 			"docs/OPERATIONS.md",
 			"docs/release-evidence.schema.json",
+			"docs/release-evidence-manifest.json",
+			"docs/release-evidence-manifest.schema.json",
 			"tools/load/fixtures/run.jsonl",
 			"packages/webtransport/test/data/events.jsonl",
 			"crates/native/tests/frames.jsonl",

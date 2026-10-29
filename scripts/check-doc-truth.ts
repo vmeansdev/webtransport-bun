@@ -1,17 +1,20 @@
 #!/usr/bin/env bun
 
 import { existsSync, readFileSync } from "node:fs";
-import { isAbsolute, relative, resolve } from "node:path";
+import { relative, resolve } from "node:path";
+import {
+	type ManifestEntry,
+	STATUS_SCHEMA_VERSION,
+	validateManifest,
+} from "./release-evidence-lib.ts";
 
 type ClaimStatus = "passed" | "pending" | "failed";
 type Stability = "experimental" | "candidate" | "stable";
 
-type EvidenceEntry = {
-	id: string;
-	path: string;
-	commit: string;
-	status: "passed" | "failed";
-};
+/** Evidence is recorded in docs/release-evidence-manifest.json; the files
+ * themselves are GitHub Release assets of the candidate pre-release and are
+ * verified (downloaded and hashed) by scripts/release-evidence.ts verify. */
+type EvidenceEntry = ManifestEntry;
 
 type Claim = {
 	id: string;
@@ -37,7 +40,7 @@ type SupportTuple = {
 type ReleaseStatus = {
 	schemaVersion: number;
 	candidate: { commit: string | null; readiness: "pending" | "ready" };
-	evidence: EvidenceEntry[];
+	evidence?: unknown;
 	claims: Claim[];
 	surfaces: { native: Surface; wasm: Surface };
 	support: { claimed: SupportTuple[]; tested: SupportTuple[] };
@@ -58,6 +61,11 @@ if (process.env.CHECK_DOC_TRUTH_ROOT && rootOverride === undefined) {
 }
 const ROOT = resolve(rootOverride ?? resolve(import.meta.dir, ".."));
 const STATUS_PATH = resolve(ROOT, "docs", "release-status.json");
+const EVIDENCE_MANIFEST_PATH = resolve(
+	ROOT,
+	"docs",
+	"release-evidence-manifest.json",
+);
 const ARCHITECTURE_PATH = resolve(ROOT, "docs", "ARCHITECTURE.md");
 const FAQ_PATH = resolve(ROOT, "docs", "FAQ.md");
 const COMPATIBILITY_PATH = resolve(ROOT, "docs", "COMPATIBILITY.md");
@@ -238,142 +246,41 @@ function asArray<T>(value: unknown, location: string): T[] {
 	return value as T[];
 }
 
-function artifactCommit(value: unknown): string | undefined {
-	if (typeof value !== "object" || value === null) return undefined;
-	const record = value as Record<string, unknown>;
-	for (const key of ["commit", "sourceCommit", "candidateCommit"]) {
-		if (typeof record[key] === "string") return record[key];
-	}
-	return undefined;
-}
-
-/**
- * Semantic checks on a passed evidence artifact's own body. Commit identity
- * alone proves binding, not outcome: a "passed" manifest entry pointing at an
- * artifact whose recorded run failed (nonzero exit, failed status, failed
- * coverage module) is a false-green and must be reported.
- */
-function artifactSemanticFailures(value: unknown): string[] {
-	if (typeof value !== "object" || value === null) return [];
-	const record = value as Record<string, unknown>;
-	const failures: string[] = [];
-	if (typeof record.exitCode === "number" && record.exitCode !== 0) {
-		failures.push(`artifact records exitCode ${record.exitCode}`);
-	}
-	if (typeof record.status === "string" && record.status !== "passed") {
-		failures.push(`artifact records status ${JSON.stringify(record.status)}`);
-	}
-	// Coverage floor-results artifacts carry per-module verdicts.
-	for (const surface of ["native", "wasm"]) {
-		const modules = record[surface];
-		if (!Array.isArray(modules)) continue;
-		for (const module of modules) {
-			if (
-				typeof module === "object" &&
-				module !== null &&
-				(module as { pass?: unknown }).pass === false
-			) {
-				failures.push(
-					`coverage module ${(module as { module?: unknown }).module ?? "<unnamed>"} recorded pass=false`,
-				);
-			}
-		}
-	}
-	// Multi-run artifacts (e.g. dual-backend parity) record per-run exits.
-	if (Array.isArray(record.runs)) {
-		for (const [index, run] of record.runs.entries()) {
-			if (
-				typeof run === "object" &&
-				run !== null &&
-				typeof (run as { exitCode?: unknown }).exitCode === "number" &&
-				(run as { exitCode: number }).exitCode !== 0
-			) {
-				failures.push(`artifact run[${index}] records a nonzero exitCode`);
-			}
-		}
-	}
-	return failures;
-}
-
 function checkEvidence(status: ReleaseStatus): Map<string, EvidenceEntry> {
 	const evidence = new Map<string, EvidenceEntry>();
-	for (const [index, entry] of asArray<EvidenceEntry>(
-		status.evidence,
-		"release-status.evidence",
-	).entries()) {
-		const location = `release-status.evidence[${index}]`;
-		if (!entry || typeof entry !== "object") {
-			report(location, "must be an object");
-			continue;
-		}
-		if (typeof entry.id !== "string" || entry.id.length === 0) {
-			report(location, "must have a non-empty id");
-			continue;
-		}
-		if (evidence.has(entry.id)) {
-			report(location, `duplicates evidence id ${entry.id}`);
-			continue;
-		}
-		evidence.set(entry.id, entry);
-		if (entry.status !== "passed" && entry.status !== "failed") {
-			report(location, "status must be passed or failed");
-			continue;
-		}
-		if (entry.status !== "passed") continue;
-
-		if (!status.candidate?.commit || !SHA40.test(status.candidate.commit)) {
-			report(
-				location,
-				"passed evidence requires a 40-character candidate commit",
-			);
-		}
-		if (!SHA40.test(entry.commit ?? "")) {
-			report(location, "passed evidence must name a 40-character commit");
-		} else if (entry.commit !== status.candidate?.commit) {
-			report(
-				location,
-				`evidence commit ${entry.commit} differs from candidate commit ${status.candidate?.commit ?? "<unbound>"}`,
-			);
-		}
-
-		if (typeof entry.path !== "string" || entry.path.length === 0) {
-			report(location, "passed evidence must name an artifact path");
-			continue;
-		}
-		const artifactPath = resolve(ROOT, entry.path);
-		if (
-			isAbsolute(entry.path) ||
-			relative(ROOT, artifactPath).startsWith("..")
-		) {
-			report(location, "evidence path must stay inside the repository root");
-			continue;
-		}
-		const artifactText = readText(artifactPath);
-		if (artifactText === undefined) continue;
-		try {
-			const artifact = JSON.parse(artifactText);
-			const commit = artifactCommit(artifact);
-			if (!commit) {
-				report(location, "evidence artifact has no commit identity");
-			} else if (
-				commit !== entry.commit ||
-				commit !== status.candidate?.commit
-			) {
-				report(
-					location,
-					`evidence artifact commit ${commit} does not match manifest and candidate`,
-				);
-			}
-			for (const failure of artifactSemanticFailures(artifact)) {
-				report(location, failure);
-			}
-		} catch (error) {
-			report(
-				location,
-				`evidence artifact is not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
-			);
-		}
+	const location = relative(ROOT, EVIDENCE_MANIFEST_PATH);
+	if (status.evidence !== undefined) {
+		report(
+			"release-status.evidence",
+			"is retired: evidence is recorded in docs/release-evidence-manifest.json and stored as release assets",
+		);
 	}
+	const text = readText(EVIDENCE_MANIFEST_PATH);
+	if (text === undefined) return evidence;
+	let manifest: unknown;
+	try {
+		manifest = JSON.parse(text);
+	} catch (error) {
+		report(
+			location,
+			`must contain valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+		);
+		return evidence;
+	}
+	const errors = validateManifest(manifest);
+	for (const error of errors) report(location, error);
+	if (errors.length > 0) return evidence;
+	const typed = manifest as {
+		candidate: { commit: string | null };
+		entries: EvidenceEntry[];
+	};
+	if (typed.candidate.commit !== (status.candidate?.commit ?? null)) {
+		report(
+			"release-status.candidate.commit",
+			`differs from the evidence manifest candidate ${typed.candidate.commit ?? "<unbound>"}`,
+		);
+	}
+	for (const entry of typed.entries) evidence.set(entry.id, entry);
 	return evidence;
 }
 
@@ -417,10 +324,23 @@ function checkClaims(
 			const entry = evidence.get(evidenceId);
 			if (!entry)
 				report(location, `references unknown evidence ID ${evidenceId}`);
+			else if (!entry.claimIds.includes(claim.id))
+				report(
+					location,
+					`evidence ${evidenceId} is not recorded as evidence for ${claim.id}`,
+				);
 			else if (claim.status === "passed" && entry.status !== "passed") {
 				report(
 					location,
 					`passed claim references non-passing evidence ${evidenceId}`,
+				);
+			} else if (
+				claim.status === "passed" &&
+				entry.commit !== status.candidate?.commit
+			) {
+				report(
+					location,
+					`evidence ${evidenceId} commit ${entry.commit} differs from candidate commit ${status.candidate?.commit ?? "<unbound>"}`,
 				);
 			}
 		}
@@ -934,8 +854,11 @@ function checkHostedH7Contract(): void {
 
 const status = readStatus();
 if (status) {
-	if (status.schemaVersion !== 1) {
-		report("release-status.schemaVersion", "must equal 1");
+	if (status.schemaVersion !== STATUS_SCHEMA_VERSION) {
+		report(
+			"release-status.schemaVersion",
+			`must equal ${STATUS_SCHEMA_VERSION}`,
+		);
 	}
 	if (
 		status.candidate?.readiness !== "pending" &&
@@ -989,8 +912,7 @@ if (status) {
 				return (
 					entry?.status === "passed" &&
 					entry.commit === status.candidate.commit &&
-					typeof entry.path === "string" &&
-					entry.path.length > 0
+					entry.claimIds.includes("iwa-direct-sockets")
 				);
 			});
 			if (!bound) {
