@@ -35,7 +35,7 @@ on:
         default: "false"
         type: string
       mode:
-        description: "bandwidth (rate ladder, default) | session-scale (session-count ladder) | g6-mmo (MMO realm gate) | g6-attribution (same-workload attribution) | ack-reflector-gate (one shard, 1,250 sessions, js vs native ack reflection) | sink-gate (RFC_STREAM_SINK latency gate, optional churn soak; tuned by sink_params)"
+        description: "bandwidth (rate ladder, default) | session-scale (session-count ladder) | sink-gate (RFC_STREAM_SINK latency gate, optional churn soak; tuned by sink_params)"
         required: false
         default: "bandwidth"
         type: string
@@ -79,57 +79,8 @@ on:
         required: false
         default: "false"
         type: string
-      g6_arms:
-        description: "g6-mmo: arms to run (steady,hotspot,storm). Every rate is derived in tools/load/g6-plan.ts, not here."
-        required: false
-        default: "steady,hotspot,storm"
-        type: string
-      g6_ladder:
-        description: "g6-mmo: realm population ladder. The gate rung is the last one."
-        required: false
-        default: "500,2500,5000"
-        type: string
-      g6_steady_seconds:
-        description: "g6-mmo: steady window per arm"
-        required: false
-        default: "120"
-        type: string
-      g6_offbox_ssh:
-        description: "g6-mmo: ssh destination of the Mac generator over the cable. EMPTY MEANS CO-RESIDENT, which can never be a G6 result."
-        required: false
-        default: ""
-        type: string
-      g6_server_address:
-        description: "g6 modes: the server's address on the bench subnet, as the off-box generator dials it"
-        required: false
-        default: "10.99.0.2"
-        type: string
-      g6_gate_server_recv_runtime:
-        description: "ack-reflector-gate: endpoint-driver placement for both legs (shared | dedicated); defaults to shared"
-        required: false
-        default: "shared"
-        type: string
-      g6_offbox_clone:
-        description: "ack-reflector-gate: absolute path of the generator clone on the off-box host; its tools/offbox/mac-generator-entry-g6.sh is the entry script. EMPTY REFUSES THE GATE."
-        required: false
-        default: ""
-        type: string
-      g6_preregistration_sha256:
-        description: "g6 modes: exact SHA-256 of the tracked successor preregistration"
-        required: false
-        default: ""
-        type: string
-      # GitHub refuses to parse a workflow with more than 25 dispatch inputs,
-      # so the twelve source-bound values ride in one JSON blob. It is decoded
-      # and fail-closed-validated by tools/load/g6-source-bound.ts before the
-      # configure step exports anything.
-      g6_source_bound:
-        description: "g6 modes: JSON with registrationPath/registrationSha256/expectedRunnerHost/expectedGeneratorHost, plus for g6-mmo the same-day preflightDown/preflightUp/floor/sink Path+Sha256 pairs (absolute runner paths)"
-        required: false
-        default: ""
-        type: string
-      # The sink gate's three knobs share one JSON input for the same 25-input
-      # reason. Any omitted key takes the default shown; unknown keys and
+      # The sink gate's three knobs share one JSON input because GitHub refuses
+      # to parse a workflow with more than 25 dispatch inputs. Any omitted key takes the default shown; unknown keys and
       # out-of-range values are refused in "Validate benchmark mode".
       sink_params:
         description: 'sink-gate: JSON {"saturatePct":90,"soakSeconds":0,"runnerLabel":"heavy"}. saturatePct = receiver-loop saturation duty for the loaded cell; soakSeconds > 0 also runs the churn soak (86400 is the 24h gate); runnerLabel heavy|soak picks the self-hosted pool'
@@ -214,7 +165,7 @@ jobs:
           SINK_PARAMS: ${{ github.event.inputs.sink_params }}
         run: |
           case "$MODE" in
-            sink-gate|bandwidth|session-scale|g6-mmo|g6-attribution|ack-reflector-gate) ;;
+            sink-gate|bandwidth|session-scale) ;;
             *) echo "::error::Unsupported benchmark mode: $MODE"; exit 2 ;;
           esac
           if [ "$MODE" = "sink-gate" ]; then
@@ -266,109 +217,6 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 90
-      - name: Configure successor evidence bundle
-        id: configure_g6_bundle
-        if: ${{ github.event.inputs.probe_only != 'true' && (github.event.inputs.mode == 'g6-mmo' || github.event.inputs.mode == 'g6-attribution' || github.event.inputs.mode == 'ack-reflector-gate') }}
-        env:
-          CANDIDATE_SHA: ${{ github.event.inputs.candidate_commit }}
-          MODE: ${{ github.event.inputs.mode }}
-          OFFBOX_SSH: ${{ github.event.inputs.g6_offbox_ssh }}
-          OFFBOX_CLONE: ${{ github.event.inputs.g6_offbox_clone }}
-          PREREGISTRATION_SHA256: ${{ github.event.inputs.g6_preregistration_sha256 }}
-          SOURCE_BOUND: ${{ github.event.inputs.g6_source_bound }}
-        run: |
-          # Every identity check runs before anything is exported to
-          # GITHUB_ENV. Later always() steps predicate on these exports, so a
-          # refused configuration must leave them unset.
-          for value in "$OFFBOX_SSH" "$PREREGISTRATION_SHA256" "$SOURCE_BOUND"; do
-            if [ -z "$value" ]; then
-              echo "::error::The off-box, preregistration, and source-bound inputs are all required"
-              exit 2
-            fi
-          done
-          # The sharded scan refuses to run without an absolute entry script in
-          # the generator clone, so the gate mode requires the clone path here
-          # rather than discovering the refusal after the candidate is built.
-          case "$MODE:$OFFBOX_CLONE" in
-            ack-reflector-gate:/*) ;;
-            ack-reflector-gate:*)
-              echo "::error::ack-reflector-gate requires g6_offbox_clone as an absolute path on the off-box host"
-              exit 2 ;;
-          esac
-          # The validator emits only allowlisted KEY=value lines (no shell
-          # metacharacters) to a temp file. We never eval its output — a value
-          # can carry no code. The one field an in-step refusal needs (the
-          # expected runner host) is read back with grep, not eval, and the
-          # whole file is appended to GITHUB_ENV only after the last refusal.
-          PARSED_FILE="$RUNNER_TEMP/g6-source-bound-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.env"
-          if ! G6_SOURCE_BOUND="$SOURCE_BOUND" G6_MODE="$MODE" bun tools/load/g6-source-bound.ts > "$PARSED_FILE"; then
-            echo "::error::source-bound input rejected"
-            exit 2
-          fi
-          EXPECTED_RUNNER_HOST="$(grep '^G6_EXPECTED_RUNNER_HOST=' "$PARSED_FILE" | cut -d= -f2-)"
-          ACTUAL_HEAD="$(git rev-parse HEAD)"
-          if [ "$ACTUAL_HEAD" != "$CANDIDATE_SHA" ]; then
-            echo "::error::Checked-out HEAD $ACTUAL_HEAD differs from registered candidate $CANDIDATE_SHA"
-            exit 2
-          fi
-          if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
-            echo "::error::Tracked candidate tree is dirty"
-            exit 2
-          fi
-          ACTUAL_RUNNER_HOST="$(hostname -s)"
-          if [ "$ACTUAL_RUNNER_HOST" != "$EXPECTED_RUNNER_HOST" ]; then
-            echo "::error::Runner host $ACTUAL_RUNNER_HOST differs from $EXPECTED_RUNNER_HOST"
-            exit 2
-          fi
-          mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
-          BUNDLE_DIR="$GITHUB_WORKSPACE/.bench-evidence/g6-${MODE}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          TREE_SHA="$(git rev-parse 'HEAD^{tree}')"
-          cat "$PARSED_FILE" >> "$GITHUB_ENV"
-          echo "G6_BUNDLE_DIR=$BUNDLE_DIR" >> "$GITHUB_ENV"
-          echo "G6_TREE_SHA=$TREE_SHA" >> "$GITHUB_ENV"
-          echo "G6_RUN_EXIT=not-run" >> "$GITHUB_ENV"
-          echo "G6_EVALUATOR_EXIT=not-run" >> "$GITHUB_ENV"
-          echo "G6_FINALIZE_EXIT=not-run" >> "$GITHUB_ENV"
-          echo "G6_VERIFY_EXIT=not-run" >> "$GITHUB_ENV"
-          echo "G6_BUNDLE_STATUS=not-run" >> "$GITHUB_ENV"
-          echo "G6_UPLOAD_FAILED=unknown" >> "$GITHUB_ENV"
-          echo "G6_CONFIGURE_OK=true" >> "$GITHUB_ENV"
-      - name: Prepare successor evidence bundle
-        if: ${{ github.event.inputs.probe_only != 'true' && (github.event.inputs.mode == 'g6-mmo' || github.event.inputs.mode == 'g6-attribution' || github.event.inputs.mode == 'ack-reflector-gate') }}
-        env:
-          MODE: ${{ github.event.inputs.mode }}
-          CANDIDATE_SHA: ${{ github.event.inputs.candidate_commit }}
-          PREREGISTRATION_SHA256: ${{ github.event.inputs.g6_preregistration_sha256 }}
-        run: |
-          KIND="attribution"
-          if [ "$MODE" = "g6-mmo" ]; then KIND="full-g6"; fi
-          if [ "$MODE" = "ack-reflector-gate" ]; then KIND="ack-reflector-gate"; fi
-          COMMON=(
-            --kind "$KIND"
-            --dir "$G6_BUNDLE_DIR"
-            --candidate "$CANDIDATE_SHA"
-            --tree-sha "$G6_TREE_SHA"
-            --preregistration "$GITHUB_WORKSPACE/docs/research/preregistrations/gate-g6-mmo-closeout.md"
-            --expected-preregistration-sha256 "$PREREGISTRATION_SHA256"
-            --registration "$G6_REGISTRATION_PATH"
-            --expected-registration-sha256 "$G6_REGISTRATION_SHA256"
-            --expected-runner-host "$G6_EXPECTED_RUNNER_HOST"
-            --expected-generator-host "$G6_EXPECTED_GENERATOR_HOST"
-          )
-          if [ "$MODE" = "g6-mmo" ]; then
-            bun tools/load/g6-bundle.ts prepare "${COMMON[@]}" \
-              --preflight-down "$G6_PREFLIGHT_DOWN_PATH" \
-              --expected-preflight-down-sha256 "$G6_PREFLIGHT_DOWN_SHA256" \
-              --preflight-up "$G6_PREFLIGHT_UP_PATH" \
-              --expected-preflight-up-sha256 "$G6_PREFLIGHT_UP_SHA256" \
-              --floor "$G6_FLOOR_PATH" \
-              --expected-floor-sha256 "$G6_FLOOR_SHA256" \
-              --sink "$G6_SINK_PATH" \
-              --expected-sink-sha256 "$G6_SINK_SHA256"
-          else
-            bun tools/load/g6-bundle.ts prepare "${COMMON[@]}"
-          fi
-          echo "G6_PREPARE_OK=true" >> "$GITHUB_ENV"
       - name: Run bandwidth ladder
         if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.mode == 'bandwidth' }}
         env:
@@ -376,13 +224,14 @@ jobs:
           BENCH_PAYLOAD_BYTES: ${{ github.event.inputs.payload_bytes }}
           BENCH_STEP_SECONDS: ${{ github.event.inputs.step_seconds }}
           BENCH_RATES: ${{ github.event.inputs.rates }}
+          CANDIDATE: ${{ github.event.inputs.candidate_commit }}
         run: |
           mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
-          BENCH_OUT="$GITHUB_WORKSPACE/.bench-evidence/bench-bandwidth-${{ github.event.inputs.candidate_commit }}.json" \
+          BENCH_OUT="$GITHUB_WORKSPACE/.bench-evidence/bench-bandwidth-$CANDIDATE.json" \
             bun tools/load/bench-bandwidth.ts
       # Session-count ladder: session count is the only variable, per-session
-      # rate is held deliberately low. Buckets and STOP conditions are
-      # pre-registered in docs/research/preregistrations/session-scale.md.
+      # rate is held deliberately low. Buckets and STOP conditions were
+      # pre-registered with the session-scale campaign (kept outside the repo).
       - name: Run session-scale ladder
         if: ${{ github.event.inputs.probe_only != 'true' && github.event.inputs.mode == 'session-scale' }}
         env:
@@ -394,6 +243,7 @@ jobs:
           SCALE_ENDPOINTS: ${{ github.event.inputs.scale_endpoints }}
           SCALE_CONNECT_CONCURRENCY: ${{ github.event.inputs.scale_connect_concurrency }}
           SCALE_STAGGER: ${{ github.event.inputs.scale_stagger }}
+          CANDIDATE: ${{ github.event.inputs.candidate_commit }}
         run: |
           mkdir -p "$GITHUB_WORKSPACE/.bench-evidence"
           # Raise the fd soft limit to the hard limit. The pre-registration
@@ -402,119 +252,8 @@ jobs:
           # as a server-side wall if it is not.
           ulimit -n "$(ulimit -Hn)" || true
           echo "fd soft limit: $(ulimit -n)"
-          SCALE_OUT="$GITHUB_WORKSPACE/.bench-evidence/bench-session-scale-${{ github.event.inputs.candidate_commit }}.json" \
+          SCALE_OUT="$GITHUB_WORKSPACE/.bench-evidence/bench-session-scale-$CANDIDATE.json" \
             bun tools/load/bench-session-scale.ts
-      # G6: the MMO realm gate. Rates, bounds and the cable STOP's requirements
-      # are derived in tools/load/g6-plan.ts from the scenario constants, so the
-      # workflow carries populations and windows and no thresholds at all.
-      # Registration: docs/research/preregistrations/gate-g6-mmo.md.
-      - name: Run G6 MMO realm gate
-        id: run_g6_mmo
-        if: ${{ always() && github.event.inputs.probe_only != 'true' && github.event.inputs.mode == 'g6-mmo' && env.G6_CONFIGURE_OK == 'true' && env.G6_PREPARE_OK == 'true' && env.G6_BUNDLE_DIR != '' }}
-        continue-on-error: true
-        env:
-          G6_ARMS: ${{ github.event.inputs.g6_arms }}
-          G6_LADDER: ${{ github.event.inputs.g6_ladder }}
-          G6_STEADY_SECONDS: ${{ github.event.inputs.g6_steady_seconds }}
-          G6_OFFBOX_SSH: ${{ github.event.inputs.g6_offbox_ssh }}
-          G6_SERVER_ADDRESS: ${{ github.event.inputs.g6_server_address }}
-          # The Mac entrypoint checks out and builds exactly this SHA; without
-          # it every off-box generator spawn exits 3 before running (O-1).
-          G6_CANDIDATE_SHA: ${{ github.event.inputs.candidate_commit }}
-          # The bench-g6/2 producer refuses to run unless the tracked
-          # preregistration hashes to exactly this value.
-          G6_PREREGISTRATION_SHA256: ${{ github.event.inputs.g6_preregistration_sha256 }}
-        run: |
-          set +e
-          ulimit -n "$(ulimit -Hn)" || true
-          echo "fd soft limit: $(ulimit -n)"
-          G6_OUT="$G6_BUNDLE_DIR/bench-g6.json" \
-            bun tools/load/bench-g6.ts
-          STATUS="$?"
-          echo "G6_RUN_EXIT=$STATUS" >> "$GITHUB_ENV"
-          exit "$STATUS"
-      - name: Run G6 attribution matrix
-        id: run_g6_attribution
-        if: ${{ always() && github.event.inputs.probe_only != 'true' && github.event.inputs.mode == 'g6-attribution' && env.G6_CONFIGURE_OK == 'true' && env.G6_PREPARE_OK == 'true' && env.G6_BUNDLE_DIR != '' }}
-        continue-on-error: true
-        env:
-          G6_ATTR_OUT_DIR: ${{ env.G6_BUNDLE_DIR }}
-          G6_ATTR_OFFBOX_SSH: ${{ github.event.inputs.g6_offbox_ssh }}
-          G6_ATTR_SERVER_ADDRESS: ${{ github.event.inputs.g6_server_address }}
-          G6_ATTR_EXPECTED_GENERATOR_HOST: ${{ env.G6_EXPECTED_GENERATOR_HOST }}
-        run: |
-          set +e
-          bun tools/load/g6-attribution-server.ts
-          STATUS="$?"
-          echo "G6_RUN_EXIT=$STATUS" >> "$GITHUB_ENV"
-          exit "$STATUS"
-      - name: Run ack reflector kill gate
-        id: run_ack_reflector_gate
-        if: ${{ always() && github.event.inputs.probe_only != 'true' && github.event.inputs.mode == 'ack-reflector-gate' && env.G6_CONFIGURE_OK == 'true' && env.G6_PREPARE_OK == 'true' && env.G6_BUNDLE_DIR != '' }}
-        continue-on-error: true
-        env:
-          G6_OFFBOX_SSH: ${{ github.event.inputs.g6_offbox_ssh }}
-          G6_OFFBOX_CLONE: ${{ github.event.inputs.g6_offbox_clone }}
-          G6_OFFBOX_ENTRY_SCRIPT: ${{ github.event.inputs.g6_offbox_clone }}/tools/offbox/mac-generator-entry-g6.sh
-          G6_GATE_SERVER_RECV_RUNTIME: ${{ github.event.inputs.g6_gate_server_recv_runtime }}
-          G6_SERVER_ADDRESS: ${{ github.event.inputs.g6_server_address }}
-          G6_CANDIDATE_SHA: ${{ github.event.inputs.candidate_commit }}
-          G6_PREREGISTRATION_SHA256: ${{ github.event.inputs.g6_preregistration_sha256 }}
-        run: |
-          set +e
-          (
-          set -euo pipefail
-          ulimit -n "$(ulimit -Hn)" || true
-          for mode in js native; do
-            # The scan refuses a pre-arm receipt older than its freshness window,
-            # so the BPF program is re-armed before every leg, as the campaign
-            # controller does before every cell.
-            sudo env PIN_DIR=/sys/fs/bpf/quic-lb G6_BPF_READY_RECEIPT="$G6_BUNDLE_DIR/g6-shard-bpf-ready.json" tools/load/g6-shard-bpf-setup.sh 1
-            # sudo drops -E and root's PATH has no bun, so the job PATH is passed
-            # explicitly; the scan needs root for bpftool map dumps and ssh's the
-            # generator with root's ssh config.
-            sudo env PATH="$PATH" \
-              G6_OFFBOX_SSH="$G6_OFFBOX_SSH" G6_OFFBOX_CLONE="$G6_OFFBOX_CLONE" G6_OFFBOX_ENTRY_SCRIPT="$G6_OFFBOX_ENTRY_SCRIPT" \
-              G6_SERVER_ADDRESS="$G6_SERVER_ADDRESS" G6_CANDIDATE_SHA="$G6_CANDIDATE_SHA" G6_PREREGISTRATION_SHA256="$G6_PREREGISTRATION_SHA256" \
-              SCAN_DIAGNOSTIC=1 SCAN_SHARDS=1 SCAN_SESSIONS=1250 SCAN_WORKLOAD_ACTIVE_SESSIONS=1250 \
-              SCAN_ENDPOINTS=128 SCAN_CONNECT_CONCURRENCY=50 SCAN_CONNECT_RATE_PER_SEC=250 SCAN_FIXED_SOURCE_PORT_BASE=20000 \
-              SCAN_ACK_REFLECTOR="$mode" SCAN_SERVER_RECV_RUNTIME="${G6_GATE_SERVER_RECV_RUNTIME:-shared}" G6_BPF_READY_RECEIPT="$G6_BUNDLE_DIR/g6-shard-bpf-ready.json" \
-              SCAN_OUT="$G6_BUNDLE_DIR/ack-gate-$mode.json" SCAN_DIAGNOSTIC_OUT="$G6_BUNDLE_DIR/ack-gate-$mode-diagnostic.json" \
-              SCAN_POST_RUN_STEERING_OUT="$G6_BUNDLE_DIR/ack-gate-$mode-steering.json" G6_EMITTER_MODE=native-mirror \
-              bun tools/load/g6-sharded-scan.ts
-          done
-          bun tools/load/g6-ack-reflector-gate.ts --js "$G6_BUNDLE_DIR/ack-gate-js.json" --native "$G6_BUNDLE_DIR/ack-gate-native.json" --out "$G6_BUNDLE_DIR/ack-reflector-gate.json"
-          )
-          STATUS="$?"
-          # The scans ran as root; hand their files back so the next checkout's
-          # git clean can remove them (run 33654147367 failed at checkout on a
-          # root-owned .scratch/runtime-tmp).
-          sudo chown -R "$(id -u):$(id -g)" .scratch "$G6_BUNDLE_DIR" 2>/dev/null || true
-          echo "G6_RUN_EXIT=$STATUS" >> "$GITHUB_ENV"
-          exit "$STATUS"
-      - name: Evaluate G6 MMO realm gate
-        id: evaluate_g6_mmo
-        if: ${{ always() && github.event.inputs.probe_only != 'true' && github.event.inputs.mode == 'g6-mmo' && env.G6_CONFIGURE_OK == 'true' && env.G6_PREPARE_OK == 'true' && env.G6_BUNDLE_DIR != '' }}
-        continue-on-error: true
-        env:
-          EXPECTED_CANDIDATE: ${{ github.event.inputs.candidate_commit }}
-          EXPECTED_GENERATOR_HOST: ${{ env.G6_EXPECTED_GENERATOR_HOST }}
-          EXPECTED_PREREGISTRATION_SHA256: ${{ github.event.inputs.g6_preregistration_sha256 }}
-        run: |
-          set +e
-          bun tools/load/g6-evaluate.ts \
-            --artifact "$G6_BUNDLE_DIR/bench-g6.json" \
-            --preflight-down "$G6_BUNDLE_DIR/inputs/preflight-down.json" \
-            --preflight-up "$G6_BUNDLE_DIR/inputs/preflight-up.json" \
-            --floor "$G6_BUNDLE_DIR/inputs/floor.log" \
-            --sink "$G6_BUNDLE_DIR/inputs/sink.json" \
-            --expected-candidate "$EXPECTED_CANDIDATE" \
-            --expected-generator-host "$EXPECTED_GENERATOR_HOST" \
-            --expected-preregistration-sha256 "$EXPECTED_PREREGISTRATION_SHA256" \
-            --out "$G6_BUNDLE_DIR/classified.json"
-          STATUS="$?"
-          echo "G6_EVALUATOR_EXIT=$STATUS" >> "$GITHUB_ENV"
-          exit "$STATUS"
       - name: Upload legacy benchmark artifacts
         if: ${{ always() && github.event.inputs.probe_only != 'true' && (github.event.inputs.mode == 'bandwidth' || github.event.inputs.mode == 'session-scale') }}
         with:
@@ -526,135 +265,3 @@ jobs:
           if-no-files-found: error
           retention-days: 90
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-      - name: Finalize successor evidence bundle
-        id: finalize_g6_bundle
-        if: ${{ always() && github.event.inputs.probe_only != 'true' && (github.event.inputs.mode == 'g6-mmo' || github.event.inputs.mode == 'g6-attribution') && env.G6_BUNDLE_DIR != '' }}
-        continue-on-error: true
-        env:
-          MODE: ${{ github.event.inputs.mode }}
-          CANDIDATE_SHA: ${{ github.event.inputs.candidate_commit }}
-          PREREGISTRATION_SHA256: ${{ github.event.inputs.g6_preregistration_sha256 }}
-        run: |
-          set +e
-          KIND="attribution"
-          if [ "$MODE" = "g6-mmo" ]; then KIND="full-g6"; fi
-          REASON=""
-          if [ "$G6_RUN_EXIT" != "0" ] && [ "$G6_RUN_EXIT" != "not-run" ]; then
-            REASON="measurement exit $G6_RUN_EXIT"
-          fi
-          if [ "$MODE" = "g6-mmo" ] && [ "$G6_EVALUATOR_EXIT" != "0" ] && [ "$G6_EVALUATOR_EXIT" != "not-run" ]; then
-            if [ -n "$REASON" ]; then REASON="$REASON; "; fi
-            REASON="${REASON}evaluator exit $G6_EVALUATOR_EXIT"
-          fi
-          FINALIZE_OUT="$RUNNER_TEMP/g6-finalize-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
-          ARGS=(
-            finalize
-            --kind "$KIND"
-            --dir "$G6_BUNDLE_DIR"
-            --candidate "$CANDIDATE_SHA"
-            --tree-sha "$G6_TREE_SHA"
-            --preregistration "$GITHUB_WORKSPACE/docs/research/preregistrations/gate-g6-mmo-closeout.md"
-            --expected-preregistration-sha256 "$PREREGISTRATION_SHA256"
-            --registration "$G6_REGISTRATION_PATH"
-            --expected-registration-sha256 "$G6_REGISTRATION_SHA256"
-            --expected-runner-host "$G6_EXPECTED_RUNNER_HOST"
-            --expected-generator-host "$G6_EXPECTED_GENERATOR_HOST"
-          )
-          if [ -n "$REASON" ]; then
-            ARGS+=(--reason "$REASON")
-          fi
-          bun tools/load/g6-bundle.ts "${ARGS[@]}" > "$FINALIZE_OUT"
-          STATUS="$?"
-          echo "G6_FINALIZE_EXIT=$STATUS" >> "$GITHUB_ENV"
-          if [ "$STATUS" = "0" ]; then
-            FINAL_STATUS="$(bun -e 'const path = process.argv[1]; const value = JSON.parse(await Bun.file(path).text()); process.stdout.write(String(value.status ?? ""));' "$FINALIZE_OUT")"
-            echo "G6_BUNDLE_STATUS=$FINAL_STATUS" >> "$GITHUB_ENV"
-          fi
-          exit "$STATUS"
-      - name: Verify successor evidence bundle
-        id: verify_g6_bundle
-        if: ${{ always() && github.event.inputs.probe_only != 'true' && (github.event.inputs.mode == 'g6-mmo' || github.event.inputs.mode == 'g6-attribution') && env.G6_BUNDLE_DIR != '' }}
-        continue-on-error: true
-        env:
-          CANDIDATE_SHA: ${{ github.event.inputs.candidate_commit }}
-          PREREGISTRATION_SHA256: ${{ github.event.inputs.g6_preregistration_sha256 }}
-        run: |
-          set +e
-          VERIFY_OUT="$RUNNER_TEMP/g6-verify-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
-          bun tools/load/g6-manifest.ts verify \
-            --dir "$G6_BUNDLE_DIR" \
-            --expected-candidate "$CANDIDATE_SHA" \
-            --expected-preregistration-sha256 "$PREREGISTRATION_SHA256" \
-            --expected-registration-sha256 "$G6_REGISTRATION_SHA256" \
-            > "$VERIFY_OUT"
-          STATUS="$?"
-          echo "G6_VERIFY_EXIT=$STATUS" >> "$GITHUB_ENV"
-          if [ "$STATUS" = "0" ]; then
-            VERIFY_STATUS="$(bun -e 'const path = process.argv[1]; const value = JSON.parse(await Bun.file(path).text()); process.stdout.write(String(value.status ?? ""));' "$VERIFY_OUT")"
-            echo "G6_BUNDLE_STATUS=$VERIFY_STATUS" >> "$GITHUB_ENV"
-          fi
-          exit "$STATUS"
-      - name: Upload successor evidence bundle
-        id: upload_g6_bundle
-        if: ${{ always() && github.event.inputs.probe_only != 'true' && (github.event.inputs.mode == 'g6-mmo' || github.event.inputs.mode == 'g6-attribution' || github.event.inputs.mode == 'ack-reflector-gate') && env.G6_BUNDLE_DIR != '' }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: g6-evidence-${{ github.event.inputs.mode }}-${{ github.event.inputs.candidate_commit }}
-          path: ${{ env.G6_BUNDLE_DIR }}
-          include-hidden-files: true
-          if-no-files-found: error
-          retention-days: 90
-      - name: Record successor evidence upload outcome
-        if: ${{ always() && github.event.inputs.probe_only != 'true' && (github.event.inputs.mode == 'g6-mmo' || github.event.inputs.mode == 'g6-attribution') }}
-        run: |
-          if [ "${{ steps.upload_g6_bundle.outcome }}" = "success" ]; then
-            echo "G6_UPLOAD_FAILED=false" >> "$GITHUB_ENV"
-          else
-            echo "G6_UPLOAD_FAILED=true" >> "$GITHUB_ENV"
-          fi
-      - name: Enforce successor evidence bundle
-        if: ${{ always() && github.event.inputs.probe_only != 'true' && (github.event.inputs.mode == 'g6-mmo' || github.event.inputs.mode == 'g6-attribution') }}
-        run: |
-          FAIL=0
-          if [ "$G6_RUN_EXIT" != "0" ]; then
-            echo "::error::G6 measurement failed with exit $G6_RUN_EXIT"
-            FAIL=1
-          fi
-          if [ "${{ github.event.inputs.mode }}" = "g6-mmo" ] && [ "$G6_EVALUATOR_EXIT" != "0" ]; then
-            echo "::error::G6 evaluator failed with exit $G6_EVALUATOR_EXIT"
-            FAIL=1
-          fi
-          if [ "${{ steps.finalize_g6_bundle.outcome }}" != "success" ] || [ "$G6_FINALIZE_EXIT" != "0" ]; then
-            echo "::error::G6 finalization failed with exit $G6_FINALIZE_EXIT"
-            FAIL=1
-          fi
-          if [ "${{ steps.verify_g6_bundle.outcome }}" != "success" ] || [ "$G6_VERIFY_EXIT" != "0" ]; then
-            echo "::error::G6 verification failed with exit $G6_VERIFY_EXIT"
-            FAIL=1
-          fi
-          if [ "${{ steps.upload_g6_bundle.outcome }}" != "success" ] || [ "$G6_UPLOAD_FAILED" = "true" ]; then
-            echo "::error::G6 bundle upload failed"
-            FAIL=1
-          fi
-          if [ "$G6_BUNDLE_STATUS" != "COMPLETE" ]; then
-            echo "::error::G6 verified status was $G6_BUNDLE_STATUS, expected COMPLETE"
-            FAIL=1
-          fi
-          if [ "$FAIL" -ne 0 ]; then
-            exit 1
-          fi
-      - name: Enforce ack reflector kill gate
-        if: ${{ always() && github.event.inputs.probe_only != 'true' && github.event.inputs.mode == 'ack-reflector-gate' }}
-        run: |
-          FAIL=0
-          if [ "$G6_RUN_EXIT" != "0" ]; then
-            echo "::error::ack reflector kill gate exited $G6_RUN_EXIT (3=fail, 2=unusable)"
-            FAIL=1
-          fi
-          if [ "${{ steps.upload_g6_bundle.outcome }}" != "success" ]; then
-            echo "::error::ack reflector evidence upload failed"
-            FAIL=1
-          fi
-          if [ "$FAIL" -ne 0 ]; then
-            exit 1
-          fi

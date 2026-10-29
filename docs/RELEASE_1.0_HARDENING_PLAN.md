@@ -2,8 +2,8 @@
 
 > **Historical plan (superseded).** This document records the earlier
 > native-only hardening scope and is not current release status or the active
-> definition of done. Native and WASM now ship under one evidence contract in
-> `docs/superpowers/plans/2026-07-21-faang-plus-1.0-closure.md`; the authoritative
+> definition of done. Native and WASM now ship under one evidence contract (the 2026-07-21
+> 1.0 closure plan, a local planning document not kept in the repo); the authoritative
 > current state is `docs/release-status.json` and
 > `docs/RELEASE_1.0_STATUS.md`.
 

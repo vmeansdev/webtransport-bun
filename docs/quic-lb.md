@@ -4,9 +4,8 @@ How the two deployment hooks compose into something a balancer can steer.
 
 This is the operator's note. The option reference lives in
 [`OPERATIONS.md`](OPERATIONS.md) — "Multi-process binds (`reusePort`)" and
-"QUIC-LB connection IDs (`quicLb`)" — the capacity and sizing argument lives in
-[the bare-metal capacity document](research/2026-08-21-bare-metal-capacity.md),
-and the reference eBPF program lives in
+"QUIC-LB connection IDs (`quicLb`)" — the capacity and sizing argument was recorded in the bare-metal capacity
+chapter (a measurement-campaign record kept outside this repository), and the reference eBPF program lives in
 [`examples/quic-lb/`](../examples/quic-lb/README.md).
 
 Everything here is pinned to **draft-ietf-quic-load-balancers-21**, the same

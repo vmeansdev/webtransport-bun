@@ -9,39 +9,50 @@ Package version: `1.0.0-rc.1`.
 `bun scripts/promote-release-status.ts` succeeds. `scale-10k-multisource` is
 `gaRequired: false`.
 
-## Local progress on candidate `c7a1e78…`
+## Current state (2026-10-29): no candidate, every claim pending
 
-The candidate was rebound to branch HEAD on 2026-07-29, after the branch commit
-messages were aligned to the project format. Every gate below was re-run at that
-commit; nothing was carried over.
+`docs/release-status.json` is bound to no candidate (`candidate.commit: null`,
+readiness `pending`) and every claim is `pending` with no evidence IDs.
 
-### Passed (commit-bound on candidate)
+Why: all previously recorded evidence was bound to the pre-rewrite candidate
+`875dfbfe…`, which no longer exists after the 2026-10 history rewrite (see
+`docs/HISTORY_REWRITE_2026-10.md`), and was already stale (the branch had moved
+967 commits past it). The evidence files themselves (`docs/release-evidence/`,
+`.release-evidence/`, `.bench-evidence/`) were removed from the repository on
+2026-10-29 together with the other measurement-campaign material and archived
+outside it.
 
-- `native-local-gates` (canonical bun package suite, 441/441)
-- `wasm-local-gates` (`bun run test:wasm`, 86/86)
-- `wasm-facade-parity` — all 9 `parity-*.test.ts` on both backends
-  (native 67 pass/0 fail; wasm 64 pass/3 skip/0 fail)
-- `wasm-dynamic-qpack`, `wasm-multi-session`, `wasm-0rtt` (timed unit evidence)
-- `package-artifact`, `supply-chain-provenance`
+Evidence will be regenerated at the next frozen candidate and stored outside
+the repository. **Open question:** whether it is published as GitHub release
+assets of the candidate tag or kept in a separate evidence repository; the
+`docs/release-evidence.schema.json` contract and
+`scripts/promote-release-status.ts` / `scripts/check-doc-truth.ts` stay in this
+repo either way, and evidence paths will need to resolve wherever that lands.
+Tracked files under `.release-evidence/` and `.bench-evidence/` are refused by
+CI (`scripts/check-tracked-hygiene.sh`).
 
-### Still pending (block promote)
+### Pending (block promote)
 
-| Claim | Blocker |
-|---|---|
-| `coverage-gates` | `cargo llvm-cov --branch` needs a nightly toolchain (`-Z coverage-options=branch`); not re-measured on the rebound candidate. Last measurement, on the pre-alignment gap-closure commit, was already under floor at endpoint/h3 branch 79.64/78.85 < 80 |
-| `runtime-consumers`, `chromium-*`, `fault-matrix` | Not re-run on the rebound candidate; demoted pending re-verify |
-| `iwa-direct-sockets` | **Demoted 2026-07-29 on rebind.** The Chrome 150 Direct Sockets proof was a manually rebuilt and signed IWA bundle; the run was real but is bound to the pre-alignment commit and cannot be reproduced non-interactively |
-| `auto-review-zero-p0-p4` | **Demoted 2026-07-29 on rebind.** Round 5 closed with no open P0-P4, but against the gap-closure commit; the candidate has since advanced by the portable-`createServer`, `ServerSession`-convergence, caPem and `E_TLS` commits |
-| `fuzz-gates` | Darwin cargo-fuzz sancov link fails; **Linux/CI campaign required** |
-| `cross-platform-matrix` | Hosted macOS+Linux+Windows evidence not rebound |
-| `soak-24h` / `soak-72h` | Wall-clock soak campaigns not run |
-| `final-no-change-confirmation` | Requires immutable freeze after all other gates |
+Every `gaRequired: true` claim: `native-local-gates`, `wasm-local-gates`,
+`wasm-facade-parity`, `wasm-dynamic-qpack`, `wasm-multi-session`, `wasm-0rtt`,
+`chromium-native-interop`, `chromium-wasm-interop`, `iwa-direct-sockets`,
+`runtime-consumers`, `cross-platform-matrix`, `fault-matrix`, `coverage-gates`,
+`fuzz-gates`, `package-artifact`, `supply-chain-provenance`, `soak-24h`,
+`soak-72h`, `auto-review-zero-p0-p4`, `final-no-change-confirmation`.
+
+Known blockers carried over from the last candidate: `coverage-gates` needs a
+nightly toolchain for `cargo llvm-cov --branch` (last measured under the 80%
+branch floor at endpoint/h3); `fuzz-gates` needs a Linux/CI campaign (darwin
+cargo-fuzz sancov link fails); `iwa-direct-sockets` needs the interactive
+Chrome Direct Sockets proof; the soaks are wall-clock campaigns;
+`final-no-change-confirmation` requires an immutable freeze after all other
+gates.
 
 ### Not GA-blocking
 
 | Claim | Harness | Evidence artifact |
 |---|---|---|
-| `scale-10k-multisource` (`gaRequired: false`, `pending`) | `tools/load/distributed-scale.ts` | `tools/load/distributed-scale.test.ts`; `.release-evidence/load/distributed-scale-artifact.json` |
+| `scale-10k-multisource` (`gaRequired: false`, `pending`) | `tools/load/distributed-scale.ts` | `tools/load/distributed-scale.test.ts`; run output `.release-evidence/load/distributed-scale-artifact.json` (untracked) |
 
 `distributed-scale.ts` is the authoritative multisource harness; the earlier
 single-source scale scripts it replaced are not release evidence.
@@ -49,22 +60,11 @@ single-source scale scripts it replaced are not release evidence.
 ## What is safe to say today
 
 - Package remains `1.0.0-rc.1`; readiness remains `pending`.
-- Facade parity is now proven, not asserted: the same nine parity suites pass on
-  the native and wasm backends through the portable `createServer`, and caPem
-  CA-root trust is verified end to end (handshake plus stream echo against a
-  CA-issued leaf, foreign CA refused with `E_TLS` alert 48).
-- R4 product gaps closed on candidate: random ticket vault, SNI=authority,
-  QPACK encode scratch + blocked-stream cap, `ticketStore` on unified client.
-- Soft facade divergences for pooling / waitUntilAvailable / getStats / CC /
-  sendOrder were closed on the parity epic path; ticket dump auto-fires on
-  close when a `TicketStoreHost` is set (`Memory` / `File` / `IndexedDB`).
-  Live TLS/SNI rotate, metricsSnapshot, log/debug, and `WasmServerSession`
-  are available on wasm managers. Async IWA plug-and-play `createServer` exists
-  on `@webtransport-bun/webtransport/wasm` (candidate; not GA; not the root
-  native sync API).
-- Promote still refuses until the pending table above clears.
+- No gate is currently `passed` in `docs/release-status.json`; earlier passes
+  were bound to a commit that no longer exists and are history, not evidence.
+- Promote refuses until every `gaRequired` claim passes at a new candidate.
 
-## Session progress 2026-08-04 (candidate advanced beyond `c7a1e78…`)
+## History: session progress 2026-08-04 (candidate advanced beyond `c7a1e78…`)
 
 The branch has advanced well past the recorded candidate. This section records
 the state honestly; it does **not** re-bind `release-status.json` or claim any
@@ -98,7 +98,7 @@ new head.
   defect; both belong to the `chromium-native-interop` / load-evidence gates.
 - **Still open for GA** (unchanged, still blocking): re-bind the candidate and
   regenerate every `gaRequired` evidence artifact at the new head; the pending
-  gate table above; external `LOKALISE_API_TOKEN` rotation and published-history
+  gates above; external `LOKALISE_API_TOKEN` rotation and published-history
   purge; the interactive IWA Direct Sockets proof; and the 24h/72h soaks.
 - **History rewritten 2026-10-29** (token rotated, history purged): SHAs cited in
   this repo predate the rewrite; resolve them via `docs/HISTORY_REWRITE_2026-10.md`.
@@ -106,14 +106,12 @@ new head.
 ## Capacity gates ruling 2026-10-28
 
 Nikita ruled the bare-metal capacity gates G1–G11 passed for 1.0, each stated
-with its own figure and placement phrase as recorded in
-`docs/research/2026-08-21-bare-metal-capacity.md` (the verdict ledger). G10
-carries a remark: no cloud verdict exists (DigitalOcean reruns stopped on
-provider-side loss between the NICs), its scenario is superseded by the
-paced-broadcast PASS, and a dedicated bare-metal rerun is parked. These gates
-are capacity evidence for the documentation; they are not `release-status.json`
-claims and do not change the coupled GA model above.
-
-The candidate recorded above (`875dfbfe`) is stale: `rebind4-staging` is 967
-commits past it (175 touching product sources), and every `gaRequired` claim
-must be regenerated at a newly frozen candidate before promote.
+with its own figure and placement phrase as recorded in the capacity chapter
+(the verdict ledger). That chapter and the campaign records behind it were
+moved out of the repository on 2026-10-29 with the other campaign material;
+they are not part of the shipped documentation. G10 carries a remark: no cloud
+verdict exists (DigitalOcean reruns stopped on provider-side loss between the
+NICs), its scenario is superseded by the paced-broadcast PASS, and a dedicated
+bare-metal rerun is parked. These gates are capacity evidence for the
+documentation; they are not `release-status.json` claims and do not change the
+coupled GA model above.

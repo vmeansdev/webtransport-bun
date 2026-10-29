@@ -544,8 +544,9 @@ turning it on:
   to a *different* process, which does not recognize it. The connection does not
   close: it **stalls until the idle timeout expires (60 s by default,
   `crates/native/src/limits.rs:47`)**, so what the application sees is a hang
-  followed by a timeout, not a clean drop. See §3 of
-  `docs/research/2026-08-21-bare-metal-capacity.md` for the verified mechanism.
+  followed by a timeout, not a clean drop. The mechanism was verified in §3 of
+  the bare-metal capacity chapter (a campaign record kept outside this
+  repository).
   The same argument applies to plain ECMP.
 - **Group membership changes re-hash the whole group.** Adding or removing a
   socket changes the hash distribution for every flow, not just new ones.
@@ -567,12 +568,12 @@ documented reuseport behavior. Distribution across the group is the kernel's,
 not this library's: Linux hashes across members, BSD/macOS delivers to the last
 binder.
 
-The full argument, the supported deployment pattern, and the sizing figures
-live in
-[docs/research/2026-08-21-bare-metal-capacity.md](research/2026-08-21-bare-metal-capacity.md)
-— sections 3 ("Unsupported: 4-tuple-hash balancers in front of long-lived
-sessions") and 4 ("Four disclosures you must read before deploying any steered
-pattern").
+The full argument and the measured sizing figures were recorded in the
+bare-metal capacity chapter — sections 3 ("Unsupported: 4-tuple-hash balancers
+in front of long-lived sessions") and 4 ("Four disclosures you must read before
+deploying any steered pattern"). That chapter is a measurement-campaign record
+and is kept outside this repository; the supported deployment pattern is
+summarized here and in [`quic-lb.md`](quic-lb.md).
 
 ## QUIC-LB connection IDs (`quicLb`)
 
@@ -650,9 +651,8 @@ directions, for the life of the connection.
 
 Put against this rig's measured egress, that is small but not free. G7's stream
 cell moved **1.2498 Gbps** with byte-exact ledgers (the run's 79.1% host-CPU
-maximum was measured on a *different* cell, B-1k — see the
-[capacity doc](research/2026-08-21-bare-metal-capacity.md), §"Host-level
-envelopes"); at the ~1,400-byte datagrams that path carries, three extra header
+maximum was measured on a *different* cell, B-1k — recorded in the bare-metal
+capacity chapter, §"Host-level envelopes", kept outside this repository); at the ~1,400-byte datagrams that path carries, three extra header
 octets is roughly **0.2%** of the wire bytes, and G3's egress cell ran with GSO
 and GRO active at 64 segments, so the added bytes ride the same syscalls rather
 than costing new ones. It has **not been measured** — no gate has run with
