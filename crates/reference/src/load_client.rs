@@ -816,6 +816,18 @@ struct SessionLoad {
     latency: Option<Arc<LatencyProbe>>,
 }
 
+/// Close code the native server sends when it refuses a session at
+/// `maxSessions` (`LIMIT_EXCEEDED_CLOSE_CODE` in crates/native/src/lib.rs).
+const LIMIT_EXCEEDED_CLOSE_CODE: u64 = 3992;
+
+fn is_admission_refusal(reason: &wtransport::error::ConnectionError) -> bool {
+    matches!(
+        reason,
+        wtransport::error::ConnectionError::ApplicationClosed(close)
+            if close.code().into_inner() == LIMIT_EXCEEDED_CLOSE_CODE
+    )
+}
+
 async fn run_session(
     conn: wtransport::Connection,
     duration: Duration,
@@ -852,7 +864,18 @@ async fn run_session(
     while start.elapsed() < duration {
         let deadline = schedule.deadline();
         tokio::select! {
-            _ = conn.closed() => break,
+            reason = conn.closed() => {
+                if is_admission_refusal(&reason) {
+                    // At capacity the server accepts the CONNECT and then closes
+                    // with E_LIMIT_EXCEEDED, so `connect()` can return before that
+                    // close lands. The session was refused, not admitted.
+                    counters.sessions_ok.fetch_sub(1, Ordering::Relaxed);
+                    counters.sessions_err.fetch_add(1, Ordering::Relaxed);
+                    eprintln!("load-client: session refused after CONNECT accept: {reason}");
+                    return;
+                }
+                break;
+            }
             _ = tokio::time::sleep_until(deadline.into()) => {
                 let intended_ns = schedule.intended_ns();
                 if let Some(probe) = latency.as_ref() {
