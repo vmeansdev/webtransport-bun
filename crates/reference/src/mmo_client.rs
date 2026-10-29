@@ -481,6 +481,9 @@ where
     }
 }
 
+// getrusage/getrlimit are POSIX-only; on other hosts (Windows CI builds the
+// harness bins too) the resource readings report as absent.
+#[cfg(unix)]
 fn rusage_self() -> Option<libc::rusage> {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
     let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
@@ -490,6 +493,7 @@ fn rusage_self() -> Option<libc::rusage> {
     Some(unsafe { usage.assume_init() })
 }
 
+#[cfg(unix)]
 fn self_rss_mb() -> Option<f64> {
     let usage = rusage_self()?;
     let raw = usage.ru_maxrss as f64;
@@ -503,11 +507,22 @@ fn self_rss_mb() -> Option<f64> {
     }
 }
 
+#[cfg(not(unix))]
+fn self_rss_mb() -> Option<f64> {
+    None
+}
+
+#[cfg(unix)]
 fn self_cpu_ms() -> Option<f64> {
     let usage = rusage_self()?;
     let user_ms = usage.ru_utime.tv_sec as f64 * 1000.0 + usage.ru_utime.tv_usec as f64 / 1000.0;
     let system_ms = usage.ru_stime.tv_sec as f64 * 1000.0 + usage.ru_stime.tv_usec as f64 / 1000.0;
     Some(user_ms + system_ms)
+}
+
+#[cfg(not(unix))]
+fn self_cpu_ms() -> Option<f64> {
+    None
 }
 
 fn percentile(sorted: &[u64], p: f64) -> Option<u64> {
@@ -889,6 +904,7 @@ struct EndpointPool {
 const LOOPBACK_DISTINCT_IP_ENDPOINT_CAP: usize = 250;
 const ENDPOINT_FD_RESERVE: u64 = 64;
 
+#[cfg(unix)]
 fn current_nofile_soft_limit() -> Option<u64> {
     let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
     let status = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) };
@@ -901,6 +917,11 @@ fn current_nofile_soft_limit() -> Option<u64> {
     } else {
         Some(limit.rlim_cur)
     }
+}
+
+#[cfg(not(unix))]
+fn current_nofile_soft_limit() -> Option<u64> {
+    None
 }
 
 fn validate_endpoint_configuration(

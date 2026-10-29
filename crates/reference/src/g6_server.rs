@@ -525,6 +525,9 @@ fn escape_json(raw: &str) -> String {
         .collect()
 }
 
+// getrusage/getrlimit are POSIX-only; on other hosts (Windows CI builds the
+// harness bins too) the resource readings report as absent.
+#[cfg(unix)]
 fn rusage_self() -> Option<libc::rusage> {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
     let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
@@ -534,6 +537,7 @@ fn rusage_self() -> Option<libc::rusage> {
     Some(unsafe { usage.assume_init() })
 }
 
+#[cfg(unix)]
 fn self_cpu_ms() -> Option<f64> {
     let usage = rusage_self()?;
     let user_ms = usage.ru_utime.tv_sec as f64 * 1000.0 + usage.ru_utime.tv_usec as f64 / 1000.0;
@@ -541,6 +545,12 @@ fn self_cpu_ms() -> Option<f64> {
     Some(user_ms + system_ms)
 }
 
+#[cfg(not(unix))]
+fn self_cpu_ms() -> Option<f64> {
+    None
+}
+
+#[cfg(unix)]
 fn self_rss_mb() -> Option<f64> {
     let usage = rusage_self()?;
     let raw = usage.ru_maxrss as f64;
@@ -552,6 +562,11 @@ fn self_rss_mb() -> Option<f64> {
     {
         Some(raw / 1024.0)
     }
+}
+
+#[cfg(not(unix))]
+fn self_rss_mb() -> Option<f64> {
+    None
 }
 
 fn phase_from_file(path: Option<&PathBuf>) -> String {

@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Read `CLOCK_MONOTONIC` in nanoseconds. Same counter the Bun side reads
 /// through `bun:ffi`, which is the whole reason one-way latency is meaningful.
+#[cfg(unix)]
 pub fn monotonic_ns() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
@@ -26,6 +27,19 @@ pub fn monotonic_ns() -> u64 {
     let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     assert_eq!(rc, 0, "clock_gettime(CLOCK_MONOTONIC) failed");
     (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
+}
+
+/// Non-POSIX fallback (the Windows CI leg builds every harness bin): a
+/// process-local monotonic clock. Its value is not comparable with another
+/// process's, so cross-process one-way latency stamps are only meaningful on
+/// unix hosts; in-process durations stay correct.
+#[cfg(not(unix))]
+pub fn monotonic_ns() -> u64 {
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    ORIGIN
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_nanos() as u64
 }
 
 pub const STAMP_MAGIC: u16 = 0x4c54; // "LT"
