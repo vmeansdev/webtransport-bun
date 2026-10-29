@@ -4,6 +4,71 @@ Required gates and process for cutting a release (RC or stable).
 
 Canonical release truth: `docs/release-status.json`. This checklist provides the evidence inputs that can move the manifest from pending to ready.
 
+## Where release evidence lives
+
+Evidence files are **GitHub Release assets of the candidate pre-release** (the
+`vX.Y.Z-rc.N` tag of the frozen candidate commit). The repository carries only
+the checksum manifest `docs/release-evidence-manifest.json` (contract:
+`docs/release-evidence.schema.json` for individual command records,
+`docs/release-evidence-manifest.schema.json` for the manifest). Nothing else
+evidence-like is committed: `scripts/check-tracked-hygiene.sh` refuses
+`.release-evidence/`, `.bench-evidence/`, `.scratch/`, `docs/superpowers/` and
+stray `*.jsonl`.
+
+Each manifest entry records the claim id(s) it supports, the asset name
+(`evidence-<id>.json` or `evidence-<id>.tar.gz`), its size and sha256, the
+sha256 of every scrubbed file inside it, the commit it was produced at, its
+producer (GitHub Actions repository/workflow/run id/attempt/URL/head SHA, or
+`local` with a description) and its creation time. `docs/release-status.json`
+claims cite manifest entry ids in `evidenceIds`; they never cite repository
+paths.
+
+Flow, all through `bun scripts/release-evidence.ts`:
+
+1. **Freeze and tag.** Bump the package to the candidate version, push the
+   `vX.Y.Z-rc.N` tag. The tag-triggered `release` workflow publishes the
+   pre-release (`prerelease` is set for any hyphenated tag) and its
+   `evidence-assets` job scrubs and attaches the run's interop, fuzz, coverage,
+   distributed-scale and package-identity evidence plus a
+   `release-evidence-fragment-release-<run>-<attempt>.json` manifest fragment.
+2. **Bind.** `bind --commit <candidate-sha> --tag vX.Y.Z-rc.N` records the
+   candidate (and the package version at that commit) in the manifest and in
+   `release-status.json`. Binding a different candidate drops every entry and
+   resets every claim to pending: evidence never carries across commits.
+3. **Collect.** `import --from-release` records the CI fragments. Evidence
+   from other workflow runs (`soak-long`, `iwa`, `fuzz`, `coverage`,
+   `bench-bandwidth`) comes in with
+   `fetch --run <run-id> --artifact <name> --claim <claim-id>`, which refuses a
+   run that did not succeed or did not build the candidate commit. Local runs
+   (interactive IWA proof, bare-metal soaks, review records) come in with
+   `package --claim <claim-id> --input <file-or-dir> --local "<what ran where>"`.
+4. **Scrub.** `package` and `fetch` rewrite the checkout path to `<repo>` and
+   then run the evidence-privacy scanner over every file: credential-shaped
+   values or keys, environment dumps (`HOME=`, `PATH=`, `*_TOKEN=` …), the local
+   login and hostname, and host paths are refused, never echoed. Remaining host
+   paths may be replaced by a fixed marker only with `--redact-host-paths`;
+   credentials and environment dumps are always refused. Binary files are
+   refused because they cannot be scanned. A `passed` entry is also refused if
+   its content records a nonzero exit, a failed status or module, or a
+   different commit.
+5. **Upload.** `upload` attaches the assets to the candidate pre-release with
+   `gh release upload`. It is a dry run unless `--execute` is given, never
+   creates a release unless `--create-prerelease` is also given (the tag must
+   already exist; nothing creates tags), refuses a release that is not a
+   pre-release or is immutable, and refuses to replace an attached asset with
+   different content.
+6. **Record.** Mark claims `passed` with the manifest entry ids and commit the
+   manifest and `release-status.json` (only those two files) on top of the
+   candidate.
+7. **Verify and promote.** `verify` downloads every asset with
+   `gh release download` and checks size, sha256 and file list against the
+   manifest, re-runs the privacy and content checks, checks that the tag
+   points to the candidate commit and that the package version matches, and
+   that every `gaRequired` claim has passing evidence bound to the candidate.
+   `bun scripts/promote-release-status.ts` runs the same verification and
+   refuses unless HEAD is the candidate or a descendant that changed only the
+   evidence record; it then sets readiness `ready`.
+
 ## Required gates (automated)
 
 The release workflow enforces these; the pipeline fails if any are missing:
@@ -14,11 +79,11 @@ The release workflow enforces these; the pipeline fails if any are missing:
 | Code quality | codeql | CodeQL analysis |
 | Parity | parity | parity-evidence.json |
 | Interop | interop | interop-evidence.json |
-| Fuzz/property testing | fuzz | `.release-evidence/fuzz/release-smoke.json` Actions artifact |
+| Fuzz/property testing | fuzz | `release-smoke.json` (Actions artifact; attached to a candidate pre-release as `evidence-fuzz-gates-release-<run>-<attempt>.tar.gz`) |
 | Build | build | prebuilds + SHA256SUMS |
 | Exact package consumers | package-consumers | successful exact-tarball Bun/Node/Deno smoke across the supported OS/runtime matrix |
 
-GitHub release assets include the prebuilds, npm tarball, `parity-evidence.json`, and `interop-evidence.json`. Fuzz evidence and the immutable npm publish input are retained as attempt-qualified Actions artifacts on the release workflow run; the exact-package consumer matrix is proven by its required successful job results.
+GitHub release assets include the prebuilds, npm tarball, `parity-evidence.json`, and `interop-evidence.json`. On a pre-release tag the `evidence-assets` job additionally attaches the scrubbed `evidence-*` bundles and the run's `release-evidence-fragment-*.json` (see above). The immutable npm publish input stays an attempt-qualified Actions artifact on the release workflow run and remains the only npm publish input; the exact-package consumer matrix is proven by its required successful job results.
 
 ## N-consecutive green policy
 
@@ -76,9 +141,7 @@ What the long-run harness now proves per segment:
 - certificate rotation followed by fresh reconnect traffic
 - final close/drain cleanup back to queue/task baseline
 
-Retain the segment JSON, CSV, stderr/stdout logs, and aggregate JSON in the release evidence bundle or release-blocking issue.
-
-Retain soak artifacts and link them in release notes (or a release-blocking issue) for audit.
+Attach the segment JSON, CSV, stderr/stdout logs, and aggregate JSON to the candidate pre-release with `bun scripts/release-evidence.ts fetch --run <run-id> --artifact soak-aggregate-<duration>h-<commit> --claim soak-24h` (and likewise for each segment artifact and for `soak-72h`; the default entry id includes the artifact name, so a segment and its aggregate from one run do not collide), then `upload --execute`; the manifest entry is what `release-status.json` cites.
 
 ## H7 hosted closure lane
 
@@ -113,6 +176,10 @@ Per release:
 - **parity-evidence.json** — parity suite passed at release time
 - **interop-evidence.json** — Chromium interop passed at release time
 - **SHA256SUMS** — prebuild integrity
-- **Soak artifacts** (if run) — leak/trend evidence from soak-long
+- **evidence-*.json / evidence-*.tar.gz** (candidate pre-release only) — the
+  claim evidence recorded, with sha256, in `docs/release-evidence-manifest.json`
 
-These are linkable from the GitHub release Assets page.
+These are linkable from the GitHub release Assets page. To audit a candidate
+from assets already on disk: `gh release download <tag> --pattern 'evidence-*'
+--dir <dir>`, then `bun scripts/release-evidence.ts verify --assets-dir <dir>`
+(the tag-to-commit and pre-release checks still query GitHub).

@@ -104,7 +104,8 @@ docs/RELEASE_CHECKLIST.md: it does not replace the 24h/72h release soak.
 4. **interop** — Chromium WebTransport interop (P3.3); runs reconnect storms, mixed concurrency, close/reset semantics; uploads `interop-evidence.json`
 5. **build** — matrix: `{linux-x64, darwin-arm64, darwin-x64, win32-x64-msvc}` — builds native addon, generates prebuilds + SHA256 checksums, uploads artifacts
 6. **package-consumers** — needs [build]; builds the exact tarball from the downloaded release prebuilds and runs the native addon, datagram, unidirectional-stream, bidirectional-stream, and deterministic-close smoke under Bun, Deno, and the supported Node engine floor/current versions across Linux, macOS, and Windows.
-7. **release** — needs [build, interop, parity, fuzz, package-consumers]; verifies required evidence and all four target prebuilds, regenerates and checks SHA256SUMS, builds and smokes the exact package under Bun/Node/Deno, then uploads the tarball plus a run/attempt/commit/tag/digest-bound `candidate-identity.json` as the immutable, attempt-qualified `npm-publish-input-<run_attempt>` Actions artifact before creating the GitHub release.
+7. **release** — needs [build, interop, parity, fuzz, package-consumers]; verifies required evidence and all four target prebuilds, regenerates and checks SHA256SUMS, builds and smokes the exact package under Bun/Node/Deno, then uploads the tarball plus a run/attempt/commit/tag/digest-bound `candidate-identity.json` as the immutable, attempt-qualified `npm-publish-input-<run_attempt>` Actions artifact before creating the GitHub release. A hyphenated tag (`vX.Y.Z-rc.N`) creates a pre-release.
+8. **evidence-assets** — needs [release]; pre-release tags only. Downloads the run's interop, fuzz, coverage, distributed-scale and npm-publish-input artifacts, privacy-scrubs and packages them per claim with `bun scripts/release-evidence.ts package`, and attaches the `evidence-*` assets plus a `release-evidence-fragment-release-<run>-<attempt>.json` manifest fragment to the candidate pre-release with `bun scripts/release-evidence.ts upload --execute` (`contents: write`, job-scoped). It runs after the release job, so a refused bundle never blocks the existing release assets. The fragment is recorded in `docs/release-evidence-manifest.json` with `release-evidence.ts import --from-release`; see docs/RELEASE_CHECKLIST.md § Where release evidence lives.
 
 The blocking **fuzz** job runs `bun run fuzz:release-smoke`, which now covers cargo-fuzz targets, stable Rust parser/property tests, and the Bun-side `WASM event decoder property harness` from `packages/webtransport/test/wasm-limits.test.ts`. Its canonical artifact path is `.release-evidence/fuzz/release-smoke.json`.
 
@@ -127,7 +128,7 @@ The job uses npm Trusted Publishing only: job-scoped `id-token: write`, the prot
 ## CI-EVIDENCE-A: Sustained evidence closure
 
 - **Release pipeline** requires security, CodeQL, fuzz, build, exact-package consumers, parity, and interop gates; fails on any missing blocker or required release evidence.
-- **Evidence retention**: prebuilds, the npm tarball, `parity-evidence.json`, and `interop-evidence.json` are attached to every GitHub release. Fuzz evidence and the immutable npm publish input remain attempt-qualified Actions artifacts under the release workflow's retention policy.
+- **Evidence retention**: prebuilds, the npm tarball, `parity-evidence.json`, and `interop-evidence.json` are attached to every GitHub release. Claim evidence is attached to the candidate pre-release as scrubbed `evidence-*` assets and recorded by sha256 in the committed `docs/release-evidence-manifest.json`; no evidence file is committed (`scripts/check-tracked-hygiene.sh`). The immutable npm publish input remains an attempt-qualified Actions artifact under the release workflow's retention policy.
 - **Release status**: `docs/release-status.json` stays the canonical readiness record for native and wasm candidate surfaces.
 - **N-consecutive green**: Release checklist (docs/RELEASE_CHECKLIST.md) documents policy; recommend 1–3 green test runs before RC, 14-day sustained green before stable.
 - See docs/RELEASE_CHECKLIST.md for full gates and soak requirements.
@@ -135,7 +136,8 @@ The job uses npm Trusted Publishing only: job-scoped `id-token: write`, the prot
 ## Release flow
 - Tag `vX.Y.Z`
 - CI runs security, CodeQL, fuzz, parity, interop, build, and exact-package consumer gates; verifies required evidence
-- GitHub release created with prebuilds, checksums, parity-evidence, interop-evidence
+- GitHub release created with prebuilds, checksums, parity-evidence, interop-evidence (a pre-release for `-rc.N` tags, which also receives the scrubbed claim evidence assets)
+- `bun scripts/release-evidence.ts verify` / `bun scripts/promote-release-status.ts` check every manifest entry against the downloaded assets before readiness can become `ready`
 - Successful completion of the tag-triggered release workflow triggers `publish.yml`; manual dispatch from `main` is reserved for retrying an exact successful release workflow run ID.
 
 ## Branch protection policy

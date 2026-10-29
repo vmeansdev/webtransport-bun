@@ -23,13 +23,27 @@ Why: all previously recorded evidence was bound to the pre-rewrite candidate
 outside it.
 
 Evidence will be regenerated at the next frozen candidate and stored outside
-the repository. **Open question:** whether it is published as GitHub release
-assets of the candidate tag or kept in a separate evidence repository; the
-`docs/release-evidence.schema.json` contract and
-`scripts/promote-release-status.ts` / `scripts/check-doc-truth.ts` stay in this
-repo either way, and evidence paths will need to resolve wherever that lands.
-Tracked files under `.release-evidence/` and `.bench-evidence/` are refused by
-CI (`scripts/check-tracked-hygiene.sh`).
+the repository.
+
+**Decision (2026-10-29, resolves the earlier open question):** release
+evidence is stored as **GitHub Release assets of the candidate pre-release**
+(the `vX.Y.Z-rc.N` tag of the frozen candidate), and the repository carries
+only a committed checksum manifest, `docs/release-evidence-manifest.json`
+(schema `docs/release-evidence-manifest.schema.json`). A separate evidence
+repository was not chosen. `release-status.json` (schema version 2) claims
+cite manifest entry ids; the in-status `evidence` list with repository paths
+is retired and `scripts/check-doc-truth.ts` rejects it. Every entry binds an
+asset name, size and sha256 (and the sha256 of each scrubbed file inside it)
+to the candidate commit, its claim ids and its producer (workflow run or
+`local`). Packaging runs the evidence-privacy scanner and refuses
+credentials, environment dumps, logins/hostnames and host paths.
+`bun scripts/release-evidence.ts verify` and
+`bun scripts/promote-release-status.ts` download the assets and check them
+against the manifest, check that the tag points to the candidate, and check
+that every `gaRequired` claim has passing evidence bound to it. The flow is in
+`docs/RELEASE_CHECKLIST.md` § Where release evidence lives. Tracked files under
+`.release-evidence/` and `.bench-evidence/` stay refused by CI
+(`scripts/check-tracked-hygiene.sh`).
 
 ### Pending (block promote)
 
@@ -52,7 +66,7 @@ gates.
 
 | Claim | Harness | Evidence artifact |
 |---|---|---|
-| `scale-10k-multisource` (`gaRequired: false`, `pending`) | `tools/load/distributed-scale.ts` | `tools/load/distributed-scale.test.ts`; run output `.release-evidence/load/distributed-scale-artifact.json` (untracked) |
+| `scale-10k-multisource` (`gaRequired: false`, `pending`) | `tools/load/distributed-scale.ts` | `tools/load/distributed-scale.test.ts`; run output `.release-evidence/load/distributed-scale-artifact.json` (untracked; attached to the candidate pre-release by the `release` workflow) |
 
 `distributed-scale.ts` is the authoritative multisource harness; the earlier
 single-source scale scripts it replaced are not release evidence.
