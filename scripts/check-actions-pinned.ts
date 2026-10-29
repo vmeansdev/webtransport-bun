@@ -948,7 +948,11 @@ function scanWorkflow(path: string): Violation[] {
 			if (!writeScope) continue;
 			const allowed =
 				(writeScope === "contents" &&
-					/(?:softprops\/action-gh-release|\bgh\s+release\b)/.test(text)) ||
+					// scripts/release-evidence.ts upload is a `gh release upload`
+					// wrapper that attaches scrubbed evidence to a pre-release.
+					/(?:softprops\/action-gh-release|\bgh\s+release\b|\bbun\s+scripts\/release-evidence\.ts\s+upload\b[\s\S]*?--execute\b)/.test(
+						text,
+					)) ||
 				(writeScope === "packages" &&
 					/(?:docker\/build-push-action|\bdocker\s+push\b)/.test(text)) ||
 				(writeScope === "security-events" &&

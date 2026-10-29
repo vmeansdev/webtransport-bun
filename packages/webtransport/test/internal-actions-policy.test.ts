@@ -433,6 +433,57 @@ jobs:
 		expect(result.stderr).toContain("must explicitly grant contents: read");
 	});
 
+	it("justifies contents: write only for an executed release-evidence upload", () => {
+		const job = (command: string) => `
+jobs:
+  evidence:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@${PIN}
+      - run: ${command}
+`;
+		const upload = runPolicy(
+			job("bun scripts/release-evidence.ts upload --tag v1.0.0-rc.2 --execute"),
+		);
+		expect(upload.status, upload.stderr).toBe(0);
+		for (const command of [
+			"bun scripts/release-evidence.ts upload --tag v1.0.0-rc.2",
+			"bun scripts/release-evidence.ts verify",
+		]) {
+			const result = runPolicy(job(command));
+			expect(result.status).toBe(1);
+			expect(result.stderr).toContain("contents: write is not justified");
+		}
+	});
+
+	it("attaches release-candidate evidence after the release without blocking it", () => {
+		const workflow = parseWorkflow(RELEASE_WORKFLOW);
+		const evidence = workflow.jobs?.["evidence-assets"] as
+			| {
+					needs?: unknown;
+					if?: string;
+					permissions?: Record<string, string>;
+			  }
+			| undefined;
+		expect(evidence).toBeDefined();
+		expect(evidence?.needs).toEqual(["release"]);
+		expect(evidence?.if).toContain("contains(github.ref_name, '-')");
+		expect(evidence?.permissions).toEqual({
+			actions: "read",
+			contents: "write",
+		});
+		expect(RELEASE_WORKFLOW).toContain(
+			"prerelease: $" + "{{ contains(github.ref_name, '-') }}",
+		);
+		expect(RELEASE_WORKFLOW).toContain(
+			"bun scripts/release-evidence.ts upload",
+		);
+		expect(RELEASE_WORKFLOW).toContain("--redact-host-paths");
+		expect(RELEASE_WORKFLOW).not.toContain("--create-prerelease");
+	});
+
 	it("rejects exact versions that are absent from the release toolchain policy", () => {
 		const result = runPolicy(`
 jobs:
