@@ -1,0 +1,195 @@
+/**
+ * Offline stand-in for the GitHub CLI used by internal-release-evidence.test.ts.
+ * It implements just the `gh` calls scripts/release-evidence*.ts make, against
+ * a JSON state file named by FAKE_GH_STATE; release assets and run artifacts
+ * are plain directories. Every invocation is appended to `calls`.
+ */
+import { createHash } from "node:crypto";
+import {
+	cpSync,
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	writeFileSync,
+} from "node:fs";
+import { basename, join } from "node:path";
+
+type Asset = { name: string; size: number; digest: string };
+type Release = {
+	isPrerelease: boolean;
+	isDraft: boolean;
+	isImmutable: boolean;
+	assets: Asset[];
+	dir: string;
+};
+type Run = {
+	databaseId: number;
+	headSha: string;
+	status: string;
+	conclusion: string;
+	url: string;
+	workflowName: string;
+	attempt: number;
+	artifacts: Record<string, string>;
+};
+type State = {
+	repo: string;
+	tags: Record<string, string>;
+	releases: Record<string, Release>;
+	runs: Record<string, Run>;
+	storeDir: string;
+	calls: string[][];
+};
+
+const statePath = process.env.FAKE_GH_STATE;
+if (!statePath) {
+	console.error("FAKE_GH_STATE is not set");
+	process.exit(2);
+}
+const state = JSON.parse(readFileSync(statePath, "utf8")) as State;
+const args = process.argv.slice(2);
+state.calls.push(args);
+const save = () => writeFileSync(statePath, JSON.stringify(state, null, 2));
+
+function flag(name: string): string | undefined {
+	const index = args.indexOf(name);
+	return index === -1 ? undefined : args[index + 1];
+}
+
+function fail(message: string, code = 1): never {
+	save();
+	console.error(message);
+	process.exit(code);
+}
+
+function checkRepo(): void {
+	if (flag("--repo") !== state.repo)
+		fail(`HTTP 404: unknown repository ${flag("--repo")}`);
+}
+
+function sha256(path: string): string {
+	return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+function globToRegExp(pattern: string): RegExp {
+	return new RegExp(
+		`^${pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")}$`,
+	);
+}
+
+const [group, command, subject] = args;
+
+if (group === "api") {
+	const match = /^repos\/([^/]+\/[^/]+)\/commits\/(.+)$/.exec(command ?? "");
+	if (!match || match[1] !== state.repo) fail("HTTP 404: Not Found");
+	const sha = state.tags[decodeURIComponent(match[2] as string)];
+	if (!sha) fail("HTTP 422: No commit found for SHA");
+	save();
+	console.log(JSON.stringify({ sha }));
+	process.exit(0);
+}
+
+if (group === "release") {
+	checkRepo();
+	const tag = subject as string;
+	const release = state.releases[tag];
+	if (command === "view") {
+		if (!release) fail("release not found");
+		save();
+		console.log(
+			JSON.stringify({
+				tagName: tag,
+				isPrerelease: release.isPrerelease,
+				isDraft: release.isDraft,
+				isImmutable: release.isImmutable,
+				assets: release.assets.map(({ name, size, digest }) => ({
+					name,
+					size,
+					digest,
+				})),
+			}),
+		);
+		process.exit(0);
+	}
+	if (command === "create") {
+		if (!state.tags[tag]) fail(`tag ${tag} does not exist`);
+		if (release) fail("a release with the same tag name already exists");
+		const dir = join(state.storeDir, `release-${tag}`);
+		mkdirSync(dir, { recursive: true });
+		state.releases[tag] = {
+			isPrerelease: args.includes("--prerelease"),
+			isDraft: false,
+			isImmutable: false,
+			assets: [],
+			dir,
+		};
+		save();
+		process.exit(0);
+	}
+	if (command === "upload") {
+		if (!release) fail("release not found");
+		const files = args
+			.slice(3)
+			.filter(
+				(arg, index, all) => arg !== "--repo" && all[index - 1] !== "--repo",
+			);
+		for (const file of files) {
+			const name = basename(file);
+			if (
+				release.assets.some((asset) => asset.name === name) &&
+				!args.includes("--clobber")
+			)
+				fail(`asset under the same name already exists: [${name}]`);
+			cpSync(file, join(release.dir, name));
+			release.assets = release.assets.filter((asset) => asset.name !== name);
+			release.assets.push({
+				name,
+				size: readFileSync(file).length,
+				digest: `sha256:${sha256(file)}`,
+			});
+		}
+		save();
+		process.exit(0);
+	}
+	if (command === "download") {
+		if (!release) fail("release not found");
+		const dir = flag("--dir") as string;
+		const pattern = globToRegExp(flag("--pattern") ?? "*");
+		mkdirSync(dir, { recursive: true });
+		const matches = release.assets.filter((asset) => pattern.test(asset.name));
+		if (matches.length === 0) fail("no assets match the file pattern");
+		for (const asset of matches) {
+			// Downloads come from the release store, so a test can tamper with a
+			// stored file to model an asset that was replaced after the fact.
+			cpSync(join(release.dir, asset.name), join(dir, asset.name));
+		}
+		save();
+		process.exit(0);
+	}
+}
+
+if (group === "run") {
+	checkRepo();
+	const run = state.runs[subject as string];
+	if (!run) fail("HTTP 404: run not found");
+	if (command === "view") {
+		const { artifacts: _artifacts, ...view } = run;
+		save();
+		console.log(JSON.stringify(view));
+		process.exit(0);
+	}
+	if (command === "download") {
+		const name = flag("--name") as string;
+		const source = run.artifacts[name];
+		if (!source || !existsSync(source)) fail(`no artifact matches ${name}`);
+		const dir = flag("--dir") as string;
+		mkdirSync(dir, { recursive: true });
+		for (const entry of readdirSync(source))
+			cpSync(join(source, entry), join(dir, entry), { recursive: true });
+		save();
+		process.exit(0);
+	}
+}
+
+fail(`fake gh: unsupported invocation ${args.join(" ")}`, 2);

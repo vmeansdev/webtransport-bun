@@ -1,0 +1,166 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"$id": "https://webtransport-bun.local/docs/release-evidence-manifest.schema.json",
+	"title": "WebTransport release evidence manifest",
+	"description": "Checksum manifest for release evidence stored as GitHub Release assets of the candidate pre-release. Enforced by scripts/release-evidence-lib.ts (validateManifest); keep both in step.",
+	"type": "object",
+	"additionalProperties": false,
+	"required": [
+		"schemaVersion",
+		"repository",
+		"packageVersion",
+		"candidate",
+		"entries"
+	],
+	"properties": {
+		"schemaVersion": { "const": 1 },
+		"repository": { "$ref": "#/$defs/repository" },
+		"packageVersion": {
+			"description": "packages/webtransport version at the candidate commit; the tag is v<packageVersion>.",
+			"oneOf": [
+				{ "type": "null" },
+				{
+					"type": "string",
+					"pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?$"
+				}
+			]
+		},
+		"candidate": {
+			"type": "object",
+			"additionalProperties": false,
+			"required": ["commit", "tag"],
+			"properties": {
+				"commit": {
+					"oneOf": [{ "type": "null" }, { "$ref": "#/$defs/commit" }]
+				},
+				"tag": {
+					"description": "Pre-release tag whose release carries the evidence assets; must point to commit.",
+					"oneOf": [
+						{ "type": "null" },
+						{
+							"type": "string",
+							"pattern": "^v\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?$"
+						}
+					]
+				}
+			}
+		},
+		"entries": {
+			"type": "array",
+			"items": { "$ref": "#/$defs/entry" }
+		}
+	},
+	"$defs": {
+		"repository": {
+			"type": "string",
+			"pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+		},
+		"commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+		"sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+		"entry": {
+			"type": "object",
+			"additionalProperties": false,
+			"required": [
+				"id",
+				"claimIds",
+				"asset",
+				"size",
+				"sha256",
+				"commit",
+				"status",
+				"producer",
+				"createdAt",
+				"files"
+			],
+			"properties": {
+				"id": {
+					"description": "Referenced from release-status.json claims[].evidenceIds.",
+					"type": "string",
+					"pattern": "^[a-z0-9][a-z0-9.-]{2,119}$"
+				},
+				"claimIds": {
+					"type": "array",
+					"minItems": 1,
+					"uniqueItems": true,
+					"items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" }
+				},
+				"asset": {
+					"description": "Release asset name: evidence-<id>.json or evidence-<id>.tar.gz.",
+					"type": "string",
+					"pattern": "^evidence-[a-z0-9][a-z0-9.-]{2,119}\\.(?:json|tar\\.gz)$"
+				},
+				"size": { "type": "integer", "minimum": 1 },
+				"sha256": { "$ref": "#/$defs/sha256" },
+				"commit": {
+					"description": "Commit the evidence was produced at; equals candidate.commit.",
+					"$ref": "#/$defs/commit"
+				},
+				"status": { "enum": ["passed", "failed"] },
+				"producer": {
+					"oneOf": [
+						{ "$ref": "#/$defs/githubActionsProducer" },
+						{ "$ref": "#/$defs/localProducer" }
+					]
+				},
+				"createdAt": { "type": "string", "format": "date-time" },
+				"files": {
+					"description": "Scrubbed files inside the asset (the asset itself for a .json asset).",
+					"type": "array",
+					"minItems": 1,
+					"items": {
+						"type": "object",
+						"additionalProperties": false,
+						"required": ["name", "size", "sha256"],
+						"properties": {
+							"name": { "type": "string", "minLength": 1, "maxLength": 255 },
+							"size": { "type": "integer", "minimum": 0 },
+							"sha256": { "$ref": "#/$defs/sha256" }
+						}
+					}
+				}
+			}
+		},
+		"githubActionsProducer": {
+			"type": "object",
+			"additionalProperties": false,
+			"required": [
+				"kind",
+				"repository",
+				"workflow",
+				"runId",
+				"runAttempt",
+				"url",
+				"headSha"
+			],
+			"properties": {
+				"kind": { "const": "github-actions" },
+				"repository": { "$ref": "#/$defs/repository" },
+				"workflow": { "type": "string", "minLength": 1 },
+				"runId": { "type": "integer", "minimum": 1 },
+				"runAttempt": { "type": "integer", "minimum": 1 },
+				"url": {
+					"type": "string",
+					"pattern": "^https://github\\.com/[^/]+/[^/]+/actions/runs/\\d+(?:/attempts/\\d+)?$"
+				},
+				"headSha": {
+					"description": "The run's head commit; equals the entry commit.",
+					"$ref": "#/$defs/commit"
+				}
+			}
+		},
+		"localProducer": {
+			"type": "object",
+			"additionalProperties": false,
+			"required": ["kind", "description"],
+			"properties": {
+				"kind": { "const": "local" },
+				"description": {
+					"description": "Who/what produced it, without host paths, logins or hostnames.",
+					"type": "string",
+					"minLength": 1,
+					"maxLength": 300
+				}
+			}
+		}
+	}
+}

@@ -1,0 +1,839 @@
+#!/usr/bin/env bun
+/**
+ * Release evidence lifecycle: package -> upload -> import -> verify.
+ *
+ * Evidence files are GitHub Release assets of the candidate pre-release; the
+ * repository only carries the checksum manifest
+ * (`docs/release-evidence-manifest.json`). See docs/RELEASE_CHECKLIST.md.
+ *
+ *   bind     --commit <sha> --tag <vX.Y.Z-rc.N> [--package-version <v>] [--reset]
+ *   package  --claim <id>... --input <path>... (--run-id <n> [--run-attempt <n>] --workflow <name> | --local <description>)
+ *            [--id <entry-id>] [--status passed|failed] [--bundle] [--out-dir <dir>]
+ *            [--fragment <file> --commit <sha> [--tag <tag>]] [--repo-root <path>...]
+ *            [--redact-host-paths] [--forbid <literal>...]
+ *   fetch    --run <id> --artifact <name> [--select <subpath>...] --claim <id>... [package options]
+ *   import   --fragment <file>... | --from-release
+ *   upload   [--tag <tag>] [--assets-dir <dir>] [--fragment <file>] [--create-prerelease] [--execute]
+ *   verify   [--assets-dir <dir>] [--download-dir <dir>] [--json]
+ *
+ * Every command takes `--root <dir>` (default: this checkout) and `--repo
+ * <owner/name>` (default: the manifest's repository). `upload` is a dry run
+ * unless `--execute` is given, and never creates a release unless
+ * `--create-prerelease` is also given. Nothing here creates tags.
+ */
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
+import { hostname, tmpdir, userInfo } from "node:os";
+import {
+	basename,
+	dirname,
+	isAbsolute,
+	join,
+	relative,
+	resolve,
+} from "node:path";
+import {
+	ASSET_NAME,
+	type BundleFile,
+	CLAIM_ID,
+	collectInputs,
+	createTarGz,
+	DEFAULT_ROOT,
+	ENTRY_ID,
+	type EvidenceStatus,
+	FRAGMENT_ASSET_NAME,
+	FRAGMENT_KIND,
+	type Fragment,
+	ghJson,
+	inspectMembers,
+	loadManifest,
+	MANIFEST_RELATIVE_PATH,
+	type Manifest,
+	type ManifestEntry,
+	mergeEntries,
+	type Producer,
+	packageVersionAt,
+	RELEASE_TAG,
+	REPOSITORY,
+	type ReleaseStatus,
+	readJsonFile,
+	runGh,
+	SHA40,
+	STATUS_RELATIVE_PATH,
+	scrubFile,
+	sha256Hex,
+	validateFragment,
+	verifyRelease,
+	viewRelease,
+	writeManifest,
+} from "./release-evidence-lib.ts";
+
+type Args = {
+	command: string;
+	values: Map<string, string[]>;
+	flags: Set<string>;
+};
+
+const BOOLEAN_FLAGS = new Set([
+	"--bundle",
+	"--redact-host-paths",
+	"--execute",
+	"--create-prerelease",
+	"--from-release",
+	"--reset",
+	"--json",
+]);
+
+class UsageError extends Error {}
+
+function parseArgs(argv: string[]): Args {
+	const [command = "", ...rest] = argv;
+	const values = new Map<string, string[]>();
+	const flags = new Set<string>();
+	for (let index = 0; index < rest.length; index += 1) {
+		const arg = rest[index] as string;
+		if (!arg.startsWith("--"))
+			throw new UsageError(`unexpected argument ${arg}`);
+		if (BOOLEAN_FLAGS.has(arg)) {
+			flags.add(arg);
+			continue;
+		}
+		const value = rest[index + 1];
+		if (value === undefined || value.startsWith("--"))
+			throw new UsageError(`${arg} needs a value`);
+		index += 1;
+		values.set(arg, [...(values.get(arg) ?? []), value]);
+	}
+	return { command, values, flags };
+}
+
+function one(args: Args, name: string): string | undefined {
+	const list = args.values.get(name);
+	if (!list) return undefined;
+	if (list.length > 1) throw new UsageError(`${name} may be given once`);
+	return list[0];
+}
+
+function many(args: Args, name: string): string[] {
+	return args.values.get(name) ?? [];
+}
+
+function required(args: Args, name: string): string {
+	const value = one(args, name);
+	if (!value) throw new UsageError(`${name} is required`);
+	return value;
+}
+
+function rootOf(args: Args): string {
+	return resolve(one(args, "--root") ?? DEFAULT_ROOT);
+}
+
+function manifestPath(root: string): string {
+	return join(root, MANIFEST_RELATIVE_PATH);
+}
+
+function defaultAssetsDir(root: string): string {
+	return join(root, ".release-evidence", "assets");
+}
+
+function log(message: string): void {
+	console.log(`release-evidence: ${message}`);
+}
+
+// --------------------------------------------------------------------------- bind
+
+function bind(args: Args): void {
+	const root = rootOf(args);
+	const path = manifestPath(root);
+	const manifest = loadManifest(path);
+	const commit = required(args, "--commit");
+	const tag = required(args, "--tag");
+	if (!SHA40.test(commit))
+		throw new UsageError("--commit must be a 40-character commit");
+	if (!RELEASE_TAG.test(tag))
+		throw new UsageError("--tag must look like v1.0.0-rc.2");
+	const packageVersion =
+		one(args, "--package-version") ?? packageVersionAt(root, commit);
+	if (`v${packageVersion}` !== tag)
+		throw new Error(
+			`tag ${tag} does not name the candidate package version ${packageVersion}`,
+		);
+	const rebinding =
+		manifest.candidate.commit !== null && manifest.candidate.commit !== commit;
+	if (rebinding && manifest.entries.length > 0 && !args.flags.has("--reset"))
+		throw new Error(
+			`manifest holds ${manifest.entries.length} entries for ${manifest.candidate.commit}; pass --reset to drop them and bind a new candidate`,
+		);
+	const dropping = rebinding || args.flags.has("--reset");
+	if (dropping) manifest.entries = [];
+	manifest.candidate = { commit, tag };
+	manifest.packageVersion = packageVersion;
+	// release-status.json names the same candidate; a new candidate starts
+	// every claim over, because no evidence carries across commits.
+	const statusPath = join(root, STATUS_RELATIVE_PATH);
+	const status = readJsonFile(statusPath) as ReleaseStatus;
+	status.candidate = { commit, readiness: "pending" };
+	if (dropping)
+		for (const claim of status.claims) {
+			claim.status = "pending";
+			claim.evidenceIds = [];
+		}
+	writeManifest(path, manifest);
+	writeFileSync(statusPath, `${JSON.stringify(status, null, "\t")}\n`);
+	log(
+		`bound candidate ${commit} (${tag}, package ${packageVersion})${dropping ? "; claims reset to pending" : ""}`,
+	);
+}
+
+// --------------------------------------------------------------------------- package
+
+type PackageTarget =
+	| { kind: "manifest"; path: string; manifest: Manifest }
+	| { kind: "fragment"; path: string; fragment: Fragment };
+
+function loadTarget(
+	args: Args,
+	root: string,
+	repoOverride?: string,
+): PackageTarget {
+	const fragmentPath = one(args, "--fragment");
+	if (fragmentPath) {
+		const path = resolve(fragmentPath);
+		if (!FRAGMENT_ASSET_NAME.test(basename(path)))
+			throw new UsageError(
+				`fragment file name must match ${FRAGMENT_ASSET_NAME}`,
+			);
+		if (existsSync(path)) {
+			const fragment = readJsonFile(path);
+			const errors = validateFragment(fragment);
+			if (errors.length > 0)
+				throw new Error(`invalid fragment:\n - ${errors.join("\n - ")}`);
+			return { kind: "fragment", path, fragment: fragment as Fragment };
+		}
+		const commit = required(args, "--commit");
+		if (!SHA40.test(commit))
+			throw new UsageError("--commit must be a 40-character commit");
+		const tag = one(args, "--tag") ?? null;
+		if (tag !== null && !RELEASE_TAG.test(tag))
+			throw new UsageError("--tag must look like v1.0.0-rc.2");
+		const repository =
+			repoOverride ??
+			process.env.GITHUB_REPOSITORY ??
+			loadManifest(manifestPath(root)).repository;
+		return {
+			kind: "fragment",
+			path,
+			fragment: {
+				schemaVersion: 1,
+				kind: FRAGMENT_KIND,
+				repository,
+				commit,
+				tag,
+				entries: [],
+			},
+		};
+	}
+	const path = manifestPath(root);
+	return { kind: "manifest", path, manifest: loadManifest(path) };
+}
+
+function targetCommit(target: PackageTarget): string {
+	if (target.kind === "fragment") return target.fragment.commit;
+	const commit = target.manifest.candidate.commit;
+	if (!commit)
+		throw new Error(
+			"manifest has no bound candidate; run `release-evidence.ts bind` first",
+		);
+	return commit;
+}
+
+function targetRepository(target: PackageTarget): string {
+	return target.kind === "fragment"
+		? target.fragment.repository
+		: target.manifest.repository;
+}
+
+function slug(value: string): string {
+	return value
+		.toLowerCase()
+		.replace(/[^a-z0-9.-]+/g, "-")
+		.replace(/^-+|-+$/g, "");
+}
+
+function utcStamp(date: Date): string {
+	return date
+		.toISOString()
+		.replace(/[-:]/g, "")
+		.replace(/\.\d+Z$/, "z")
+		.toLowerCase();
+}
+
+type PackageInput = {
+	inputs: string[];
+	producer: Producer;
+	forbidden: string[];
+	defaultId?: string;
+};
+
+function packageEvidence(
+	args: Args,
+	root: string,
+	target: PackageTarget,
+	input: PackageInput,
+): ManifestEntry {
+	const commit = targetCommit(target);
+	const explicitCommit = one(args, "--commit");
+	if (explicitCommit && explicitCommit !== commit)
+		throw new Error(
+			`--commit ${explicitCommit} differs from the bound candidate ${commit}`,
+		);
+	const claimIds = many(args, "--claim");
+	if (claimIds.length === 0)
+		throw new UsageError("at least one --claim is required");
+	for (const claim of claimIds)
+		if (!CLAIM_ID.test(claim))
+			throw new UsageError(`invalid claim id ${claim}`);
+	const status = (one(args, "--status") ?? "passed") as EvidenceStatus;
+	if (status !== "passed" && status !== "failed")
+		throw new UsageError("--status must be passed or failed");
+	const createdAt = one(args, "--created-at") ?? new Date().toISOString();
+	if (new Date(Date.parse(createdAt)).toISOString() !== createdAt)
+		throw new UsageError("--created-at must be an ISO-8601 UTC timestamp");
+
+	const producer = input.producer;
+	const defaultId =
+		producer.kind === "github-actions"
+			? `${claimIds[0]}-${slug(producer.workflow)}-${producer.runId}-${producer.runAttempt}`
+			: `${claimIds[0]}-local-${utcStamp(new Date(createdAt))}`;
+	const id = one(args, "--id") ?? input.defaultId ?? defaultId;
+	if (!ENTRY_ID.test(id))
+		throw new UsageError(`entry id ${id} must match ${ENTRY_ID}`);
+
+	const repoRoots = [...many(args, "--repo-root"), root].map((p) =>
+		resolve(p).replace(/[\\/]+$/, ""),
+	);
+	const members = collectInputs(input.inputs);
+	const problems: string[] = [];
+	const scrubbed = members.map((member) => {
+		const result = scrubFile(member.name, member.data, {
+			repoRoots,
+			redactHostPaths: args.flags.has("--redact-host-paths"),
+			forbiddenLiterals: input.forbidden,
+		});
+		if (!result.ok) {
+			problems.push(...result.problems);
+			return member;
+		}
+		return { name: member.name, data: result.data };
+	});
+	if (problems.length > 0)
+		throw new Error(
+			`evidence refused by the privacy scan:\n - ${problems.join("\n - ")}`,
+		);
+	const contentProblems = inspectMembers(scrubbed, commit, status);
+	if (contentProblems.length > 0)
+		throw new Error(
+			`evidence content does not support status=${status}:\n - ${contentProblems.join("\n - ")}`,
+		);
+
+	const single =
+		scrubbed.length === 1 &&
+		scrubbed[0]?.name.endsWith(".json") &&
+		!args.flags.has("--bundle");
+	const asset = single ? `evidence-${id}.json` : `evidence-${id}.tar.gz`;
+	if (!ASSET_NAME.test(asset))
+		throw new Error(`asset name ${asset} is not publishable`);
+	const data = single
+		? (scrubbed[0]?.data as Uint8Array)
+		: createTarGz(scrubbed);
+	const files: BundleFile[] = scrubbed
+		.map((member) => ({
+			name: member.name,
+			size: member.data.length,
+			sha256: sha256Hex(member.data),
+		}))
+		.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+
+	const outDir = resolve(one(args, "--out-dir") ?? defaultAssetsDir(root));
+	mkdirSync(outDir, { recursive: true });
+	const assetPath = join(outDir, asset);
+	if (
+		existsSync(assetPath) &&
+		sha256Hex(new Uint8Array(readFileSync(assetPath))) !== sha256Hex(data)
+	)
+		throw new Error(
+			`${asset} already exists in the output directory with different content`,
+		);
+	writeFileSync(assetPath, data);
+
+	const entry: ManifestEntry = {
+		id,
+		claimIds,
+		asset,
+		size: data.length,
+		sha256: sha256Hex(data),
+		commit,
+		status,
+		producer,
+		createdAt,
+		files,
+	};
+	if (target.kind === "manifest") {
+		mergeEntries(target.manifest, [entry]);
+		writeManifest(target.path, target.manifest);
+	} else {
+		const existing = target.fragment.entries.find((e) => e.id === entry.id);
+		if (existing && JSON.stringify(existing) !== JSON.stringify(entry))
+			throw new Error(`fragment already has a different entry ${entry.id}`);
+		if (!existing) target.fragment.entries.push(entry);
+		const errors = validateFragment(target.fragment);
+		if (errors.length > 0)
+			throw new Error(`invalid fragment:\n - ${errors.join("\n - ")}`);
+		mkdirSync(dirname(target.path), { recursive: true });
+		writeFileSync(
+			target.path,
+			`${JSON.stringify(target.fragment, null, "\t")}\n`,
+		);
+	}
+	log(
+		`packaged ${asset} (${entry.size} bytes, sha256 ${entry.sha256}) for ${claimIds.join(", ")}`,
+	);
+	return entry;
+}
+
+function localForbiddenLiterals(args: Args): string[] {
+	const literals = [...many(args, "--forbid")];
+	try {
+		literals.push(userInfo().username);
+	} catch {
+		// no passwd entry; nothing to add
+	}
+	const host = hostname();
+	literals.push(host, host.split(".")[0] ?? host);
+	return literals.filter((literal) => literal.length >= 3);
+}
+
+function packageCommand(args: Args): void {
+	const root = rootOf(args);
+	const target = loadTarget(args, root, one(args, "--repo"));
+	const inputs = many(args, "--input");
+	if (inputs.length === 0)
+		throw new UsageError("at least one --input is required");
+	const runId = one(args, "--run-id");
+	const local = one(args, "--local");
+	if ((runId === undefined) === (local === undefined))
+		throw new UsageError(
+			"name the producer with exactly one of --run-id or --local",
+		);
+	let producer: Producer;
+	let forbidden: string[];
+	if (runId !== undefined) {
+		const repository = one(args, "--repo") ?? targetRepository(target);
+		const runAttempt = Number(one(args, "--run-attempt") ?? "1");
+		const workflow = required(args, "--workflow");
+		if (
+			!/^\d+$/.test(runId) ||
+			!Number.isSafeInteger(runAttempt) ||
+			runAttempt <= 0
+		)
+			throw new UsageError(
+				"--run-id and --run-attempt must be positive integers",
+			);
+		producer = {
+			kind: "github-actions",
+			repository,
+			workflow,
+			runId: Number(runId),
+			runAttempt,
+			url: `https://github.com/${repository}/actions/runs/${runId}`,
+			headSha: targetCommit(target),
+		};
+		forbidden = many(args, "--forbid");
+	} else {
+		producer = { kind: "local", description: local as string };
+		forbidden = localForbiddenLiterals(args);
+	}
+	packageEvidence(args, root, target, { inputs, producer, forbidden });
+}
+
+// --------------------------------------------------------------------------- fetch
+
+type RunView = {
+	databaseId: number;
+	headSha: string;
+	status: string;
+	conclusion: string;
+	url: string;
+	workflowName: string;
+	attempt: number;
+};
+
+function fetchCommand(args: Args): void {
+	const root = rootOf(args);
+	const target = loadTarget(args, root, one(args, "--repo"));
+	const commit = targetCommit(target);
+	const repository = one(args, "--repo") ?? targetRepository(target);
+	if (!REPOSITORY.test(repository))
+		throw new UsageError("--repo must be owner/name");
+	const runId = required(args, "--run");
+	if (!/^\d+$/.test(runId))
+		throw new UsageError("--run must be a numeric run id");
+	const artifact = required(args, "--artifact");
+	if (!/^[A-Za-z0-9._-]+$/.test(artifact))
+		throw new UsageError("--artifact must be a plain artifact name");
+	const run = ghJson(
+		[
+			"run",
+			"view",
+			runId,
+			"--repo",
+			repository,
+			"--json",
+			"databaseId,headSha,status,conclusion,url,workflowName,attempt",
+		],
+		root,
+	) as RunView;
+	if (run.status !== "completed")
+		throw new Error(`run ${runId} is ${run.status}, not completed`);
+	const status = one(args, "--status") ?? "passed";
+	if (status === "passed" && run.conclusion !== "success")
+		throw new Error(
+			`run ${runId} concluded ${run.conclusion}; it cannot be passed evidence`,
+		);
+	if (run.headSha !== commit)
+		throw new Error(
+			`run ${runId} built ${run.headSha}, not the candidate ${commit}`,
+		);
+
+	const work = mkdtempSync(join(tmpdir(), "release-evidence-fetch-"));
+	try {
+		const into = join(work, artifact);
+		const download = runGh(
+			[
+				"run",
+				"download",
+				runId,
+				"--repo",
+				repository,
+				"--name",
+				artifact,
+				"--dir",
+				into,
+			],
+			root,
+		);
+		if (download.status !== 0)
+			throw new Error(
+				`could not download artifact ${artifact} from run ${runId}`,
+			);
+		const selects = many(args, "--select");
+		const inputs =
+			selects.length === 0
+				? [into]
+				: selects.map((select) => {
+						const path = resolve(into, select);
+						if (isAbsolute(select) || relative(into, path).startsWith(".."))
+							throw new UsageError("--select must stay inside the artifact");
+						return path;
+					});
+		packageEvidence(args, root, target, {
+			inputs,
+			producer: {
+				kind: "github-actions",
+				repository,
+				workflow: run.workflowName,
+				runId: Number(runId),
+				runAttempt: run.attempt,
+				url: `https://github.com/${repository}/actions/runs/${runId}`,
+				headSha: run.headSha,
+			},
+			forbidden: many(args, "--forbid"),
+			// One run can upload several artifacts (a soak segment and its
+			// aggregate), so the artifact name is part of the default id.
+			defaultId:
+				`${many(args, "--claim")[0] ?? "evidence"}-${slug(artifact)}-${runId}-${run.attempt}`.slice(
+					0,
+					120,
+				),
+		});
+	} finally {
+		rmSync(work, { recursive: true, force: true });
+	}
+}
+
+// --------------------------------------------------------------------------- import
+
+function importCommand(args: Args): void {
+	const root = rootOf(args);
+	const path = manifestPath(root);
+	const manifest = loadManifest(path);
+	const { commit, tag } = manifest.candidate;
+	if (!commit || !tag)
+		throw new Error(
+			"manifest has no bound candidate; run `release-evidence.ts bind` first",
+		);
+	let files = many(args, "--fragment").map((file) => resolve(file));
+	let work: string | undefined;
+	if (args.flags.has("--from-release")) {
+		work = mkdtempSync(join(tmpdir(), "release-evidence-fragments-"));
+		const download = runGh(
+			[
+				"release",
+				"download",
+				tag,
+				"--repo",
+				manifest.repository,
+				"--dir",
+				work,
+				"--pattern",
+				"release-evidence-fragment-*.json",
+			],
+			root,
+		);
+		if (download.status !== 0)
+			throw new Error(`could not download fragments from ${tag}`);
+		files = [
+			...files,
+			...readdirSync(work)
+				.filter((name) => FRAGMENT_ASSET_NAME.test(name))
+				.map((name) => join(work as string, name)),
+		];
+	}
+	if (files.length === 0)
+		throw new UsageError("give --fragment <file> or --from-release");
+	try {
+		let added = 0;
+		for (const file of files) {
+			const fragment = readJsonFile(file);
+			const errors = validateFragment(fragment);
+			if (errors.length > 0)
+				throw new Error(
+					`${basename(file)} is invalid:\n - ${errors.join("\n - ")}`,
+				);
+			const typed = fragment as Fragment;
+			if (typed.repository !== manifest.repository)
+				throw new Error(
+					`${basename(file)} is for ${typed.repository}, not ${manifest.repository}`,
+				);
+			if (typed.commit !== commit)
+				throw new Error(
+					`${basename(file)} is bound to ${typed.commit}, not ${commit}`,
+				);
+			if (typed.tag !== null && typed.tag !== tag)
+				throw new Error(`${basename(file)} targets ${typed.tag}, not ${tag}`);
+			added += mergeEntries(manifest, typed.entries);
+		}
+		writeManifest(path, manifest);
+		log(
+			`imported ${added} new entr${added === 1 ? "y" : "ies"} from ${files.length} fragment(s)`,
+		);
+	} finally {
+		if (work) rmSync(work, { recursive: true, force: true });
+	}
+}
+
+// --------------------------------------------------------------------------- upload
+
+function uploadCommand(args: Args): void {
+	const root = rootOf(args);
+	const execute = args.flags.has("--execute");
+	const fragmentPath = one(args, "--fragment");
+	let entries: ManifestEntry[];
+	let repository: string;
+	let tag: string | null;
+	const extraFiles: string[] = [];
+	if (fragmentPath) {
+		const fragment = readJsonFile(resolve(fragmentPath));
+		const errors = validateFragment(fragment);
+		if (errors.length > 0)
+			throw new Error(`invalid fragment:\n - ${errors.join("\n - ")}`);
+		if (!FRAGMENT_ASSET_NAME.test(basename(fragmentPath)))
+			throw new UsageError(
+				`fragment file name must match ${FRAGMENT_ASSET_NAME}`,
+			);
+		const typed = fragment as Fragment;
+		entries = typed.entries;
+		repository = typed.repository;
+		tag = typed.tag;
+		extraFiles.push(resolve(fragmentPath));
+	} else {
+		const manifest = loadManifest(manifestPath(root));
+		entries = manifest.entries;
+		repository = manifest.repository;
+		tag = manifest.candidate.tag;
+	}
+	repository = one(args, "--repo") ?? repository;
+	tag = one(args, "--tag") ?? tag;
+	if (!tag || !RELEASE_TAG.test(tag))
+		throw new UsageError("no candidate tag: pass --tag or bind the manifest");
+	if (!tag.includes("-"))
+		throw new Error(
+			`evidence is attached to a candidate pre-release; ${tag} is not a pre-release tag`,
+		);
+	const assetsDir = resolve(
+		one(args, "--assets-dir") ?? defaultAssetsDir(root),
+	);
+
+	const local: { name: string; path: string; sha256: string; size: number }[] =
+		[];
+	for (const entry of entries) {
+		const path = join(assetsDir, entry.asset);
+		if (!existsSync(path))
+			throw new Error(
+				`${entry.asset} is missing from ${relative(root, assetsDir) || "."}`,
+			);
+		const data = new Uint8Array(readFileSync(path));
+		if (data.length !== entry.size || sha256Hex(data) !== entry.sha256)
+			throw new Error(
+				`${entry.asset} on disk does not match its manifest entry`,
+			);
+		local.push({
+			name: entry.asset,
+			path,
+			sha256: entry.sha256,
+			size: entry.size,
+		});
+	}
+	for (const path of extraFiles) {
+		const data = new Uint8Array(readFileSync(path));
+		local.push({
+			name: basename(path),
+			path,
+			sha256: sha256Hex(data),
+			size: data.length,
+		});
+	}
+
+	const release = viewRelease(repository, tag, root);
+	if (!release) {
+		if (!args.flags.has("--create-prerelease"))
+			throw new Error(
+				`release ${tag} does not exist; pass --create-prerelease to create it (the tag must already exist)`,
+			);
+		if (execute) {
+			const created = runGh(
+				[
+					"release",
+					"create",
+					tag,
+					"--repo",
+					repository,
+					"--prerelease",
+					"--verify-tag",
+					"--title",
+					tag,
+					"--notes",
+					`Release candidate ${tag}. Evidence assets are recorded in ${MANIFEST_RELATIVE_PATH}.`,
+				],
+				root,
+			);
+			if (created.status !== 0)
+				throw new Error(`could not create pre-release ${tag}`);
+			log(`created pre-release ${tag}`);
+		} else log(`would create pre-release ${tag}`);
+	} else {
+		if (!release.isPrerelease)
+			throw new Error(
+				`release ${tag} is not a pre-release; refusing to attach evidence`,
+			);
+		if (release.isImmutable)
+			throw new Error(`release ${tag} is immutable and cannot take new assets`);
+	}
+
+	const pending: string[] = [];
+	for (const file of local) {
+		const remote = release?.assets.find((asset) => asset.name === file.name);
+		if (remote) {
+			const same = remote.digest
+				? remote.digest === `sha256:${file.sha256}`
+				: remote.size === file.size;
+			if (!same)
+				throw new Error(
+					`${file.name} is already attached to ${tag} with different content; assets are immutable`,
+				);
+			log(`${file.name} already attached`);
+			continue;
+		}
+		pending.push(file.path);
+		log(
+			`${execute ? "uploading" : "would upload"} ${file.name} (${file.size} bytes)`,
+		);
+	}
+	if (!execute) {
+		log(
+			`dry run: ${pending.length} asset(s) to attach to ${tag}; pass --execute to upload`,
+		);
+		return;
+	}
+	if (pending.length === 0) {
+		log(`nothing to upload to ${tag}`);
+		return;
+	}
+	const uploaded = runGh(
+		["release", "upload", tag, "--repo", repository, ...pending],
+		root,
+	);
+	if (uploaded.status !== 0)
+		throw new Error(
+			`gh release upload failed: ${uploaded.stderr.trim().split("\n")[0] ?? ""}`,
+		);
+	log(`attached ${pending.length} asset(s) to ${tag}`);
+}
+
+// --------------------------------------------------------------------------- verify
+
+function verifyCommand(args: Args): void {
+	const root = rootOf(args);
+	const assetsDir = one(args, "--assets-dir");
+	const downloadDir = one(args, "--download-dir");
+	const report = verifyRelease({
+		root,
+		assetsDir: assetsDir ? resolve(assetsDir) : undefined,
+		downloadDir: downloadDir ? resolve(downloadDir) : undefined,
+	});
+	if (args.flags.has("--json")) console.log(JSON.stringify(report, null, 2));
+	for (const warning of report.warnings)
+		console.warn(`release-evidence: warning: ${warning}`);
+	if (report.failures.length > 0) {
+		console.error("release-evidence: verify FAILED");
+		for (const failure of report.failures) console.error(` - ${failure}`);
+		process.exit(1);
+	}
+	log(
+		`verify passed: ${report.verifiedEntries} asset(s) for ${report.tag} at ${report.commit}`,
+	);
+}
+
+// --------------------------------------------------------------------------- main
+
+const COMMANDS: Record<string, (args: Args) => void> = {
+	bind,
+	package: packageCommand,
+	fetch: fetchCommand,
+	import: importCommand,
+	upload: uploadCommand,
+	verify: verifyCommand,
+};
+
+if (import.meta.main) {
+	try {
+		const args = parseArgs(Bun.argv.slice(2));
+		const run = COMMANDS[args.command];
+		if (!run)
+			throw new UsageError(
+				`unknown command ${JSON.stringify(args.command)}; expected ${Object.keys(COMMANDS).join(", ")}`,
+			);
+		run(args);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		console.error(`release-evidence: ${message}`);
+		process.exit(error instanceof UsageError ? 2 : 1);
+	}
+}

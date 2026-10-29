@@ -177,3 +177,104 @@ export function sanitizeEvidenceDocument(
 
 	return visit(document);
 }
+
+/**
+ * Uppercase environment-variable-shaped name (`HOME`, `GITHUB_TOKEN`, …).
+ * Combined with `ENV_SECRET_KEY_PATTERN` this recognises an inherited
+ * environment that was dumped into an evidence file.
+ */
+const ENV_NAME_PATTERN = /^[A-Z][A-Z0-9_]*$/;
+
+/** `KEY=value` or `export KEY=value` at the start of a log line. */
+const ENV_ASSIGNMENT_PATTERN =
+	/^\s*(?:export\s+|declare\s+-x\s+)?([A-Z][A-Z0-9_]*)=/;
+
+/** Why a free-text line is unsafe to publish, or `undefined` when it is safe.
+ *
+ * Unlike `unsafeStringReason`, a line is not treated as a single value: a log
+ * line that merely starts with `/` (a comment, a rate such as `/s`) is fine;
+ * only an embedded multi-segment absolute path, a home/temp directory
+ * reference, a credential-shaped value, or an inherited-environment assignment
+ * is refused. */
+export function unsafeTextLineReason(line: string): string | undefined {
+	if (SECRET_VALUE_PATTERN.test(line)) return "credential-shaped value";
+	const assignment = ENV_ASSIGNMENT_PATTERN.exec(line)?.[1];
+	if (assignment && ENV_SECRET_KEY_PATTERN.test(assignment))
+		return "environment dump";
+	if (HOST_PATH_ANYWHERE_PATTERN.test(line))
+		return "home or temporary directory path";
+	if (EMBEDDED_ABSOLUTE_PATH_PATTERN.test(line))
+		return "embedded absolute path";
+	return undefined;
+}
+
+export interface TextPrivacyViolation {
+	/** 1-based line number. Never carries the line itself. */
+	readonly line: number;
+	readonly reason: string;
+}
+
+/** Scan free text (logs, CSV, Markdown) line by line. */
+export function findTextPrivacyViolations(
+	text: string,
+): TextPrivacyViolation[] {
+	const violations: TextPrivacyViolation[] = [];
+	text.split(/\r?\n/).forEach((line, index) => {
+		const reason = unsafeTextLineReason(line);
+		if (reason) violations.push({ line: index + 1, reason });
+	});
+	return violations;
+}
+
+/**
+ * Environment dumps inside a JSON document: an object member whose name is an
+ * environment-variable name that matches the inherited-shell-state pattern
+ * (`HOME`, `PATH`, `USER`, `GITHUB_TOKEN`, …). Structural camelCase keys such as
+ * `path` or `user` are deliberately not matched.
+ */
+export function findEnvironmentDumpViolations(
+	document: unknown,
+): PrivacyViolation[] {
+	const violations: PrivacyViolation[] = [];
+	const visit = (node: unknown, pointer: string): void => {
+		if (Array.isArray(node)) {
+			node.forEach((entry, index) => {
+				visit(entry, `${pointer}/${index}`);
+			});
+			return;
+		}
+		if (node === null || typeof node !== "object") return;
+		for (const [key, entry] of Object.entries(node)) {
+			const childPointer = `${pointer}/${escapePointerToken(key)}`;
+			if (ENV_NAME_PATTERN.test(key) && ENV_SECRET_KEY_PATTERN.test(key)) {
+				violations.push({ pointer: childPointer, reason: "environment dump" });
+				continue;
+			}
+			visit(entry, childPointer);
+		}
+	};
+	visit(document, "");
+	return violations;
+}
+
+/**
+ * Literal identifiers (an operator's login, a machine's hostname) that must
+ * not appear anywhere in published text. Matching is case-insensitive and on
+ * word boundaries so a short login does not match inside unrelated words.
+ */
+export function containsForbiddenLiteral(
+	text: string,
+	literals: readonly string[],
+): boolean {
+	for (const literal of literals) {
+		if (literal.length < 3) continue;
+		const escaped = literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+		if (
+			new RegExp(`(?:^|[^A-Za-z0-9])${escaped}(?:$|[^A-Za-z0-9])`, "i").test(
+				text,
+			)
+		)
+			return true;
+	}
+	return false;
+}
