@@ -11,6 +11,7 @@ import {
 	mkdirSync,
 	readdirSync,
 	readFileSync,
+	rmSync,
 	writeFileSync,
 } from "node:fs";
 import { basename, join } from "node:path";
@@ -50,6 +51,15 @@ type State = {
 	runs: Record<string, Run>;
 	storeDir: string;
 	calls: string[][];
+	/** Overwrite this local file the first time `release view` runs: models
+	 * a file replaced between upload's validation and its `gh` call. */
+	mutateOnView?: { path: string; content: string } | null;
+	/** Store different bytes than the file given to `release upload`, as a
+	 * corrupted or swapped upload would. */
+	corruptUpload?: boolean;
+	/** Base64 of the exact bytes of every file `release upload` was given,
+	 * read when it was invoked. */
+	uploadedBytes?: Record<string, string>;
 };
 
 const statePath = process.env.FAKE_GH_STATE;
@@ -162,6 +172,10 @@ if (group === "release") {
 	const tag = subject as string;
 	const release = state.releases[tag];
 	if (command === "view") {
+		if (state.mutateOnView) {
+			writeFileSync(state.mutateOnView.path, state.mutateOnView.content);
+			state.mutateOnView = null;
+		}
 		if (!release) fail("release not found");
 		save();
 		console.log(
@@ -206,14 +220,35 @@ if (group === "release") {
 				!args.includes("--clobber")
 			)
 				fail(`asset under the same name already exists: [${name}]`);
-			cpSync(file, join(release.dir, name));
+			state.uploadedBytes = {
+				...(state.uploadedBytes ?? {}),
+				[name]: readFileSync(file).toString("base64"),
+			};
+			const stored = join(release.dir, name);
+			if (state.corruptUpload)
+				writeFileSync(
+					stored,
+					Buffer.concat([readFileSync(file), Buffer.from("x")]),
+				);
+			// Store a copy of the bytes, not the file: a release keeps no modes.
+			else writeFileSync(stored, readFileSync(file));
 			release.assets = release.assets.filter((asset) => asset.name !== name);
 			release.assets.push({
 				name,
-				size: readFileSync(file).length,
-				digest: `sha256:${sha256(file)}`,
+				size: readFileSync(stored).length,
+				digest: `sha256:${sha256(stored)}`,
 			});
 		}
+		save();
+		process.exit(0);
+	}
+	if (command === "delete-asset") {
+		if (!release) fail("release not found");
+		const name = args[3] as string;
+		if (!release.assets.some((asset) => asset.name === name))
+			fail(`asset ${name} not found`);
+		release.assets = release.assets.filter((asset) => asset.name !== name);
+		rmSync(join(release.dir, name), { force: true });
 		save();
 		process.exit(0);
 	}

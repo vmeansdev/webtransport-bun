@@ -36,6 +36,7 @@
  * and verification both enforce it.
  */
 import {
+	chmodSync,
 	existsSync,
 	lstatSync,
 	mkdirSync,
@@ -779,9 +780,17 @@ function uploadCommand(args: Args): void {
 	let tag: string | null;
 	/** The commit the evidence being uploaded is bound to. */
 	let boundCommit: string | null;
-	const extraFiles: string[] = [];
+	/** The fragment, read once: the bytes parsed, validated and uploaded are
+	 * the same buffer. */
+	const extraFiles: { name: string; data: Uint8Array }[] = [];
 	if (fragmentPath) {
-		const fragment = readJsonFile(resolve(fragmentPath));
+		const fragmentBytes = new Uint8Array(readFileSync(resolve(fragmentPath)));
+		let fragment: unknown;
+		try {
+			fragment = JSON.parse(new TextDecoder().decode(fragmentBytes));
+		} catch {
+			throw new Error(`fragment ${basename(fragmentPath)} is not valid JSON`);
+		}
 		const errors = validateFragment(fragment);
 		if (errors.length > 0)
 			throw new Error(`invalid fragment:\n - ${errors.join("\n - ")}`);
@@ -794,7 +803,7 @@ function uploadCommand(args: Args): void {
 		repository = typed.repository;
 		tag = typed.tag;
 		boundCommit = typed.commit;
-		extraFiles.push(resolve(fragmentPath));
+		extraFiles.push({ name: basename(fragmentPath), data: fragmentBytes });
 	} else {
 		const manifest = loadManifest(manifestPath(root));
 		entries = manifest.entries;
@@ -826,8 +835,16 @@ function uploadCommand(args: Args): void {
 		one(args, "--assets-dir") ?? defaultAssetsDir(root),
 	);
 
-	const local: { name: string; path: string; sha256: string; size: number }[] =
-		[];
+	// Every file is read exactly once. These buffers are what gets validated,
+	// staged and uploaded; the original paths are never handed to gh, so a
+	// file replaced after validation cannot be what is published.
+	const local: {
+		name: string;
+		data: Uint8Array;
+		sha256: string;
+		size: number;
+	}[] = [];
+	const entryBytes = new Map<string, Uint8Array>();
 	for (const entry of entries) {
 		const path = join(assetsDir, entry.asset);
 		if (!existsSync(path))
@@ -839,22 +856,21 @@ function uploadCommand(args: Args): void {
 			throw new Error(
 				`${entry.asset} on disk does not match its manifest entry`,
 			);
+		entryBytes.set(entry.asset, data);
 		local.push({
 			name: entry.asset,
-			path,
+			data,
 			sha256: entry.sha256,
 			size: entry.size,
 		});
 	}
-	for (const path of extraFiles) {
-		const data = new Uint8Array(readFileSync(path));
+	for (const file of extraFiles)
 		local.push({
-			name: basename(path),
-			path,
-			sha256: sha256Hex(data),
-			size: data.length,
+			name: file.name,
+			data: file.data,
+			sha256: sha256Hex(file.data),
+			size: file.data.length,
 		});
-	}
 
 	// Publication is the privacy boundary: the exact bytes about to be
 	// attached go through the same checks verify applies afterwards, before
@@ -862,18 +878,23 @@ function uploadCommand(args: Args): void {
 	// would only fail verify later is refused here, while it is still private.
 	const registry = parseRegistry(registryTextAt(root, tagCommit));
 	const refused: string[] = [];
-	for (const entry of entries) {
-		const data = new Uint8Array(readFileSync(join(assetsDir, entry.asset)));
-		refused.push(...entryAssetProblems(entry, data, registry, root));
-	}
-	for (const path of extraFiles)
+	for (const entry of entries)
+		refused.push(
+			...entryAssetProblems(
+				entry,
+				entryBytes.get(entry.asset) as Uint8Array,
+				registry,
+				root,
+			),
+		);
+	for (const file of extraFiles)
 		refused.push(
 			...fragmentAssetProblems(
-				new Uint8Array(readFileSync(path)),
+				file.data,
 				{ candidate: { commit: tagCommit }, entries },
 				repository,
 				tag,
-			).map((problem) => `fragment ${basename(path)}: ${problem}`),
+			).map((problem) => `fragment ${file.name}: ${problem}`),
 		);
 	if (refused.length > 0)
 		throw new Error(
@@ -916,7 +937,7 @@ function uploadCommand(args: Args): void {
 			throw new Error(`release ${tag} is immutable and cannot take new assets`);
 	}
 
-	const pending: string[] = [];
+	const pending: typeof local = [];
 	for (const file of local) {
 		const remote = release?.assets.find((asset) => asset.name === file.name);
 		if (remote) {
@@ -932,7 +953,7 @@ function uploadCommand(args: Args): void {
 			log(`${file.name} already attached`);
 			continue;
 		}
-		pending.push(file.path);
+		pending.push(file);
 		log(
 			`${execute ? "uploading" : "would upload"} ${file.name} (${file.size} bytes)`,
 		);
@@ -947,15 +968,66 @@ function uploadCommand(args: Args): void {
 		log(`nothing to upload to ${tag}`);
 		return;
 	}
-	const uploaded = runGh(
-		["release", "upload", tag, "--repo", repository, ...pending],
-		root,
-	);
-	if (uploaded.status !== 0)
-		throw new Error(
-			`gh release upload failed: ${uploaded.stderr.trim().split("\n")[0] ?? ""}`,
+	// Stage the validated buffers as read-only files in a private directory
+	// and upload only those.
+	const stage = mkdtempSync(join(tmpdir(), "release-evidence-upload-"));
+	try {
+		chmodSync(stage, 0o700);
+		const staged = pending.map((file) => {
+			const path = join(stage, file.name);
+			writeFileSync(path, file.data, { mode: 0o400, flag: "wx" });
+			return path;
+		});
+		const uploaded = runGh(
+			["release", "upload", tag, "--repo", repository, ...staged],
+			root,
 		);
-	log(`attached ${pending.length} asset(s) to ${tag}`);
+		if (uploaded.status !== 0)
+			throw new Error(
+				`gh release upload failed: ${uploaded.stderr.trim().split("\n")[0] ?? ""}`,
+			);
+	} finally {
+		rmSync(stage, { recursive: true, force: true });
+	}
+	// Read back what is attached now: every uploaded asset must carry exactly
+	// the validated bytes. A mismatching asset is deleted and the upload fails.
+	const attached = viewRelease(repository, tag, root);
+	const mismatched: string[] = [];
+	for (const file of pending) {
+		const remote = attached?.assets.find((asset) => asset.name === file.name);
+		const remoteDigest = remote?.digest
+			? remote.digest.replace(/^sha256:/, "")
+			: remote
+				? remoteSha256(repository, tag, file.name, root)
+				: undefined;
+		if (remoteDigest === file.sha256) continue;
+		mismatched.push(file.name);
+		if (remote) {
+			const deleted = runGh(
+				[
+					"release",
+					"delete-asset",
+					tag,
+					file.name,
+					"--repo",
+					repository,
+					"--yes",
+				],
+				root,
+			);
+			if (deleted.status !== 0)
+				mismatched.push(
+					`${file.name} (could not be deleted: delete it by hand)`,
+				);
+		}
+	}
+	if (mismatched.length > 0)
+		throw new Error(
+			`attached assets do not carry the validated bytes; deleted: ${mismatched.join(", ")}`,
+		);
+	log(
+		`attached ${pending.length} asset(s) to ${tag}; read back and digest-checked`,
+	);
 }
 
 function remoteSha256(

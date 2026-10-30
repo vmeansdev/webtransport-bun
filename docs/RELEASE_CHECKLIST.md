@@ -177,7 +177,12 @@ All through `bun scripts/release-evidence.ts`:
    form and member list against its entry, the privacy re-scan, the claim's
    content allowlist and proof validator, and for a fragment the privacy
    scan, schema and repository/candidate/tag binding. Any problem refuses the
-   whole upload. The release job's own attachments outside `upload` (the
+   whole upload. Every file is read once; those validated buffers are staged
+   as read-only files in a private temporary directory and only the staged
+   copies are given to `gh`, so a file replaced after validation is never
+   what gets published. After uploading, `upload` reads the release back and
+   digest-checks every attached asset; one that does not carry the validated
+   bytes is deleted and the upload fails. The release job's own attachments outside `upload` (the
    interop report and the parity record) pass the same privacy re-scan and
    content allowlist through `release-evidence.ts scan` first.
 6. **Record.** Mark claims `passed` with the manifest entry ids and commit the

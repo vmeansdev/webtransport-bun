@@ -3078,6 +3078,90 @@ describe("release evidence lifecycle", () => {
 		expect(calls).not.toContain("release create");
 	});
 
+	it("upload publishes the validated bytes even if the file changes before gh runs", () => {
+		const fixture = makeFixture();
+		cli(fixture, "bind", "--commit", fixture.commit, "--tag", TAG);
+		const artifact = writeTree(
+			temp("wt-evidence-native-"),
+			nativeGates(fixture.commit),
+		);
+		writeState(fixture, (state) => {
+			state.runs["41"] = runView(
+				fixture,
+				41,
+				{ workflowName: "test" },
+				artifact,
+				"release-evidence-native-gates",
+			);
+		});
+		const fetched = cli(
+			fixture,
+			"fetch",
+			"--run",
+			"41",
+			"--artifact",
+			"release-evidence-native-gates",
+			"--claim",
+			"native-local-gates",
+		);
+		expect(fetched.status, fetched.stderr).toBe(0);
+		const entry = manifest(fixture).entries[0] as { asset: string };
+		const original = join(
+			fixture.root,
+			".release-evidence",
+			"assets",
+			entry.asset,
+		);
+		const validated = readFileSync(original);
+		// Replace the file after upload has validated it and before gh opens
+		// it (the fake gh does this during the `release view` that follows
+		// validation).
+		const forged = JSON.stringify({ token: FAKE_TOKEN });
+		writeState(fixture, (state) => {
+			Object.assign(state, {
+				mutateOnView: { path: original, content: forged },
+			});
+		});
+		const upload = cli(fixture, "upload", "--create-prerelease", "--execute");
+		expect(upload.status, upload.stderr).toBe(0);
+		expect(readFileSync(original, "utf8")).toBe(forged);
+		const state = readState(fixture) as ReturnType<typeof readState> & {
+			uploadedBytes: Record<string, string>;
+		};
+		// gh was handed a staged copy, never the mutable original path ...
+		const uploadCall = state.calls.find(
+			(c) => c[0] === "release" && c[1] === "upload",
+		) as string[];
+		expect(uploadCall.some((arg) => arg === original)).toBe(false);
+		// ... whose bytes are exactly the validated ones.
+		expect(
+			Buffer.from(state.uploadedBytes[entry.asset] as string, "base64"),
+		).toEqual(validated);
+		expect(readFileSync(join(releaseDir(fixture), entry.asset))).toEqual(
+			validated,
+		);
+		expect(cli(fixture, "verify", "--integrity-only").status).toBe(0);
+	});
+
+	it("upload deletes an attached asset whose read-back digest differs and fails", () => {
+		const fixture = makeFixture();
+		cli(fixture, "bind", "--commit", fixture.commit, "--tag", TAG);
+		expect(fetchIwa(fixture).status).toBe(0);
+		writeState(fixture, (state) => {
+			Object.assign(state, { corruptUpload: true });
+		});
+		const upload = cli(fixture, "upload", "--create-prerelease", "--execute");
+		expect(upload.status).toBe(1);
+		expect(upload.stderr).toContain(
+			"attached assets do not carry the validated bytes",
+		);
+		const state = readState(fixture);
+		expect(
+			state.calls.some((c) => c[0] === "release" && c[1] === "delete-asset"),
+		).toBe(true);
+		expect(state.releases[TAG]?.assets).toEqual([]);
+	});
+
 	it("scan gates release files attached outside upload", () => {
 		const dir = temp("wt-evidence-scan-");
 		writeFileSync(
