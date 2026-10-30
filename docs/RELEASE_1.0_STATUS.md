@@ -41,7 +41,36 @@ credentials, environment dumps, logins/hostnames and host paths.
 `bun scripts/promote-release-status.ts` download the assets and check them
 against the manifest, check that the tag points to the candidate, and check
 that every `gaRequired` claim has passing evidence bound to it. The flow is in
-`docs/RELEASE_CHECKLIST.md` § Where release evidence lives. Tracked files under
+`docs/RELEASE_CHECKLIST.md` § Where release evidence lives.
+
+Follow-on decisions (2026-10-30):
+
+- The GA gate set is pinned in `docs/release-claims.json` (read from the
+  candidate commit); `release-status.json` cannot add, drop or downgrade a
+  gate. Every `passed` entry must carry the registered positive proof in its
+  producer's own format.
+- Promotion always verifies assets downloaded from the release, has no
+  stale-candidate override, and writes a promotion lock (tag commit + asset
+  sha256s) into the manifest. The pre-release must not be edited after
+  promotion; `release-evidence-verify.yml` re-verifies daily and the stable
+  release job's GA evidence gate refuses to release if anything changed.
+- **The GA tag `v1.0.0` points at the candidate commit**, not at the
+  evidence-record commit.
+- rc tags publish to npm under the `next` dist-tag; stable tags under
+  `latest`.
+- Pre-releases, and the evidence attached to them, are public.
+- Self-attaching evidence from `soak-long`, `iwa`, `fuzz`, `coverage` and
+  `bench-bandwidth` runs is a later follow-up; until then their artifacts are
+  pulled in with `release-evidence.ts fetch`.
+
+**Open question (versioning):** `publish.yml` publishes a tag only when it
+equals `v<package.json version>`. With the GA tag on the candidate commit, that
+commit's `package.json` must say `1.0.0`, so an rc tag on the same commit
+(`v1.0.0-rc.N`, accepted by the evidence tooling as a pre-release of `1.0.0`)
+cannot be published to npm by the current workflow; conversely a candidate at
+`1.0.0-rc.N` cannot be released as `v1.0.0` without a new commit. Options:
+stamp the package version from the tag at build time, accept that the final
+rc is not published to npm, or bump to `1.0.0` and re-run the evidence. Tracked files under
 `.release-evidence/` and `.bench-evidence/` stay refused by CI
 (`scripts/check-tracked-hygiene.sh`).
 

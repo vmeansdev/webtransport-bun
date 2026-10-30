@@ -8,12 +8,12 @@ Canonical release truth: `docs/release-status.json`. This checklist provides the
 
 Evidence files are **GitHub Release assets of the candidate pre-release** (the
 `vX.Y.Z-rc.N` tag of the frozen candidate commit). The repository carries only
-the checksum manifest `docs/release-evidence-manifest.json` (contract:
-`docs/release-evidence.schema.json` for individual command records,
-`docs/release-evidence-manifest.schema.json` for the manifest). Nothing else
-evidence-like is committed: `scripts/check-tracked-hygiene.sh` refuses
-`.release-evidence/`, `.bench-evidence/`, `.scratch/`, `docs/superpowers/` and
-stray `*.jsonl`.
+the checksum manifest `docs/release-evidence-manifest.json` (schema
+`docs/release-evidence-manifest.schema.json`; individual command records follow
+`docs/release-evidence.schema.json`). Nothing else evidence-like is committed:
+`scripts/check-tracked-hygiene.sh` refuses `.release-evidence/`,
+`.bench-evidence/`, `.scratch/`, `docs/superpowers/` and stray `*.jsonl`.
+Pre-releases are public, and so is their evidence.
 
 Each manifest entry records the claim id(s) it supports, the asset name
 (`evidence-<id>.json` or `evidence-<id>.tar.gz`), its size and sha256, the
@@ -23,51 +23,114 @@ producer (GitHub Actions repository/workflow/run id/attempt/URL/head SHA, or
 claims cite manifest entry ids in `evidenceIds`; they never cite repository
 paths.
 
-Flow, all through `bun scripts/release-evidence.ts`:
+### The gate set is pinned
 
-1. **Freeze and tag.** Bump the package to the candidate version, push the
-   `vX.Y.Z-rc.N` tag. The tag-triggered `release` workflow publishes the
-   pre-release (`prerelease` is set for any hyphenated tag) and its
-   `evidence-assets` job scrubs and attaches the run's interop, fuzz, coverage,
-   distributed-scale and package-identity evidence plus a
-   `release-evidence-fragment-release-<run>-<attempt>.json` manifest fragment.
+`docs/release-claims.json` is the claim registry: which claims exist, their
+surface, whether each is `gaRequired`, and the positive proof a `passed` entry
+must carry. `release-status.json` only records progress against it:
+`scripts/check-doc-truth.ts` refuses a status file whose claim set, surfaces or
+`gaRequired` flags differ from the registry. Verification reads the registry
+from the candidate commit itself (its sha256 is bound into the manifest), so
+changing a gate is a code change that invalidates the candidate.
+
+Positive proof is checked in each producer's own output format
+(`scripts/release-claims.ts`); an unknown document, `{}`, or a text-only bundle
+is refused:
+
+| Proof | Claims | Requires |
+|---|---|---|
+| command records (`scripts/generate-release-evidence.ts`) | local gates, wasm protocol gates, runtime consumers, cross-platform matrix, supply-chain provenance | every record exit 0 at the candidate commit; the claim's commands (e.g. `cargo test` and `bun test`) or platforms present |
+| Playwright JSON report | Chromium native/wasm interop, fault matrix | `expected > 0`, no unexpected/flaky/errors, every spec ok; from a GitHub Actions run |
+| `release-smoke.json` | fuzz gates | no failures, every command exit 0 in time, non-empty corpora; from a GitHub Actions run |
+| llvm-cov + Bun LCOV reports | coverage gates | `scripts/check-llvm-cov-floors.py` re-run over the bundled reports passes; from a GitHub Actions run |
+| soak aggregate | soak 24h / 72h | `status: pass`, candidate commit, every segment passed, the full duration |
+| `run-iwa.mjs` evidence | IWA Direct Sockets | every functional check of `validateEvidence`, `sourceCommit` = candidate |
+| `candidate-identity.json` | package artifact | bound to the candidate and the release workflow run |
+| distributed-scale artifact | scale 10k (not GA-blocking) | promotable, `source.sha` = candidate, ≥ 10 000 sessions |
+| review record `{kind: "review", commit, reviewer, scope, verdict: "pass", findings: {P0..P4: 0}}` | auto-review | all counts zero |
+| `{kind: "no-change-confirmation", commit, frozenAt, verdict: "pass", changedFilesSinceFreeze: []}` | final no-change | nothing changed |
+
+### Flow
+
+All through `bun scripts/release-evidence.ts`:
+
+1. **Freeze and tag.** Push the `vX.Y.Z-rc.N` tag on the candidate commit.
+   The tag-triggered `release` workflow publishes the pre-release (`prerelease`
+   is set for any hyphenated tag; `publish.yml` puts the rc on npm under the
+   `next` dist-tag, never `latest`). Its `evidence-assets` job scrubs and
+   attaches the run's interop, fuzz, distributed-scale and package-identity
+   evidence plus a `release-evidence-fragment-release-<run>-<attempt>.json`
+   manifest fragment. The job is `continue-on-error`: a refused bundle never
+   blocks the release or the rc publish, but the failure stays on the run.
 2. **Bind.** `bind --commit <candidate-sha> --tag vX.Y.Z-rc.N` records the
-   candidate (and the package version at that commit) in the manifest and in
-   `release-status.json`. Binding a different candidate drops every entry and
-   resets every claim to pending: evidence never carries across commits.
+   candidate, the package version at that commit and the registry's sha256 in
+   the manifest and the candidate in `release-status.json`. Binding a different
+   candidate drops every entry and resets every claim to pending.
 3. **Collect.** `import --from-release` records the CI fragments. Evidence
    from other workflow runs (`soak-long`, `iwa`, `fuzz`, `coverage`,
    `bench-bandwidth`) comes in with
-   `fetch --run <run-id> --artifact <name> --claim <claim-id>`, which refuses a
-   run that did not succeed or did not build the candidate commit. Local runs
+   `fetch --run <run-id> --artifact <name> --claim <claim-id>`. Local runs
    (interactive IWA proof, bare-metal soaks, review records) come in with
    `package --claim <claim-id> --input <file-or-dir> --local "<what ran where>"`.
-4. **Scrub.** `package` and `fetch` rewrite the checkout path to `<repo>` and
-   then run the evidence-privacy scanner over every file: credential-shaped
-   values or keys, environment dumps (`HOME=`, `PATH=`, `*_TOKEN=` …), the local
-   login and hostname, and host paths are refused, never echoed. Remaining host
-   paths may be replaced by a fixed marker only with `--redact-host-paths`;
-   credentials and environment dumps are always refused. Binary files are
-   refused because they cannot be scanned. A `passed` entry is also refused if
-   its content records a nonzero exit, a failed status or module, or a
-   different commit.
-5. **Upload.** `upload` attaches the assets to the candidate pre-release with
-   `gh release upload`. It is a dry run unless `--execute` is given, never
-   creates a release unless `--create-prerelease` is also given (the tag must
-   already exist; nothing creates tags), refuses a release that is not a
-   pre-release or is immutable, and refuses to replace an attached asset with
-   different content.
+   Provenance is never self-attested: `fetch` and `package --run-id` read the
+   run back from the Actions API and refuse a run in another repository or
+   workflow, one that did not build the candidate, or one that did not succeed
+   (the only in-progress run accepted is the release run packaging its own
+   evidence from inside itself).
+4. **Scrub.** `package` and `fetch` rewrite the checkout path to `<repo>`, then
+   run the evidence-privacy scanner over every file. It refuses, without
+   echoing the value: credential-shaped values or keys; environment dumps, by
+   name (`HOME`, `PATH`, `USER`, `LOGNAME`, `HOSTNAME`, `RUNNER_*`,
+   `GITHUB_*`, `*_TOKEN`, …) and by structure (three or more
+   environment-shaped names that are not documented `WT_*`/`WEBTRANSPORT_*`
+   knobs); the local login and hostname; host paths; and any of these hidden
+   behind base64/base64url, hex, percent-encoding or gzip (decoded and
+   rescanned recursively, bounded). Remaining plain host paths may be replaced
+   by a marker only with `--redact-host-paths`; everything else is always
+   refused. Binary files are refused because they cannot be scanned. Bundles
+   are canonical: a single gzip member without header extras or trailing
+   bytes, a tar archive byte-identical to the canonical archive of its listed
+   members and its end-of-archive marker, so nothing can ride along unscanned.
+5. **Upload.** `upload` attaches the assets with `gh release upload`. It is a
+   dry run unless `--execute`, creates the pre-release only with
+   `--create-prerelease` (the tag must already exist; nothing creates tags),
+   refuses a release that is not a pre-release or is immutable, and refuses to
+   replace an attached asset with different content (downloading and hashing
+   it when the API gives no digest).
 6. **Record.** Mark claims `passed` with the manifest entry ids and commit the
    manifest and `release-status.json` (only those two files) on top of the
    candidate.
-7. **Verify and promote.** `verify` downloads every asset with
-   `gh release download` and checks size, sha256 and file list against the
-   manifest, re-runs the privacy and content checks, checks that the tag
-   points to the candidate commit and that the package version matches, and
-   that every `gaRequired` claim has passing evidence bound to the candidate.
-   `bun scripts/promote-release-status.ts` runs the same verification and
-   refuses unless HEAD is the candidate or a descendant that changed only the
-   evidence record; it then sets readiness `ready`.
+7. **Verify and promote.** `verify` downloads every evidence and fragment
+   asset with `gh release download` and hashes it (a remote digest is a
+   cross-check, never a substitute), checks size, sha256 and file list against
+   the manifest, re-runs the privacy and proof checks, re-reads every producing
+   run, checks that the tag points to the candidate and the package version
+   matches, and that every `gaRequired` claim (per the candidate's registry)
+   has passing evidence bound to it. `verify --assets-dir <dir>` is an audit of
+   assets already on disk and is never release verification.
+   `bun scripts/promote-release-status.ts` runs the full verification against
+   downloaded assets and refuses unless HEAD is the candidate or a descendant
+   that changed only the evidence record; there is no override. It sets
+   readiness `ready` and writes a **promotion lock** into the manifest: the tag
+   commit and the sha256 of every evidence asset on the pre-release.
+8. **Do not edit the pre-release after promotion.** The
+   `release-evidence-verify` workflow re-verifies daily and on every change to
+   the record (`verify --require-ready` once promoted, `verify
+   --integrity-only` while evidence is still being collected) and fails if the
+   tag moved or any evidence asset was added, removed or replaced.
+9. **GA.** The GA tag `vX.Y.Z` points at the **candidate commit** itself, not
+   at the evidence-record commit. The `release` workflow's "GA evidence gate"
+   step runs `verify --ga-tag vX.Y.Z --require-ready` against the record on
+   `main` before it creates the release, so the GA release (and therefore the
+   npm `latest` publish) is refused unless the record is promoted, the GA tag
+   is the candidate commit, and the pre-release still matches the lock.
+
+The candidate tag must be `v<package version>` or a pre-release of it: a
+candidate whose `package.json` says `1.0.0` may carry the rc tag `v1.0.0-rc.N`
+on the same commit, which is what lets `v1.0.0` point at the candidate. Note
+that `publish.yml` publishes only a tag equal to `v<package version>`, so on
+such a commit the rc tag's npm publish is refused; see
+`docs/RELEASE_1.0_STATUS.md`.
 
 ## Required gates (automated)
 
@@ -83,7 +146,7 @@ The release workflow enforces these; the pipeline fails if any are missing:
 | Build | build | prebuilds + SHA256SUMS |
 | Exact package consumers | package-consumers | successful exact-tarball Bun/Node/Deno smoke across the supported OS/runtime matrix |
 
-GitHub release assets include the prebuilds, npm tarball, `parity-evidence.json`, and `interop-evidence.json`. On a pre-release tag the `evidence-assets` job additionally attaches the scrubbed `evidence-*` bundles and the run's `release-evidence-fragment-*.json` (see above). The immutable npm publish input stays an attempt-qualified Actions artifact on the release workflow run and remains the only npm publish input; the exact-package consumer matrix is proven by its required successful job results.
+GitHub release assets include the prebuilds, npm tarball, `parity-evidence.json`, and `interop-evidence.json`. On a pre-release tag the `evidence-assets` job additionally attaches the scrubbed `evidence-*` bundles and the run's `release-evidence-fragment-*.json` (see above); on a stable tag the GA evidence gate must pass before the release is created. The immutable npm publish input stays an attempt-qualified Actions artifact on the release workflow run and remains the only npm publish input; the exact-package consumer matrix is proven by its required successful job results.
 
 ## N-consecutive green policy
 
@@ -182,4 +245,5 @@ Per release:
 These are linkable from the GitHub release Assets page. To audit a candidate
 from assets already on disk: `gh release download <tag> --pattern 'evidence-*'
 --dir <dir>`, then `bun scripts/release-evidence.ts verify --assets-dir <dir>`
-(the tag-to-commit and pre-release checks still query GitHub).
+(an audit only: the tag-to-commit and pre-release checks still query GitHub,
+and only a verification that downloads the assets itself counts).
