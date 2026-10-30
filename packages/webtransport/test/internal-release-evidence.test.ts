@@ -5,7 +5,7 @@
  * whose releases and run artifacts are local directories. Evidence payloads
  * follow the real producers' formats.
  */
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, setDefaultTimeout } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
@@ -43,6 +43,10 @@ const REPO = "example/webtransport-bun";
 const TAG = "v1.0.0-rc.2";
 // Assembled at runtime so the literal never sits in the source as a token.
 const FAKE_TOKEN = ["ghp", "_", "abcdefghijklmnopqrstuvwxyz0123"].join("");
+
+// Lifecycle tests spawn the CLI, git and the fake gh many times; Windows
+// runners need far more than the 5 s default.
+setDefaultTimeout(60_000);
 
 const roots: string[] = [];
 afterEach(() => {
@@ -1074,10 +1078,10 @@ describe("release evidence lifecycle", () => {
 		expect(again.stdout).toContain("already promoted");
 	});
 
-	it("completes a promotion interrupted between its two writes", () => {
-		const statusPath = (fixture: Fixture) =>
-			join(fixture.root, "docs", "release-status.json");
-		// Crash after the lock was written, before the status.
+	const statusPath = (fixture: Fixture) =>
+		join(fixture.root, "docs", "release-status.json");
+
+	it("completes a promotion interrupted after the lock was written", () => {
 		const lockedOnly = makeFixture();
 		readyCandidate(lockedOnly);
 		expect(run(lockedOnly, PROMOTE, "--root", lockedOnly.root).status).toBe(0);
@@ -1091,7 +1095,9 @@ describe("release evidence lifecycle", () => {
 				.readiness,
 		).toBe("ready");
 		expect(cli(lockedOnly, "verify", "--require-ready").status).toBe(0);
-		// The status says ready but the lock never landed.
+	}, 60_000);
+
+	it("completes a promotion whose status landed before the lock", () => {
 		const readyOnly = makeFixture();
 		readyCandidate(readyOnly);
 		editStatus(readyOnly, (status) => {
@@ -1102,7 +1108,9 @@ describe("release evidence lifecycle", () => {
 		expect(completed.status, completed.stderr).toBe(0);
 		expect(manifest(readyOnly).promotion).not.toBeNull();
 		expect(cli(readyOnly, "verify", "--require-ready").status).toBe(0);
-		// A resumed promotion still refuses a release changed in between.
+	}, 60_000);
+
+	it("does not resume a promotion whose release changed in between", () => {
 		const tampered = makeFixture();
 		readyCandidate(tampered);
 		expect(run(tampered, PROMOTE, "--root", tampered.root).status).toBe(0);
@@ -1113,7 +1121,7 @@ describe("release evidence lifecycle", () => {
 			state.tags[TAG] = "c".repeat(40);
 		});
 		expect(run(tampered, PROMOTE, "--root", tampered.root).status).toBe(1);
-	});
+	}, 60_000);
 
 	it("detects an evidence asset added after promotion", () => {
 		const fixture = makeFixture();
