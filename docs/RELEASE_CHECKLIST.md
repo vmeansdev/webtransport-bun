@@ -50,6 +50,47 @@ is refused:
 | review record `{kind: "review", commit, reviewer, scope, verdict: "pass", findings: {P0..P4: 0}}` | auto-review | all counts zero |
 | `{kind: "no-change-confirmation", commit, frozenAt, verdict: "pass", changedFilesSinceFreeze: []}` | final no-change | nothing changed |
 
+### Content is allowlisted
+
+Each proof kind in `docs/release-claims.json` declares the files its bundle may
+contain (`proof.files`: a glob and a content schema from
+`scripts/release-evidence-content.ts`). A member that matches no declared file
+is refused; JSON must satisfy its schema exactly (unknown fields refused at any
+depth, typed values); a declared text file (Bun LCOV) must match its line
+grammar. Free text is capped, control-character free, and may not contain an
+*opaque run*: 24+ characters of base64/hex alphabet with the character-class
+churn of encoded data, where chunks split by single punctuation or whitespace
+(`TE9L!QUxJ.U0Vf,…`) count as one run. Hashes and digests are accepted only in
+fields declared as digests, with their exact lengths. The decode-and-rescan
+privacy scanner still runs over everything as defence in depth.
+
+### Who produces each claim's evidence
+
+Tool output is evidence only when a GitHub Actions run produced it: every
+proof kind except `iwa-proof`, `review-record` and `no-change-confirmation`
+refuses a `--local` producer and must come in through
+`release-evidence.ts fetch --run <id> --artifact <name>` from a run whose head
+SHA is the candidate.
+
+| Claim | Producer (workflow / job) | Artifact to fetch |
+|---|---|---|
+| `native-local-gates` | `test.yml` / `test` (ubuntu-latest), recorded `cargo test` + `bun test` | `release-evidence-native-gates-ubuntu-latest` |
+| `cross-platform-matrix` | `test.yml` / `test` matrix (Linux, macOS, Windows), joined by `release-evidence` | `release-evidence-cross-platform` |
+| `runtime-consumers` | `test.yml` / `package-consumers` matrix, joined by `release-evidence` | `release-evidence-runtime-consumers` |
+| `wasm-local-gates`, `wasm-dynamic-qpack`, `wasm-multi-session`, `wasm-0rtt`, `wasm-facade-parity` | `test.yml` / `wasm` (recorded `test:wasm` and the four focused suites) | `release-evidence-wasm-gates` |
+| `chromium-wasm-interop` | `test.yml` / `wasm` (`INTEROP_EVIDENCE=1` Playwright report) | `release-evidence-wasm-interop` |
+| `chromium-native-interop` | `release.yml` / `interop` | `interop-evidence` (attached by `evidence-assets`) |
+| `fuzz-gates` | `release.yml` / `fuzz` (or `fuzz.yml`) | `fuzz-evidence` (`--select .release-evidence/fuzz`) |
+| `coverage-gates` | `coverage.yml` / `coverage` | `coverage-artifacts` (`--select native-coverage.json --select wasm-coverage.json --select bun/lcov.info`) |
+| `package-artifact` | `release.yml` / `release` | `npm-publish-input-<attempt>` (`--select candidate-identity.json`) |
+| `scale-10k-multisource` (not GA) | `release.yml` / `distributed-scale` | `distributed-scale-evidence` |
+| `soak-24h`, `soak-72h` | `soak-long.yml` | `soak-aggregate-<hours>h-<commit>` |
+| `iwa-direct-sockets` | `iwa.yml` (`iwa-proof-<sha>`, `--select evidence.json`), or the interactive run's `run-iwa.mjs` JSON with `--local` | |
+| `auto-review-zero-p0-p4` | human review record, `--local` | |
+| `final-no-change-confirmation` | human freeze record, `--local` | |
+| `fault-matrix` | **no CI producer yet**: needs a job running `playwright.fault.config.ts` with the JSON reporter + sanitizer | |
+| `supply-chain-provenance` | **no CI producer yet**: needs a post-publish job (dispatched on the rc tag) that records `npm audit signatures` against the published version | |
+
 ### Flow
 
 All through `bun scripts/release-evidence.ts`:
@@ -100,8 +141,10 @@ All through `bun scripts/release-evidence.ts`:
    are canonical: a single gzip member without header extras or trailing
    bytes, a tar archive byte-identical to the canonical archive of its listed
    members and its end-of-archive marker, so nothing can ride along unscanned.
-5. **Upload.** `upload` attaches the assets with `gh release upload`. It is a
-   dry run unless `--execute`, creates the pre-release only with
+5. **Upload.** `upload` attaches the assets with `gh release upload`. It
+   resolves the tag on GitHub first and refuses unless it points at the commit
+   every entry (and the manifest or fragment) is bound to. It is a dry run
+   unless `--execute`, creates the pre-release only with
    `--create-prerelease` (the tag must already exist; nothing creates tags),
    refuses a release that is not a pre-release or is immutable, and refuses to
    replace an attached asset with different content (downloading and hashing

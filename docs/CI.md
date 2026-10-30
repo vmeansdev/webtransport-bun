@@ -93,6 +93,10 @@ that run's immutable ID and re-verify them with the fail-closed
 SHA and the same workload tuple. This lane supplements the release soak policy in
 docs/RELEASE_CHECKLIST.md: it does not replace the 24h/72h release soak.
 
+### Release evidence artifacts from test.yml
+
+`scripts/record-command.ts` wraps gate commands and writes release-evidence command records, uploaded as named artifacts that `release-evidence.ts fetch` pulls in for the candidate: `release-evidence-native-gates-<os>` (recorded `cargo test` and `bun test` per matrix OS), `release-evidence-runtime-consumers-<os>-node<version>` (exact-package consumers), `release-evidence-wasm-gates` (`test:wasm` plus the QPACK, multi-session, 0-RTT and facade suites), `release-evidence-wasm-interop` (the sanitized `INTEROP_EVIDENCE=1` Playwright report, verified with `verify-evidence.ts --interop`), and the joined `release-evidence-cross-platform` / `release-evidence-runtime-consumers` from the `release-evidence` job. See docs/RELEASE_CHECKLIST.md § Who produces each claim's evidence.
+
 ### release.yml (tag push `v*`, workflow_dispatch)
 
 **P3.2**: Security gates block release. Jobs run before build:
