@@ -584,6 +584,15 @@ jobs:
           git worktree add --detach "$RUNNER_TEMP/evidence-record" origin/main
           bun "$RUNNER_TEMP/evidence-record/scripts/release-evidence.ts" verify \
             --root "$RUNNER_TEMP/evidence-record" --ga-tag "$GA_TAG" --require-ready
+      - name: Scan evidence files attached to the release
+        # The interop report and the parity record are published with every
+        # release outside `release-evidence.ts upload`, so they get the same
+        # pre-publication gate here: privacy re-scan and content allowlist on
+        # the exact bytes the next step attaches.
+        run: |
+          set -euo pipefail
+          bun scripts/release-evidence.ts scan --schema playwright-report --input interop-evidence
+          bun scripts/release-evidence.ts scan --schema parity-evidence --input parity-evidence
       - name: Create release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2 resolved 2026-07-22
         with:

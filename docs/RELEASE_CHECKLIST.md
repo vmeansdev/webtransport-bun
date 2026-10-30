@@ -171,7 +171,15 @@ All through `bun scripts/release-evidence.ts`:
    `--create-prerelease` (the tag must already exist; nothing creates tags),
    refuses a release that is not a pre-release or is immutable, and refuses to
    replace an attached asset with different content (downloading and hashing
-   it when the API gives no digest).
+   it when the API gives no digest). Publication is the privacy boundary, so
+   before it creates or uploads anything `upload` runs verify's own checks on
+   the exact bytes it is about to attach: every asset's size, sha256, archive
+   form and member list against its entry, the privacy re-scan, the claim's
+   content allowlist and proof validator, and for a fragment the privacy
+   scan, schema and repository/candidate/tag binding. Any problem refuses the
+   whole upload. The release job's own attachments outside `upload` (the
+   interop report and the parity record) pass the same privacy re-scan and
+   content allowlist through `release-evidence.ts scan` first.
 6. **Record.** Mark claims `passed` with the manifest entry ids and commit the
    manifest and `release-status.json` (only those two files) on top of the
    candidate.

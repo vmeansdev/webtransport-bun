@@ -2932,6 +2932,190 @@ describe("release evidence lifecycle", () => {
 		});
 	});
 
+	it("upload refuses hand-authored fragment and asset bytes that would fail verify, before any upload", () => {
+		const zip = Buffer.from([
+			0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x00, 0x00, 0x08, 0x00, 1, 2, 3, 4, 5,
+			6, 7, 8, 9, 10, 11, 12,
+		]).toString("base64");
+		const payloads: Record<string, string> = {
+			"encoded credential": Buffer.from(
+				`LOKALISE_API_TOKEN=${FAKE_TOKEN}`,
+			).toString("base64"),
+			"environment dump":
+				"USER=alice\nLOGNAME=alice\nHOSTNAME=runner-1\nRUNNER_NAME=r\nGITHUB_ACTOR=x",
+			"host path": "cache:/opt/actions-runner/_work/repo/file.json",
+			"nested archive": zip,
+		};
+		const reasons: Record<string, string> = {
+			"encoded credential": "encoded payload hides credential-shaped value",
+			"environment dump": "environment",
+			"host path": "embedded absolute path",
+			"nested archive": "an archive that cannot be scanned",
+		};
+		for (const [what, payload] of Object.entries(payloads)) {
+			const fixture = makeFixture();
+			cli(fixture, "bind", "--commit", fixture.commit, "--tag", TAG);
+			const interop = writeTree(temp("wt-evidence-artifact-"), {
+				"interop-evidence.json": playwrightReport(),
+			});
+			writeState(fixture, (state) => {
+				state.runs["77"] = runView(
+					fixture,
+					77,
+					{ workflowName: "release" },
+					interop,
+					"interop-evidence",
+				);
+			});
+			const outDir = join(fixture.root, ".release-evidence", "ci");
+			const fragmentPath = join(
+				outDir,
+				"release-evidence-fragment-release-77-1.json",
+			);
+			const packaged = cli(
+				fixture,
+				"fetch",
+				"--claim",
+				"chromium-native-interop",
+				"--id",
+				"chromium-native-interop-release-77-1",
+				"--run",
+				"77",
+				"--artifact",
+				"interop-evidence",
+				"--fragment",
+				fragmentPath,
+				"--commit",
+				fixture.commit,
+				"--tag",
+				TAG,
+				"--out-dir",
+				outDir,
+			);
+			expect(packaged.status, packaged.stderr).toBe(0);
+			// Hand-author the published bytes: a report carrying the payload,
+			// and a schema-valid fragment whose hashes match it exactly.
+			const fragment = JSON.parse(readFileSync(fragmentPath, "utf8")) as {
+				entries: {
+					asset: string;
+					size: number;
+					sha256: string;
+					files: { name: string; size: number; sha256: string }[];
+				}[];
+				note?: string;
+			};
+			const entry = fragment.entries[0] as (typeof fragment.entries)[0];
+			const report = playwrightReport() as Record<string, unknown>;
+			const bytes = new TextEncoder().encode(
+				JSON.stringify({ ...report, errors: [{ message: payload }] }),
+			);
+			writeFileSync(join(outDir, entry.asset), bytes);
+			const digest = createHash("sha256").update(bytes).digest("hex");
+			entry.size = bytes.length;
+			entry.sha256 = digest;
+			entry.files = [
+				{
+					name: entry.files[0]?.name ?? "interop-evidence.json",
+					size: bytes.length,
+					sha256: digest,
+				},
+			];
+			writeFileSync(fragmentPath, `${JSON.stringify(fragment, null, 2)}\n`);
+			const upload = cli(
+				fixture,
+				"upload",
+				"--fragment",
+				fragmentPath,
+				"--assets-dir",
+				outDir,
+				"--create-prerelease",
+				"--execute",
+			);
+			expect(upload.status, what).toBe(1);
+			expect(upload.stderr, what).toContain(
+				"refusing to publish evidence that fails verification",
+			);
+			expect(upload.stderr).not.toContain(FAKE_TOKEN);
+			expect(upload.stderr, what).toContain(reasons[what] as string);
+			const calls = readState(fixture).calls.map((c) => `${c[0]} ${c[1]}`);
+			expect(calls, what).not.toContain("release upload");
+			expect(calls, what).not.toContain("release create");
+		}
+		// A fragment that itself carries a credential is refused the same way.
+		const fixture = makeFixture();
+		cli(fixture, "bind", "--commit", fixture.commit, "--tag", TAG);
+		const outDir = join(fixture.root, ".release-evidence", "ci");
+		mkdirSync(outDir, { recursive: true });
+		const fragmentPath = join(
+			outDir,
+			"release-evidence-fragment-release-78-1.json",
+		);
+		writeFileSync(
+			fragmentPath,
+			JSON.stringify({
+				schemaVersion: 1,
+				kind: "release-evidence-fragment",
+				repository: REPO,
+				commit: fixture.commit,
+				tag: `${TAG}`,
+				entries: [],
+				pad: Buffer.from(`LOKALISE_API_TOKEN=${FAKE_TOKEN}`).toString("base64"),
+			}),
+		);
+		const refused = cli(
+			fixture,
+			"upload",
+			"--fragment",
+			fragmentPath,
+			"--assets-dir",
+			outDir,
+			"--create-prerelease",
+			"--execute",
+		);
+		expect(refused.status).toBe(1);
+		const calls = readState(fixture).calls.map((c) => `${c[0]} ${c[1]}`);
+		expect(calls).not.toContain("release upload");
+		expect(calls).not.toContain("release create");
+	});
+
+	it("scan gates release files attached outside upload", () => {
+		const dir = temp("wt-evidence-scan-");
+		writeFileSync(
+			join(dir, "parity-evidence.json"),
+			JSON.stringify({
+				suite: "parity",
+				passed: true,
+				timestamp: "2026-10-30T19:00:00Z",
+				ref: "v1.0.0-rc.2",
+			}),
+		);
+		const scan = (schema: string) =>
+			spawnSync(
+				process.execPath,
+				[CLI, "scan", "--schema", schema, "--input", dir],
+				{ encoding: "utf8" },
+			);
+		expect(scan("parity-evidence").status).toBe(0);
+		writeFileSync(
+			join(dir, "parity-evidence.json"),
+			JSON.stringify({
+				suite: "parity",
+				passed: true,
+				timestamp: "2026-10-30T19:00:00Z",
+				ref: "cache:/opt/actions-runner/_work/x/y",
+			}),
+		);
+		const leak = scan("parity-evidence");
+		expect(leak.status).toBe(1);
+		expect(leak.stderr).toContain("refusing to publish");
+		writeFileSync(
+			join(dir, "interop-evidence.json"),
+			JSON.stringify(playwrightReport()),
+		);
+		rmSync(join(dir, "parity-evidence.json"));
+		expect(scan("playwright-report").status).toBe(0);
+	});
+
 	it("imports a CI fragment attached to the pre-release into the manifest", () => {
 		const fixture = makeFixture();
 		cli(fixture, "bind", "--commit", fixture.commit, "--tag", TAG);

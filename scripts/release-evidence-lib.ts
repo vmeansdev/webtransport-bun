@@ -1566,7 +1566,9 @@ export function listRunArtifacts(
  */
 export function fragmentAssetProblems(
 	data: Uint8Array,
-	manifest: Manifest,
+	manifest: Pick<Manifest, "entries"> & {
+		candidate: { commit: string | null };
+	},
 	repository: string,
 	tag: string,
 ): string[] {
@@ -1602,6 +1604,65 @@ export function fragmentAssetProblems(
 		else if (JSON.stringify(recorded) !== JSON.stringify(entry))
 			problems.push(`entry ${entry.id} differs from the manifest record`);
 	}
+	return problems;
+}
+
+/**
+ * Everything checked about one evidence asset's bytes, the same before
+ * publication (`upload`) and after (`verify`): it is the size and sha256 its
+ * entry records, it parses as the recorded single file or canonical bundle,
+ * its member list matches the entry, and every member passes the privacy
+ * re-scan, the claim's content allowlist and its proof validator.
+ */
+export function entryAssetProblems(
+	entry: ManifestEntry,
+	data: Uint8Array,
+	registry: ClaimRegistry,
+	root: string,
+): string[] {
+	if (data.length !== entry.size)
+		return [
+			`asset ${entry.asset} is ${data.length} bytes, its entry says ${entry.size}`,
+		];
+	if (sha256Hex(data) !== entry.sha256)
+		return [`asset ${entry.asset} sha256 does not match its entry`];
+	let members: BundleMember[];
+	try {
+		members = assetMembers(entry, data);
+	} catch (error) {
+		return [
+			`asset ${entry.asset}: ${error instanceof Error ? error.message : String(error)}`,
+		];
+	}
+	const problems: string[] = [];
+	const listed = new Map(entry.files.map((file) => [file.name, file]));
+	if (members.length !== entry.files.length)
+		problems.push(
+			`asset ${entry.asset} has ${members.length} files, its entry lists ${entry.files.length}`,
+		);
+	for (const member of members) {
+		const file = listed.get(member.name);
+		if (
+			!file ||
+			file.size !== member.data.length ||
+			file.sha256 !== sha256Hex(member.data)
+		)
+			problems.push(
+				`asset ${entry.asset} member ${member.name} does not match the entry's file list`,
+			);
+	}
+	for (const problem of inspectMembers(
+		members,
+		{
+			commit: entry.commit,
+			status: entry.status,
+			claimIds: entry.claimIds,
+			producerKind: entry.producer.kind,
+		},
+		registry,
+		root,
+	))
+		problems.push(`asset ${entry.asset}: ${problem}`);
 	return problems;
 }
 
@@ -1899,44 +1960,10 @@ export function verifyRelease(options: VerifyOptions): VerifyReport {
 				);
 				continue;
 			}
-			let members: BundleMember[];
-			try {
-				members = assetMembers(entry, data);
-			} catch (error) {
-				failures.push(
-					`asset ${entry.asset}: ${error instanceof Error ? error.message : String(error)}`,
-				);
-				continue;
-			}
-			const listed = new Map(entry.files.map((file) => [file.name, file]));
-			if (members.length !== entry.files.length)
-				failures.push(
-					`asset ${entry.asset} has ${members.length} files, manifest lists ${entry.files.length}`,
-				);
-			for (const member of members) {
-				const file = listed.get(member.name);
-				if (
-					!file ||
-					file.size !== member.data.length ||
-					file.sha256 !== sha256Hex(member.data)
-				)
-					failures.push(
-						`asset ${entry.asset} member ${member.name} does not match the manifest file list`,
-					);
-			}
 			if (registry)
-				for (const problem of inspectMembers(
-					members,
-					{
-						commit: entry.commit,
-						status: entry.status,
-						claimIds: entry.claimIds,
-						producerKind: entry.producer.kind,
-					},
-					registry,
-					options.root,
-				))
-					failures.push(`asset ${entry.asset}: ${problem}`);
+				failures.push(
+					...entryAssetProblems(entry, data, registry, options.root),
+				);
 			failures.push(
 				...producerFailures(entry, repo, options.root, runCache, registry),
 			);

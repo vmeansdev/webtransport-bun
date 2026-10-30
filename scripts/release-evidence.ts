@@ -22,6 +22,8 @@
  *   import   --fragment <file>... | --from-release
  *   upload   [--tag <tag>] [--assets-dir <dir>] [--fragment <file>] [--create-prerelease] [--execute]
  *   verify   [--ga-tag <vX.Y.Z>] [--require-ready | --integrity-only] [--json]
+ *   scan     --schema <content schema> --input <path>...   (pre-publication gate for release
+ *            files attached outside upload: privacy re-scan + content allowlist)
  *            [--assets-dir <dir>]   (audit only: reads assets from disk; never promotable)
  *
  * Every command takes `--root <dir>` (default: this checkout) and `--repo
@@ -35,6 +37,7 @@
  */
 import {
 	existsSync,
+	lstatSync,
 	mkdirSync,
 	mkdtempSync,
 	readdirSync,
@@ -57,6 +60,10 @@ import {
 	workflowPathOf,
 } from "./release-claims.ts";
 import {
+	CONTENT_SCHEMA_NAMES,
+	contentProblems,
+} from "./release-evidence-content.ts";
+import {
 	ASSET_NAME,
 	type BundleFile,
 	CLAIM_ID,
@@ -65,10 +72,12 @@ import {
 	DEFAULT_ROOT,
 	ENTRY_ID,
 	type EvidenceStatus,
+	entryAssetProblems,
 	FRAGMENT_ASSET_NAME,
 	FRAGMENT_KIND,
 	type Fragment,
 	fileTextAt,
+	fragmentAssetProblems,
 	type GithubActionsProducer,
 	ghJson,
 	inspectMembers,
@@ -847,6 +856,30 @@ function uploadCommand(args: Args): void {
 		});
 	}
 
+	// Publication is the privacy boundary: the exact bytes about to be
+	// attached go through the same checks verify applies afterwards, before
+	// anything is created or uploaded. A hand-edited fragment or asset that
+	// would only fail verify later is refused here, while it is still private.
+	const registry = parseRegistry(registryTextAt(root, tagCommit));
+	const refused: string[] = [];
+	for (const entry of entries) {
+		const data = new Uint8Array(readFileSync(join(assetsDir, entry.asset)));
+		refused.push(...entryAssetProblems(entry, data, registry, root));
+	}
+	for (const path of extraFiles)
+		refused.push(
+			...fragmentAssetProblems(
+				new Uint8Array(readFileSync(path)),
+				{ candidate: { commit: tagCommit }, entries },
+				repository,
+				tag,
+			).map((problem) => `fragment ${basename(path)}: ${problem}`),
+		);
+	if (refused.length > 0)
+		throw new Error(
+			`refusing to publish evidence that fails verification:\n - ${refused.join("\n - ")}`,
+		);
+
 	const release = viewRelease(repository, tag, root);
 	if (!release) {
 		if (!args.flags.has("--create-prerelease"))
@@ -984,6 +1017,51 @@ function verifyCommand(args: Args): void {
 
 // --------------------------------------------------------------------------- main
 
+// --------------------------------------------------------------------------- scan
+
+/**
+ * Release files published outside `upload` (the release job attaches the
+ * interop report and the parity record to every release) get the same
+ * pre-publication gate: the privacy re-scan and the content allowlist of the
+ * named schema, on the exact bytes, refusing on any problem.
+ */
+function scanCommand(args: Args): void {
+	const schema = required(args, "--schema");
+	if (!CONTENT_SCHEMA_NAMES.has(schema))
+		throw new UsageError(`unknown content schema ${schema}`);
+	const inputs = many(args, "--input");
+	if (inputs.length === 0)
+		throw new UsageError("at least one --input is required");
+	const files: string[] = [];
+	const walk = (path: string): void => {
+		if (lstatSync(path).isDirectory())
+			for (const name of readdirSync(path).sort()) walk(join(path, name));
+		else files.push(path);
+	};
+	for (const input of inputs) walk(resolve(input));
+	if (files.length === 0) throw new Error("no files to scan");
+	const problems: string[] = [];
+	for (const path of files) {
+		const name = basename(path);
+		const data = new Uint8Array(readFileSync(path));
+		const privacy = scrubFile(name, data, {
+			repoRoots: [],
+			redactHostPaths: false,
+			forbiddenLiterals: [],
+		});
+		if (!privacy.ok)
+			problems.push(
+				...privacy.problems.map((p) => `${name}: privacy scan: ${p}`),
+			);
+		problems.push(
+			...contentProblems([{ name, data }], [{ match: name, schema }]),
+		);
+	}
+	if (problems.length > 0)
+		throw new Error(`refusing to publish:\n - ${problems.join("\n - ")}`);
+	log(`scanned ${files.length} file(s): clean`);
+}
+
 const COMMANDS: Record<string, (args: Args) => void> = {
 	bind,
 	package: packageCommand,
@@ -991,6 +1069,7 @@ const COMMANDS: Record<string, (args: Args) => void> = {
 	import: importCommand,
 	upload: uploadCommand,
 	verify: verifyCommand,
+	scan: scanCommand,
 };
 
 if (import.meta.main) {

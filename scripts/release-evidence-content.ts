@@ -1124,6 +1124,13 @@ export const JSON_SCHEMAS: Record<string, Schema> = {
 	"llvm-cov-export": llvmCovExport,
 	"distributed-scale-artifact": distributedScale,
 	"npm-publish-identity": npmPublishIdentity,
+	// release.yml's parity record, attached to every release.
+	"parity-evidence": obj({
+		suite: lit("parity"),
+		passed: bool,
+		timestamp: iso,
+		ref: ident(100),
+	}),
 	"soak-aggregate": soakAggregate,
 	"iwa-evidence": iwaEvidence,
 	"review-record": reviewRecord,

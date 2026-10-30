@@ -236,6 +236,18 @@ function envNameReason(name: string): string | undefined {
 	return undefined;
 }
 
+/** An `NAME=value` assignment of a host-identity or secret-shaped variable
+ * anywhere in a string (line starts, after spaces, separators or quotes), so
+ * an environment dump folded into one string value is found too. */
+const ENV_ASSIGNMENT_ANYWHERE_PATTERN =
+	/(?:^|[\s;,&|"'`(])(?:export\s+|declare\s+-x\s+|set\s+)?([A-Z][A-Z0-9_]*)=/gm;
+
+function envAssignmentReason(text: string): string | undefined {
+	for (const match of text.matchAll(ENV_ASSIGNMENT_ANYWHERE_PATTERN))
+		if (envNameReason(match[1] as string)) return "environment dump";
+	return undefined;
+}
+
 /** Why a free-text line is unsafe to publish, or `undefined` when it is safe.
  *
  * Unlike `unsafeStringReason`, a line is not treated as a single value: a log
@@ -247,6 +259,7 @@ export function unsafeTextLineReason(line: string): string | undefined {
 	if (SECRET_VALUE_PATTERN.test(line)) return "credential-shaped value";
 	const assignment = ENV_ASSIGNMENT_PATTERN.exec(line)?.[1];
 	if (assignment && envNameReason(assignment)) return "environment dump";
+	if (envAssignmentReason(line)) return "environment dump";
 	if (HOST_PATH_ANYWHERE_PATTERN.test(line))
 		return "home or temporary directory path";
 	if (FILE_URI_PATTERN.test(line)) return "file URI (a host path)";
@@ -301,6 +314,11 @@ export function findEnvironmentDumpViolations(
 			node.forEach((entry, index) => {
 				visit(entry, `${pointer}/${index}`);
 			});
+			return;
+		}
+		if (typeof node === "string") {
+			const reason = envAssignmentReason(node);
+			if (reason) violations.push({ pointer: pointer || "/", reason });
 			return;
 		}
 		if (node === null || typeof node !== "object") return;
