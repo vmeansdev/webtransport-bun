@@ -67,8 +67,9 @@ Follow-on decisions (2026-10-30):
   pulled in with `release-evidence.ts fetch`.
 - Evidence content is allowlisted per proof kind (declared files, strict
   schemas, typed strings, no opaque runs outside digest fields), and tool
-  output is accepted only from GitHub Actions runs; `--local` is limited to
-  the IWA interactive proof and the human review/no-change records. Every
+  output is accepted only from the GitHub Actions producer the claim registry
+  names for it (workflow file and its reviewed sha256, job, artifact name);
+  `--local` is limited to the human review/no-change records. Every
   machine-checked claim has a CI producer: `fault-matrix` comes from
   `test.yml` / `fault-matrix`, and `supply-chain-provenance` from
   `supply-chain.yml`, dispatched on the rc tag after it is published (see

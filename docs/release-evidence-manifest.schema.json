@@ -200,6 +200,7 @@
 				"kind",
 				"repository",
 				"workflow",
+				"workflowPath",
 				"runId",
 				"runAttempt",
 				"url",
@@ -212,6 +213,11 @@
 				},
 				"repository": {
 					"$ref": "#/$defs/repository"
+				},
+				"workflowPath": {
+					"description": "The run's workflow file as the Actions API reports it; must be a producer registered for the claim in docs/release-claims.json.",
+					"type": "string",
+					"pattern": "^\\.github/workflows/[A-Za-z0-9._-]+\\.ya?ml$"
 				},
 				"workflow": {
 					"type": "string",

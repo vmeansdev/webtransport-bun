@@ -32,6 +32,8 @@ type Run = {
 	conclusion: string;
 	url: string;
 	workflowName: string;
+	/** Workflow file path, as `GET /repos/{repo}/actions/runs/{id}` reports it. */
+	path: string;
 	attempt: number;
 	artifacts: Record<string, string>;
 	artifactListing?: {
@@ -125,6 +127,25 @@ if (group === "api") {
 		if (!run) fail("HTTP 404: Not Found");
 		save();
 		console.log(JSON.stringify({ artifacts: artifactListing(run) }));
+		process.exit(0);
+	}
+	const runMatch = /^repos\/([^/]+\/[^/]+)\/actions\/runs\/(\d+)$/.exec(
+		command ?? "",
+	);
+	if (runMatch) {
+		if (runMatch[1] !== state.repo) fail("HTTP 404: Not Found");
+		const run = state.runs[runMatch[2] as string];
+		if (!run) fail("HTTP 404: Not Found");
+		save();
+		console.log(
+			JSON.stringify({
+				id: run.databaseId,
+				path: run.path,
+				head_sha: run.headSha,
+				status: run.status,
+				conclusion: run.conclusion,
+			}),
+		);
 		process.exit(0);
 	}
 	const match = /^repos\/([^/]+\/[^/]+)\/commits\/(.+)$/.exec(command ?? "");

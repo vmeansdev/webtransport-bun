@@ -21,7 +21,17 @@
 						"schema": "command-summary"
 					}
 				]
-			}
+			},
+			"producers": [
+				{
+					"workflow": ".github/workflows/test.yml",
+					"workflowSha256": "6bc23eda6167d68fc7c9e3056e5e3588d195b75c9f1645b2f60b82db3245d083",
+					"jobs": [
+						"test"
+					],
+					"artifact": "release-evidence-native-gates-ubuntu-latest"
+				}
+			]
 		},
 		{
 			"id": "wasm-local-gates",
@@ -42,7 +52,17 @@
 						"schema": "command-summary"
 					}
 				]
-			}
+			},
+			"producers": [
+				{
+					"workflow": ".github/workflows/test.yml",
+					"workflowSha256": "6bc23eda6167d68fc7c9e3056e5e3588d195b75c9f1645b2f60b82db3245d083",
+					"jobs": [
+						"wasm"
+					],
+					"artifact": "release-evidence-wasm-gates"
+				}
+			]
 		},
 		{
 			"id": "cross-platform-matrix",
@@ -66,7 +86,17 @@
 						"schema": "command-summary"
 					}
 				]
-			}
+			},
+			"producers": [
+				{
+					"workflow": ".github/workflows/test.yml",
+					"workflowSha256": "6bc23eda6167d68fc7c9e3056e5e3588d195b75c9f1645b2f60b82db3245d083",
+					"jobs": [
+						"release-evidence"
+					],
+					"artifact": "release-evidence-cross-platform"
+				}
+			]
 		},
 		{
 			"id": "runtime-consumers",
@@ -87,7 +117,17 @@
 						"schema": "command-summary"
 					}
 				]
-			}
+			},
+			"producers": [
+				{
+					"workflow": ".github/workflows/test.yml",
+					"workflowSha256": "6bc23eda6167d68fc7c9e3056e5e3588d195b75c9f1645b2f60b82db3245d083",
+					"jobs": [
+						"release-evidence"
+					],
+					"artifact": "release-evidence-runtime-consumers"
+				}
+			]
 		},
 		{
 			"id": "chromium-native-interop",
@@ -102,7 +142,17 @@
 						"schema": "playwright-report"
 					}
 				]
-			}
+			},
+			"producers": [
+				{
+					"workflow": ".github/workflows/release.yml",
+					"workflowSha256": "317f24b29edb4a592962a79c1ffc47e3f31d181197029297f2490c11a69f1465",
+					"jobs": [
+						"interop"
+					],
+					"artifact": "interop-evidence"
+				}
+			]
 		},
 		{
 			"id": "chromium-wasm-interop",
@@ -117,7 +167,17 @@
 						"schema": "playwright-report"
 					}
 				]
-			}
+			},
+			"producers": [
+				{
+					"workflow": ".github/workflows/test.yml",
+					"workflowSha256": "6bc23eda6167d68fc7c9e3056e5e3588d195b75c9f1645b2f60b82db3245d083",
+					"jobs": [
+						"wasm"
+					],
+					"artifact": "release-evidence-wasm-interop"
+				}
+			]
 		},
 		{
 			"id": "iwa-direct-sockets",
@@ -131,7 +191,17 @@
 						"schema": "iwa-evidence"
 					}
 				]
-			}
+			},
+			"producers": [
+				{
+					"workflow": ".github/workflows/iwa.yml",
+					"workflowSha256": "44bd3239ed7a1e5d6273d3a553fee5384cd4842ae30e34c18738337f83ca0b7f",
+					"jobs": [
+						"iwa-interop"
+					],
+					"artifact": "iwa-proof-*"
+				}
+			]
 		},
 		{
 			"id": "fault-matrix",
@@ -158,7 +228,17 @@
 						"schema": "playwright-report"
 					}
 				]
-			}
+			},
+			"producers": [
+				{
+					"workflow": ".github/workflows/test.yml",
+					"workflowSha256": "6bc23eda6167d68fc7c9e3056e5e3588d195b75c9f1645b2f60b82db3245d083",
+					"jobs": [
+						"fault-matrix"
+					],
+					"artifact": "release-evidence-fault-matrix"
+				}
+			]
 		},
 		{
 			"id": "coverage-gates",
@@ -180,7 +260,25 @@
 						"schema": "lcov"
 					}
 				]
-			}
+			},
+			"producers": [
+				{
+					"workflow": ".github/workflows/coverage.yml",
+					"workflowSha256": "38e6a7b904a68878872ec380a96b6065bc88085f19788c01f630a4da1ba2e02b",
+					"jobs": [
+						"coverage"
+					],
+					"artifact": "coverage-artifacts"
+				},
+				{
+					"workflow": ".github/workflows/release.yml",
+					"workflowSha256": "317f24b29edb4a592962a79c1ffc47e3f31d181197029297f2490c11a69f1465",
+					"jobs": [
+						"coverage"
+					],
+					"artifact": "coverage-artifacts"
+				}
+			]
 		},
 		{
 			"id": "fuzz-gates",
@@ -194,7 +292,25 @@
 						"schema": "fuzz-release-smoke"
 					}
 				]
-			}
+			},
+			"producers": [
+				{
+					"workflow": ".github/workflows/release.yml",
+					"workflowSha256": "317f24b29edb4a592962a79c1ffc47e3f31d181197029297f2490c11a69f1465",
+					"jobs": [
+						"fuzz"
+					],
+					"artifact": "fuzz-evidence"
+				},
+				{
+					"workflow": ".github/workflows/fuzz.yml",
+					"workflowSha256": "bdece1c731ca6d9747d95fe88d98ec02846dcbf14a0f3094285dacaeda9b288c",
+					"jobs": [
+						"fuzz"
+					],
+					"artifact": "fuzz-evidence"
+				}
+			]
 		},
 		{
 			"id": "scale-10k-multisource",
@@ -209,7 +325,17 @@
 						"schema": "distributed-scale-artifact"
 					}
 				]
-			}
+			},
+			"producers": [
+				{
+					"workflow": ".github/workflows/release.yml",
+					"workflowSha256": "317f24b29edb4a592962a79c1ffc47e3f31d181197029297f2490c11a69f1465",
+					"jobs": [
+						"distributed-scale"
+					],
+					"artifact": "distributed-scale-evidence"
+				}
+			]
 		},
 		{
 			"id": "package-artifact",
@@ -223,7 +349,17 @@
 						"schema": "npm-publish-identity"
 					}
 				]
-			}
+			},
+			"producers": [
+				{
+					"workflow": ".github/workflows/release.yml",
+					"workflowSha256": "317f24b29edb4a592962a79c1ffc47e3f31d181197029297f2490c11a69f1465",
+					"jobs": [
+						"release"
+					],
+					"artifact": "npm-publish-input-*"
+				}
+			]
 		},
 		{
 			"id": "supply-chain-provenance",
@@ -246,7 +382,17 @@
 					}
 				],
 				"minRecords": 2
-			}
+			},
+			"producers": [
+				{
+					"workflow": ".github/workflows/supply-chain.yml",
+					"workflowSha256": "2356fe6590fcd04c994a63632c102613a891a1ca7a9bda0a8da773bdc62f89d7",
+					"jobs": [
+						"audit-signatures"
+					],
+					"artifact": "release-evidence-supply-chain"
+				}
+			]
 		},
 		{
 			"id": "soak-24h",
@@ -261,7 +407,17 @@
 						"schema": "soak-aggregate"
 					}
 				]
-			}
+			},
+			"producers": [
+				{
+					"workflow": ".github/workflows/soak-long.yml",
+					"workflowSha256": "b7be2dbcb843d9682c51afa119a2d4aa7e109d9078f88f569960e293947490b0",
+					"jobs": [
+						"soak"
+					],
+					"artifact": "soak-aggregate-24h-*"
+				}
+			]
 		},
 		{
 			"id": "soak-72h",
@@ -276,7 +432,17 @@
 						"schema": "soak-aggregate"
 					}
 				]
-			}
+			},
+			"producers": [
+				{
+					"workflow": ".github/workflows/soak-long.yml",
+					"workflowSha256": "b7be2dbcb843d9682c51afa119a2d4aa7e109d9078f88f569960e293947490b0",
+					"jobs": [
+						"soak"
+					],
+					"artifact": "soak-aggregate-72h-*"
+				}
+			]
 		},
 		{
 			"id": "auto-review-zero-p0-p4",
@@ -325,7 +491,17 @@
 						"schema": "command-summary"
 					}
 				]
-			}
+			},
+			"producers": [
+				{
+					"workflow": ".github/workflows/test.yml",
+					"workflowSha256": "6bc23eda6167d68fc7c9e3056e5e3588d195b75c9f1645b2f60b82db3245d083",
+					"jobs": [
+						"wasm"
+					],
+					"artifact": "release-evidence-wasm-gates"
+				}
+			]
 		},
 		{
 			"id": "wasm-multi-session",
@@ -346,7 +522,17 @@
 						"schema": "command-summary"
 					}
 				]
-			}
+			},
+			"producers": [
+				{
+					"workflow": ".github/workflows/test.yml",
+					"workflowSha256": "6bc23eda6167d68fc7c9e3056e5e3588d195b75c9f1645b2f60b82db3245d083",
+					"jobs": [
+						"wasm"
+					],
+					"artifact": "release-evidence-wasm-gates"
+				}
+			]
 		},
 		{
 			"id": "wasm-0rtt",
@@ -367,7 +553,17 @@
 						"schema": "command-summary"
 					}
 				]
-			}
+			},
+			"producers": [
+				{
+					"workflow": ".github/workflows/test.yml",
+					"workflowSha256": "6bc23eda6167d68fc7c9e3056e5e3588d195b75c9f1645b2f60b82db3245d083",
+					"jobs": [
+						"wasm"
+					],
+					"artifact": "release-evidence-wasm-gates"
+				}
+			]
 		},
 		{
 			"id": "wasm-facade-parity",
@@ -388,7 +584,17 @@
 						"schema": "command-summary"
 					}
 				]
-			}
+			},
+			"producers": [
+				{
+					"workflow": ".github/workflows/test.yml",
+					"workflowSha256": "6bc23eda6167d68fc7c9e3056e5e3588d195b75c9f1645b2f60b82db3245d083",
+					"jobs": [
+						"wasm"
+					],
+					"artifact": "release-evidence-wasm-gates"
+				}
+			]
 		}
 	]
 }

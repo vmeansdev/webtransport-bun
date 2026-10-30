@@ -42,8 +42,11 @@ import {
 	CLAIM_REGISTRY_RELATIVE_PATH,
 	type ClaimRegistry,
 	parseRegistry,
+	producerPolicyProblems,
+	type RegisteredClaim,
 	registrySha256,
 	validateClaimProof,
+	workflowPathOf,
 } from "./release-claims.ts";
 import { contentProblems } from "./release-evidence-content.ts";
 
@@ -80,6 +83,8 @@ export type GithubActionsProducer = {
 	kind: "github-actions";
 	repository: string;
 	workflow: string;
+	/** The run's workflow file, as the Actions API reports it. */
+	workflowPath: string;
 	runId: number;
 	runAttempt: number;
 	url: string;
@@ -196,6 +201,7 @@ function validateProducer(value: unknown, location: string, errors: string[]) {
 				"kind",
 				"repository",
 				"workflow",
+				"workflowPath",
 				"runId",
 				"runAttempt",
 				"url",
@@ -205,6 +211,13 @@ function validateProducer(value: unknown, location: string, errors: string[]) {
 			location,
 			errors,
 		);
+		if (
+			typeof value.workflowPath !== "string" ||
+			!/^\.github\/workflows\/[A-Za-z0-9._-]+\.ya?ml$/.test(value.workflowPath)
+		)
+			errors.push(
+				`${location}.workflowPath: must be the run's .github/workflows/<file> path`,
+			);
 		const artifact = value.artifact;
 		if (
 			!isObject(artifact) ||
@@ -1469,8 +1482,52 @@ type RunView = {
 	status?: string;
 	conclusion?: string;
 	workflowName?: string;
+	jobs?: { name?: string; status?: string; conclusion?: string }[];
+	path?: string;
 	artifacts?: ListedArtifact[];
 };
+
+/** The run's workflow file path from the Actions API (`path`); the display
+ * name is not an identity, the file is. */
+export function runWorkflowPath(
+	repository: string,
+	runId: string,
+	root: string,
+): string {
+	const value = ghJson(
+		["api", `repos/${repository}/actions/runs/${runId}`],
+		root,
+	);
+	const path = isObject(value) ? value.path : undefined;
+	if (typeof path !== "string" || path.length === 0)
+		throw new Error(`run ${runId} workflow path could not be read`);
+	return path;
+}
+
+/** A file's text at `commit`, or undefined when it does not exist there. */
+export function fileTextAt(
+	root: string,
+	commit: string,
+	path: string,
+): string | undefined {
+	const result = runGit(["show", `${commit}:${path}`], root);
+	return result.status === 0 ? result.stdout : undefined;
+}
+
+/** The registered producer policy check for every claim an entry serves. */
+export function producerPolicyFailures(
+	claims: RegisteredClaim[],
+	run: { path: string; artifact: string; jobs: RunView["jobs"] },
+	workflowAt: (path: string) => string | undefined,
+): string[] {
+	return claims.flatMap((claim) =>
+		producerPolicyProblems(
+			claim,
+			{ path: run.path, artifact: run.artifact, jobs: run.jobs ?? [] },
+			workflowAt,
+		),
+	);
+}
 
 export type ListedArtifact = {
 	id: number;
@@ -1507,6 +1564,7 @@ function producerFailures(
 	repository: string,
 	root: string,
 	cache: Map<string, RunView | Error>,
+	registry: ClaimRegistry | undefined,
 ): string[] {
 	const producer = entry.producer;
 	if (producer.kind !== "github-actions") return [];
@@ -1526,10 +1584,11 @@ function producerFailures(
 					"--repo",
 					repository,
 					"--json",
-					"headSha,status,conclusion,workflowName",
+					"headSha,status,conclusion,workflowName,jobs",
 				],
 				root,
 			) as RunView;
+			run.path = runWorkflowPath(repository, key, root);
 			run.artifacts = listRunArtifacts(repository, key, root);
 		} catch (error) {
 			run = error instanceof Error ? error : new Error(String(error));
@@ -1547,6 +1606,28 @@ function producerFailures(
 		failures.push(
 			`evidence ${entry.id}: run ${key} is workflow ${String(run.workflowName)}, not ${producer.workflow}`,
 		);
+	if (workflowPathOf(run.path ?? "") !== producer.workflowPath)
+		failures.push(
+			`evidence ${entry.id}: run ${key} ran ${String(run.path)}, not ${producer.workflowPath}`,
+		);
+	// The registry pinned at the candidate decides which workflow, job and
+	// artifact may produce each claim; a successful run of anything else is
+	// not evidence.
+	if (registry) {
+		const claims = entry.claimIds
+			.map((id) => registry.claims.find((claim) => claim.id === id))
+			.filter((claim): claim is RegisteredClaim => claim !== undefined);
+		for (const problem of producerPolicyFailures(
+			claims,
+			{
+				path: run.path ?? "",
+				artifact: producer.artifact.name,
+				jobs: run.jobs,
+			},
+			(path) => fileTextAt(root, entry.commit, path),
+		))
+			failures.push(`evidence ${entry.id}: ${problem}`);
+	}
 	if (
 		entry.status === "passed" &&
 		(run.status !== "completed" || run.conclusion !== "success")
@@ -1799,7 +1880,9 @@ export function verifyRelease(options: VerifyOptions): VerifyReport {
 					options.root,
 				))
 					failures.push(`asset ${entry.asset}: ${problem}`);
-			failures.push(...producerFailures(entry, repo, options.root, runCache));
+			failures.push(
+				...producerFailures(entry, repo, options.root, runCache, registry),
+			);
 			verified += 1;
 		}
 		const recorded = new Set(manifest.entries.map((entry) => entry.asset));

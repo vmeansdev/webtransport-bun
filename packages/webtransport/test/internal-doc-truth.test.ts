@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
 	mkdirSync,
 	mkdtempSync,
@@ -13,6 +14,41 @@ import { join } from "node:path";
 const PROJECT_ROOT = join(import.meta.dir, "..", "..", "..");
 const COMMIT = "0123456789abcdef0123456789abcdef01234567";
 const roots: string[] = [];
+
+/** Producer workflows written into every doc-truth fixture root. */
+const WORKFLOWS: Record<string, string> = {
+	"test.yml": `name: test
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-evidence-native-gates-\${{ matrix.os }}
+`,
+	"iwa.yml": `name: iwa
+on: workflow_dispatch
+jobs:
+  iwa-interop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iwa-proof-\${{ github.sha }}
+`,
+};
+
+function producer(file: string, jobs: string[], artifact: string) {
+	return {
+		workflow: `.github/workflows/${file}`,
+		workflowSha256: createHash("sha256")
+			.update(WORKFLOWS[file] as string)
+			.digest("hex"),
+		jobs,
+		artifact,
+	};
+}
 
 /** The exact hosted-H7 contract every operator doc has to carry verbatim. */
 const H7_CONTRACT = [
@@ -106,6 +142,9 @@ function validStatus() {
 						kind: "command-records",
 						files: [{ match: "commands/*.json", schema: "command-record" }],
 					},
+					producers: [
+						producer("test.yml", ["test"], "release-evidence-native-gates-*"),
+					] as Record<string, unknown>[] | undefined,
 				},
 				{
 					id: "wasm-browser",
@@ -115,6 +154,9 @@ function validStatus() {
 						kind: "iwa-proof",
 						files: [{ match: "evidence*.json", schema: "iwa-evidence" }],
 					},
+					producers: [producer("iwa.yml", ["iwa-interop"], "iwa-proof-*")] as
+						| Record<string, unknown>[]
+						| undefined,
 				},
 			],
 		},
@@ -171,6 +213,9 @@ function runPolicy(mutate?: (fixture: Fixture, root: string) => void) {
 	mkdirSync(join(root, "crates", "native", "src"), { recursive: true });
 	mkdirSync(join(root, "packages", "webtransport"), { recursive: true });
 	mkdirSync(join(root, "tools", "load"), { recursive: true });
+	mkdirSync(join(root, ".github", "workflows"), { recursive: true });
+	for (const [file, text] of Object.entries(WORKFLOWS))
+		writeFileSync(join(root, ".github", "workflows", file), text);
 
 	const fixture = validStatus();
 	writeFileSync(
@@ -389,6 +434,44 @@ describe("documentation truth policy", () => {
 		expect(result.status).toBe(1);
 		expect(result.stderr).toContain("is missing pinned claim wasm-browser");
 		expect(result.stderr).toContain("wasm-renamed is not a pinned claim");
+	});
+
+	it("requires every machine claim's producer to be a reviewed workflow job that uploads its artifact", () => {
+		const missing = runPolicy((fixture) => {
+			delete getAt(fixture.registry.claims, 0).producers;
+		});
+		expect(missing.status).toBe(1);
+		expect(missing.stderr).toContain("must name its CI producer");
+		const unknown = runPolicy((fixture) => {
+			const policy = getAt(fixture.registry.claims, 0).producers?.[0] ?? {};
+			policy.workflow = ".github/workflows/scratch.yml";
+		});
+		expect(unknown.stderr).toContain(
+			"workflow .github/workflows/scratch.yml does not exist",
+		);
+		const stale = runPolicy((_fixture, root) => {
+			writeFileSync(
+				join(root, ".github", "workflows", "test.yml"),
+				`${WORKFLOWS["test.yml"]}# edited\n`,
+			);
+		});
+		expect(stale.status).toBe(1);
+		expect(stale.stderr).toContain(
+			".github/workflows/test.yml changed since it was registered",
+		);
+		const job = runPolicy((fixture) => {
+			const policy = getAt(fixture.registry.claims, 0).producers?.[0] ?? {};
+			policy.jobs = ["lint"];
+		});
+		expect(job.stderr).toContain(".github/workflows/test.yml has no job lint");
+		const artifact = runPolicy((fixture) => {
+			const policy = getAt(fixture.registry.claims, 1).producers?.[0] ?? {};
+			policy.artifact = "iwa-other-*";
+		});
+		expect(artifact.status).toBe(1);
+		expect(artifact.stderr).toContain(
+			"no iwa-interop job in .github/workflows/iwa.yml uploads an artifact named like iwa-other-*",
+		);
 	});
 
 	it("ties readiness to the manifest promotion lock", () => {

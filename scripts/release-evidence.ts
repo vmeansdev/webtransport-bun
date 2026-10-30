@@ -14,7 +14,9 @@
  *   fetch    --run <id> --artifact <name> [--workflow <name>] [--select <subpath>...] --claim <id>...
  *            [--fragment <file> --commit <sha> [--tag <tag>]] [--out-dir <dir>] [--repo-root <path>...]
  *            [--redact-host-paths]   (CI evidence: the run is read back from the Actions API --
- *            same repository/workflow, head SHA = candidate, concluded success, or the in-progress
+ *            same repository, a producer the candidate's claim registry names for every --claim
+ *            (workflow file path + reviewed sha256, job, artifact glob), head SHA = candidate,
+ *            concluded success, or the in-progress
  *            run packaging its own evidence from inside itself -- and the bytes are the named
  *            artifact's, whose id/name/digest are recorded and re-checked by verify)
  *   import   --fragment <file>... | --from-release
@@ -49,7 +51,11 @@ import {
 	relative,
 	resolve,
 } from "node:path";
-import { registrySha256 } from "./release-claims.ts";
+import {
+	parseRegistry,
+	registrySha256,
+	workflowPathOf,
+} from "./release-claims.ts";
 import {
 	ASSET_NAME,
 	type BundleFile,
@@ -62,6 +68,7 @@ import {
 	FRAGMENT_ASSET_NAME,
 	FRAGMENT_KIND,
 	type Fragment,
+	fileTextAt,
 	type GithubActionsProducer,
 	ghJson,
 	inspectMembers,
@@ -74,6 +81,7 @@ import {
 	mergeEntries,
 	type Producer,
 	packageVersionAt,
+	producerPolicyFailures,
 	RELEASE_TAG,
 	REPOSITORY,
 	type ReleaseStatus,
@@ -81,6 +89,7 @@ import {
 	registryTextAt,
 	remoteTagCommit,
 	runGh,
+	runWorkflowPath,
 	SHA40,
 	STATUS_RELATIVE_PATH,
 	scrubFile,
@@ -484,6 +493,7 @@ function verifiedRunProducer(
 	commit: string,
 	status: string,
 	artifactName: string,
+	claimIds: string[],
 ): GithubActionsProducer {
 	const run = ghJson(
 		[
@@ -549,10 +559,31 @@ function verifiedRunProducer(
 	if (artifact.expired) throw new Error(`artifact ${artifactName} has expired`);
 	if (!artifact.digest || !/^sha256:[0-9a-f]{64}$/.test(artifact.digest))
 		throw new Error(`artifact ${artifactName} has no sha256 digest`);
+	// Producer policy from the registry pinned at the candidate: the run must
+	// be the registered workflow file (reviewed content), with the registered
+	// job having succeeded, and the artifact must carry a registered name.
+	const path = runWorkflowPath(repository, runId, root);
+	const registry = parseRegistry(registryTextAt(root, commit));
+	const claims = claimIds.map((id) => {
+		const claim = registry.claims.find((c) => c.id === id);
+		if (!claim)
+			throw new Error(`claim ${id} is not in the candidate's claim registry`);
+		return claim;
+	});
+	const refused = producerPolicyFailures(
+		claims,
+		{ path, artifact: artifactName, jobs: run.jobs },
+		(file) => fileTextAt(root, commit, file),
+	);
+	if (refused.length > 0)
+		throw new Error(
+			`run ${runId} is not a registered producer:\n - ${refused.join("\n - ")}`,
+		);
 	return {
 		kind: "github-actions",
 		repository,
 		workflow: run.workflowName,
+		workflowPath: workflowPathOf(path),
 		runId: Number(runId),
 		runAttempt: run.attempt,
 		url: `https://github.com/${repository}/actions/runs/${runId}`,
@@ -606,6 +637,7 @@ function fetchCommand(args: Args): void {
 		commit,
 		one(args, "--status") ?? "passed",
 		artifact,
+		many(args, "--claim"),
 	);
 
 	const work = mkdtempSync(join(tmpdir(), "release-evidence-fetch-"));

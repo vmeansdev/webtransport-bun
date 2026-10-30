@@ -20,10 +20,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
 import {
+	producerPolicyProblems,
 	type RegisteredClaim,
 	validateClaimProof,
+	validateRegistry,
 } from "../../../scripts/release-claims.ts";
-import { contentProblems } from "../../../scripts/release-evidence-content.ts";
+import {
+	contentProblems,
+	opaqueRunReason,
+} from "../../../scripts/release-evidence-content.ts";
 import {
 	createTar,
 	createTarGz,
@@ -82,6 +87,132 @@ function git(root: string, ...args: string[]): string {
 	return result.stdout.trim();
 }
 
+/** Workflow files committed in every fixture candidate: the registered
+ * producers below name them by path and pin their sha256. */
+const FIXTURE_WORKFLOWS: Record<string, string> = {
+	".github/workflows/test.yml": `name: test
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-evidence-native-gates-\${{ matrix.os }}
+`,
+	".github/workflows/iwa.yml": `name: IWA
+on: workflow_dispatch
+jobs:
+  iwa-interop:
+    name: IWA Browser Server (Direct Sockets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iwa-proof-\${{ github.sha }}
+`,
+	".github/workflows/fuzz.yml": `name: fuzz
+on: workflow_dispatch
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-evidence
+`,
+	".github/workflows/release.yml": `name: release
+on: push
+jobs:
+  interop:
+    name: Interop (Chromium)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/upload-artifact@v4
+        with:
+          name: interop-evidence
+  fuzz:
+    name: Fuzz smoke (blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-evidence
+`,
+	".github/workflows/scratch.yml": `name: scratch
+on: workflow_dispatch
+jobs:
+  anything:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-evidence
+`,
+};
+
+function producer(workflow: string, jobs: string[], artifact: string) {
+	const path = `.github/workflows/${workflow}`;
+	return {
+		workflow: path,
+		workflowSha256: createHash("sha256")
+			.update(FIXTURE_WORKFLOWS[path] as string)
+			.digest("hex"),
+		jobs,
+		artifact,
+	};
+}
+
+/** Each workflow's run as the fake Actions API reports it. */
+const FIXTURE_RUNS: Record<
+	string,
+	{ path: string; jobs: { name: string; status: string; conclusion: string }[] }
+> = {
+	test: {
+		path: ".github/workflows/test.yml",
+		jobs: [
+			{
+				name: "test (ubuntu-latest, 1.3.14)",
+				status: "completed",
+				conclusion: "success",
+			},
+		],
+	},
+	IWA: {
+		path: ".github/workflows/iwa.yml",
+		jobs: [
+			{
+				name: "IWA Browser Server (Direct Sockets)",
+				status: "completed",
+				conclusion: "success",
+			},
+		],
+	},
+	fuzz: {
+		path: ".github/workflows/fuzz.yml",
+		jobs: [{ name: "fuzz", status: "completed", conclusion: "success" }],
+	},
+	release: {
+		path: ".github/workflows/release.yml",
+		jobs: [
+			{
+				name: "Interop (Chromium)",
+				status: "completed",
+				conclusion: "success",
+			},
+			{
+				name: "Fuzz smoke (blocking)",
+				status: "completed",
+				conclusion: "success",
+			},
+		],
+	},
+	scratch: {
+		path: ".github/workflows/scratch.yml",
+		jobs: [{ name: "anything", status: "completed", conclusion: "success" }],
+	},
+};
+
 const REGISTRY: { schemaVersion: 1; claims: RegisteredClaim[] } = {
 	schemaVersion: 1,
 	claims: [
@@ -97,6 +228,9 @@ const REGISTRY: { schemaVersion: 1; claims: RegisteredClaim[] } = {
 					{ match: "summary.json", schema: "command-summary" },
 				],
 			},
+			producers: [
+				producer("test.yml", ["test"], "release-evidence-native-gates*"),
+			],
 		},
 		{
 			id: "iwa-direct-sockets",
@@ -106,6 +240,7 @@ const REGISTRY: { schemaVersion: 1; claims: RegisteredClaim[] } = {
 				kind: "iwa-proof",
 				files: [{ match: "evidence*.json", schema: "iwa-evidence" }],
 			},
+			producers: [producer("iwa.yml", ["iwa-interop"], "iwa-proof-*")],
 		},
 		{
 			id: "fuzz-gates",
@@ -115,6 +250,10 @@ const REGISTRY: { schemaVersion: 1; claims: RegisteredClaim[] } = {
 				kind: "fuzz-release-smoke",
 				files: [{ match: "release-smoke.json", schema: "fuzz-release-smoke" }],
 			},
+			producers: [
+				producer("fuzz.yml", ["fuzz"], "fuzz-evidence"),
+				producer("release.yml", ["fuzz"], "fuzz-evidence"),
+			],
 		},
 		{
 			id: "chromium-native-interop",
@@ -125,6 +264,7 @@ const REGISTRY: { schemaVersion: 1; claims: RegisteredClaim[] } = {
 				minExpected: 1,
 				files: [{ match: "*.json", schema: "playwright-report" }],
 			},
+			producers: [producer("release.yml", ["interop"], "interop-evidence")],
 		},
 	],
 };
@@ -202,6 +342,7 @@ function makeFixture(version = "1.0.0"): Fixture {
 		)}\n`,
 	);
 	writeFileSync(join(root, ".gitignore"), ".release-evidence/\n");
+	writeTree(root, FIXTURE_WORKFLOWS);
 	git(root, "init", "-q");
 	git(root, "add", ".");
 	git(root, "commit", "-q", "-m", "candidate");
@@ -613,20 +754,14 @@ function readyCandidate(fixture: Fixture, tag = TAG) {
 		"native-local-gates-test-41-1",
 	);
 	expect(result.status, result.stderr).toBe(0);
-	result = packageLocal(
-		fixture,
-		"iwa-direct-sockets",
-		"iwa-direct-sockets-local-1",
-		writeTree(inputDir(fixture, "iwa"), {
-			"evidence.json": iwaEvidence(fixture.commit),
-		}),
-	);
+	// IWA evidence is machine-produced too: iwa.yml's artifact, never --local.
+	result = fetchIwa(fixture);
 	expect(result.status, result.stderr).toBe(0);
 	result = cli(fixture, "upload", "--create-prerelease", "--execute");
 	expect(result.status, result.stderr).toBe(0);
 	passClaims(fixture, {
 		"native-local-gates": "native-local-gates-test-41-1",
-		"iwa-direct-sockets": "iwa-direct-sockets-local-1",
+		"iwa-direct-sockets": "iwa-direct-sockets-iwa-42-1",
 	});
 }
 
@@ -641,18 +776,58 @@ function runView(
 	artifact?: string,
 	artifactName = "fuzz-evidence",
 ) {
+	const workflowName = String(overrides.workflowName ?? "fuzz");
+	const workflow = FIXTURE_RUNS[workflowName];
+	if (!workflow) throw new Error(`no fixture workflow ${workflowName}`);
 	return {
 		databaseId: id,
 		headSha: fixture.commit,
 		status: "completed",
 		conclusion: "success",
 		url: `https://github.com/${REPO}/actions/runs/${id}`,
-		workflowName: "fuzz",
+		workflowName,
+		path: workflow.path,
 		attempt: 1,
-		jobs: [],
+		jobs: workflow.jobs,
 		artifacts: artifact ? { [artifactName]: artifact } : {},
 		...overrides,
 	};
+}
+
+/** IWA evidence the way iwa.yml uploads it, fetched from that run. */
+function fetchIwa(
+	fixture: Fixture,
+	runId = 42,
+	evidence: unknown = iwaEvidence(fixture.commit),
+) {
+	const artifact = writeTree(temp("wt-evidence-iwa-"), {
+		".release-evidence/iwa/evidence.json": evidence,
+		".release-evidence/iwa/origin.txt": "isolated-app://fixture\n",
+	});
+	const name = `iwa-proof-${fixture.commit}`;
+	writeState(fixture, (state) => {
+		state.runs[String(runId)] = runView(
+			fixture,
+			runId,
+			{ workflowName: "IWA" },
+			artifact,
+			name,
+		);
+	});
+	return cli(
+		fixture,
+		"fetch",
+		"--run",
+		String(runId),
+		"--artifact",
+		name,
+		"--select",
+		".release-evidence/iwa/evidence.json",
+		"--claim",
+		"iwa-direct-sockets",
+		"--id",
+		`iwa-direct-sockets-iwa-${runId}-1`,
+	);
 }
 
 // ---- privacy ---------------------------------------------------------------
@@ -1120,13 +1295,23 @@ describe("manifest and claim registry contract", () => {
 		expect(
 			validateClaimProof(
 				iwa,
-				ctx([json("evidence.json", iwaEvidence("f".repeat(40)))]),
+				ctx(
+					[json("evidence.json", iwaEvidence("f".repeat(40)))],
+					"github-actions",
+				),
 			).join("\n"),
 		).toContain("sourceCommit");
+		// IWA proof is tool output: only a fetched iwa.yml artifact counts.
 		expect(
 			validateClaimProof(
 				iwa,
 				ctx([json("evidence.json", iwaEvidence(commit))]),
+			).join("\n"),
+		).toContain("GitHub Actions run");
+		expect(
+			validateClaimProof(
+				iwa,
+				ctx([json("evidence.json", iwaEvidence(commit))], "github-actions"),
 			),
 		).toEqual([]);
 		// A Playwright report carries no commit: only an Actions run binds it.
@@ -1402,7 +1587,23 @@ describe("evidence content allowlist", () => {
 	const chunked = (separator: string) =>
 		(secret.match(/.{1,4}/g) ?? []).join(separator);
 
-	for (const separator of ["!", ".", ",", ":", " "]) {
+	// Single, doubled, mixed and long separators, line breaks and natural
+	// word gaps: a permissive decoder skips them all.
+	for (const separator of [
+		"!",
+		".",
+		",",
+		":",
+		" ",
+		"!!",
+		"!.,:",
+		".,!:;",
+		"!@#$%^&*()",
+		"          ",
+		"\n",
+		", ",
+		"! ",
+	]) {
 		it(`refuses base64 split by ${JSON.stringify(separator)} in a free-text field`, () => {
 			const gates = nativeGates(commit);
 			const record = {
@@ -1413,7 +1614,8 @@ describe("evidence content allowlist", () => {
 				[member("ci/commands/cargo-test.json", record)],
 				filesFor("native-local-gates"),
 			);
-			expect(problems.join("\n")).toContain("opaque run");
+			// (a line break in a one-line field is refused outright)
+			expect(problems.join("\n")).toMatch(/opaque run|encoded|non-printable/);
 			expect(problems.join("\n")).not.toContain(secret.slice(0, 8));
 		});
 		it(`the scanner also rejoins base64 split by ${JSON.stringify(separator)}`, () => {
@@ -1425,6 +1627,65 @@ describe("evidence content allowlist", () => {
 			expect(result.ok).toBe(false);
 		});
 	}
+
+	it("refuses the review-note payload from round 4 and its variants", () => {
+		const review = (notes: string) =>
+			contentProblems(
+				[
+					member("review.json", {
+						schemaVersion: 1,
+						kind: "review",
+						commit,
+						reviewer: "release reviewer",
+						scope: "full candidate",
+						verdict: "pass",
+						findings: { P0: 0, P1: 0, P2: 0, P3: 0, P4: 0 },
+						notes,
+					}),
+				],
+				filesFor("auto-review-zero-p0-p4"),
+			).join("\n");
+		// Separators of every width between chunks of every width.
+		for (const width of [1, 2, 3, 4, 6, 8])
+			for (const separator of ["!!", "!.,:", " ~ ", "\n\n", "  ", "!", ", "]) {
+				const chunks = secret.match(new RegExp(`.{1,${width}}`, "g")) ?? [];
+				expect(
+					review(chunks.join(separator)),
+					`${width} ${JSON.stringify(separator)}`,
+				).toMatch(/opaque run|encoded|non-printable/);
+			}
+		// Raw (non-printable) key material, split up: refused by churn.
+		const raw = Buffer.from(
+			Array.from({ length: 33 }, (_, i) => (i * 97 + 13) % 256),
+		).toString("base64");
+		for (const separator of ["!!", "!.,:", "\n"])
+			expect(review((raw.match(/.{1,4}/g) ?? []).join(separator))).toMatch(
+				/opaque run|encoded|non-printable/,
+			);
+		// A multi-line log split one chunk per line is one run to a decoder.
+		for (const separator of ["\n", "\n\n", "\r\n!!\r\n"])
+			expect(
+				opaqueRunReason((secret.match(/.{1,4}/g) ?? []).join(separator)),
+			).toBeDefined();
+		// Natural notes stay accepted.
+		expect(
+			review(
+				"Reviewed the full candidate: no findings. Checked P0..P4 queues, the 0-RTT path, x86_64 and arm64 builds, and the 2026-10-30 CI runs.",
+			),
+		).toBe("");
+	});
+
+	it("keeps accepting natural log lines with counters, units and addresses", () => {
+		for (const line of [
+			"INFO: Loaded 1 modules   (12345 inline 8-bit counters): 12345 [0x55d5c8a0b2c0, 0x55d5c8a0e2f1),",
+			"#65536\tpulse  cov: 1301 ft: 2511 corp: 40/3Kb lim: 4096 exec/s: 21845 rss: 64Mb",
+			"test result: ok. 442 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.35s",
+			"(pass) native 0-RTT > a plain (non-resumed) connect never offers early data even with enable0Rtt [55.02ms]",
+			"     Running `target/x86_64-unknown-linux-gnu/release/h3_frame -max_total_time=60 -timeout=10`",
+			"seen 205 forwarded 189 dropped 16 duplicated 0 delayed 0 reordered 0",
+		])
+			expect(opaqueRunReason(line), line).toBeUndefined();
+	});
 
 	it("refuses CI git metadata in a Playwright report until the sanitizer prunes it", () => {
 		const report = playwrightReport();
@@ -1802,7 +2063,7 @@ describe("release evidence lifecycle", () => {
 				.entries.map((e) => e.asset)
 				.sort(),
 		).toEqual([
-			"evidence-iwa-direct-sockets-local-1.json",
+			"evidence-iwa-direct-sockets-iwa-42-1.json",
 			"evidence-native-local-gates-test-41-1.tar.gz",
 		]);
 		expect(readState(fixture).releases[TAG]?.isPrerelease).toBe(true);
@@ -1820,7 +2081,7 @@ describe("release evidence lifecycle", () => {
 			readiness: "ready",
 		});
 		expect(manifest(fixture).promotion?.assets.map((a) => a.name)).toEqual([
-			"evidence-iwa-direct-sockets-local-1.json",
+			"evidence-iwa-direct-sockets-iwa-42-1.json",
 			"evidence-native-local-gates-test-41-1.tar.gz",
 		]);
 		const locked = cli(fixture, "verify", "--require-ready");
@@ -1932,7 +2193,7 @@ describe("release evidence lifecycle", () => {
 	it("always hashes downloaded assets, even when the API omits digests", () => {
 		const fixture = makeFixture();
 		readyCandidate(fixture);
-		const name = "evidence-iwa-direct-sockets-local-1.json";
+		const name = "evidence-iwa-direct-sockets-iwa-42-1.json";
 		const path = join(releaseDir(fixture), name);
 		const original = readFileSync(path, "utf8");
 		// Same size, different bytes; the release API reports no digest.
@@ -2019,16 +2280,7 @@ describe("release evidence lifecycle", () => {
 	it("upload resolves the tag and refuses another candidate's pre-release", () => {
 		const fixture = makeFixture();
 		cli(fixture, "bind", "--commit", fixture.commit, "--tag", TAG);
-		expect(
-			packageLocal(
-				fixture,
-				"iwa-direct-sockets",
-				"iwa-direct-sockets-local-1",
-				writeTree(inputDir(fixture, "iwa"), {
-					"evidence.json": iwaEvidence(fixture.commit),
-				}),
-			).status,
-		).toBe(0);
+		expect(fetchIwa(fixture).status).toBe(0);
 		writeState(fixture, (state) => {
 			state.tags[TAG] = "9".repeat(40);
 		});
@@ -2066,7 +2318,9 @@ describe("release evidence lifecycle", () => {
 	it("verify fails a GA claim whose evidence is for another claim", () => {
 		const fixture = makeFixture();
 		readyCandidate(fixture);
-		passClaims(fixture, { "native-local-gates": "iwa-direct-sockets-local-1" });
+		passClaims(fixture, {
+			"native-local-gates": "iwa-direct-sockets-iwa-42-1",
+		});
 		const verify = cli(fixture, "verify");
 		expect(verify.status).toBe(1);
 		expect(verify.stderr).toContain(
@@ -2093,16 +2347,7 @@ describe("release evidence lifecycle", () => {
 	it("upload is a dry run by default and never creates a release unasked", () => {
 		const fixture = makeFixture();
 		cli(fixture, "bind", "--commit", fixture.commit, "--tag", TAG);
-		expect(
-			packageLocal(
-				fixture,
-				"iwa-direct-sockets",
-				"iwa-direct-sockets-local-1",
-				writeTree(inputDir(fixture, "n"), {
-					"evidence.json": iwaEvidence(fixture.commit),
-				}),
-			).status,
-		).toBe(0);
+		expect(fetchIwa(fixture).status).toBe(0);
 		const missing = cli(fixture, "upload", "--execute");
 		expect(missing.status).toBe(1);
 		expect(missing.stderr).toContain("--create-prerelease");
@@ -2331,6 +2576,205 @@ describe("release evidence lifecycle", () => {
 		const swapped = cli(fixture, "verify", "--integrity-only");
 		expect(swapped.status).toBe(1);
 		expect(swapped.stderr).toContain("with the recorded digest");
+	});
+
+	it("accepts CI evidence only from the claim's registered workflow, job and artifact", () => {
+		const fixture = makeFixture();
+		cli(fixture, "bind", "--commit", fixture.commit, "--tag", TAG);
+		const smoke = { "release-smoke.json": fuzzSmoke() };
+		const artifact = writeTree(temp("wt-evidence-artifact-"), smoke);
+		writeState(fixture, (state) => {
+			// Any successful workflow at the candidate SHA can upload
+			// schema-valid bytes; only the registered producer is evidence.
+			state.runs["51"] = runView(
+				fixture,
+				51,
+				{ workflowName: "scratch" },
+				artifact,
+			);
+			// The registered workflow, but the producing job never ran.
+			state.runs["52"] = runView(fixture, 52, { jobs: [] }, artifact);
+			// The registered workflow whose producing job failed.
+			state.runs["53"] = runView(
+				fixture,
+				53,
+				{
+					jobs: [{ name: "fuzz", status: "completed", conclusion: "failure" }],
+				},
+				artifact,
+			);
+			// The registered workflow, an unregistered artifact.
+			state.runs["54"] = runView(
+				fixture,
+				54,
+				{},
+				artifact,
+				"fuzz-evidence-extra",
+			);
+			state.runs["55"] = runView(fixture, 55, {}, artifact);
+		});
+		const fetch = (runId: string, name = "fuzz-evidence") =>
+			cli(
+				fixture,
+				"fetch",
+				"--run",
+				runId,
+				"--artifact",
+				name,
+				"--claim",
+				"fuzz-gates",
+			);
+		const scratch = fetch("51");
+		expect(scratch.status).toBe(1);
+		expect(scratch.stderr).toContain("is not a registered producer");
+		expect(scratch.stderr).toContain(
+			"run workflow is .github/workflows/scratch.yml, not .github/workflows/fuzz.yml",
+		);
+		expect(fetch("52").stderr).toContain("no fuzz job ran in the run");
+		expect(fetch("53").stderr).toContain(
+			"a fuzz job did not complete successfully",
+		);
+		expect(fetch("54", "fuzz-evidence-extra").stderr).toContain(
+			"artifact fuzz-evidence-extra does not match fuzz-evidence",
+		);
+		expect(manifest(fixture).entries).toEqual([]);
+		const ok = fetch("55");
+		expect(ok.status, ok.stderr).toBe(0);
+		expect(manifest(fixture).entries[0]?.producer).toMatchObject({
+			workflow: "fuzz",
+			workflowPath: ".github/workflows/fuzz.yml",
+		});
+		// verify re-reads the run's workflow file and re-applies the policy.
+		expect(
+			cli(fixture, "upload", "--create-prerelease", "--execute").status,
+		).toBe(0);
+		expect(cli(fixture, "verify", "--integrity-only").status).toBe(0);
+		writeState(fixture, (state) => {
+			(state.runs["55"] as Record<string, unknown>).path =
+				".github/workflows/scratch.yml";
+		});
+		const moved = cli(fixture, "verify", "--integrity-only");
+		expect(moved.status).toBe(1);
+		expect(moved.stderr).toContain(
+			"ran .github/workflows/scratch.yml, not .github/workflows/fuzz.yml",
+		);
+		expect(moved.stderr).toContain("does not accept this producer");
+	});
+
+	it("refuses a producer whose workflow at the candidate is not the reviewed one", () => {
+		const claim = registered("fuzz-gates");
+		const run = {
+			path: ".github/workflows/fuzz.yml@refs/heads/main",
+			artifact: "fuzz-evidence",
+			jobs: [{ name: "fuzz", status: "completed", conclusion: "success" }],
+		};
+		const reviewed = (path: string) => FIXTURE_WORKFLOWS[path];
+		expect(producerPolicyProblems(claim, run, reviewed)).toEqual([]);
+		const edited = (path: string) =>
+			`${FIXTURE_WORKFLOWS[path] ?? ""}      - run: echo forged\n`;
+		expect(producerPolicyProblems(claim, run, edited).join("\n")).toContain(
+			"is not the reviewed workflow",
+		);
+		expect(
+			producerPolicyProblems(claim, run, () => undefined).join("\n"),
+		).toContain("does not exist at the candidate");
+		// Matrix and templated job names are matched by their workflow name.
+		const matrix = registered("native-local-gates");
+		expect(
+			producerPolicyProblems(
+				matrix,
+				{
+					path: ".github/workflows/test.yml",
+					artifact: "release-evidence-native-gates-ubuntu-latest",
+					jobs: [
+						{
+							name: "test (macos-latest, 1.3.14)",
+							status: "completed",
+							conclusion: "success",
+						},
+					],
+				},
+				reviewed,
+			),
+		).toEqual([]);
+	});
+
+	it("registry: machine claims name producers, human records have none", () => {
+		const claims = (claim: Record<string, unknown>) => ({
+			schemaVersion: 1,
+			claims: [{ id: "x", surface: "release", gaRequired: true, ...claim }],
+		});
+		const commandProof = {
+			kind: "command-records",
+			files: [{ match: "commands/*.json", schema: "command-record" }],
+		};
+		expect(
+			validateRegistry(claims({ proof: commandProof })).join("\n"),
+		).toContain("must name its CI producer");
+		expect(
+			validateRegistry(
+				claims({
+					proof: commandProof,
+					producers: [
+						{ workflow: "test", workflowSha256: "x", jobs: [], artifact: "a" },
+					],
+				}),
+			).join("\n"),
+		).toContain(".workflow: must be a .github/workflows/<file> path");
+		expect(
+			validateRegistry(
+				claims({
+					proof: {
+						kind: "review-record",
+						files: [{ match: "review.json", schema: "review-record" }],
+					},
+					producers: [producer("test.yml", ["test"], "x")],
+				}),
+			).join("\n"),
+		).toContain("is human work and has no CI producer");
+		const committed = JSON.parse(
+			readFileSync(join(PROJECT_ROOT, "docs", "release-claims.json"), "utf8"),
+		) as { claims: RegisteredClaim[] };
+		expect(validateRegistry(committed)).toEqual([]);
+		expect(
+			committed.claims
+				.filter((claim) => !claim.producers)
+				.map((claim) => claim.id)
+				.sort(),
+		).toEqual(["auto-review-zero-p0-p4", "final-no-change-confirmation"]);
+		expect(
+			committed.claims.find((claim) => claim.id === "iwa-direct-sockets")
+				?.producers,
+		).toMatchObject([
+			{
+				workflow: ".github/workflows/iwa.yml",
+				jobs: ["iwa-interop"],
+				artifact: "iwa-proof-*",
+			},
+		]);
+	});
+
+	it("never packages IWA evidence locally", () => {
+		const fixture = makeFixture();
+		cli(fixture, "bind", "--commit", fixture.commit, "--tag", TAG);
+		const local = packageLocal(
+			fixture,
+			"iwa-direct-sockets",
+			"iwa-direct-sockets-local-1",
+			writeTree(inputDir(fixture, "iwa"), {
+				"evidence.json": iwaEvidence(fixture.commit),
+			}),
+		);
+		expect(local.status).toBe(1);
+		expect(local.stderr).toContain("GitHub Actions run");
+		expect(manifest(fixture).entries).toEqual([]);
+		const fetched = fetchIwa(fixture);
+		expect(fetched.status, fetched.stderr).toBe(0);
+		expect(manifest(fixture).entries[0]?.producer).toMatchObject({
+			kind: "github-actions",
+			workflowPath: ".github/workflows/iwa.yml",
+			artifact: { name: `iwa-proof-${fixture.commit}` },
+		});
 	});
 
 	it("imports a CI fragment attached to the pre-release into the manifest", () => {

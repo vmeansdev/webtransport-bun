@@ -2,7 +2,15 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { relative, resolve } from "node:path";
-import { validateRegistry } from "./release-claims.ts";
+import {
+	artifactGlob,
+	jobArtifactTemplates,
+	parseWorkflow,
+	type RegisteredClaim,
+	sha256Text,
+	templatePattern,
+	validateRegistry,
+} from "./release-claims.ts";
 import {
 	type ManifestEntry,
 	STATUS_SCHEMA_VERSION,
@@ -319,6 +327,10 @@ function checkClaimRegistry(status: ReleaseStatus): void {
 	const errors = validateRegistry(registry);
 	for (const error of errors) report(location, error);
 	if (errors.length > 0) return;
+	checkClaimProducers(
+		location,
+		(registry as { claims: RegisteredClaim[] }).claims,
+	);
 	const pinned = (
 		registry as {
 			claims: { id: string; surface: string; gaRequired: boolean }[];
@@ -348,6 +360,58 @@ function checkClaimRegistry(status: ReleaseStatus): void {
 				"release-status.claims",
 				`${claim.id} is not a pinned claim in ${location}`,
 			);
+	}
+}
+
+/**
+ * Every registered producer must name a workflow file that exists, at the
+ * reviewed content (its sha256), a job that exists in it, and an artifact
+ * that job actually uploads; otherwise fetch/verify could never accept the
+ * claim's evidence, or would accept it from something nobody reviewed.
+ */
+function checkClaimProducers(
+	location: string,
+	claims: RegisteredClaim[],
+): void {
+	for (const claim of claims) {
+		for (const [index, policy] of (claim.producers ?? []).entries()) {
+			const at = `${claim.id} producers[${index}]`;
+			const text = readText(resolve(ROOT, policy.workflow));
+			if (text === undefined) {
+				report(location, `${at}: workflow ${policy.workflow} does not exist`);
+				continue;
+			}
+			const digest = sha256Text(text);
+			if (digest !== policy.workflowSha256)
+				report(
+					location,
+					`${at}: ${policy.workflow} changed since it was registered; review it and set workflowSha256 to ${digest}`,
+				);
+			const jobs = parseWorkflow(text);
+			// A sample name the glob accepts, to test against the job's templates.
+			const sample = policy.artifact.replaceAll("*", "0");
+			let uploads = false;
+			for (const id of policy.jobs) {
+				const job = jobs[id];
+				if (!job) {
+					report(location, `${at}: ${policy.workflow} has no job ${id}`);
+					continue;
+				}
+				if (
+					jobArtifactTemplates(job).some(
+						(template) =>
+							templatePattern(template).test(sample) &&
+							artifactGlob(policy.artifact).test(sample),
+					)
+				)
+					uploads = true;
+			}
+			if (!uploads)
+				report(
+					location,
+					`${at}: no ${policy.jobs.join("/")} job in ${policy.workflow} uploads an artifact named like ${policy.artifact}`,
+				);
+		}
 	}
 }
 

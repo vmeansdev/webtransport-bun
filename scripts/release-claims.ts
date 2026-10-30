@@ -37,14 +37,28 @@ export type ProofSpec = ProofKind & {
 	files: DeclaredFile[];
 };
 
-/** Proof kinds a local (operator-run) producer may carry: inherently human
- * work. Everything else is tool output and must come from a GitHub Actions
- * run through `fetch`. */
+/** Proof kinds a local (operator-run) producer may carry: human records
+ * (a review verdict, a freeze confirmation). Everything else is tool output
+ * and must come from a registered GitHub Actions producer through `fetch`. */
 export const LOCAL_PROOF_KINDS: ReadonlySet<string> = new Set([
-	"iwa-proof",
 	"review-record",
 	"no-change-confirmation",
 ]);
+
+/**
+ * Where a machine-produced claim's evidence may come from. A run is accepted
+ * only when its workflow file (by repository path, as the Actions API reports
+ * it) is `workflow`, that file at the candidate commit hashes to
+ * `workflowSha256` (the reviewed workflow; doc-truth keeps the hash current),
+ * one of `jobs` ran in it and every run of those jobs succeeded, and the
+ * artifact's name matches the `artifact` glob.
+ */
+export type ProducerPolicy = {
+	workflow: string;
+	workflowSha256: string;
+	jobs: string[];
+	artifact: string;
+};
 
 export type ProofKind =
 	| {
@@ -69,6 +83,8 @@ export type RegisteredClaim = {
 	surface: "native" | "wasm" | "release";
 	gaRequired: boolean;
 	proof: ProofSpec;
+	/** Required for every machine proof kind; absent for local kinds. */
+	producers?: ProducerPolicy[];
 };
 
 export type ClaimRegistry = { schemaVersion: 1; claims: RegisteredClaim[] };
@@ -121,9 +137,25 @@ export function validateRegistry(value: unknown): string[] {
 			errors.push(`${at}: must be an object`);
 			return;
 		}
-		const keys = Object.keys(claim).sort().join(",");
+		const keys = Object.keys(claim)
+			.filter((key) => key !== "producers")
+			.sort()
+			.join(",");
 		if (keys !== "gaRequired,id,proof,surface")
-			errors.push(`${at}: must have exactly id, surface, gaRequired, proof`);
+			errors.push(
+				`${at}: must have exactly id, surface, gaRequired, proof (and producers)`,
+			);
+		if (isObject(claim.proof) && typeof claim.proof.kind === "string") {
+			const local = LOCAL_PROOF_KINDS.has(claim.proof.kind);
+			if (local && claim.producers !== undefined)
+				errors.push(
+					`${at}.producers: a ${claim.proof.kind} record is human work and has no CI producer`,
+				);
+			if (!local)
+				errors.push(
+					...producerPolicyErrors(claim.producers, `${at}.producers`),
+				);
+		}
 		if (typeof claim.id !== "string" || !/^[a-z0-9][a-z0-9-]*$/.test(claim.id))
 			errors.push(`${at}.id: invalid`);
 		else if (ids.has(claim.id)) errors.push(`${at}.id: duplicate ${claim.id}`);
@@ -165,6 +197,186 @@ export function validateRegistry(value: unknown): string[] {
 		}
 	});
 	return errors;
+}
+
+const WORKFLOW_PATH = /^\.github\/workflows\/[A-Za-z0-9._-]+\.ya?ml$/;
+
+function producerPolicyErrors(value: unknown, at: string): string[] {
+	if (!Array.isArray(value) || value.length === 0)
+		return [
+			`${at}: a machine-produced claim must name its CI producer(s) (workflow, workflowSha256, jobs, artifact)`,
+		];
+	const errors: string[] = [];
+	value.forEach((policy, index) => {
+		const where = `${at}[${index}]`;
+		if (
+			!isObject(policy) ||
+			Object.keys(policy).sort().join(",") !==
+				"artifact,jobs,workflow,workflowSha256"
+		) {
+			errors.push(
+				`${where}: must be exactly {workflow, workflowSha256, jobs, artifact}`,
+			);
+			return;
+		}
+		if (
+			typeof policy.workflow !== "string" ||
+			!WORKFLOW_PATH.test(policy.workflow)
+		)
+			errors.push(`${where}.workflow: must be a .github/workflows/<file> path`);
+		if (
+			typeof policy.workflowSha256 !== "string" ||
+			!/^[0-9a-f]{64}$/.test(policy.workflowSha256)
+		)
+			errors.push(`${where}.workflowSha256: must be a sha256 hex digest`);
+		if (
+			!Array.isArray(policy.jobs) ||
+			policy.jobs.length === 0 ||
+			!policy.jobs.every(
+				(job) => typeof job === "string" && /^[A-Za-z0-9_-]+$/.test(job),
+			)
+		)
+			errors.push(`${where}.jobs: must list workflow job ids`);
+		if (
+			typeof policy.artifact !== "string" ||
+			!/^[A-Za-z0-9._*-]+$/.test(policy.artifact)
+		)
+			errors.push(`${where}.artifact: must be an artifact name glob`);
+	});
+	return errors;
+}
+
+// ---------------------------------------------------------------------------
+// Producer policy
+
+export function sha256Text(text: string): string {
+	return createHash("sha256").update(text).digest("hex");
+}
+
+/** An artifact-name glob (`*` = any run of name characters) as a RegExp. */
+export function artifactGlob(glob: string): RegExp {
+	return new RegExp(
+		`^${glob
+			.split("*")
+			.map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&"))
+			.join("[A-Za-z0-9._-]*")}$`,
+	);
+}
+
+/** A workflow string template: each `${{ expression }}` stands for any text. */
+export function templatePattern(template: string): RegExp {
+	return new RegExp(
+		`^${template
+			.split(/\$\{\{[^}]*\}\}/)
+			.map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&"))
+			.join(".+")}$`,
+	);
+}
+
+type WorkflowJob = {
+	name?: unknown;
+	steps?: { uses?: unknown; with?: Record<string, unknown> }[];
+};
+
+export function parseWorkflow(text: string): Record<string, WorkflowJob> {
+	const parsed = Bun.YAML.parse(text) as unknown;
+	const jobs = isObject(parsed) ? parsed.jobs : undefined;
+	return isObject(jobs) ? (jobs as Record<string, WorkflowJob>) : {};
+}
+
+/** How the Actions API names a job's runs: its `name:` (or id), with a
+ * ` (matrix values)` suffix for matrix jobs whose name has no expression. */
+export function jobDisplayPattern(id: string, job: WorkflowJob): RegExp {
+	const base = typeof job.name === "string" ? job.name : id;
+	const core = templatePattern(base).source.slice(1, -1);
+	return new RegExp(`^${core}(?: \\(.+\\))?$`);
+}
+
+/** Names of the artifacts a job uploads (workflow templates). */
+export function jobArtifactTemplates(job: WorkflowJob): string[] {
+	return (Array.isArray(job.steps) ? job.steps : [])
+		.filter(
+			(step) =>
+				isObject(step) &&
+				typeof step.uses === "string" &&
+				step.uses.startsWith("actions/upload-artifact@"),
+		)
+		.map((step) => step.with?.name)
+		.filter((name): name is string => typeof name === "string");
+}
+
+export type ProducingRun = {
+	/** The run's workflow file as the Actions API reports it (`path`). */
+	path: string;
+	artifact: string;
+	jobs: { name?: string; status?: string; conclusion?: string }[];
+};
+
+/** Normalise the API's `path` (`.github/workflows/x.yml@refs/...`). */
+export function workflowPathOf(path: string): string {
+	const at = path.indexOf("@");
+	return at === -1 ? path : path.slice(0, at);
+}
+
+/**
+ * Why `run` is not an accepted producer for `claim`, or [] when one of the
+ * claim's registered producers accepts it. `workflowAt` returns a workflow
+ * file's text at the candidate commit (undefined when it does not exist).
+ */
+export function producerPolicyProblems(
+	claim: RegisteredClaim,
+	run: ProducingRun,
+	workflowAt: (path: string) => string | undefined,
+): string[] {
+	const policies = claim.producers ?? [];
+	if (policies.length === 0)
+		return [`claim ${claim.id} has no registered CI producer`];
+	const path = workflowPathOf(run.path);
+	const rejected: string[] = [];
+	for (const policy of policies) {
+		const why: string[] = [];
+		if (path !== policy.workflow)
+			why.push(
+				`run workflow is ${path || "<unknown>"}, not ${policy.workflow}`,
+			);
+		if (!artifactGlob(policy.artifact).test(run.artifact))
+			why.push(`artifact ${run.artifact} does not match ${policy.artifact}`);
+		const text = why.length === 0 ? workflowAt(policy.workflow) : undefined;
+		if (why.length === 0 && text === undefined)
+			why.push(`${policy.workflow} does not exist at the candidate`);
+		if (text !== undefined) {
+			if (sha256Text(text) !== policy.workflowSha256)
+				why.push(
+					`${policy.workflow} at the candidate is not the reviewed workflow (sha256 differs from the registry)`,
+				);
+			const jobs = parseWorkflow(text);
+			const ran: typeof run.jobs = [];
+			for (const id of policy.jobs) {
+				const job = jobs[id];
+				if (!job) {
+					why.push(`${policy.workflow} has no job ${id}`);
+					continue;
+				}
+				const pattern = jobDisplayPattern(id, job);
+				ran.push(...run.jobs.filter((j) => pattern.test(String(j.name ?? ""))));
+			}
+			if (ran.length === 0)
+				why.push(`no ${policy.jobs.join("/")} job ran in the run`);
+			else if (
+				ran.some(
+					(job) => job.status !== "completed" || job.conclusion !== "success",
+				)
+			)
+				why.push(
+					`a ${policy.jobs.join("/")} job did not complete successfully`,
+				);
+		}
+		if (why.length === 0) return [];
+		rejected.push(`${policy.workflow}: ${why.join("; ")}`);
+	}
+	return [
+		`claim ${claim.id} does not accept this producer (${rejected.join(" | ")})`,
+	];
 }
 
 export function parseRegistry(text: string): ClaimRegistry {

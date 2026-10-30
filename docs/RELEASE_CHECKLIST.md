@@ -59,19 +59,39 @@ contain (`proof.files`: a glob and a content schema from
 is refused; JSON must satisfy its schema exactly (unknown fields refused at any
 depth, typed values); a declared text file (Bun LCOV) must match its line
 grammar. Free text is capped, control-character free, and may not contain an
-*opaque run*: 24+ characters of base64/hex alphabet with the character-class
-churn of encoded data, where chunks split by single punctuation or whitespace
-(`TE9L!QUxJ.U0Vf,…`) count as one run. Hashes and digests are accepted only in
+*opaque run*. A permissive decoder skips every non-alphabet character, so the
+check works on what it would see: chunks of the base64/hex alphabet separated
+by any run of other characters (`TE9L!QUxJ`, `TE9L!!QUxJ`, `TE9L!.,:QUxJ`,
+line breaks, long separators) are one run unless the gap is a natural word gap
+(one space, optionally after punctuation), and a 24+ character run with the
+character-class churn of encoded data is refused. Across word gaps too, the
+alphabet-only projection of the whole value is refused where it decodes
+(base64 or hex, any alignment) to mostly printable text, or where its chunks
+are mostly non-words with the churn of encoded data. Hashes and digests are accepted only in
 fields declared as digests, with their exact lengths. The decode-and-rescan
 privacy scanner still runs over everything as defence in depth.
 
 ### Who produces each claim's evidence
 
 Tool output is evidence only when a GitHub Actions run produced it: every
-proof kind except `iwa-proof`, `review-record` and `no-change-confirmation`
+proof kind except `review-record` and `no-change-confirmation` (human records)
 refuses a `--local` producer and must come in through
 `release-evidence.ts fetch --run <id> --artifact <name>` from a run whose head
 SHA is the candidate.
+
+The table below is enforced. Each machine-produced claim in
+`docs/release-claims.json` lists its `producers`: the workflow file (by
+repository path), that file's sha256, the job id(s) and an artifact-name glob.
+`fetch` and `verify` read the run's workflow path from the Actions API
+(`GET /repos/{repo}/actions/runs/{id}` → `path`) and its job listing, and
+accept the run only when it is a registered workflow file whose content at the
+candidate hashes to the registered sha256, a registered job ran in it and every
+run of that job succeeded, and the artifact name matches. Any other successful
+run at the candidate SHA is refused, however valid its bytes.
+`check-doc-truth.ts` keeps the registry honest: every producer's workflow must
+exist with the registered sha256 (an edited workflow fails until it is
+reviewed and the hash updated), the job must exist, and it must upload an
+artifact the glob accepts.
 
 | Claim | Producer (workflow / job) | Artifact to fetch |
 |---|---|---|
@@ -86,7 +106,7 @@ SHA is the candidate.
 | `package-artifact` | `release.yml` / `release` | `npm-publish-input-<attempt>` (`--select candidate-identity.json`) |
 | `scale-10k-multisource` (not GA) | `release.yml` / `distributed-scale` | `distributed-scale-evidence` |
 | `soak-24h`, `soak-72h` | `soak-long.yml` | `soak-aggregate-<hours>h-<commit>` |
-| `iwa-direct-sockets` | `iwa.yml` (`iwa-proof-<sha>`, `--select evidence.json`), or the interactive run's `run-iwa.mjs` JSON with `--local` | |
+| `iwa-direct-sockets` | `iwa.yml` / `iwa-interop`, dispatched on the candidate tag so the run's head SHA is the candidate (`--select .release-evidence/iwa/evidence.json`); never `--local` | `iwa-proof-<sha>` |
 | `auto-review-zero-p0-p4` | human review record, `--local` | |
 | `final-no-change-confirmation` | human freeze record, `--local` | |
 | `fault-matrix` | `test.yml` / `fault-matrix` (`playwright.fault.config.ts` with `INTEROP_EVIDENCE=1`: JSON reporter + sanitizer) | `release-evidence-fault-matrix` |
@@ -114,12 +134,12 @@ All through `bun scripts/release-evidence.ts`:
 3. **Collect.** `import --from-release` records the CI fragments. Evidence
    from other workflow runs (`soak-long`, `iwa`, `fuzz`, `coverage`,
    `bench-bandwidth`) comes in with
-   `fetch --run <run-id> --artifact <name> --claim <claim-id>`. Local runs
-   (interactive IWA proof, bare-metal soaks, review records) come in with
-   `package --claim <claim-id> --input <file-or-dir> --local "<what ran where>"`.
+   `fetch --run <run-id> --artifact <name> --claim <claim-id>`. Only the human
+   records (review, no-change confirmation) come in with
+   `package --claim <claim-id> --input <file-or-dir> --local "<who, what>"`.
    Provenance is never self-attested: CI evidence enters only through `fetch`,
    which reads the run back from the Actions API (refusing a run in another
-   repository or workflow, one that did not build the candidate, or one that
+   repository, one that is not a registered producer of the claim, one that did not build the candidate, or one that
    did not succeed; the only in-progress run accepted is the release run
    fetching its own artifacts from inside itself), downloads the named
    artifact itself, and records the artifact's id, name and digest; verify
