@@ -34,17 +34,34 @@ export const ABSOLUTE_PATH_PATTERN = /^(?:\/|[A-Za-z]:[\\/]|\\\\)/;
 /** Host-identifying path fragments anywhere inside a value, which catches
  * command strings and messages that embed a path rather than being one. */
 const HOST_PATH_ANYWHERE_PATTERN =
-	/(?:\/(?:Users|home|private|tmp|Volumes|root)\/|\/var\/folders\/|(?:^|[\s"'=(;,])[A-Za-z]:[\\/]|\\\\[^\\/\s]+\\|%USERPROFILE%|%TEMP%|\$HOME\b|\$TMPDIR\b|(?:^|\s)~\/)/i;
+	/(?:\/(?:Users|home|private|tmp|Volumes|root)\/|\/var\/folders\/|%USERPROFILE%|%TEMP%|\$HOME\b|\$TMPDIR\b|(?:^|\s)~\/)/i;
 
-/** Any embedded multi-segment absolute POSIX path, regardless of its root.
- * The named-root list above documents the common cases, but a self-hosted or
+/** Where a path can begin: after anything that cannot itself be part of a
+ * path (`cache:`, `x=`, `(`, a quote, a space, the start), except the
+ * `<repo>` placeholder the scrubber reroots the checkout to. */
+const PATH_BOUNDARY = String.raw`(?<![A-Za-z0-9._~+\-/\\])(?<!<repo>)`;
+
+/** A Windows drive path (`C:\…`, `c:/…`) or a UNC share (`\\host\share`)
+ * after any non-path boundary. A URI scheme cannot match: its letters are
+ * preceded by more letters, and its `:` by a letter, never a boundary. */
+const EMBEDDED_WINDOWS_PATH_PATTERN = new RegExp(
+	String.raw`${PATH_BOUNDARY}(?:[A-Za-z]:[\\/]|\\\\[^\\/\s]+[\\/])`,
+);
+
+/** `file:` URIs name host paths; every other scheme is a URL. */
+const FILE_URI_PATTERN = /\bfile:\/\//i;
+
+/** Any embedded multi-segment absolute POSIX path, regardless of its root,
+ * after any non-path boundary (`cache:/opt/…`, `x=/opt/…`, `(/home/…`). The
+ * named-root list above documents the common cases, but a self-hosted or
  * containerized runner rooted at /opt, /srv, /builds, /workspace, … must not
- * slip through just because its root is not enumerated. URL paths do not match:
- * the character before a scheme's `//` is `:`, which is deliberately absent
- * from the prefix class. Single-segment values (`/`, `/cert-hash`) stay legal
- * for the public-value allowlist. */
-const EMBEDDED_ABSOLUTE_PATH_PATTERN =
-	/(?:^|[\s"'=(;,])\/(?:[A-Za-z0-9._+-]+\/)+[A-Za-z0-9._+-]+/;
+ * slip through just because its root is not enumerated. URL paths do not
+ * match: a scheme's `//` has an empty first segment, and a URL path's `/`
+ * follows its host, a path character. Single-segment values (`/`,
+ * `/cert-hash`) stay legal for the public-value allowlist. */
+const EMBEDDED_ABSOLUTE_PATH_PATTERN = new RegExp(
+	String.raw`${PATH_BOUNDARY}\/(?:[^\s/\\"'<>|]+\/)+[^\s/\\"'<>|]+`,
+);
 
 /**
  * Genuinely public protocol values that are path-shaped. Kept as exact strings
@@ -81,6 +98,9 @@ export function unsafeStringReason(value: string): string | undefined {
 	if (ABSOLUTE_PATH_PATTERN.test(value)) return "absolute host path";
 	if (HOST_PATH_ANYWHERE_PATTERN.test(value))
 		return "home or temporary directory path";
+	if (FILE_URI_PATTERN.test(value)) return "file URI (a host path)";
+	if (EMBEDDED_WINDOWS_PATH_PATTERN.test(value))
+		return "embedded Windows drive or UNC path";
 	if (EMBEDDED_ABSOLUTE_PATH_PATTERN.test(value))
 		return "embedded absolute path";
 	return undefined;
@@ -229,6 +249,9 @@ export function unsafeTextLineReason(line: string): string | undefined {
 	if (assignment && envNameReason(assignment)) return "environment dump";
 	if (HOST_PATH_ANYWHERE_PATTERN.test(line))
 		return "home or temporary directory path";
+	if (FILE_URI_PATTERN.test(line)) return "file URI (a host path)";
+	if (EMBEDDED_WINDOWS_PATH_PATTERN.test(line))
+		return "embedded Windows drive or UNC path";
 	if (EMBEDDED_ABSOLUTE_PATH_PATTERN.test(line))
 		return "embedded absolute path";
 	return undefined;

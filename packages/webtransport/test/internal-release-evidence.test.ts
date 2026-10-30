@@ -40,7 +40,11 @@ import {
 	distTagFor,
 	stampedVersion,
 } from "../../../scripts/stamp-version-from-tag.ts";
-import { pruneReportMetadata } from "../../../tools/interop/evidence-privacy.ts";
+import {
+	pruneReportMetadata,
+	unsafeStringReason,
+	unsafeTextLineReason,
+} from "../../../tools/interop/evidence-privacy.ts";
 import { RELEASE_FAULT_PROFILES } from "../../../tools/interop/udp-fault-proxy.ts";
 
 const PROJECT_ROOT = join(import.meta.dir, "..", "..", "..");
@@ -765,6 +769,21 @@ function readyCandidate(fixture: Fixture, tag = TAG) {
 	});
 }
 
+/** Publish an extra asset on the candidate pre-release, as anyone with write
+ * access could. */
+function attach(fixture: Fixture, name: string, body: unknown) {
+	const data =
+		typeof body === "string" ? body : `${JSON.stringify(body, null, 2)}\n`;
+	writeFileSync(join(releaseDir(fixture), name), data);
+	writeState(fixture, (state) => {
+		state.releases[TAG]?.assets.push({
+			name,
+			size: Buffer.byteLength(data),
+			digest: `sha256:${createHash("sha256").update(data).digest("hex")}`,
+		});
+	});
+}
+
 function releaseDir(fixture: Fixture): string {
 	return readState(fixture).releases[TAG]?.dir as string;
 }
@@ -833,6 +852,52 @@ function fetchIwa(
 // ---- privacy ---------------------------------------------------------------
 
 describe("release evidence privacy scrubbing", () => {
+	it("finds absolute paths after any non-path boundary, never in URLs", () => {
+		const leaks = [
+			// The reviewer's values.
+			"cache:C:\\Users\\alice\\secrets\\dump.json",
+			"cache:/opt/actions-runner/_work/repo/file.json",
+			"x=/opt/actions-runner/_work/repo/file.json",
+			"(/home/runner/work/repo/file.json)",
+			// Drive, UNC and POSIX paths behind other boundaries.
+			"saved to D:/a/webtransport-bun/out.json",
+			"log[C:\\actions\\_work\\x]",
+			"share \\\\build-host\\drop\\x.json",
+			"see:\\\\build-host\\drop",
+			"key=c:\\ProgramData\\x",
+			"'/srv/runner/work/x'",
+			"→/builds/group/project/x",
+			"|/workspace/build/out.log",
+			"file:///etc/ssl/private/key.pem",
+			"FILE://host/share/x",
+		];
+		for (const value of leaks) {
+			expect(unsafeStringReason(value), value).toBeDefined();
+			expect(unsafeTextLineReason(value), value).toBeDefined();
+			expect(
+				scrubFile(
+					"review.json",
+					new TextEncoder().encode(JSON.stringify({ notes: value })),
+					{ repoRoots: [], redactHostPaths: false, forbiddenLiterals: [] },
+				).ok,
+				value,
+			).toBe(false);
+		}
+		const clean = [
+			"https://github.com/example/webtransport-bun/actions/runs/1",
+			"http://127.0.0.1:4433/cert-hash/x",
+			"wss://example.test/a/b",
+			"git+ssh://example.test/a/b",
+			"<repo>/tools/interop/tests/fault-matrix.spec.ts:78:31",
+			"and/or exec/s: 21845 corp: 40/3Kb",
+			"ratio 1:2/3 at 10:30/day",
+			"/cert-hash",
+			"target/x86_64-unknown-linux-gnu/release/h3_frame",
+		];
+		for (const value of clean)
+			expect(unsafeStringReason(value), value).toBeUndefined();
+	});
+
 	const options = {
 		repoRoots: ["/work/checkout"],
 		redactHostPaths: false,
@@ -2302,6 +2367,96 @@ describe("release evidence lifecycle", () => {
 		const calls = readState(fixture).calls.map((c) => `${c[0]} ${c[1]}`);
 		expect(calls).not.toContain("release create");
 		expect(calls).not.toContain("release upload");
+	});
+
+	it("verify fails closed on an evidence asset the manifest does not record", () => {
+		const fixture = makeFixture();
+		readyCandidate(fixture);
+		expect(cli(fixture, "verify").status).toBe(0);
+		attach(fixture, "evidence-unrecorded-dump-1.json", { env: "anything" });
+		const verify = cli(fixture, "verify", "--integrity-only");
+		expect(verify.status).toBe(1);
+		expect(verify.stderr).toContain(
+			"release asset evidence-unrecorded-dump-1.json is not recorded in the manifest",
+		);
+		// A near-miss name is not a way around it.
+		const other = makeFixture();
+		readyCandidate(other);
+		attach(other, "evidence-Dump.txt", "x");
+		expect(cli(other, "verify", "--integrity-only").stderr).toContain(
+			"has an evidence name but is neither",
+		);
+	});
+
+	it("verify parses, binds and privacy-scans every fragment asset", () => {
+		const fragment = (
+			fixture: Fixture,
+			extra: Record<string, unknown> = {},
+		) => ({
+			schemaVersion: 1,
+			kind: "release-evidence-fragment",
+			repository: REPO,
+			commit: fixture.commit,
+			tag: TAG,
+			entries: [],
+			...extra,
+		});
+		const verifyWith = (name: string, body: (f: Fixture) => unknown) => {
+			const fixture = makeFixture();
+			readyCandidate(fixture);
+			attach(fixture, name, body(fixture));
+			return cli(fixture, "verify", "--integrity-only");
+		};
+		const ok = verifyWith("release-evidence-fragment-release-1-1.json", (f) =>
+			fragment(f),
+		);
+		expect(ok.status, ok.stderr).toBe(0);
+		const credential = verifyWith(
+			"release-evidence-fragment-release-2-1.json",
+			(f) => ({ ...fragment(f), note: `token ${FAKE_TOKEN}` }),
+		);
+		expect(credential.status).toBe(1);
+		expect(credential.stderr).toContain(
+			"fragment release-evidence-fragment-release-2-1.json: privacy scan",
+		);
+		expect(credential.stderr).not.toContain(FAKE_TOKEN);
+		const hostPath = verifyWith(
+			"release-evidence-fragment-release-3-1.json",
+			(f) => ({ ...fragment(f), tag: "cache:/opt/actions-runner/_work/x/y" }),
+		);
+		expect(hostPath.status).toBe(1);
+		expect(hostPath.stderr).toContain("privacy scan");
+		const unbound = verifyWith(
+			"release-evidence-fragment-release-4-1.json",
+			() => fragment({ commit: "e".repeat(40) } as Fixture),
+		);
+		expect(unbound.status).toBe(1);
+		expect(unbound.stderr).toContain("not the candidate");
+		const junk = verifyWith(
+			"release-evidence-fragment-release-5-1.json",
+			() => "{",
+		);
+		expect(junk.status).toBe(1);
+		expect(junk.stderr).toContain("release-evidence-fragment-release-5-1.json");
+		const extraEntry = verifyWith(
+			"release-evidence-fragment-release-6-1.json",
+			(f) => {
+				const recorded = manifest(f).entries[0] as Record<string, unknown>;
+				return fragment(f, {
+					entries: [
+						{
+							...recorded,
+							id: "native-local-gates-forged-1",
+							asset: `evidence-native-local-gates-forged-1${String(recorded.asset).endsWith(".tar.gz") ? ".tar.gz" : ".json"}`,
+						},
+					],
+				});
+			},
+		);
+		expect(extraEntry.status).toBe(1);
+		expect(extraEntry.stderr).toContain(
+			"entry native-local-gates-forged-1 is not recorded in the manifest",
+		);
 	});
 
 	it("verify fails when the tag does not point at the candidate", () => {

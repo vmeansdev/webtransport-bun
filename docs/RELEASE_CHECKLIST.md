@@ -151,7 +151,9 @@ All through `bun scripts/release-evidence.ts`:
    name (`HOME`, `PATH`, `USER`, `LOGNAME`, `HOSTNAME`, `RUNNER_*`,
    `GITHUB_*`, `*_TOKEN`, …) and by structure (three or more
    environment-shaped names that are not documented `WT_*`/`WEBTRANSPORT_*`
-   knobs); the local login and hostname; host paths; and any of these hidden
+   knobs); the local login and hostname; host paths (POSIX absolute, Windows
+   drive and UNC paths, and `file:` URIs, wherever they start after a non-path
+   character such as `cache:`, `x=` or `(`; URLs are not paths); and any of these hidden
    behind base64/base64url, hex, percent-encoding or gzip. Encodings are
    rejoined across whitespace, line wraps and split JSON strings, decoded at
    every alignment, inflated when compressed (a tar.gz inside is read), and
@@ -179,7 +181,14 @@ All through `bun scripts/release-evidence.ts`:
    the manifest, re-runs the privacy and proof checks, re-reads every producing
    run, checks that the tag points to the candidate and the package version
    matches, and that every `gaRequired` claim (per the candidate's registry)
-   has passing evidence bound to it. `verify --assets-dir <dir>` is an audit of
+   has passing evidence bound to it. Nothing evidence-named goes unchecked:
+   an `evidence-*` asset the manifest does not record fails verification (as
+   does any other asset named `evidence-*`/`release-evidence-*` that is
+   neither form), and every `release-evidence-fragment-*` asset is parsed,
+   schema-checked, bound to the repository, candidate commit and tag,
+   privacy-scanned, and may only carry entries the manifest recorded
+   unchanged. Run `import --from-release` before verifying a release whose
+   CI fragments are not recorded yet. `verify --assets-dir <dir>` is an audit of
    assets already on disk and is never release verification.
    `bun scripts/promote-release-status.ts` runs the full verification against
    downloaded assets and refuses unless HEAD is the candidate or a descendant

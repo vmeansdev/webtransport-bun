@@ -1558,6 +1558,53 @@ export function listRunArtifacts(
 	}));
 }
 
+/**
+ * A manifest fragment published on the candidate pre-release: it must parse,
+ * pass the fragment schema, be bound to this repository, candidate commit and
+ * tag, pass the same privacy scan as evidence, and carry only entries the
+ * manifest recorded unchanged.
+ */
+export function fragmentAssetProblems(
+	data: Uint8Array,
+	manifest: Manifest,
+	repository: string,
+	tag: string,
+): string[] {
+	const privacy = scrubFile("fragment.json", data, {
+		repoRoots: [],
+		redactHostPaths: false,
+		forbiddenLiterals: [],
+	});
+	if (!privacy.ok) return privacy.problems.map((p) => `privacy scan: ${p}`);
+	let fragment: unknown;
+	try {
+		fragment = JSON.parse(new TextDecoder().decode(data));
+	} catch {
+		return ["is not valid JSON"];
+	}
+	const errors = validateFragment(fragment);
+	if (errors.length > 0) return errors;
+	const typed = fragment as Fragment;
+	const problems: string[] = [];
+	if (typed.repository !== repository)
+		problems.push(`is for ${typed.repository}, not ${repository}`);
+	if (typed.commit !== manifest.candidate.commit)
+		problems.push(
+			`is bound to ${typed.commit}, not the candidate ${manifest.candidate.commit ?? "<unbound>"}`,
+		);
+	if (typed.tag !== null && typed.tag !== tag)
+		problems.push(`is bound to tag ${typed.tag}, not ${tag}`);
+	const entries = new Map(manifest.entries.map((entry) => [entry.id, entry]));
+	for (const entry of typed.entries) {
+		const recorded = entries.get(entry.id);
+		if (!recorded)
+			problems.push(`entry ${entry.id} is not recorded in the manifest`);
+		else if (JSON.stringify(recorded) !== JSON.stringify(entry))
+			problems.push(`entry ${entry.id} differs from the manifest record`);
+	}
+	return problems;
+}
+
 /** Re-check a GitHub Actions producer against the Actions API. */
 function producerFailures(
 	entry: ManifestEntry,
@@ -1799,8 +1846,18 @@ export function verifyRelease(options: VerifyOptions): VerifyReport {
 		// hashed; the remote digest is a cross-check, never a substitute.
 		const hashed = new Map<string, Uint8Array>();
 		for (const asset of release?.assets ?? []) {
-			if (!ASSET_NAME.test(asset.name) && !FRAGMENT_ASSET_NAME.test(asset.name))
+			if (
+				!ASSET_NAME.test(asset.name) &&
+				!FRAGMENT_ASSET_NAME.test(asset.name)
+			) {
+				// Anything published under an evidence-like name must be one of
+				// the two recorded forms; a near miss is not someone else's file.
+				if (/^(?:release-)?evidence-/i.test(asset.name))
+					failures.push(
+						`release asset ${asset.name} has an evidence name but is neither a recorded evidence asset nor a manifest fragment`,
+					);
 				continue;
+			}
 			const data = fetchAsset(asset.name);
 			if (!data) {
 				failures.push(`could not download ${asset.name}`);
@@ -1885,12 +1942,24 @@ export function verifyRelease(options: VerifyOptions): VerifyReport {
 			);
 			verified += 1;
 		}
+		// Every evidence-named asset is published with the candidate and locked
+		// at promotion, so none may go unchecked: an evidence asset must be a
+		// manifest entry (checked above), and a fragment is checked here.
 		const recorded = new Set(manifest.entries.map((entry) => entry.asset));
 		for (const asset of releaseAssets)
 			if (ASSET_NAME.test(asset.name) && !recorded.has(asset.name))
-				warnings.push(
-					`release asset ${asset.name} is not recorded in the manifest`,
+				failures.push(
+					`release asset ${asset.name} is not recorded in the manifest; delete it from ${tag} or record it with import`,
 				);
+		for (const [name, data] of hashed)
+			if (FRAGMENT_ASSET_NAME.test(name))
+				for (const problem of fragmentAssetProblems(
+					data,
+					manifest,
+					repo,
+					tag as string,
+				))
+					failures.push(`fragment ${name}: ${problem}`);
 	} finally {
 		if (!options.assetsDir) rmSync(workDir, { recursive: true, force: true });
 	}
