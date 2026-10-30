@@ -7,8 +7,9 @@
  *
  *   bun scripts/record-command.ts --name <slug> --out <dir> -- <command> [args...]
  *
- * Output is streamed through unchanged; its sha256 becomes the record's
- * `artifactSha256`. The process exits with the command's exit code, so a
+ * Output goes straight to the job log. The record's `artifactSha256` is the
+ * digest of the record itself plus the run identity (there is no separate
+ * artifact). The process exits with the command's exit code, so a
  * wrapped CI step fails exactly when the command does (the record of a failed
  * run is still written, with its real exit code).
  */
@@ -56,26 +57,14 @@ function headCommit(): string {
 
 const commit = headCommit();
 const startedAt = new Date().toISOString();
+// The command's output goes straight to the job log (inherited stdio): piping
+// it through this process competes for CPU with timing-sensitive suites.
 const proc = Bun.spawn(command, {
 	stdin: "inherit",
-	stdout: "pipe",
-	stderr: "pipe",
+	stdout: "inherit",
+	stderr: "inherit",
 	env: process.env,
 });
-const digest = createHash("sha256");
-async function pump(
-	stream: ReadableStream<Uint8Array>,
-	sink: NodeJS.WriteStream,
-): Promise<void> {
-	for await (const chunk of stream) {
-		digest.update(chunk);
-		sink.write(chunk);
-	}
-}
-await Promise.all([
-	pump(proc.stdout, process.stdout),
-	pump(proc.stderr, process.stderr),
-]);
 const exitCode = await proc.exited;
 const finishedAt = new Date().toISOString();
 
@@ -90,13 +79,24 @@ const record = {
 	exitCode,
 	startedAt,
 	finishedAt,
-	artifactSha256: digest.digest("hex"),
 };
+// The record carries no separate artifact (the output lives in the job log),
+// so its digest field binds the record's own content and the run identity.
+const artifactSha256 = createHash("sha256")
+	.update(
+		JSON.stringify({
+			...record,
+			runId: process.env.GITHUB_RUN_ID ?? null,
+			runAttempt: process.env.GITHUB_RUN_ATTEMPT ?? null,
+			job: process.env.GITHUB_JOB ?? null,
+		}),
+	)
+	.digest("hex");
 const dir = join(out, "commands");
 mkdirSync(dir, { recursive: true });
 writeFileSync(
 	join(dir, `${name}.json`),
-	`${JSON.stringify(record, null, 2)}\n`,
+	`${JSON.stringify({ ...record, artifactSha256 }, null, 2)}\n`,
 );
 console.error(
 	`record-command: ${name} exit ${exitCode} recorded for ${commit}`,
