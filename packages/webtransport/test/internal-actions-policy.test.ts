@@ -433,6 +433,58 @@ jobs:
 		expect(result.stderr).toContain("must explicitly grant contents: read");
 	});
 
+	it("publishes pre-release versions to the next dist-tag only", () => {
+		expect(PUBLISH_WORKFLOW).toContain(
+			"version.includes('-') ? 'next' : 'latest'",
+		);
+		const untagged = runPolicy(
+			mutatePublishWorkflow(
+				'--provenance --tag "$DIST_TAG" --registry',
+				"--provenance --registry",
+			),
+			"publish.yml",
+		);
+		expect(untagged.status).toBe(1);
+		expect(untagged.stderr).toContain('publish must pass --tag "$DIST_TAG"');
+		const alwaysLatest = runPolicy(
+			PUBLISH_WORKFLOW.replaceAll(
+				"? 'next' : 'latest'",
+				"? 'latest' : 'latest'",
+			),
+			"publish.yml",
+		);
+		expect(alwaysLatest.status).toBe(1);
+		expect(alwaysLatest.stderr).toContain(
+			'publish must pass --tag "$DIST_TAG"',
+		);
+	});
+
+	it("gates stable releases on the promoted evidence record", () => {
+		const workflow = parseWorkflow(RELEASE_WORKFLOW);
+		const steps = (workflow.jobs?.release?.steps ?? []) as Array<
+			Record<string, unknown>
+		>;
+		const gateIndex = steps.findIndex(
+			(step) => step.name === "GA evidence gate (stable tags)",
+		);
+		const createIndex = steps.findIndex(
+			(step) => step.name === "Create release",
+		);
+		expect(gateIndex).toBeGreaterThan(-1);
+		expect(gateIndex).toBeLessThan(createIndex);
+		const gate = steps[gateIndex] as { if?: string; run?: string };
+		expect(gate.if).toContain("!contains(github.ref_name, '-')");
+		expect(gate.run).toContain("--ga-tag");
+		expect(gate.run).toContain("--require-ready");
+		const verifyWorkflow = readFileSync(
+			join(PROJECT_ROOT, ".github", "workflows", "release-evidence-verify.yml"),
+			"utf8",
+		);
+		expect(verifyWorkflow).toContain("schedule:");
+		expect(verifyWorkflow).toContain("verify --require-ready");
+		expect(verifyWorkflow).toContain("verify --integrity-only");
+	});
+
 	it("justifies contents: write only for an executed release-evidence upload", () => {
 		const job = (command: string) => `
 jobs:

@@ -552,6 +552,21 @@ jobs:
           path: .release-evidence/npm-publish-input/
           if-no-files-found: error
           retention-days: 90
+      - name: GA evidence gate (stable tags)
+        # A stable tag publishes only a promoted candidate: the evidence record
+        # on main must be ready, the GA tag must point at the candidate commit
+        # this run built, and every evidence asset on the candidate pre-release
+        # must still match the promotion lock (scripts/release-evidence.ts).
+        if: ${{ !contains(github.ref_name, '-') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GA_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "+refs/heads/main:refs/remotes/origin/main"
+          git worktree add --detach "$RUNNER_TEMP/evidence-record" origin/main
+          bun "$RUNNER_TEMP/evidence-record/scripts/release-evidence.ts" verify \
+            --root "$RUNNER_TEMP/evidence-record" --ga-tag "$GA_TAG" --require-ready
       - name: Create release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2 resolved 2026-07-22
         with:
@@ -574,9 +589,13 @@ jobs:
     # produced, attaches it with a manifest fragment, and leaves recording it
     # in docs/release-evidence-manifest.json to
     # `bun scripts/release-evidence.ts import --from-release`. It runs after
-    # the release exists, so a bundle refused by the privacy scan never blocks
-    # the prebuilds, npm tarball, parity or interop assets.
+    # the release exists, so a bundle refused by the privacy scan or by its
+    # claim's proof validator never blocks the prebuilds, npm tarball, parity
+    # or interop assets; the failure stays visible on this job. Coverage
+    # evidence comes from coverage.yml (the floor gate needs the native, wasm
+    # and Bun reports), pulled in with `release-evidence.ts fetch`.
     needs: [release]
+    continue-on-error: true
     if: startsWith(github.ref, 'refs/tags/v') && contains(github.ref_name, '-')
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -598,10 +617,6 @@ jobs:
           path: evidence-inputs/fuzz-evidence
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: coverage-artifacts
-          path: evidence-inputs/coverage-artifacts
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
           name: distributed-scale-evidence
           path: evidence-inputs/distributed-scale-evidence
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -610,6 +625,8 @@ jobs:
           path: evidence-inputs/npm-publish-input
       - name: Package scrubbed evidence and its manifest fragment
         env:
+          # package --run-id reads this run back from the Actions API.
+          GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
           CANDIDATE_COMMIT: ${{ github.sha }}
@@ -622,14 +639,13 @@ jobs:
             bun scripts/release-evidence.ts package \
               --fragment "$FRAGMENT" --commit "$CANDIDATE_COMMIT" --tag "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" --workflow release \
-              --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT" \
+              --run-id "$RUN_ID" \
               --out-dir "$OUT" --repo-root "$GITHUB_WORKSPACE" --redact-host-paths "$@"
           }
           pack --claim chromium-native-interop --input evidence-inputs/interop-evidence/interop-evidence.json
           SMOKE="$(find evidence-inputs/fuzz-evidence -name release-smoke.json -type f | head -n 1)"
           test -n "$SMOKE"
           pack --claim fuzz-gates --input "$(dirname "$SMOKE")" --bundle
-          pack --claim coverage-gates --input evidence-inputs/coverage-artifacts --bundle
           pack --claim scale-10k-multisource --input evidence-inputs/distributed-scale-evidence --bundle
           pack --claim package-artifact --input evidence-inputs/npm-publish-input/candidate-identity.json
           echo "EVIDENCE_FRAGMENT=$FRAGMENT" >> "$GITHUB_ENV"

@@ -188,6 +188,9 @@ jobs:
           BOUND_DIGEST: ${{ steps.candidate.outputs.digest }}
         run: |
           set -euo pipefail
+          # Pre-release versions (vX.Y.Z-rc.N) go to the `next` dist-tag and
+          # never move `latest`; stable versions go to `latest`.
+          DIST_TAG="$(node -p "require('./packages/webtransport/package.json').version.includes('-') ? 'next' : 'latest'")"
           IDENTITY="$RUNNER_TEMP/npm-publish-input/candidate-identity.json"
           EXPECTED_DIGEST="$(jq -er '.tarballSha256' "$IDENTITY")"
           ACTUAL_DIGEST="$(shasum -a 256 "$TARBALL" | cut -d' ' -f1)"
@@ -195,13 +198,16 @@ jobs:
             echo "::error::Tarball changed before npm dry-run"
             exit 1
           fi
-          npm publish "$TARBALL" --dry-run --ignore-scripts --access public --registry=https://registry.npmjs.org/
+          npm publish "$TARBALL" --dry-run --ignore-scripts --access public --tag "$DIST_TAG" --registry=https://registry.npmjs.org/
       - name: Publish to npm with trusted publishing and provenance
         env:
           TARBALL: ${{ steps.candidate.outputs.tarball }}
           BOUND_DIGEST: ${{ steps.candidate.outputs.digest }}
         run: |
           set -euo pipefail
+          # Pre-release versions (vX.Y.Z-rc.N) go to the `next` dist-tag and
+          # never move `latest`; stable versions go to `latest`.
+          DIST_TAG="$(node -p "require('./packages/webtransport/package.json').version.includes('-') ? 'next' : 'latest'")"
           IDENTITY="$RUNNER_TEMP/npm-publish-input/candidate-identity.json"
           EXPECTED_DIGEST="$(jq -er '.tarballSha256' "$IDENTITY")"
           ACTUAL_DIGEST="$(shasum -a 256 "$TARBALL" | cut -d' ' -f1)"
@@ -209,4 +215,4 @@ jobs:
             echo "::error::Tarball changed before registry upload"
             exit 1
           fi
-          npm publish "$TARBALL" --ignore-scripts --access public --provenance --registry=https://registry.npmjs.org/
+          npm publish "$TARBALL" --ignore-scripts --access public --provenance --tag "$DIST_TAG" --registry=https://registry.npmjs.org/

@@ -778,6 +778,26 @@ function validatePublishHandoff(
 		(finalPublish?.step.start ?? -1) >
 			(candidate?.start ?? Number.MAX_SAFE_INTEGER) &&
 		/\s--provenance(?:\s|$)/.test(finalPublish?.command ?? "");
+	// Pre-release versions must go to `next` and never move `latest`: every
+	// publish passes --tag "$DIST_TAG", computed in the same step from the
+	// verified package version.
+	const distTagged =
+		canonicalPublishes.length > 0 &&
+		canonicalPublishes.every(
+			({ command, step }) =>
+				/\s--tag\s+"\$DIST_TAG"(?:\s|$)/.test(command) &&
+				commandLines(step).some((line) =>
+					/^DIST_TAG="\$\(node -p "require\('\.\/packages\/webtransport\/package\.json'\)\.version\.includes\('-'\) \? 'next' : 'latest'"\)"$/.test(
+						line,
+					),
+				),
+		);
+	if (!distTagged) {
+		add(
+			job.start,
+			'publish must pass --tag "$DIST_TAG" (next for pre-release versions, latest otherwise)',
+		);
+	}
 	if (rebuilds || !finalPublishValid) {
 		add(
 			job.start,
