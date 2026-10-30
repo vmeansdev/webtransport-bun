@@ -196,6 +196,8 @@ jobs:
         run: bun run build:native
       - name: Install interop deps and Chromium
         run: cd tools/interop && bun install --frozen-lockfile && bun run install:browsers && bun run prepare:interop
+      - name: Fault engine and proxy unit tests
+        run: bun test tools/interop/tests/udp-fault-proxy.test.ts
       - name: Run the fault matrix
         env:
           INTEROP_EVIDENCE: "1"

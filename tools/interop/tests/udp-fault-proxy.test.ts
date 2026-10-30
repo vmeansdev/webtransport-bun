@@ -1,8 +1,11 @@
 import { describe, expect, test } from "bun:test";
+import { createSocket, type Socket } from "node:dgram";
 import {
 	assertFaultProfile,
+	isQuicLongHeader,
 	RELEASE_FAULT_PROFILES,
 	SeededUdpFaultEngine,
+	UdpFaultProxy,
 } from "../udp-fault-proxy.js";
 
 describe("seeded UDP fault engine", () => {
@@ -103,5 +106,66 @@ describe("seeded UDP fault engine", () => {
 				blackHole: { startMs: 0, durationMs: 0 },
 			}),
 		).toThrow("durationMs");
+	});
+});
+
+describe("UDP fault proxy client binding", () => {
+	const bound = (socket: Socket, port = 0) =>
+		new Promise<number>((resolve) =>
+			socket.bind(port, "127.0.0.1", () => resolve(socket.address().port)),
+		);
+	const nextMessage = (socket: Socket, timeoutMs: number) =>
+		new Promise<Buffer | null>((resolve) => {
+			const timer = setTimeout(() => resolve(null), timeoutMs);
+			socket.once("message", (data) => {
+				clearTimeout(timer);
+				resolve(data);
+			});
+		});
+
+	test("classifies QUIC long-header packets", () => {
+		expect(isQuicLongHeader(Uint8Array.of(0xc3, 0))).toBe(true);
+		expect(isQuicLongHeader(Uint8Array.of(0x5b, 0))).toBe(false);
+		expect(isQuicLongHeader(new Uint8Array())).toBe(false);
+	});
+
+	test("a stale short-header sender cannot capture the proxy before the new connection's Initial", async () => {
+		const upstream = createSocket("udp4");
+		const upstreamPort = await bound(upstream);
+		upstream.on("message", (data, remote) =>
+			upstream.send(data, remote.port, remote.address),
+		);
+		const probe = createSocket("udp4");
+		const listenPort = await bound(probe);
+		probe.close();
+		const proxy = new UdpFaultProxy({
+			listenPort,
+			upstreamPort,
+			profile: { name: "binding", seed: 1 },
+		});
+		await proxy.start();
+		const stale = createSocket("udp4");
+		const fresh = createSocket("udp4");
+		await bound(stale);
+		await bound(fresh);
+		try {
+			// The previous scenario's connection: a short-header ACK first.
+			stale.send(Uint8Array.of(0x5b, 1, 2, 3), listenPort, "127.0.0.1");
+			await Bun.sleep(50);
+			const reply = nextMessage(fresh, 2000);
+			fresh.send(Uint8Array.of(0xc0, 9, 9, 9), listenPort, "127.0.0.1");
+			expect([...((await reply) ?? [])]).toEqual([0xc0, 9, 9, 9]);
+			// Once bound, the stale socket stays ignored.
+			const staleReply = nextMessage(stale, 300);
+			stale.send(Uint8Array.of(0xc0, 7), listenPort, "127.0.0.1");
+			expect(await staleReply).toBeNull();
+			// The stale packet never reached the fault engine's accounting.
+			expect(proxy.engine.evidence().stats.seen).toBe(2);
+		} finally {
+			proxy.close();
+			stale.close();
+			fresh.close();
+			upstream.close();
+		}
 	});
 });

@@ -220,6 +220,13 @@ export class UdpFaultProxy {
 			) {
 				return;
 			}
+			// Bind to the connection that opens through this proxy, not to
+			// whatever reaches the port first: the browser keeps sending
+			// short-header packets (ACKs, CONNECTION_CLOSE) for the previous
+			// scenario's connection after the proxy on this port is replaced.
+			// Locking onto that stale socket dropped the new connection's
+			// Initials and failed the scenario on a QUIC idle timeout.
+			if (!this.client && !isQuicLongHeader(data)) return;
 			this.client = { address: remote.address, port: remote.port };
 			this.forward("client-to-server", data, (packet) => back.send(packet));
 		});
@@ -287,6 +294,12 @@ export class UdpFaultProxy {
 		this.back = null;
 		this.client = null;
 	}
+}
+
+/** A QUIC long-header packet (Initial, 0-RTT, Handshake, Retry): only these
+ * open a connection, so only these may bind the proxy to a client. */
+export function isQuicLongHeader(packet: Uint8Array): boolean {
+	return packet.length > 0 && ((packet[0] as number) & 0x80) !== 0;
 }
 
 export const RELEASE_FAULT_PROFILES: readonly UdpFaultProfile[] = [
