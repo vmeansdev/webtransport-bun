@@ -1,26 +1,30 @@
 #!/usr/bin/env bun
 /**
- * Promote docs/release-status.json readiness only when every gaRequired claim
- * is passed with evidence that verifies end to end:
+ * Promote docs/release-status.json readiness only when the candidate's
+ * evidence verifies end to end against the release itself:
  *
- *   - each claim's evidenceIds name entries of docs/release-evidence-manifest.json
- *     that are `passed`, list the claim, and are bound to the manifest candidate;
+ *   - the GA gate set is the pinned registry (docs/release-claims.json) read
+ *     from the candidate commit; release-status.json cannot downgrade it;
+ *   - every gaRequired claim cites manifest entries that are `passed`, list
+ *     the claim, are bound to the candidate, and carry the registered positive
+ *     proof;
  *   - the candidate tag resolves (on GitHub) to the candidate commit and its
  *     release is a pre-release;
- *   - every manifest entry's asset is downloaded from that release and matches
- *     the recorded size, sha256 and file list, passes the privacy backstop, and
- *     does not record a failed outcome or a different commit.
+ *   - every evidence asset is downloaded from that release (never read from a
+ *     local directory) and matches its recorded size, sha256 and file list;
+ *   - every GitHub Actions producer is re-read and built the candidate.
  *
- * Claims with `gaRequired: false` (e.g. scale-10k-multisource) are tracked but
- * do not block GA.
+ * The checkout must be the candidate itself or a descendant that changed only
+ * the evidence record (the manifest and release-status.json). There is no
+ * override.
  *
- * The working tree may be the candidate itself or a descendant that only
- * changed the evidence record (the manifest and release-status.json); anything
- * else needs --allow-stale-candidate.
+ * On success it records a promotion lock in the manifest -- the tag commit and
+ * the sha256 of every evidence asset on the release -- and sets readiness
+ * `ready`. `release-evidence.ts verify` (scheduled, and in the GA release
+ * job) fails if the tag or any evidence asset changes afterwards.
  *
  * Usage:
- *   bun scripts/promote-release-status.ts [--dry-run] [--assets-dir <dir>]
- *        [--commit <40-hex>] [--allow-stale-candidate] [--root <dir>]
+ *   bun scripts/promote-release-status.ts [--dry-run] [--root <dir>]
  */
 import { spawnSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
@@ -32,30 +36,24 @@ import {
 	loadStatus,
 	MANIFEST_RELATIVE_PATH,
 	runGit,
-	SHA40,
 	STATUS_RELATIVE_PATH,
 	verifyRelease,
+	writeManifest,
 } from "./release-evidence-lib.ts";
 
 function parseArgs(argv: string[]) {
-	let commit: string | null = null;
 	let dryRun = false;
-	let allowStale = false;
-	let assetsDir: string | undefined;
 	let root = DEFAULT_ROOT;
 	for (let i = 0; i < argv.length; i++) {
 		const a = argv[i];
 		if (a === "--dry-run") dryRun = true;
-		else if (a === "--allow-stale-candidate") allowStale = true;
-		else if (a === "--commit") commit = argv[++i] ?? null;
-		else if (a === "--assets-dir") assetsDir = argv[++i];
 		else if (a === "--root") root = resolve(argv[++i] ?? ".");
 		else {
 			console.error(`promote-release-status: unknown argument ${a}`);
 			process.exit(2);
 		}
 	}
-	return { commit, dryRun, allowStale, assetsDir, root };
+	return { dryRun, root };
 }
 
 function refuse(failures: string[]): never {
@@ -65,43 +63,30 @@ function refuse(failures: string[]): never {
 }
 
 function main() {
-	const {
-		commit: argCommit,
-		dryRun,
-		allowStale,
-		assetsDir,
-		root,
-	} = parseArgs(process.argv.slice(2));
-	let manifestCommit: string | null;
+	const { dryRun, root } = parseArgs(process.argv.slice(2));
+	const manifestPath = join(root, MANIFEST_RELATIVE_PATH);
+	let manifest: ReturnType<typeof loadManifest>;
 	try {
-		manifestCommit = loadManifest(join(root, MANIFEST_RELATIVE_PATH)).candidate
-			.commit;
+		manifest = loadManifest(manifestPath);
 	} catch (error) {
 		refuse([error instanceof Error ? error.message : String(error)]);
 	}
-	const commit = argCommit ?? manifestCommit;
-	if (!commit || !SHA40.test(commit))
+	const commit = manifest.candidate.commit;
+	if (!commit)
 		refuse([
 			`need a bound candidate: ${MANIFEST_RELATIVE_PATH} has no candidate commit`,
-		]);
-	if (commit !== manifestCommit)
-		refuse([
-			`--commit ${commit} is not the manifest candidate ${manifestCommit ?? "<unbound>"}`,
 		]);
 	if (runGit(["cat-file", "-e", `${commit}^{commit}`], root).status !== 0)
 		refuse([`commit ${commit} does not exist in this repository`]);
 
 	// Promotion certifies the candidate tree. The checkout may only differ from
-	// it by the evidence record itself; certifying a tree that moved on would
-	// silently bless code no evidence was produced for.
+	// it by the evidence record itself.
 	const head = runGit(["rev-parse", "HEAD"], root).stdout.trim();
-	if (head !== commit && !allowStale) {
+	if (head !== commit) {
 		if (
 			runGit(["merge-base", "--is-ancestor", commit, "HEAD"], root).status !== 0
 		)
-			refuse([
-				`candidate ${commit} is not an ancestor of HEAD ${head}; pass --allow-stale-candidate to promote it deliberately`,
-			]);
+			refuse([`candidate ${commit} is not an ancestor of HEAD ${head}`]);
 		const changed = runGit(["diff", "--name-only", commit, "HEAD"], root)
 			.stdout.split("\n")
 			.map((line) => line.trim())
@@ -111,25 +96,31 @@ function main() {
 		);
 		if (foreign.length > 0)
 			refuse([
-				`HEAD ${head} changed ${foreign.length} file(s) beyond the evidence record since candidate ${commit} (first: ${foreign[0]}); pass --allow-stale-candidate to promote it deliberately`,
+				`HEAD ${head} changed ${foreign.length} file(s) beyond the evidence record since candidate ${commit} (first: ${foreign[0]})`,
 			]);
 	}
 
-	const report = verifyRelease({
-		root,
-		assetsDir: assetsDir ? resolve(assetsDir) : undefined,
-	});
+	const report = verifyRelease({ root });
+	if (report.mode !== "release")
+		refuse(["promotion requires assets downloaded from the release"]);
 	const status = loadStatus(root);
 	const failures = [...report.failures];
-	const iwa = status.claims.find((c) => c.id === "iwa-direct-sockets");
-	if (!iwa || iwa.status !== "passed" || !iwa.evidenceIds.length)
-		failures.push("iwa-direct-sockets must be passed with bound evidence");
+	if (manifest.promotion)
+		failures.push(
+			"the manifest is already promoted; bind a new candidate to start over",
+		);
 	for (const warning of report.warnings)
 		console.warn(`promote-release-status: warning: ${warning}`);
 	if (failures.length > 0) refuse(failures);
 
 	status.candidate.commit = commit;
 	status.candidate.readiness = "ready";
+	manifest.promotion = {
+		tag: manifest.candidate.tag as string,
+		tagCommit: commit,
+		verifiedAt: new Date().toISOString(),
+		assets: report.releaseAssets,
+	};
 
 	if (dryRun) {
 		console.log(
@@ -139,6 +130,7 @@ function main() {
 					commit,
 					tag: report.tag,
 					verifiedAssets: report.verifiedEntries,
+					lockedAssets: report.releaseAssets.length,
 					readiness: "ready",
 				},
 				null,
@@ -149,9 +141,10 @@ function main() {
 	}
 
 	const statusPath = join(root, STATUS_RELATIVE_PATH);
+	writeManifest(manifestPath, manifest);
 	writeFileSync(statusPath, `${JSON.stringify(status, null, "\t")}\n`);
 	console.log(
-		`promote-release-status: readiness=ready commit=${commit} tag=${report.tag}`,
+		`promote-release-status: readiness=ready commit=${commit} tag=${report.tag} (${report.releaseAssets.length} assets locked)`,
 	);
 
 	// The documentation truth check validates the real checkout; a --root test
@@ -168,6 +161,8 @@ function main() {
 			"promote-release-status: check-doc-truth failed after write; reverting readiness",
 		);
 		status.candidate.readiness = "pending";
+		manifest.promotion = null;
+		writeManifest(manifestPath, manifest);
 		writeFileSync(statusPath, `${JSON.stringify(status, null, "\t")}\n`);
 		process.exit(1);
 	}

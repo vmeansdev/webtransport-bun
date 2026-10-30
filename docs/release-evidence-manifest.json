@@ -6,5 +6,7 @@
 		"commit": null,
 		"tag": null
 	},
+	"claimRegistrySha256": null,
+	"promotion": null,
 	"entries": []
 }

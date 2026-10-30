@@ -7,19 +7,27 @@
  * (`docs/release-evidence-manifest.json`). See docs/RELEASE_CHECKLIST.md.
  *
  *   bind     --commit <sha> --tag <vX.Y.Z-rc.N> [--package-version <v>] [--reset]
- *   package  --claim <id>... --input <path>... (--run-id <n> [--run-attempt <n>] --workflow <name> | --local <description>)
+ *   package  --claim <id>... --input <path>... (--run-id <n> --workflow <name> | --local <description>)
+ *            (--run-id is read back from the Actions API: same repository and
+ *            workflow, head SHA = candidate, concluded success -- or the
+ *            in-progress run packaging its own evidence from inside itself)
  *            [--id <entry-id>] [--status passed|failed] [--bundle] [--out-dir <dir>]
  *            [--fragment <file> --commit <sha> [--tag <tag>]] [--repo-root <path>...]
  *            [--redact-host-paths] [--forbid <literal>...]
  *   fetch    --run <id> --artifact <name> [--select <subpath>...] --claim <id>... [package options]
  *   import   --fragment <file>... | --from-release
  *   upload   [--tag <tag>] [--assets-dir <dir>] [--fragment <file>] [--create-prerelease] [--execute]
- *   verify   [--assets-dir <dir>] [--download-dir <dir>] [--json]
+ *   verify   [--ga-tag <vX.Y.Z>] [--require-ready | --integrity-only] [--json]
+ *            [--assets-dir <dir>]   (audit only: reads assets from disk; never promotable)
  *
  * Every command takes `--root <dir>` (default: this checkout) and `--repo
  * <owner/name>` (default: the manifest's repository). `upload` is a dry run
  * unless `--execute` is given, and never creates a release unless
  * `--create-prerelease` is also given. Nothing here creates tags.
+ *
+ * Every `passed` entry must carry the positive proof its claim's entry in
+ * docs/release-claims.json requires (scripts/release-claims.ts); packaging
+ * and verification both enforce it.
  */
 import {
 	existsSync,
@@ -39,6 +47,7 @@ import {
 	relative,
 	resolve,
 } from "node:path";
+import { registrySha256 } from "./release-claims.ts";
 import {
 	ASSET_NAME,
 	type BundleFile,
@@ -54,6 +63,7 @@ import {
 	ghJson,
 	inspectMembers,
 	loadManifest,
+	loadWorkingRegistry,
 	MANIFEST_RELATIVE_PATH,
 	type Manifest,
 	type ManifestEntry,
@@ -64,11 +74,13 @@ import {
 	REPOSITORY,
 	type ReleaseStatus,
 	readJsonFile,
+	registryTextAt,
 	runGh,
 	SHA40,
 	STATUS_RELATIVE_PATH,
 	scrubFile,
 	sha256Hex,
+	tagMatchesVersion,
 	validateFragment,
 	verifyRelease,
 	viewRelease,
@@ -89,6 +101,8 @@ const BOOLEAN_FLAGS = new Set([
 	"--from-release",
 	"--reset",
 	"--json",
+	"--require-ready",
+	"--integrity-only",
 ]);
 
 class UsageError extends Error {}
@@ -161,10 +175,12 @@ function bind(args: Args): void {
 		throw new UsageError("--tag must look like v1.0.0-rc.2");
 	const packageVersion =
 		one(args, "--package-version") ?? packageVersionAt(root, commit);
-	if (`v${packageVersion}` !== tag)
+	if (!tagMatchesVersion(tag, packageVersion))
 		throw new Error(
 			`tag ${tag} does not name the candidate package version ${packageVersion}`,
 		);
+	// The gate set is whatever the candidate commit pinned.
+	const claimRegistrySha256 = registrySha256(registryTextAt(root, commit));
 	const rebinding =
 		manifest.candidate.commit !== null && manifest.candidate.commit !== commit;
 	if (rebinding && manifest.entries.length > 0 && !args.flags.has("--reset"))
@@ -175,6 +191,8 @@ function bind(args: Args): void {
 	if (dropping) manifest.entries = [];
 	manifest.candidate = { commit, tag };
 	manifest.packageVersion = packageVersion;
+	manifest.claimRegistrySha256 = claimRegistrySha256;
+	manifest.promotion = null;
 	// release-status.json names the same candidate; a new candidate starts
 	// every claim over, because no evidence carries across commits.
 	const statusPath = join(root, STATUS_RELATIVE_PATH);
@@ -337,7 +355,16 @@ function packageEvidence(
 		throw new Error(
 			`evidence refused by the privacy scan:\n - ${problems.join("\n - ")}`,
 		);
-	const contentProblems = inspectMembers(scrubbed, commit, status);
+	const registry = loadWorkingRegistry(
+		root,
+		target.kind === "manifest" ? target.manifest.claimRegistrySha256 : null,
+	);
+	const contentProblems = inspectMembers(
+		scrubbed,
+		{ commit, status, claimIds, producerKind: producer.kind },
+		registry,
+		root,
+	);
 	if (contentProblems.length > 0)
 		throw new Error(
 			`evidence content does not support status=${status}:\n - ${contentProblems.join("\n - ")}`,
@@ -408,7 +435,12 @@ function packageEvidence(
 	return entry;
 }
 
-function localForbiddenLiterals(args: Args): string[] {
+/** The operator's login and machine name must not reach published evidence.
+ * The repository owner is already public (it is in every asset URL), so it is
+ * not treated as a leak when the login happens to be the same word; host paths
+ * under a home directory are still refused by the path rules. */
+function localForbiddenLiterals(args: Args, repository: string): string[] {
+	const owner = repository.split("/")[0]?.toLowerCase();
 	const literals = [...many(args, "--forbid")];
 	try {
 		literals.push(userInfo().username);
@@ -417,7 +449,92 @@ function localForbiddenLiterals(args: Args): string[] {
 	}
 	const host = hostname();
 	literals.push(host, host.split(".")[0] ?? host);
-	return literals.filter((literal) => literal.length >= 3);
+	return literals.filter(
+		(literal) => literal.length >= 3 && literal.toLowerCase() !== owner,
+	);
+}
+
+type RunJob = { name?: string; status?: string; conclusion?: string };
+
+/**
+ * Provenance for `package --run-id`: the run is read back from the Actions
+ * API, never self-attested. It must be in this repository, be the named
+ * workflow, have built the candidate, and have succeeded. The one exception
+ * is the run packaging its own evidence (the release workflow's
+ * evidence-assets job): it is still in progress, so it must be this very
+ * process's run (GITHUB_RUN_ID/GITHUB_SHA/GITHUB_REPOSITORY) and every job
+ * that has finished so far must have succeeded.
+ */
+function verifiedRunProducer(
+	root: string,
+	repository: string,
+	runId: string,
+	workflow: string,
+	commit: string,
+	status: string,
+): Producer {
+	const run = ghJson(
+		[
+			"run",
+			"view",
+			runId,
+			"--repo",
+			repository,
+			"--json",
+			"databaseId,headSha,status,conclusion,workflowName,attempt,jobs",
+		],
+		root,
+	) as {
+		databaseId: number;
+		headSha: string;
+		status: string;
+		conclusion: string;
+		workflowName: string;
+		attempt: number;
+		jobs?: RunJob[];
+	};
+	if (String(run.databaseId) !== runId)
+		throw new Error(`run ${runId} could not be read back`);
+	if (run.workflowName !== workflow)
+		throw new Error(
+			`run ${runId} is workflow ${run.workflowName}, not ${workflow}`,
+		);
+	if (run.headSha !== commit)
+		throw new Error(
+			`run ${runId} built ${run.headSha}, not the candidate ${commit}`,
+		);
+	if (run.status === "completed") {
+		if (status === "passed" && run.conclusion !== "success")
+			throw new Error(
+				`run ${runId} concluded ${run.conclusion}; it cannot be passed evidence`,
+			);
+	} else {
+		const self =
+			process.env.GITHUB_RUN_ID === runId &&
+			process.env.GITHUB_SHA === commit &&
+			process.env.GITHUB_REPOSITORY === repository;
+		if (!self)
+			throw new Error(
+				`run ${runId} is ${run.status}; only a completed run, or the run packaging its own evidence, can be a producer`,
+			);
+		const failed = (run.jobs ?? []).filter(
+			(job) =>
+				job.status === "completed" &&
+				job.conclusion !== "success" &&
+				job.conclusion !== "skipped",
+		);
+		if (failed.length > 0)
+			throw new Error(`run ${runId} has ${failed.length} unsuccessful job(s)`);
+	}
+	return {
+		kind: "github-actions",
+		repository,
+		workflow,
+		runId: Number(runId),
+		runAttempt: run.attempt,
+		url: `https://github.com/${repository}/actions/runs/${runId}`,
+		headSha: run.headSha,
+	};
 }
 
 function packageCommand(args: Args): void {
@@ -436,29 +553,21 @@ function packageCommand(args: Args): void {
 	let forbidden: string[];
 	if (runId !== undefined) {
 		const repository = one(args, "--repo") ?? targetRepository(target);
-		const runAttempt = Number(one(args, "--run-attempt") ?? "1");
 		const workflow = required(args, "--workflow");
-		if (
-			!/^\d+$/.test(runId) ||
-			!Number.isSafeInteger(runAttempt) ||
-			runAttempt <= 0
-		)
-			throw new UsageError(
-				"--run-id and --run-attempt must be positive integers",
-			);
-		producer = {
-			kind: "github-actions",
+		if (!/^\d+$/.test(runId))
+			throw new UsageError("--run-id must be a positive integer");
+		producer = verifiedRunProducer(
+			root,
 			repository,
+			runId,
 			workflow,
-			runId: Number(runId),
-			runAttempt,
-			url: `https://github.com/${repository}/actions/runs/${runId}`,
-			headSha: targetCommit(target),
-		};
+			targetCommit(target),
+			one(args, "--status") ?? "passed",
+		);
 		forbidden = many(args, "--forbid");
 	} else {
 		producer = { kind: "local", description: local as string };
-		forbidden = localForbiddenLiterals(args);
+		forbidden = localForbiddenLiterals(args, targetRepository(target));
 	}
 	packageEvidence(args, root, target, { inputs, producer, forbidden });
 }
@@ -751,9 +860,11 @@ function uploadCommand(args: Args): void {
 	for (const file of local) {
 		const remote = release?.assets.find((asset) => asset.name === file.name);
 		if (remote) {
+			// Without a digest the attached bytes are downloaded and hashed;
+			// a matching size proves nothing.
 			const same = remote.digest
 				? remote.digest === `sha256:${file.sha256}`
-				: remote.size === file.size;
+				: remoteSha256(repository, tag, file.name, root) === file.sha256;
 			if (!same)
 				throw new Error(
 					`${file.name} is already attached to ${tag} with different content; assets are immutable`,
@@ -787,16 +898,47 @@ function uploadCommand(args: Args): void {
 	log(`attached ${pending.length} asset(s) to ${tag}`);
 }
 
+function remoteSha256(
+	repository: string,
+	tag: string,
+	name: string,
+	root: string,
+): string | undefined {
+	const work = mkdtempSync(join(tmpdir(), "release-evidence-check-"));
+	try {
+		const result = runGh(
+			[
+				"release",
+				"download",
+				tag,
+				"--repo",
+				repository,
+				"--dir",
+				work,
+				"--pattern",
+				name,
+			],
+			root,
+		);
+		const path = join(work, name);
+		if (result.status !== 0 || !existsSync(path)) return undefined;
+		return sha256Hex(new Uint8Array(readFileSync(path)));
+	} finally {
+		rmSync(work, { recursive: true, force: true });
+	}
+}
+
 // --------------------------------------------------------------------------- verify
 
 function verifyCommand(args: Args): void {
 	const root = rootOf(args);
 	const assetsDir = one(args, "--assets-dir");
-	const downloadDir = one(args, "--download-dir");
 	const report = verifyRelease({
 		root,
 		assetsDir: assetsDir ? resolve(assetsDir) : undefined,
-		downloadDir: downloadDir ? resolve(downloadDir) : undefined,
+		gaTag: one(args, "--ga-tag"),
+		requireReady: args.flags.has("--require-ready"),
+		integrityOnly: args.flags.has("--integrity-only"),
 	});
 	if (args.flags.has("--json")) console.log(JSON.stringify(report, null, 2));
 	for (const warning of report.warnings)
@@ -807,7 +949,9 @@ function verifyCommand(args: Args): void {
 		process.exit(1);
 	}
 	log(
-		`verify passed: ${report.verifiedEntries} asset(s) for ${report.tag} at ${report.commit}`,
+		report.mode === "release"
+			? `verify passed: ${report.verifiedEntries} asset(s) for ${report.tag} at ${report.commit}`
+			: `audit passed for ${report.verifiedEntries} local asset(s); this is not release verification`,
 	);
 }
 

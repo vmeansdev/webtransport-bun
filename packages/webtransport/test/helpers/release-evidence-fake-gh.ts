@@ -21,6 +21,8 @@ type Release = {
 	isDraft: boolean;
 	isImmutable: boolean;
 	assets: Asset[];
+	/** Model a release API response without asset digests. */
+	omitDigests?: boolean;
 	dir: string;
 };
 type Run = {
@@ -103,11 +105,9 @@ if (group === "release") {
 				isPrerelease: release.isPrerelease,
 				isDraft: release.isDraft,
 				isImmutable: release.isImmutable,
-				assets: release.assets.map(({ name, size, digest }) => ({
-					name,
-					size,
-					digest,
-				})),
+				assets: release.assets.map(({ name, size, digest }) =>
+					release.omitDigests ? { name, size } : { name, size, digest },
+				),
 			}),
 		);
 		process.exit(0);

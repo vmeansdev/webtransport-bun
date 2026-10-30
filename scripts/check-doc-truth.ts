@@ -2,6 +2,7 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { relative, resolve } from "node:path";
+import { validateRegistry } from "./release-claims.ts";
 import {
 	type ManifestEntry,
 	STATUS_SCHEMA_VERSION,
@@ -61,6 +62,7 @@ if (process.env.CHECK_DOC_TRUTH_ROOT && rootOverride === undefined) {
 }
 const ROOT = resolve(rootOverride ?? resolve(import.meta.dir, ".."));
 const STATUS_PATH = resolve(ROOT, "docs", "release-status.json");
+const CLAIM_REGISTRY_PATH = resolve(ROOT, "docs", "release-claims.json");
 const EVIDENCE_MANIFEST_PATH = resolve(
 	ROOT,
 	"docs",
@@ -272,6 +274,7 @@ function checkEvidence(status: ReleaseStatus): Map<string, EvidenceEntry> {
 	if (errors.length > 0) return evidence;
 	const typed = manifest as {
 		candidate: { commit: string | null };
+		promotion: unknown;
 		entries: EvidenceEntry[];
 	};
 	if (typed.candidate.commit !== (status.candidate?.commit ?? null)) {
@@ -280,8 +283,71 @@ function checkEvidence(status: ReleaseStatus): Map<string, EvidenceEntry> {
 			`differs from the evidence manifest candidate ${typed.candidate.commit ?? "<unbound>"}`,
 		);
 	}
+	if (
+		(typed.promotion !== null) !==
+		(status.candidate?.readiness === "ready")
+	) {
+		report(
+			"release-status.candidate.readiness",
+			"ready exactly when the evidence manifest carries a promotion lock (scripts/promote-release-status.ts)",
+		);
+	}
 	for (const entry of typed.entries) evidence.set(entry.id, entry);
 	return evidence;
+}
+
+/**
+ * The claim set and every claim's surface and gaRequired flag are pinned by
+ * docs/release-claims.json; release-status.json records progress only and
+ * cannot add, drop, or downgrade a gate.
+ */
+function checkClaimRegistry(status: ReleaseStatus): void {
+	const location = relative(ROOT, CLAIM_REGISTRY_PATH);
+	const text = readText(CLAIM_REGISTRY_PATH);
+	if (text === undefined) return;
+	let registry: unknown;
+	try {
+		registry = JSON.parse(text);
+	} catch (error) {
+		report(
+			location,
+			`must contain valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+		);
+		return;
+	}
+	const errors = validateRegistry(registry);
+	for (const error of errors) report(location, error);
+	if (errors.length > 0) return;
+	const pinned = (
+		registry as {
+			claims: { id: string; surface: string; gaRequired: boolean }[];
+		}
+	).claims;
+	const claims = Array.isArray(status.claims) ? status.claims : [];
+	for (const entry of pinned) {
+		const claim = claims.find((c) => c?.id === entry.id);
+		if (!claim) {
+			report("release-status.claims", `is missing pinned claim ${entry.id}`);
+			continue;
+		}
+		if (claim.gaRequired !== entry.gaRequired)
+			report(
+				"release-status.claims",
+				`${entry.id} gaRequired must be ${entry.gaRequired} as pinned in ${location}`,
+			);
+		if (claim.surface !== entry.surface)
+			report(
+				"release-status.claims",
+				`${entry.id} surface must be ${entry.surface} as pinned in ${location}`,
+			);
+	}
+	for (const claim of claims) {
+		if (claim?.id && !pinned.some((entry) => entry.id === claim.id))
+			report(
+				"release-status.claims",
+				`${claim.id} is not a pinned claim in ${location}`,
+			);
+	}
 }
 
 function checkClaims(
@@ -875,6 +941,7 @@ if (status) {
 			"must be null or a 40-character commit",
 		);
 	}
+	checkClaimRegistry(status);
 	const evidence = checkEvidence(status);
 	const claims = checkClaims(status, evidence);
 	checkSurfaces(status, claims);

@@ -1,0 +1,189 @@
+{
+	"schemaVersion": 1,
+	"claims": [
+		{
+			"id": "native-local-gates",
+			"surface": "native",
+			"gaRequired": true,
+			"proof": {
+				"kind": "command-records",
+				"commandPatterns": ["cargo test", "bun test"]
+			}
+		},
+		{
+			"id": "wasm-local-gates",
+			"surface": "wasm",
+			"gaRequired": true,
+			"proof": {
+				"kind": "command-records",
+				"commandPatterns": ["test:wasm"]
+			}
+		},
+		{
+			"id": "cross-platform-matrix",
+			"surface": "release",
+			"gaRequired": true,
+			"proof": {
+				"kind": "command-records",
+				"minRecords": 3,
+				"platforms": ["linux", "darwin", "win32"]
+			}
+		},
+		{
+			"id": "runtime-consumers",
+			"surface": "release",
+			"gaRequired": true,
+			"proof": {
+				"kind": "command-records",
+				"commandPatterns": ["test-package-artifact"]
+			}
+		},
+		{
+			"id": "chromium-native-interop",
+			"surface": "native",
+			"gaRequired": true,
+			"proof": {
+				"kind": "playwright-report",
+				"minExpected": 1
+			}
+		},
+		{
+			"id": "chromium-wasm-interop",
+			"surface": "wasm",
+			"gaRequired": true,
+			"proof": {
+				"kind": "playwright-report",
+				"minExpected": 1
+			}
+		},
+		{
+			"id": "iwa-direct-sockets",
+			"surface": "wasm",
+			"gaRequired": true,
+			"proof": {
+				"kind": "iwa-proof"
+			}
+		},
+		{
+			"id": "fault-matrix",
+			"surface": "release",
+			"gaRequired": true,
+			"proof": {
+				"kind": "playwright-report",
+				"minExpected": 1
+			}
+		},
+		{
+			"id": "coverage-gates",
+			"surface": "release",
+			"gaRequired": true,
+			"proof": {
+				"kind": "llvm-cov-floors"
+			}
+		},
+		{
+			"id": "fuzz-gates",
+			"surface": "release",
+			"gaRequired": true,
+			"proof": {
+				"kind": "fuzz-release-smoke"
+			}
+		},
+		{
+			"id": "scale-10k-multisource",
+			"surface": "release",
+			"gaRequired": false,
+			"proof": {
+				"kind": "distributed-scale",
+				"minSessions": 10000
+			}
+		},
+		{
+			"id": "package-artifact",
+			"surface": "release",
+			"gaRequired": true,
+			"proof": {
+				"kind": "npm-publish-identity"
+			}
+		},
+		{
+			"id": "supply-chain-provenance",
+			"surface": "release",
+			"gaRequired": true,
+			"proof": {
+				"kind": "command-records",
+				"commandPatterns": ["audit signatures"]
+			}
+		},
+		{
+			"id": "soak-24h",
+			"surface": "release",
+			"gaRequired": true,
+			"proof": {
+				"kind": "soak-aggregate",
+				"hours": 24
+			}
+		},
+		{
+			"id": "soak-72h",
+			"surface": "release",
+			"gaRequired": true,
+			"proof": {
+				"kind": "soak-aggregate",
+				"hours": 72
+			}
+		},
+		{
+			"id": "auto-review-zero-p0-p4",
+			"surface": "release",
+			"gaRequired": true,
+			"proof": {
+				"kind": "review-record"
+			}
+		},
+		{
+			"id": "final-no-change-confirmation",
+			"surface": "release",
+			"gaRequired": true,
+			"proof": {
+				"kind": "no-change-confirmation"
+			}
+		},
+		{
+			"id": "wasm-dynamic-qpack",
+			"surface": "wasm",
+			"gaRequired": true,
+			"proof": {
+				"kind": "command-records",
+				"commandPatterns": ["qpack"]
+			}
+		},
+		{
+			"id": "wasm-multi-session",
+			"surface": "wasm",
+			"gaRequired": true,
+			"proof": {
+				"kind": "command-records",
+				"commandPatterns": ["multi-session"]
+			}
+		},
+		{
+			"id": "wasm-0rtt",
+			"surface": "wasm",
+			"gaRequired": true,
+			"proof": {
+				"kind": "command-records",
+				"commandPatterns": ["0rtt"]
+			}
+		},
+		{
+			"id": "wasm-facade-parity",
+			"surface": "wasm",
+			"gaRequired": true,
+			"proof": {
+				"kind": "command-records",
+				"commandPatterns": ["facade"]
+			}
+		}
+	]
+}

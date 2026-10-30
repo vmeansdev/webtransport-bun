@@ -24,9 +24,11 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
-import { gunzipSync, gzipSync } from "node:zlib";
+import { gunzipSync, gzipSync, inflateRawSync } from "node:zlib";
 import {
 	containsForbiddenLiteral,
+	encodedPayloadReason,
+	findEncodedPayloadViolations,
 	findEnvironmentDumpViolations,
 	findPrivacyViolations,
 	findTextPrivacyViolations,
@@ -35,6 +37,13 @@ import {
 	unsafeStringReason,
 	unsafeTextLineReason,
 } from "../tools/interop/evidence-privacy.ts";
+import {
+	CLAIM_REGISTRY_RELATIVE_PATH,
+	type ClaimRegistry,
+	parseRegistry,
+	registrySha256,
+	validateClaimProof,
+} from "./release-claims.ts";
 
 export const DEFAULT_ROOT = resolve(import.meta.dir, "..");
 export const MANIFEST_RELATIVE_PATH = "docs/release-evidence-manifest.json";
@@ -94,11 +103,25 @@ export type ManifestEntry = {
 	files: BundleFile[];
 };
 
+export type LockedAsset = { name: string; size: number; sha256: string };
+
+/** Written by promote: the release state that was verified. Any later change
+ * to the tag or to the evidence assets fails `verify` and the GA gate. */
+export type Promotion = {
+	tag: string;
+	tagCommit: string;
+	verifiedAt: string;
+	assets: LockedAsset[];
+};
+
 export type Manifest = {
 	schemaVersion: 1;
 	repository: string;
 	packageVersion: string | null;
 	candidate: { commit: string | null; tag: string | null };
+	/** sha256 of docs/release-claims.json at the candidate commit. */
+	claimRegistrySha256: string | null;
+	promotion: Promotion | null;
 	entries: ManifestEntry[];
 };
 
@@ -319,7 +342,15 @@ export function validateManifest(value: unknown): string[] {
 	if (!isObject(value)) return ["manifest: must be an object"];
 	exactKeys(
 		value,
-		["schemaVersion", "repository", "packageVersion", "candidate", "entries"],
+		[
+			"schemaVersion",
+			"repository",
+			"packageVersion",
+			"candidate",
+			"claimRegistrySha256",
+			"promotion",
+			"entries",
+		],
 		"manifest",
 		errors,
 	);
@@ -357,11 +388,80 @@ export function validateManifest(value: unknown): string[] {
 			errors.push("manifest.candidate.tag: must be null or a vX.Y.Z[-pre] tag");
 		if ((candidate.commit === null) !== (candidate.tag === null))
 			errors.push("manifest.candidate: commit and tag are bound together");
-		if (candidate.commit !== null && value.packageVersion === null)
+		if ((candidate.commit === null) !== (value.packageVersion === null))
 			errors.push(
-				"manifest.packageVersion: required once a candidate is bound",
+				"manifest.packageVersion: set exactly when a candidate is bound",
 			);
+		if ((candidate.commit === null) !== (value.claimRegistrySha256 === null))
+			errors.push(
+				"manifest.claimRegistrySha256: set exactly when a candidate is bound",
+			);
+		if (
+			typeof candidate.tag === "string" &&
+			typeof value.packageVersion === "string" &&
+			!tagMatchesVersion(candidate.tag, value.packageVersion)
+		)
+			errors.push(
+				"manifest.candidate.tag: must be v<packageVersion> or a pre-release of it",
+			);
+		if (value.promotion !== null) {
+			const promotion = value.promotion;
+			if (!isObject(promotion))
+				errors.push("manifest.promotion: must be null or an object");
+			else {
+				exactKeys(
+					promotion,
+					["tag", "tagCommit", "verifiedAt", "assets"],
+					"manifest.promotion",
+					errors,
+				);
+				if (promotion.tag !== candidate.tag)
+					errors.push("manifest.promotion.tag: must be the candidate tag");
+				if (promotion.tagCommit !== candidate.commit)
+					errors.push(
+						"manifest.promotion.tagCommit: must be the candidate commit",
+					);
+				if (!isIsoTimestamp(promotion.verifiedAt))
+					errors.push(
+						"manifest.promotion.verifiedAt: must be an ISO-8601 UTC timestamp",
+					);
+				if (!Array.isArray(promotion.assets) || promotion.assets.length === 0)
+					errors.push(
+						"manifest.promotion.assets: must list the verified assets",
+					);
+				else
+					promotion.assets.forEach((asset, index) => {
+						const at = `manifest.promotion.assets[${index}]`;
+						if (!isObject(asset)) {
+							errors.push(`${at}: must be an object`);
+							return;
+						}
+						exactKeys(asset, ["name", "size", "sha256"], at, errors);
+						if (
+							typeof asset.name !== "string" ||
+							!(
+								ASSET_NAME.test(asset.name) ||
+								FRAGMENT_ASSET_NAME.test(asset.name)
+							)
+						)
+							errors.push(`${at}.name: not an evidence asset name`);
+						if (
+							!Number.isSafeInteger(asset.size) ||
+							(asset.size as number) <= 0
+						)
+							errors.push(`${at}.size: must be a positive integer`);
+						if (typeof asset.sha256 !== "string" || !SHA256.test(asset.sha256))
+							errors.push(`${at}.sha256: must be lowercase hex sha256`);
+					});
+			}
+		}
 	}
+	if (
+		value.claimRegistrySha256 !== null &&
+		(typeof value.claimRegistrySha256 !== "string" ||
+			!SHA256.test(value.claimRegistrySha256))
+	)
+		errors.push("manifest.claimRegistrySha256: must be null or a sha256");
 	if (!Array.isArray(value.entries)) {
 		errors.push("manifest.entries: must be an array");
 		return errors;
@@ -435,8 +535,26 @@ export function emptyManifest(repository: string): Manifest {
 		repository,
 		packageVersion: null,
 		candidate: { commit: null, tag: null },
+		claimRegistrySha256: null,
+		promotion: null,
 		entries: [],
 	};
+}
+
+/** Base version without its pre-release suffix: 1.0.0-rc.2 -> 1.0.0. */
+export function baseVersion(version: string): string {
+	return version.replace(/-.*$/, "");
+}
+
+/**
+ * The candidate tag names the package version at the candidate commit,
+ * either exactly (`v1.0.0-rc.2` for package 1.0.0-rc.2) or as a pre-release
+ * of a stable package version (`v1.0.0-rc.2` for package 1.0.0, so the GA tag
+ * `v1.0.0` can later point at the same commit).
+ */
+export function tagMatchesVersion(tag: string, version: string): boolean {
+	if (tag === `v${version}`) return true;
+	return !version.includes("-") && tag.startsWith(`v${version}-`);
 }
 
 export function readJsonFile(path: string): unknown {
@@ -537,8 +655,9 @@ function writeText(
 	header.set(bytes, offset);
 }
 
-/** Minimal deterministic ustar writer: sorted members, fixed mode/owner/mtime. */
-export function createTarGz(members: BundleMember[]): Uint8Array {
+/** Minimal deterministic ustar writer: sorted members, fixed mode/owner/mtime,
+ * terminated by exactly two zero blocks. */
+export function createTar(members: BundleMember[]): Uint8Array {
 	const sorted = [...members].sort((a, b) =>
 		a.name < b.name ? -1 : a.name > b.name ? 1 : 0,
 	);
@@ -590,7 +709,11 @@ export function createTarGz(members: BundleMember[]): Uint8Array {
 		tar.set(block, offset);
 		offset += block.length;
 	}
-	return new Uint8Array(gzipSync(tar, { level: 9 }));
+	return tar;
+}
+
+export function createTarGz(members: BundleMember[]): Uint8Array {
+	return new Uint8Array(gzipSync(createTar(members), { level: 9 }));
 }
 
 function readCString(
@@ -603,31 +726,80 @@ function readCString(
 	return new TextDecoder().decode(end === -1 ? slice : slice.subarray(0, end));
 }
 
-/** Reads only what `createTarGz` writes: regular files with safe names. */
+function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
+	if (a.length !== b.length) return false;
+	for (let i = 0; i < a.length; i += 1) if (a[i] !== b[i]) return false;
+	return true;
+}
+
+/**
+ * Inflate a bundle, refusing anything a scan could miss: the gzip stream must
+ * be a single member with no header extras (FNAME/FEXTRA/FCOMMENT) and no
+ * bytes after its trailer.
+ */
+function inflateSingleGzipMember(data: Uint8Array): Uint8Array {
+	if (
+		data.length < 18 ||
+		data[0] !== 0x1f ||
+		data[1] !== 0x8b ||
+		data[2] !== 0x08
+	)
+		throw new Error("bundle is not a gzip stream");
+	if (data[3] !== 0) throw new Error("bundle gzip header carries extra fields");
+	const raw = inflateRawSync(data.subarray(10), { info: true }) as unknown as {
+		buffer: Uint8Array;
+		engine: { bytesWritten: number };
+	};
+	const consumed = raw.engine.bytesWritten;
+	if (10 + consumed + 8 !== data.length)
+		throw new Error("bundle has bytes after its gzip stream");
+	const inflated = new Uint8Array(gunzipSync(data));
+	if (!equalBytes(inflated, new Uint8Array(raw.buffer)))
+		throw new Error("bundle gzip stream is not a single member");
+	return inflated;
+}
+
+/**
+ * Reads only what `createTarGz` writes: regular files with safe names, in
+ * order, followed by exactly the end-of-archive marker. Every decompressed
+ * byte is accounted for: the archive must be byte-identical to the canonical
+ * archive of the members it lists, so nothing can hide in padding, header
+ * fields, after the end-of-archive marker, or in unlisted members.
+ */
 export function readTarGz(data: Uint8Array): BundleMember[] {
-	const tar = new Uint8Array(gunzipSync(data));
+	const tar = inflateSingleGzipMember(data);
 	const members: BundleMember[] = [];
 	let offset = 0;
+	let terminated = false;
 	while (offset + 512 <= tar.length) {
 		const header = tar.subarray(offset, offset + 512);
-		if (header.every((byte) => byte === 0)) break;
+		if (header.every((byte) => byte === 0)) {
+			terminated = true;
+			break;
+		}
 		const name = readCString(header, 0, 100);
 		const prefix = readCString(header, 345, 155);
 		const fullName = prefix ? `${prefix}/${name}` : name;
 		const type = header[156];
-		if (type !== 0x30 && type !== 0)
-			throw new Error(`bundle member ${fullName} is not a regular file`);
+		if (type !== 0x30)
+			throw new Error("bundle contains a member that is not a regular file");
 		if (!isSafeMemberName(fullName))
 			throw new Error("bundle contains an unsafe member name");
-		const size = Number.parseInt(readCString(header, 124, 12).trim() || "0", 8);
-		if (!Number.isSafeInteger(size) || size < 0)
-			throw new Error(`bundle member ${fullName} has an invalid size`);
+		const sizeText = readCString(header, 124, 12);
+		if (!/^[0-7]{1,11}$/.test(sizeText))
+			throw new Error("bundle member has an invalid size");
+		const size = Number.parseInt(sizeText, 8);
 		const start = offset + 512;
 		if (start + size > tar.length)
-			throw new Error(`bundle member ${fullName} is truncated`);
+			throw new Error("bundle member is truncated");
 		members.push({ name: fullName, data: tar.slice(start, start + size) });
 		offset = start + Math.ceil(size / 512) * 512;
 	}
+	if (!terminated) throw new Error("bundle has no end-of-archive marker");
+	if (!equalBytes(tar, createTar(members)))
+		throw new Error(
+			"bundle is not canonical: it carries bytes outside its listed members",
+		);
 	return members;
 }
 
@@ -655,6 +827,7 @@ const REFUSE_ALWAYS = new Set([
 
 function isRefuseAlways(reason: string): boolean {
 	return (
+		reason.startsWith("encoded payload") ||
 		REFUSE_ALWAYS.has(reason) ||
 		reason.startsWith("property name is a credential")
 	);
@@ -744,6 +917,7 @@ export function scrubFile(
 		const firstPass = [
 			...findPrivacyViolations(scrubbed),
 			...findEnvironmentDumpViolations(scrubbed),
+			...findEncodedPayloadViolations(scrubbed, options.forbiddenLiterals),
 		];
 		for (const violation of firstPass) {
 			if (isRefuseAlways(violation.reason) || !options.redactHostPaths)
@@ -776,6 +950,10 @@ export function scrubFile(
 		if (isRefuseAlways(violation.reason) || !options.redactHostPaths)
 			problems.push(`${name}:${violation.line}: ${violation.reason}`);
 	}
+	rerooted.split(/\r?\n/).forEach((line, index) => {
+		const reason = encodedPayloadReason(line, options.forbiddenLiterals);
+		if (reason) problems.push(`${name}:${index + 1}: ${reason}`);
+	});
 	if (problems.length > 0) return { ok: false, problems };
 	const output = options.redactHostPaths
 		? rerooted.split("\n").map(redactTextLine).join("\n")
@@ -888,12 +1066,21 @@ export function assetMembers(
 	return [{ name: entry.files[0]?.name ?? entry.asset, data }];
 }
 
+export type InspectTarget = {
+	commit: string;
+	status: EvidenceStatus;
+	claimIds: string[];
+	producerKind: Producer["kind"];
+};
+
 /** Content-level checks shared by package (before upload) and verify (after
- * download): privacy backstop, recorded outcome, and recorded commit. */
+ * download): privacy backstop, recorded outcome, recorded commit, and -- for
+ * a passed entry -- the registered positive proof of every claim it names. */
 export function inspectMembers(
 	members: BundleMember[],
-	commit: string,
-	status: EvidenceStatus,
+	target: InspectTarget,
+	registry: ClaimRegistry,
+	root: string,
 ): string[] {
 	const problems: string[] = [];
 	for (const member of members) {
@@ -911,13 +1098,30 @@ export function inspectMembers(
 			continue; // already reported by the privacy recheck
 		}
 		const recorded = artifactCommit(document);
-		if (recorded !== undefined && recorded !== commit)
+		if (recorded !== undefined && recorded !== target.commit)
 			problems.push(
-				`${member.name}: records commit ${recorded}, not ${commit}`,
+				`${member.name}: records commit ${recorded}, not ${target.commit}`,
 			);
-		if (status === "passed")
+		if (target.status === "passed")
 			for (const failure of artifactSemanticFailures(document))
 				problems.push(`${member.name}: ${failure}`);
+	}
+	if (target.status !== "passed") return problems;
+	for (const claimId of target.claimIds) {
+		const claim = registry.claims.find((c) => c.id === claimId);
+		if (!claim) {
+			problems.push(
+				`claim ${claimId} is not in ${CLAIM_REGISTRY_RELATIVE_PATH}`,
+			);
+			continue;
+		}
+		for (const problem of validateClaimProof(claim, {
+			commit: target.commit,
+			producerKind: target.producerKind,
+			members,
+			root,
+		}))
+			problems.push(`${claimId} proof: ${problem}`);
 	}
 	return problems;
 }
@@ -1052,32 +1256,86 @@ export function packageVersionAt(root: string, commit: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Claim registry
+
+export function registryPath(root: string): string {
+	return join(root, CLAIM_REGISTRY_RELATIVE_PATH);
+}
+
+/** The registry text committed at `commit`; the gate set is whatever the
+ * candidate itself pinned, never what a later checkout says. */
+export function registryTextAt(root: string, commit: string): string {
+	const result = runGit(
+		["show", `${commit}:${CLAIM_REGISTRY_RELATIVE_PATH}`],
+		root,
+	);
+	if (result.status !== 0)
+		throw new Error(
+			`candidate ${commit} has no ${CLAIM_REGISTRY_RELATIVE_PATH}; it predates the pinned claim registry`,
+		);
+	return result.stdout;
+}
+
+/** Registry for packaging: the working tree's, which must be the one the
+ * manifest bound (when it bound one). */
+export function loadWorkingRegistry(
+	root: string,
+	expectedSha256: string | null,
+): ClaimRegistry {
+	const text = readFileSync(registryPath(root), "utf8");
+	if (expectedSha256 !== null && registrySha256(text) !== expectedSha256)
+		throw new Error(
+			`${CLAIM_REGISTRY_RELATIVE_PATH} differs from the registry bound to the candidate`,
+		);
+	return parseRegistry(text);
+}
+
+// ---------------------------------------------------------------------------
 // Verification
 
 export type VerifyOptions = {
 	root: string;
-	/** Pre-downloaded assets; when absent they are fetched with gh. */
+	/**
+	 * Audit mode only: check assets already on disk instead of downloading
+	 * them. A report produced this way has `mode: "local-assets"` and can never
+	 * be used to promote.
+	 */
 	assetsDir?: string;
-	/** Keep downloaded assets here instead of a temporary directory. */
-	downloadDir?: string;
+	/** GA gate: this tag must also point at the candidate commit. */
+	gaTag?: string;
+	/** Require readiness `ready` and an intact promotion lock. */
+	requireReady?: boolean;
+	/**
+	 * Check the record's integrity (assets, tag, proofs, producers, bindings
+	 * that exist) without requiring every GA claim to have passed yet. Used by
+	 * the scheduled verification while a candidate is still collecting
+	 * evidence.
+	 */
+	integrityOnly?: boolean;
 };
 
 export type VerifyReport = {
+	mode: "release" | "local-assets";
 	failures: string[];
 	warnings: string[];
 	commit: string | null;
 	tag: string | null;
 	verifiedEntries: number;
+	/** Every evidence/fragment asset on the release, hashed after download. */
+	releaseAssets: LockedAsset[];
 };
 
 export function loadStatus(root: string): ReleaseStatus {
 	return readJsonFile(join(root, STATUS_RELATIVE_PATH)) as ReleaseStatus;
 }
 
-/** Claim-to-evidence binding against the manifest, without touching assets. */
+/** Claim-to-evidence binding against the manifest and the pinned registry,
+ * without touching assets. GA requirements come from the registry only. */
 export function checkClaimBindings(
 	status: ReleaseStatus,
 	manifest: Manifest,
+	registry: ClaimRegistry,
+	requireComplete = true,
 ): string[] {
 	const failures: string[] = [];
 	const entries = new Map(manifest.entries.map((entry) => [entry.id, entry]));
@@ -1090,12 +1348,40 @@ export function checkClaimBindings(
 		failures.push(
 			"release-status.evidence is retired; evidence is recorded in the manifest",
 		);
-	if (status.candidate.commit !== null && status.candidate.commit !== commit)
+	if (status.candidate.commit !== commit)
 		failures.push(
-			`release-status candidate ${status.candidate.commit} differs from manifest candidate ${commit ?? "<unbound>"}`,
+			`release-status candidate ${status.candidate.commit ?? "<unbound>"} differs from manifest candidate ${commit ?? "<unbound>"}`,
 		);
-	for (const claim of status.claims) {
-		if (claim.gaRequired === false) continue;
+	const statusIds = status.claims.map((claim) => claim.id).sort();
+	const registryIds = registry.claims.map((claim) => claim.id).sort();
+	if (JSON.stringify(statusIds) !== JSON.stringify(registryIds))
+		failures.push(
+			`release-status claims differ from ${CLAIM_REGISTRY_RELATIVE_PATH}`,
+		);
+	for (const registered of registry.claims) {
+		const claim = status.claims.find((c) => c.id === registered.id);
+		if (claim && claim.gaRequired !== registered.gaRequired)
+			failures.push(
+				`claim ${claim.id} gaRequired=${String(claim.gaRequired)} differs from the pinned registry (${registered.gaRequired})`,
+			);
+		if (!claim) continue;
+		const mustPass = registered.gaRequired && requireComplete;
+		if (!mustPass && claim.status !== "passed") {
+			// Not (yet) required: any evidence it cites must still exist and
+			// name it.
+			for (const id of claim.evidenceIds ?? []) {
+				const entry = entries.get(id);
+				if (!entry)
+					failures.push(
+						`claim ${claim.id} references evidence ${id} missing from the manifest`,
+					);
+				else if (!entry.claimIds.includes(claim.id))
+					failures.push(
+						`evidence ${id} is not recorded as evidence for claim ${claim.id}`,
+					);
+			}
+			continue;
+		}
 		if (claim.status !== "passed") {
 			failures.push(`claim ${claim.id} status=${claim.status}`);
 			continue;
@@ -1133,43 +1419,155 @@ export function checkClaimBindings(
 	return failures;
 }
 
+type RunView = {
+	headSha?: string;
+	status?: string;
+	conclusion?: string;
+	workflowName?: string;
+};
+
+/** Re-check a GitHub Actions producer against the Actions API. */
+function producerFailures(
+	entry: ManifestEntry,
+	repository: string,
+	root: string,
+	cache: Map<string, RunView | Error>,
+): string[] {
+	const producer = entry.producer;
+	if (producer.kind !== "github-actions") return [];
+	if (producer.repository !== repository)
+		return [
+			`evidence ${entry.id} was produced in ${producer.repository}, not ${repository}`,
+		];
+	const key = String(producer.runId);
+	let run = cache.get(key);
+	if (!run) {
+		try {
+			run = ghJson(
+				[
+					"run",
+					"view",
+					key,
+					"--repo",
+					repository,
+					"--json",
+					"headSha,status,conclusion,workflowName",
+				],
+				root,
+			) as RunView;
+		} catch (error) {
+			run = error instanceof Error ? error : new Error(String(error));
+		}
+		cache.set(key, run);
+	}
+	if (run instanceof Error)
+		return [`evidence ${entry.id}: producing run ${key} could not be read`];
+	const failures: string[] = [];
+	if (run.headSha !== entry.commit)
+		failures.push(
+			`evidence ${entry.id}: run ${key} built ${String(run.headSha)}, not ${entry.commit}`,
+		);
+	if (run.workflowName !== producer.workflow)
+		failures.push(
+			`evidence ${entry.id}: run ${key} is workflow ${String(run.workflowName)}, not ${producer.workflow}`,
+		);
+	if (
+		entry.status === "passed" &&
+		(run.status !== "completed" || run.conclusion !== "success")
+	)
+		failures.push(
+			`evidence ${entry.id}: run ${key} did not complete successfully`,
+		);
+	return failures;
+}
+
+function downloadAsset(
+	repo: string,
+	tag: string,
+	name: string,
+	dir: string,
+	root: string,
+): Uint8Array | undefined {
+	const download = runGh(
+		[
+			"release",
+			"download",
+			tag,
+			"--repo",
+			repo,
+			"--dir",
+			dir,
+			"--pattern",
+			name,
+			"--clobber",
+		],
+		root,
+	);
+	const path = join(dir, name);
+	if (download.status !== 0 || !existsSync(path)) return undefined;
+	return new Uint8Array(readFileSync(path));
+}
+
 /**
- * Full release verification: manifest contract, candidate identity (tag ->
- * commit, package version), every asset's size and sha256 as downloaded from
- * the release, content-level checks, and claim bindings.
+ * Full release verification: manifest contract, pinned claim registry,
+ * candidate identity (tag -> commit, package version, optional GA tag), every
+ * asset downloaded from the release and checked against its recorded size,
+ * sha256 and file list, the content and positive-proof checks, the producing
+ * runs, the claim bindings, and -- once promoted -- the promotion lock.
  */
 export function verifyRelease(options: VerifyOptions): VerifyReport {
 	const failures: string[] = [];
 	const warnings: string[] = [];
-	const manifestPath = join(options.root, MANIFEST_RELATIVE_PATH);
-	let manifest: Manifest;
-	try {
-		manifest = loadManifest(manifestPath);
-	} catch (error) {
-		return {
-			failures: [error instanceof Error ? error.message : String(error)],
-			warnings,
-			commit: null,
-			tag: null,
-			verifiedEntries: 0,
-		};
-	}
-	const { commit, tag } = manifest.candidate;
+	const releaseAssets: LockedAsset[] = [];
+	const mode = options.assetsDir ? "local-assets" : "release";
+	let verified = 0;
+	let commit: string | null = null;
+	let tag: string | null = null;
 	const report = (): VerifyReport => ({
+		mode,
 		failures,
 		warnings,
 		commit,
 		tag,
 		verifiedEntries: verified,
+		releaseAssets,
 	});
-	let verified = 0;
-	if (commit === null || tag === null) {
+	let manifest: Manifest;
+	try {
+		manifest = loadManifest(join(options.root, MANIFEST_RELATIVE_PATH));
+	} catch (error) {
+		failures.push(error instanceof Error ? error.message : String(error));
+		return report();
+	}
+	commit = manifest.candidate.commit;
+	tag = manifest.candidate.tag;
+	if (commit === null || tag === null || manifest.packageVersion === null) {
 		failures.push(
 			"manifest has no bound candidate (run release-evidence.ts bind)",
 		);
 		return report();
 	}
+	if (mode === "local-assets")
+		warnings.push(
+			"audit mode: assets were read from disk, not downloaded from the release",
+		);
 	const repo = manifest.repository;
+
+	let registry: ClaimRegistry | undefined;
+	try {
+		const text = registryTextAt(options.root, commit);
+		if (registrySha256(text) !== manifest.claimRegistrySha256)
+			failures.push(
+				"claim registry at the candidate differs from the one the manifest bound",
+			);
+		if (readFileSync(registryPath(options.root), "utf8") !== text)
+			failures.push(
+				`${CLAIM_REGISTRY_RELATIVE_PATH} changed since the candidate; the gate set is pinned by the candidate`,
+			);
+		registry = parseRegistry(text);
+	} catch (error) {
+		failures.push(error instanceof Error ? error.message : String(error));
+	}
 
 	try {
 		const version = packageVersionAt(options.root, commit);
@@ -1177,21 +1575,34 @@ export function verifyRelease(options: VerifyOptions): VerifyReport {
 			failures.push(
 				`manifest packageVersion ${manifest.packageVersion} != candidate package.json ${version}`,
 			);
-		if (`v${version}` !== tag)
+		if (!tagMatchesVersion(tag, version))
 			failures.push(
 				`candidate tag ${tag} does not name the candidate package version ${version}`,
 			);
+		if (
+			options.gaTag !== undefined &&
+			options.gaTag !== `v${baseVersion(version)}`
+		)
+			failures.push(`GA tag ${options.gaTag} is not v${baseVersion(version)}`);
 	} catch (error) {
 		failures.push(error instanceof Error ? error.message : String(error));
 	}
 
 	let release: ReleaseView | undefined;
+	let tagCommit: string | undefined;
 	try {
-		const tagCommit = remoteTagCommit(repo, tag, options.root);
+		tagCommit = remoteTagCommit(repo, tag, options.root);
 		if (tagCommit !== commit)
 			failures.push(
 				`tag ${tag} points to ${tagCommit}, not the candidate ${commit}`,
 			);
+		if (options.gaTag !== undefined) {
+			const gaCommit = remoteTagCommit(repo, options.gaTag, options.root);
+			if (gaCommit !== commit)
+				failures.push(
+					`GA tag ${options.gaTag} points to ${gaCommit}, not the candidate ${commit}`,
+				);
+		}
 		release = viewRelease(repo, tag, options.root);
 		if (!release) failures.push(`release ${tag} does not exist`);
 		else {
@@ -1203,62 +1614,54 @@ export function verifyRelease(options: VerifyOptions): VerifyReport {
 		failures.push(error instanceof Error ? error.message : String(error));
 	}
 
-	let workDir = options.assetsDir;
-	let cleanup: string | undefined;
-	if (!workDir && release) {
-		workDir =
-			options.downloadDir ?? mkdtempSync(join(tmpdir(), "release-evidence-"));
-		if (!options.downloadDir) cleanup = workDir;
-	}
+	const workDir =
+		options.assetsDir ?? mkdtempSync(join(tmpdir(), "release-evidence-"));
+	const runCache = new Map<string, RunView | Error>();
 	try {
-		for (const entry of manifest.entries) {
-			if (release) {
-				const remote = release.assets.find(
-					(asset) => asset.name === entry.asset,
-				);
-				if (!remote) {
-					failures.push(
-						`asset ${entry.asset} (${entry.id}) is not attached to ${tag}`,
-					);
-					continue;
-				}
-				if (remote.size !== entry.size)
-					failures.push(
-						`asset ${entry.asset} size ${remote.size} != manifest ${entry.size}`,
-					);
-				if (remote.digest && remote.digest !== `sha256:${entry.sha256}`)
-					failures.push(
-						`asset ${entry.asset} digest differs from the manifest`,
-					);
+		const fetchAsset = (name: string): Uint8Array | undefined => {
+			if (options.assetsDir) {
+				const path = join(options.assetsDir, name);
+				return existsSync(path)
+					? new Uint8Array(readFileSync(path))
+					: undefined;
 			}
-			if (!workDir) continue;
-			const local = join(workDir, entry.asset);
-			if (!options.assetsDir) {
-				const download = runGh(
-					[
-						"release",
-						"download",
-						tag,
-						"--repo",
-						repo,
-						"--dir",
-						workDir,
-						"--pattern",
-						entry.asset,
-						"--clobber",
-					],
-					options.root,
-				);
-				if (download.status !== 0) {
-					failures.push(`could not download ${entry.asset}`);
-					continue;
-				}
-			}
-			if (!existsSync(local)) {
-				failures.push(`asset ${entry.asset} was not found locally`);
+			return downloadAsset(repo, tag as string, name, workDir, options.root);
+		};
+		// Every evidence and fragment asset on the release is downloaded and
+		// hashed; the remote digest is a cross-check, never a substitute.
+		const hashed = new Map<string, Uint8Array>();
+		for (const asset of release?.assets ?? []) {
+			if (!ASSET_NAME.test(asset.name) && !FRAGMENT_ASSET_NAME.test(asset.name))
+				continue;
+			const data = fetchAsset(asset.name);
+			if (!data) {
+				failures.push(`could not download ${asset.name}`);
 				continue;
 			}
-			const data = new Uint8Array(readFileSync(local));
+			const sha256 = sha256Hex(data);
+			if (asset.digest && asset.digest !== `sha256:${sha256}`)
+				failures.push(
+					`asset ${asset.name} digest differs from its downloaded content`,
+				);
+			if (asset.size !== data.length)
+				failures.push(
+					`asset ${asset.name} size differs from its downloaded content`,
+				);
+			hashed.set(asset.name, data);
+			releaseAssets.push({ name: asset.name, size: data.length, sha256 });
+		}
+		releaseAssets.sort((a, b) =>
+			a.name < b.name ? -1 : a.name > b.name ? 1 : 0,
+		);
+
+		for (const entry of manifest.entries) {
+			const data = hashed.get(entry.asset);
+			if (!data) {
+				failures.push(
+					`asset ${entry.asset} (${entry.id}) is not attached to ${tag}`,
+				);
+				continue;
+			}
 			if (data.length !== entry.size) {
 				failures.push(
 					`asset ${entry.asset} is ${data.length} bytes, manifest says ${entry.size}`,
@@ -1296,29 +1699,71 @@ export function verifyRelease(options: VerifyOptions): VerifyReport {
 						`asset ${entry.asset} member ${member.name} does not match the manifest file list`,
 					);
 			}
-			for (const problem of inspectMembers(members, entry.commit, entry.status))
-				failures.push(`asset ${entry.asset}: ${problem}`);
+			if (registry)
+				for (const problem of inspectMembers(
+					members,
+					{
+						commit: entry.commit,
+						status: entry.status,
+						claimIds: entry.claimIds,
+						producerKind: entry.producer.kind,
+					},
+					registry,
+					options.root,
+				))
+					failures.push(`asset ${entry.asset}: ${problem}`);
+			failures.push(...producerFailures(entry, repo, options.root, runCache));
 			verified += 1;
 		}
-		if (release) {
-			const recorded = new Set(manifest.entries.map((entry) => entry.asset));
-			for (const asset of release.assets) {
-				if (ASSET_NAME.test(asset.name) && !recorded.has(asset.name))
-					warnings.push(
-						`release asset ${asset.name} is not recorded in the manifest`,
-					);
-			}
-		}
+		const recorded = new Set(manifest.entries.map((entry) => entry.asset));
+		for (const asset of releaseAssets)
+			if (ASSET_NAME.test(asset.name) && !recorded.has(asset.name))
+				warnings.push(
+					`release asset ${asset.name} is not recorded in the manifest`,
+				);
 	} finally {
-		if (cleanup) rmSync(cleanup, { recursive: true, force: true });
+		if (!options.assetsDir) rmSync(workDir, { recursive: true, force: true });
 	}
 
+	let status: ReleaseStatus | undefined;
 	try {
-		failures.push(...checkClaimBindings(loadStatus(options.root), manifest));
+		status = loadStatus(options.root);
+		if (registry)
+			failures.push(
+				...checkClaimBindings(
+					status,
+					manifest,
+					registry,
+					!options.integrityOnly,
+				),
+			);
 	} catch (error) {
 		failures.push(
 			`release-status: ${error instanceof Error ? error.message : String(error)}`,
 		);
 	}
+
+	// Promotion lock: once promoted, the release must stay exactly as verified.
+	const promotion = manifest.promotion;
+	if (options.requireReady) {
+		if (status?.candidate.readiness !== "ready")
+			failures.push("release-status readiness is not ready");
+		if (!promotion) failures.push("manifest has no promotion lock");
+	}
+	if (promotion) {
+		if (tagCommit !== undefined && promotion.tagCommit !== tagCommit)
+			failures.push(
+				`tag ${tag} moved since promotion (${promotion.tagCommit} -> ${tagCommit})`,
+			);
+		if (JSON.stringify(promotion.assets) !== JSON.stringify(releaseAssets))
+			failures.push(`evidence assets on ${tag} changed since promotion`);
+		if (status && status.candidate.readiness !== "ready")
+			failures.push(
+				"manifest is promoted but release-status readiness is not ready",
+			);
+	} else if (status?.candidate.readiness === "ready")
+		failures.push(
+			"release-status is ready but the manifest has no promotion lock",
+		);
 	return report();
 }

@@ -2,7 +2,7 @@
 	"$schema": "https://json-schema.org/draft/2020-12/schema",
 	"$id": "https://webtransport-bun.local/docs/release-evidence-manifest.schema.json",
 	"title": "WebTransport release evidence manifest",
-	"description": "Checksum manifest for release evidence stored as GitHub Release assets of the candidate pre-release. Enforced by scripts/release-evidence-lib.ts (validateManifest); keep both in step.",
+	"description": "Checksum manifest for release evidence stored as GitHub Release assets of the candidate pre-release. Enforced by scripts/release-evidence-lib.ts (validateManifest); keep both in step. Rules the schema cannot express: every entry commit equals candidate.commit, candidate.tag is v<packageVersion> or a pre-release of it, and promotion.tag/tagCommit equal the candidate.",
 	"type": "object",
 	"additionalProperties": false,
 	"required": [
@@ -10,15 +10,23 @@
 		"repository",
 		"packageVersion",
 		"candidate",
+		"claimRegistrySha256",
+		"promotion",
 		"entries"
 	],
 	"properties": {
-		"schemaVersion": { "const": 1 },
-		"repository": { "$ref": "#/$defs/repository" },
+		"schemaVersion": {
+			"const": 1
+		},
+		"repository": {
+			"$ref": "#/$defs/repository"
+		},
 		"packageVersion": {
 			"description": "packages/webtransport version at the candidate commit; the tag is v<packageVersion>.",
 			"oneOf": [
-				{ "type": "null" },
+				{
+					"type": "null"
+				},
 				{
 					"type": "string",
 					"pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?$"
@@ -31,12 +39,21 @@
 			"required": ["commit", "tag"],
 			"properties": {
 				"commit": {
-					"oneOf": [{ "type": "null" }, { "$ref": "#/$defs/commit" }]
+					"oneOf": [
+						{
+							"type": "null"
+						},
+						{
+							"$ref": "#/$defs/commit"
+						}
+					]
 				},
 				"tag": {
 					"description": "Pre-release tag whose release carries the evidence assets; must point to commit.",
 					"oneOf": [
-						{ "type": "null" },
+						{
+							"type": "null"
+						},
 						{
 							"type": "string",
 							"pattern": "^v\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?$"
@@ -45,9 +62,33 @@
 				}
 			}
 		},
+		"claimRegistrySha256": {
+			"description": "sha256 of docs/release-claims.json at the candidate commit; the GA gate set the evidence is judged against.",
+			"oneOf": [
+				{
+					"type": "null"
+				},
+				{
+					"$ref": "#/$defs/sha256"
+				}
+			]
+		},
+		"promotion": {
+			"description": "Written by scripts/promote-release-status.ts: the release state that was verified. Later changes to the tag or the evidence assets fail verification.",
+			"oneOf": [
+				{
+					"type": "null"
+				},
+				{
+					"$ref": "#/$defs/promotion"
+				}
+			]
+		},
 		"entries": {
 			"type": "array",
-			"items": { "$ref": "#/$defs/entry" }
+			"items": {
+				"$ref": "#/$defs/entry"
+			}
 		}
 	},
 	"$defs": {
@@ -55,8 +96,14 @@
 			"type": "string",
 			"pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
 		},
-		"commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
-		"sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+		"commit": {
+			"type": "string",
+			"pattern": "^[0-9a-f]{40}$"
+		},
+		"sha256": {
+			"type": "string",
+			"pattern": "^[0-9a-f]{64}$"
+		},
 		"entry": {
 			"type": "object",
 			"additionalProperties": false,
@@ -82,27 +129,44 @@
 					"type": "array",
 					"minItems": 1,
 					"uniqueItems": true,
-					"items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" }
+					"items": {
+						"type": "string",
+						"pattern": "^[a-z0-9][a-z0-9-]*$"
+					}
 				},
 				"asset": {
 					"description": "Release asset name: evidence-<id>.json or evidence-<id>.tar.gz.",
 					"type": "string",
 					"pattern": "^evidence-[a-z0-9][a-z0-9.-]{2,119}\\.(?:json|tar\\.gz)$"
 				},
-				"size": { "type": "integer", "minimum": 1 },
-				"sha256": { "$ref": "#/$defs/sha256" },
+				"size": {
+					"type": "integer",
+					"minimum": 1
+				},
+				"sha256": {
+					"$ref": "#/$defs/sha256"
+				},
 				"commit": {
 					"description": "Commit the evidence was produced at; equals candidate.commit.",
 					"$ref": "#/$defs/commit"
 				},
-				"status": { "enum": ["passed", "failed"] },
+				"status": {
+					"enum": ["passed", "failed"]
+				},
 				"producer": {
 					"oneOf": [
-						{ "$ref": "#/$defs/githubActionsProducer" },
-						{ "$ref": "#/$defs/localProducer" }
+						{
+							"$ref": "#/$defs/githubActionsProducer"
+						},
+						{
+							"$ref": "#/$defs/localProducer"
+						}
 					]
 				},
-				"createdAt": { "type": "string", "format": "date-time" },
+				"createdAt": {
+					"type": "string",
+					"format": "date-time"
+				},
 				"files": {
 					"description": "Scrubbed files inside the asset (the asset itself for a .json asset).",
 					"type": "array",
@@ -112,9 +176,18 @@
 						"additionalProperties": false,
 						"required": ["name", "size", "sha256"],
 						"properties": {
-							"name": { "type": "string", "minLength": 1, "maxLength": 255 },
-							"size": { "type": "integer", "minimum": 0 },
-							"sha256": { "$ref": "#/$defs/sha256" }
+							"name": {
+								"type": "string",
+								"minLength": 1,
+								"maxLength": 255
+							},
+							"size": {
+								"type": "integer",
+								"minimum": 0
+							},
+							"sha256": {
+								"$ref": "#/$defs/sha256"
+							}
 						}
 					}
 				}
@@ -133,11 +206,24 @@
 				"headSha"
 			],
 			"properties": {
-				"kind": { "const": "github-actions" },
-				"repository": { "$ref": "#/$defs/repository" },
-				"workflow": { "type": "string", "minLength": 1 },
-				"runId": { "type": "integer", "minimum": 1 },
-				"runAttempt": { "type": "integer", "minimum": 1 },
+				"kind": {
+					"const": "github-actions"
+				},
+				"repository": {
+					"$ref": "#/$defs/repository"
+				},
+				"workflow": {
+					"type": "string",
+					"minLength": 1
+				},
+				"runId": {
+					"type": "integer",
+					"minimum": 1
+				},
+				"runAttempt": {
+					"type": "integer",
+					"minimum": 1
+				},
 				"url": {
 					"type": "string",
 					"pattern": "^https://github\\.com/[^/]+/[^/]+/actions/runs/\\d+(?:/attempts/\\d+)?$"
@@ -153,7 +239,9 @@
 			"additionalProperties": false,
 			"required": ["kind", "description"],
 			"properties": {
-				"kind": { "const": "local" },
+				"kind": {
+					"const": "local"
+				},
 				"description": {
 					"description": "Who/what produced it, without host paths, logins or hostnames.",
 					"type": "string",
@@ -161,6 +249,101 @@
 					"maxLength": 300
 				}
 			}
+		},
+		"promotion": {
+			"type": "object",
+			"additionalProperties": false,
+			"required": ["tag", "tagCommit", "verifiedAt", "assets"],
+			"properties": {
+				"tag": {
+					"type": "string",
+					"pattern": "^v\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?$"
+				},
+				"tagCommit": {
+					"$ref": "#/$defs/commit"
+				},
+				"verifiedAt": {
+					"type": "string",
+					"format": "date-time"
+				},
+				"assets": {
+					"type": "array",
+					"minItems": 1,
+					"items": {
+						"type": "object",
+						"additionalProperties": false,
+						"required": ["name", "size", "sha256"],
+						"properties": {
+							"name": {
+								"type": "string",
+								"pattern": "^(?:evidence-[a-z0-9][a-z0-9.-]{2,119}\\.(?:json|tar\\.gz)|release-evidence-fragment-[A-Za-z0-9.-]{1,100}\\.json)$"
+							},
+							"size": {
+								"type": "integer",
+								"minimum": 1
+							},
+							"sha256": {
+								"$ref": "#/$defs/sha256"
+							}
+						}
+					}
+				}
+			}
 		}
-	}
+	},
+	"allOf": [
+		{
+			"if": {
+				"properties": {
+					"candidate": {
+						"properties": {
+							"commit": {
+								"type": "null"
+							}
+						}
+					}
+				}
+			},
+			"then": {
+				"properties": {
+					"candidate": {
+						"properties": {
+							"tag": {
+								"type": "null"
+							}
+						}
+					},
+					"packageVersion": {
+						"type": "null"
+					},
+					"claimRegistrySha256": {
+						"type": "null"
+					},
+					"promotion": {
+						"type": "null"
+					},
+					"entries": {
+						"maxItems": 0
+					}
+				}
+			},
+			"else": {
+				"properties": {
+					"candidate": {
+						"properties": {
+							"tag": {
+								"type": "string"
+							}
+						}
+					},
+					"packageVersion": {
+						"type": "string"
+					},
+					"claimRegistrySha256": {
+						"type": "string"
+					}
+				}
+			}
+		}
+	]
 }

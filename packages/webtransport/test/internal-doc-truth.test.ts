@@ -95,11 +95,30 @@ function validStatus() {
 	return {
 		schemaVersion: 2,
 		candidate: { commit: COMMIT, readiness: "pending" },
+		registry: {
+			schemaVersion: 1,
+			claims: [
+				{
+					id: "native-local",
+					surface: "native",
+					gaRequired: true,
+					proof: { kind: "command-records" },
+				},
+				{
+					id: "wasm-browser",
+					surface: "wasm",
+					gaRequired: true,
+					proof: { kind: "iwa-proof" },
+				},
+			],
+		},
 		manifest: {
 			schemaVersion: 1,
 			repository: "example/webtransport-bun",
 			packageVersion: "1.0.0-rc.2",
 			candidate: { commit: COMMIT, tag: "v1.0.0-rc.2" },
+			claimRegistrySha256: "b".repeat(64),
+			promotion: null as null | Record<string, unknown>,
 			entries: [
 				manifestEntry("native-bun-linux", "native-local"),
 				manifestEntry("wasm-iwa", "wasm-browser"),
@@ -111,12 +130,14 @@ function validStatus() {
 				surface: "native",
 				status: "passed",
 				evidenceIds: ["native-bun-linux"],
+				gaRequired: true,
 			},
 			{
 				id: "wasm-browser",
 				surface: "wasm",
 				status: "passed",
 				evidenceIds: ["wasm-iwa"],
+				gaRequired: true,
 			},
 		],
 		surfaces: {
@@ -273,7 +294,11 @@ pub(crate) static CLIENT_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
 });`,
 	);
 	mutate?.(fixture, root);
-	const { manifest, ...status } = fixture;
+	const { manifest, registry, ...status } = fixture;
+	writeFileSync(
+		join(root, "docs", "release-claims.json"),
+		JSON.stringify(registry),
+	);
 	writeFileSync(
 		join(root, "docs", "release-status.json"),
 		JSON.stringify(status),
@@ -337,6 +362,36 @@ describe("documentation truth policy", () => {
 		expect(result.status).toBe(1);
 		expect(result.stderr).toContain(
 			"evidence wasm-iwa is not recorded as evidence for native-local",
+		);
+	});
+
+	it("rejects a status file that downgrades a pinned gate", () => {
+		const result = runPolicy((fixture) => {
+			getAt(fixture.claims, 0).gaRequired = false;
+		});
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain(
+			"native-local gaRequired must be true as pinned in docs/release-claims.json",
+		);
+	});
+
+	it("rejects a claim the registry does not pin, and a missing pinned claim", () => {
+		const result = runPolicy((fixture) => {
+			getAt(fixture.claims, 1).id = "wasm-renamed";
+			fixture.surfaces.wasm.requiredClaims = ["wasm-renamed"];
+		});
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain("is missing pinned claim wasm-browser");
+		expect(result.stderr).toContain("wasm-renamed is not a pinned claim");
+	});
+
+	it("ties readiness to the manifest promotion lock", () => {
+		const ready = runPolicy((fixture) => {
+			fixture.candidate.readiness = "ready";
+		});
+		expect(ready.status).toBe(1);
+		expect(ready.stderr).toContain(
+			"ready exactly when the evidence manifest carries a promotion lock",
 		);
 	});
 
