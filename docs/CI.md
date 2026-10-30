@@ -35,6 +35,10 @@ six-way matrix.
 5. Interop — Playwright Chromium (`cd tools/interop && bun run playwright test`)
 6. Smoke test — `bun add` from built package
 
+**fault-matrix** job — `ubuntu-latest` only
+
+Runs the seeded user-space UDP fault matrix (`tools/interop/playwright.fault.config.ts`, seven profiles: loss, duplication, reordering, fixed delay, jitter, burst loss, black-hole recovery) against the native addon server with `INTEROP_EVIDENCE=1`, verifies the sanitized Playwright report with `verify-evidence.ts --interop`, and uploads it with the matrix's own `fault-matrix.json` as `release-evidence-fault-matrix` (the `fault-matrix` claim's producer).
+
 **load** job — `ubuntu-latest` only, `LOAD_CLIENT_PROBE_TIMEOUT_MS=15000` job-wide
 
 1. Build reference + load-client
@@ -95,7 +99,7 @@ docs/RELEASE_CHECKLIST.md: it does not replace the 24h/72h release soak.
 
 ### Release evidence artifacts from test.yml
 
-`scripts/record-command.ts` wraps gate commands and writes release-evidence command records, uploaded as named artifacts that `release-evidence.ts fetch` pulls in for the candidate: `release-evidence-native-gates-<os>` (recorded `cargo test` and `bun test` per matrix OS), `release-evidence-runtime-consumers-<os>-node<version>` (exact-package consumers), `release-evidence-wasm-gates` (`test:wasm` plus the QPACK, multi-session, 0-RTT and facade suites), `release-evidence-wasm-interop` (the sanitized `INTEROP_EVIDENCE=1` Playwright report, verified with `verify-evidence.ts --interop`), and the joined `release-evidence-cross-platform` / `release-evidence-runtime-consumers` from the `release-evidence` job. See docs/RELEASE_CHECKLIST.md § Who produces each claim's evidence.
+`scripts/record-command.ts` wraps gate commands and writes release-evidence command records, uploaded as named artifacts that `release-evidence.ts fetch` pulls in for the candidate: `release-evidence-native-gates-<os>` (recorded `cargo test` and `bun test` per matrix OS), `release-evidence-runtime-consumers-<os>-node<version>` (exact-package consumers), `release-evidence-wasm-gates` (`test:wasm` plus the QPACK, multi-session, 0-RTT and facade suites), `release-evidence-wasm-interop` (the sanitized `INTEROP_EVIDENCE=1` Playwright report, verified with `verify-evidence.ts --interop`), `release-evidence-fault-matrix` (the `fault-matrix` job: the seeded UDP fault matrix's `fault-matrix.json` plus its sanitized Playwright report), `release-evidence-supply-chain` (`supply-chain.yml`, dispatched on a release tag after publish: the recorded install of the exact published version and `npm audit signatures`), and the joined `release-evidence-cross-platform` / `release-evidence-runtime-consumers` from the `release-evidence` job. See docs/RELEASE_CHECKLIST.md § Who produces each claim's evidence.
 
 ### release.yml (tag push `v*`, workflow_dispatch)
 
@@ -126,6 +130,10 @@ The published version is stamped from the tag: the release build runs `scripts/s
 Automatic publishing accepts only a successful same-repository `release.yml` run caused by a semantic-version tag push. Manual retry is accepted only when dispatching `publish.yml` from `main` and requires the exact numeric `release_run_id`; a tag is not an acceptable retry identity. The job verifies the release run through the GitHub Actions API, downloads only the attempt-qualified `npm-publish-input-<run_attempt>` artifact from that exact run ID, validates candidate repository/workflow/run/attempt/commit/tag/tarball identity and SHA-256, checks out the bound commit, then smokes, dry-runs, and publishes that exact downloaded tarball. Both the dry-run and real publish step reload the candidate-bound digest and re-hash the exact tarball immediately before invoking npm, closing the post-verification replacement window. GitHub release bodies and assets are never trusted as npm input and the package is not rebuilt in the publish job. The repository policy checker parses the publish job and required steps structurally, requires live dataflow from the queried release-run JSON through exact step outputs and candidate environment mappings, and rejects hardcoded metadata, conditional/dead handoff steps, alternate acquisition paths, rebuilds, digest omissions, a different tarball, a second publish path, or a missing immediate digest recheck.
 
 The job uses npm Trusted Publishing only: job-scoped `id-token: write`, the protected `npm-publish` GitHub environment, exact npm `11.18.0`, and no npm authentication secret. The npm package must have a trusted publisher configured for repository `vmeansdev/webtransport-bun`, workflow `publish.yml`, and environment `npm-publish`; that registry-side configuration is an external release prerequisite and must be verified before the stable tag.
+
+### supply-chain.yml (workflow_dispatch on a release tag)
+
+Producer for the `supply-chain-provenance` claim. Dispatch it on the rc tag once `publish.yml` has published that tag's version (`gh workflow run supply-chain.yml --ref v1.0.0-rc.N`); the job refuses any ref that is not a `v*` tag. It resolves the version from the tag with `scripts/stamp-version-from-tag.ts --check`, installs exactly that version from the npm registry into an empty project, and records the install and `npm audit signatures` (registry signatures and provenance attestations) with `scripts/record-command.ts`, uploading `release-evidence-supply-chain`. `contents: read` only; no credentials.
 
 ### rollback.yml (workflow_dispatch)
 

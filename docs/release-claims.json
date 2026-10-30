@@ -7,7 +7,10 @@
 			"gaRequired": true,
 			"proof": {
 				"kind": "command-records",
-				"commandPatterns": ["cargo test", "bun test"],
+				"commandPatterns": [
+					"cargo test",
+					"bun test"
+				],
 				"files": [
 					{
 						"match": "commands/*.json",
@@ -26,7 +29,9 @@
 			"gaRequired": true,
 			"proof": {
 				"kind": "command-records",
-				"commandPatterns": ["test:wasm"],
+				"commandPatterns": [
+					"test:wasm"
+				],
 				"files": [
 					{
 						"match": "commands/*.json",
@@ -46,7 +51,11 @@
 			"proof": {
 				"kind": "command-records",
 				"minRecords": 3,
-				"platforms": ["linux", "darwin", "win32"],
+				"platforms": [
+					"linux",
+					"darwin",
+					"win32"
+				],
 				"files": [
 					{
 						"match": "commands/*.json",
@@ -65,7 +74,9 @@
 			"gaRequired": true,
 			"proof": {
 				"kind": "command-records",
-				"commandPatterns": ["test-package-artifact"],
+				"commandPatterns": [
+					"test-package-artifact"
+				],
 				"files": [
 					{
 						"match": "commands/*.json",
@@ -127,11 +138,23 @@
 			"surface": "release",
 			"gaRequired": true,
 			"proof": {
-				"kind": "playwright-report",
-				"minExpected": 1,
+				"kind": "fault-matrix",
+				"profiles": [
+					"seeded-loss",
+					"seeded-duplication",
+					"seeded-reordering",
+					"fixed-delay",
+					"seeded-jitter",
+					"burst-loss",
+					"black-hole-recovery"
+				],
 				"files": [
 					{
-						"match": "*.json",
+						"match": "fault-matrix.json",
+						"schema": "fault-matrix-evidence"
+					},
+					{
+						"match": "fault-matrix-report.json",
 						"schema": "playwright-report"
 					}
 				]
@@ -208,7 +231,10 @@
 			"gaRequired": true,
 			"proof": {
 				"kind": "command-records",
-				"commandPatterns": ["audit signatures"],
+				"commandPatterns": [
+					"npm install --ignore-scripts --save-exact @webtransport-bun/webtransport@",
+					"npm audit signatures"
+				],
 				"files": [
 					{
 						"match": "commands/*.json",
@@ -218,7 +244,8 @@
 						"match": "summary.json",
 						"schema": "command-summary"
 					}
-				]
+				],
+				"minRecords": 2
 			}
 		},
 		{
@@ -285,7 +312,9 @@
 			"gaRequired": true,
 			"proof": {
 				"kind": "command-records",
-				"commandPatterns": ["qpack"],
+				"commandPatterns": [
+					"qpack"
+				],
 				"files": [
 					{
 						"match": "commands/*.json",
@@ -304,7 +333,9 @@
 			"gaRequired": true,
 			"proof": {
 				"kind": "command-records",
-				"commandPatterns": ["multi-session"],
+				"commandPatterns": [
+					"multi-session"
+				],
 				"files": [
 					{
 						"match": "commands/*.json",
@@ -323,7 +354,9 @@
 			"gaRequired": true,
 			"proof": {
 				"kind": "command-records",
-				"commandPatterns": ["0rtt"],
+				"commandPatterns": [
+					"0rtt"
+				],
 				"files": [
 					{
 						"match": "commands/*.json",
@@ -342,7 +375,9 @@
 			"gaRequired": true,
 			"proof": {
 				"kind": "command-records",
-				"commandPatterns": ["facade"],
+				"commandPatterns": [
+					"facade"
+				],
 				"files": [
 					{
 						"match": "commands/*.json",

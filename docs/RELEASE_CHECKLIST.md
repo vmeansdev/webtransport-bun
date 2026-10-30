@@ -40,7 +40,8 @@ is refused:
 | Proof | Claims | Requires |
 |---|---|---|
 | command records (`scripts/generate-release-evidence.ts`) | local gates, wasm protocol gates, runtime consumers, cross-platform matrix, supply-chain provenance | every record exit 0 at the candidate commit; the claim's commands (e.g. `cargo test` and `bun test`) or platforms present |
-| Playwright JSON report | Chromium native/wasm interop, fault matrix | `expected > 0`, no unexpected/flaky/errors, every spec ok; from a GitHub Actions run |
+| Playwright JSON report | Chromium native/wasm interop | `expected > 0`, no unexpected/flaky/errors, every spec ok; from a GitHub Actions run |
+| `fault-matrix.json` + its Playwright report | fault matrix | `status: passed`, `sourceCommit` = candidate, exactly the registered profiles in order, each payload round-tripped and its fault actually injected (loss → dropped, duplication → duplicated, reordering → reordered, delay/jitter → delayed, burst → burstDropped, black hole → blackHoled); the report passes as above; from a GitHub Actions run |
 | `release-smoke.json` | fuzz gates | no failures, every command exit 0 in time, non-empty corpora; from a GitHub Actions run |
 | llvm-cov + Bun LCOV reports | coverage gates | `scripts/check-llvm-cov-floors.py` re-run over the bundled reports passes; from a GitHub Actions run |
 | soak aggregate | soak 24h / 72h | `status: pass`, candidate commit, every segment passed, the full duration |
@@ -88,8 +89,8 @@ SHA is the candidate.
 | `iwa-direct-sockets` | `iwa.yml` (`iwa-proof-<sha>`, `--select evidence.json`), or the interactive run's `run-iwa.mjs` JSON with `--local` | |
 | `auto-review-zero-p0-p4` | human review record, `--local` | |
 | `final-no-change-confirmation` | human freeze record, `--local` | |
-| `fault-matrix` | **no CI producer yet**: needs a job running `playwright.fault.config.ts` with the JSON reporter + sanitizer | |
-| `supply-chain-provenance` | **no CI producer yet**: needs a post-publish job (dispatched on the rc tag) that records `npm audit signatures` against the published version | |
+| `fault-matrix` | `test.yml` / `fault-matrix` (`playwright.fault.config.ts` with `INTEROP_EVIDENCE=1`: JSON reporter + sanitizer) | `release-evidence-fault-matrix` |
+| `supply-chain-provenance` | `supply-chain.yml` / `audit-signatures`, dispatched on the rc tag after `publish.yml` published it (`gh workflow run supply-chain.yml --ref v1.0.0-rc.N`): recorded `npm install` of the exact published version plus `npm audit signatures` | `release-evidence-supply-chain` |
 
 ### Flow
 

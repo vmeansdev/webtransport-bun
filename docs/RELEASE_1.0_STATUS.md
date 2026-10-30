@@ -68,9 +68,11 @@ Follow-on decisions (2026-10-30):
 - Evidence content is allowlisted per proof kind (declared files, strict
   schemas, typed strings, no opaque runs outside digest fields), and tool
   output is accepted only from GitHub Actions runs; `--local` is limited to
-  the IWA interactive proof and the human review/no-change records. Two GA
-  claims have no CI producer yet and need new jobs: `fault-matrix` and
-  `supply-chain-provenance` (see docs/RELEASE_CHECKLIST.md).
+  the IWA interactive proof and the human review/no-change records. Every
+  machine-checked claim has a CI producer: `fault-matrix` comes from
+  `test.yml` / `fault-matrix`, and `supply-chain-provenance` from
+  `supply-chain.yml`, dispatched on the rc tag after it is published (see
+  docs/RELEASE_CHECKLIST.md).
 
 **Decision (2026-10-30): the version comes from the tag.** The committed
 `packages/webtransport/package.json` carries the base version (`1.0.0`). The

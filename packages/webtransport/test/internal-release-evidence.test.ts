@@ -36,6 +36,7 @@ import {
 	stampedVersion,
 } from "../../../scripts/stamp-version-from-tag.ts";
 import { pruneReportMetadata } from "../../../tools/interop/evidence-privacy.ts";
+import { RELEASE_FAULT_PROFILES } from "../../../tools/interop/udp-fault-proxy.ts";
 
 const PROJECT_ROOT = join(import.meta.dir, "..", "..", "..");
 const CLI = join(PROJECT_ROOT, "scripts", "release-evidence.ts");
@@ -1163,6 +1164,217 @@ describe("manifest and claim registry contract", () => {
 		expect(validateClaimProof(native, ctx(partial)).join("\n")).toContain(
 			"GitHub Actions run",
 		);
+	});
+});
+
+/** A claim as the committed docs/release-claims.json registers it. */
+function committedClaim(id: string): RegisteredClaim {
+	const registry = JSON.parse(
+		readFileSync(join(PROJECT_ROOT, "docs", "release-claims.json"), "utf8"),
+	) as { claims: RegisteredClaim[] };
+	const found = registry.claims.find((claim) => claim.id === id);
+	if (!found) throw new Error(`registered claim ${id} is missing`);
+	return found;
+}
+
+// ---- fault matrix ----------------------------------------------------------
+
+/** The shape tools/interop/tests/fault-matrix.spec.ts writes. */
+function faultMatrixEvidence(commit: string) {
+	return {
+		schemaVersion: 1,
+		status: "passed",
+		sourceCommit: commit,
+		startedAt: "2026-10-30T10:00:00.000Z",
+		finishedAt: "2026-10-30T10:01:00.000Z",
+		scenarios: RELEASE_FAULT_PROFILES.map((profile) => ({
+			profile,
+			stats: {
+				seen: 120,
+				forwarded: 110,
+				dropped: profile.lossRate ? 9 : 0,
+				duplicated: profile.duplicateRate ? 7 : 0,
+				delayed: profile.delayMs || profile.jitterMs ? 110 : 0,
+				reordered: profile.reorderRate ? 8 : 0,
+				blackHoled: profile.blackHole ? 14 : 0,
+				burstDropped: profile.burstLoss ? 3 : 0,
+			},
+			payload: `fault-matrix-${profile.name}`,
+			durationMs: 2345.5,
+		})),
+	};
+}
+
+describe("fault-matrix proof", () => {
+	const commit = "0123456789abcdef0123456789abcdef01234567";
+	const claim = committedClaim("fault-matrix");
+	const encode = (value: unknown) =>
+		new TextEncoder().encode(JSON.stringify(value, null, 2));
+	const members = (evidence: unknown, report: unknown = playwrightReport()) => [
+		{ name: "fault-matrix.json", data: encode(evidence) },
+		{ name: "fault-matrix-report.json", data: encode(report) },
+	];
+	const check = (
+		evidence: unknown,
+		producerKind: "local" | "github-actions" = "github-actions",
+		report?: unknown,
+	) =>
+		validateClaimProof(claim, {
+			commit,
+			producerKind,
+			members: members(evidence, report),
+			root: PROJECT_ROOT,
+		}).join("\n");
+
+	it("registers exactly the profiles the matrix runs", () => {
+		expect(claim.proof.kind).toBe("fault-matrix");
+		expect((claim.proof as { profiles: string[] }).profiles).toEqual(
+			RELEASE_FAULT_PROFILES.map((p) => p.name),
+		);
+	});
+
+	it("passes the matrix's own output plus its report from an Actions run", () => {
+		expect(
+			contentProblems(members(faultMatrixEvidence(commit)), claim.proof.files),
+		).toEqual([]);
+		expect(check(faultMatrixEvidence(commit))).toBe("");
+	});
+
+	it("is tool output: refused from --local", () => {
+		expect(check(faultMatrixEvidence(commit), "local")).toContain(
+			"GitHub Actions run",
+		);
+	});
+
+	it("refuses a failed, unbound or incomplete matrix", () => {
+		expect(
+			check({ ...faultMatrixEvidence(commit), status: "failed" }),
+		).toContain("status is not passed");
+		expect(check(faultMatrixEvidence("f".repeat(40)))).toContain(
+			"sourceCommit is not the candidate",
+		);
+		const local = {
+			...faultMatrixEvidence(commit),
+			sourceCommit: "local-unbound",
+		};
+		expect(check(local)).toContain("sourceCommit is not the candidate");
+		const missing = faultMatrixEvidence(commit);
+		missing.scenarios.pop();
+		expect(check(missing)).toContain("scenarios are not exactly");
+	});
+
+	it("refuses a profile whose fault was not injected or payload not echoed", () => {
+		const noLoss = faultMatrixEvidence(commit);
+		(noLoss.scenarios[0] as { stats: { dropped: number } }).stats.dropped = 0;
+		expect(check(noLoss)).toContain("seeded-loss: no loss injected");
+		const noHole = faultMatrixEvidence(commit);
+		(
+			noHole.scenarios[6] as { stats: { blackHoled: number } }
+		).stats.blackHoled = 0;
+		expect(check(noHole)).toContain(
+			"black-hole-recovery: no black hole injected",
+		);
+		const wrongPayload = faultMatrixEvidence(commit);
+		(wrongPayload.scenarios[3] as { payload: string }).payload = "other";
+		expect(check(wrongPayload)).toContain(
+			"fixed-delay: payload did not round-trip",
+		);
+	});
+
+	it("refuses a failing report and unknown fields", () => {
+		const report = {
+			...playwrightReport(),
+			stats: { ...playwrightReport().stats, expected: 0, unexpected: 1 },
+		};
+		expect(
+			check(faultMatrixEvidence(commit), "github-actions", report),
+		).toContain("report:");
+		const extra = { ...faultMatrixEvidence(commit), env: { HOME: "/x" } };
+		expect(check(extra)).not.toBe("");
+	});
+});
+
+describe("supply-chain-provenance proof", () => {
+	const commit = "0123456789abcdef0123456789abcdef01234567";
+	const claim = committedClaim("supply-chain-provenance");
+	const install = commandRecord(commit, "npm-install-published", [
+		"npm",
+		"install",
+		"--ignore-scripts",
+		"--save-exact",
+		"@webtransport-bun/webtransport@1.0.0-rc.1",
+	]);
+	const audit = commandRecord(commit, "npm-audit-signatures", [
+		"npm",
+		"audit",
+		"signatures",
+	]);
+	const summary = (count: number) => ({
+		schemaVersion: 1,
+		kind: "summary",
+		commit,
+		generatedAt: "2026-10-30T10:06:00.000Z",
+		recordCount: count,
+		records: [],
+	});
+	const encode = (value: unknown) =>
+		new TextEncoder().encode(JSON.stringify(value, null, 2));
+	const check = (
+		files: Record<string, unknown>,
+		producerKind: "local" | "github-actions" = "github-actions",
+	) => {
+		const members = Object.entries(files).map(([name, value]) => ({
+			name,
+			data: encode(value),
+		}));
+		return [
+			...contentProblems(members, claim.proof.files),
+			...validateClaimProof(claim, {
+				commit,
+				producerKind,
+				members,
+				root: PROJECT_ROOT,
+			}),
+		].join("\n");
+	};
+
+	it("passes the recorded install of the published version plus the audit", () => {
+		expect(
+			check({
+				"commands/npm-install-published.json": install,
+				"commands/npm-audit-signatures.json": audit,
+				"summary.json": summary(2),
+			}),
+		).toBe("");
+	});
+
+	it("refuses an audit without the install of the published package", () => {
+		expect(
+			check({
+				"commands/npm-audit-signatures.json": audit,
+				"summary.json": summary(1),
+			}),
+		).toContain("@webtransport-bun/webtransport@");
+	});
+
+	it("refuses a failed audit and a local record", () => {
+		expect(
+			check({
+				"commands/npm-install-published.json": install,
+				"commands/npm-audit-signatures.json": { ...audit, exitCode: 1 },
+				"summary.json": summary(2),
+			}),
+		).toContain("exitCode 1");
+		expect(
+			check(
+				{
+					"commands/npm-install-published.json": install,
+					"commands/npm-audit-signatures.json": audit,
+					"summary.json": summary(2),
+				},
+				"local",
+			),
+		).toContain("GitHub Actions run");
 	});
 });
 

@@ -510,6 +510,43 @@ jobs:
 		expect(verifyWorkflow).toContain("verify --integrity-only");
 	});
 
+	it("has CI producers for the fault-matrix and supply-chain claims", () => {
+		const test = readFileSync(
+			join(PROJECT_ROOT, ".github", "workflows", "test.yml"),
+			"utf8",
+		);
+		const faultJob = test.slice(
+			test.indexOf("\n  fault-matrix:"),
+			test.indexOf("\n  test:"),
+		);
+		expect(faultJob).toContain("playwright.fault.config.ts");
+		expect(faultJob).toContain('INTEROP_EVIDENCE: "1"');
+		expect(faultJob).toContain(
+			"verify-evidence.ts --interop fault-matrix-report.json",
+		);
+		expect(faultJob).toContain("name: release-evidence-fault-matrix");
+		const faultConfig = readFileSync(
+			join(PROJECT_ROOT, "tools", "interop", "playwright.fault.config.ts"),
+			"utf8",
+		);
+		expect(faultConfig).toContain("./evidence-sanitizer.ts");
+		expect(faultConfig).toContain('"fault-matrix-report.json"');
+		const supply = readFileSync(
+			join(PROJECT_ROOT, ".github", "workflows", "supply-chain.yml"),
+			"utf8",
+		);
+		expect(supply).toContain("workflow_dispatch:");
+		expect(supply).toContain("if: startsWith(github.ref, 'refs/tags/v')");
+		expect(supply).toContain(
+			'stamp-version-from-tag.ts "$GITHUB_REF_NAME" --check',
+		);
+		expect(supply).toContain('"@webtransport-bun/webtransport@$VERSION"');
+		expect(supply).toContain("--name npm-audit-signatures");
+		expect(supply).toContain("npm audit signatures");
+		expect(supply).toContain("name: release-evidence-supply-chain");
+		expect(supply).not.toMatch(/contents:\s*write|id-token|secrets\./);
+	});
+
 	it("justifies contents: write only for an executed release-evidence upload", () => {
 		const job = (command: string) => `
 jobs:
