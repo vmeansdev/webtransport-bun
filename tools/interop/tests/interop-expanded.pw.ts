@@ -15,6 +15,12 @@ import { getCertHashBase64 } from "../cert-hash.js";
 
 test.describe("P3.3 interop expansion", () => {
 	test.beforeEach(async ({ page }) => {
+		// Chromium reports why a WebTransport failed (the net error) only on
+		// the console; keep it in the test log so a failure carries its cause.
+		page.on("console", (message) => {
+			if (message.type() === "error" || message.type() === "warning")
+				console.log(`[chromium console.${message.type()}] ${message.text()}`);
+		});
 		await page.addInitScript({
 			content: BROWSER_READ_WITH_TIMEOUT_INIT_SCRIPT,
 		});

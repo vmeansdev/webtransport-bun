@@ -161,6 +161,14 @@ const wtServer = createServer({
 	// Keep QUIC idle as a backstop above the application idle closer so the
 	// harness can emit ApplicationClosed(3990) before an abrupt transport drop.
 	limits: { idleTimeoutMs: IDLE_TIMEOUT_MS + 10_000 },
+	// Server-side refusals (rate limits, limits, failed handshakes) are
+	// otherwise invisible to the interop log.
+	log: (event) => {
+		if (event.level === "warn" || event.level === "error")
+			console.log(
+				`[addon-server ${event.level}] ${event.msg}${event.peerPort === undefined ? "" : ` peerPort=${event.peerPort}`}`,
+			);
+	},
 	onSession: async (session) => {
 		const activity: SessionActivity = { lastActivityMs: performance.now() };
 		void session.closed
