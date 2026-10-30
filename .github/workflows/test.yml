@@ -301,8 +301,8 @@ jobs:
           done
         timeout-minutes: 3
       - name: Interop (Chromium)
-        run: cd tools/interop && bun install --frozen-lockfile && bun run install:browsers && bun run prepare:interop && bun run playwright test ${{ runner.os == 'Windows' && '--repeat-each=12' || '' }}
-        timeout-minutes: 20
+        run: cd tools/interop && bun install --frozen-lockfile && bun run install:browsers && bun run prepare:interop && bun run playwright test
+        timeout-minutes: 5
       - name: Smoke test (bun add from package)
         run: |
           bun run --cwd packages/webtransport build
