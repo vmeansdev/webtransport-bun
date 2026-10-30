@@ -2366,12 +2366,30 @@ async fn run_connect_0rtt(
         .unwrap_or(false);
 
     let accepted: Arc<std::sync::OnceLock<bool>> = Arc::new(std::sync::OnceLock::new());
-    let accepted_writer = Arc::clone(&accepted);
-    let conn_watch = conn.clone();
-    CLIENT_RUNTIME.spawn(async move {
-        let result = conn_watch.handshake_confirmed().await;
-        let _ = accepted_writer.set(result);
-    });
+    // A connection that sent no early data (no ticket, or 0-RTT refused
+    // locally) is already confirmed: `handshake_confirmed()` is ready on its
+    // first poll. Record that before connect resolves so `handshakeConfirmed`
+    // is true the moment the session reaches JS, instead of racing the
+    // watcher task below onto the runtime.
+    let ready = {
+        let confirmed = conn.handshake_confirmed();
+        let mut confirmed = std::pin::pin!(confirmed);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        match std::future::Future::poll(confirmed.as_mut(), &mut cx) {
+            std::task::Poll::Ready(result) => Some(result),
+            std::task::Poll::Pending => None,
+        }
+    };
+    if let Some(result) = ready {
+        let _ = accepted.set(result);
+    } else {
+        let accepted_writer = Arc::clone(&accepted);
+        let conn_watch = conn.clone();
+        CLIENT_RUNTIME.spawn(async move {
+            let result = conn_watch.handshake_confirmed().await;
+            let _ = accepted_writer.set(result);
+        });
+    }
 
     let addr = conn.remote_address();
     let peer_ip = addr.ip().to_string();
