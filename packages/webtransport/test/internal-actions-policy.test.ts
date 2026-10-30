@@ -435,7 +435,10 @@ jobs:
 
 	it("publishes pre-release versions to the next dist-tag only", () => {
 		expect(PUBLISH_WORKFLOW).toContain(
-			"version.includes('-') ? 'next' : 'latest'",
+			'if (.packageVersion | contains("-")) then "next" else "latest" end',
+		);
+		expect(PUBLISH_WORKFLOW).toContain(
+			'bun scripts/stamp-version-from-tag.ts "$RELEASE_TAG" --check',
 		);
 		const untagged = runPolicy(
 			mutatePublishWorkflow(
@@ -447,10 +450,7 @@ jobs:
 		expect(untagged.status).toBe(1);
 		expect(untagged.stderr).toContain('publish must pass --tag "$DIST_TAG"');
 		const alwaysLatest = runPolicy(
-			PUBLISH_WORKFLOW.replaceAll(
-				"? 'next' : 'latest'",
-				"? 'latest' : 'latest'",
-			),
+			PUBLISH_WORKFLOW.replaceAll('then "next" else', 'then "latest" else'),
 			"publish.yml",
 		);
 		expect(alwaysLatest.status).toBe(1);
@@ -534,6 +534,17 @@ jobs:
 		);
 		expect(RELEASE_WORKFLOW).toContain("--redact-host-paths");
 		expect(RELEASE_WORKFLOW).not.toContain("--create-prerelease");
+		// CI evidence is the run's own artifacts, fetched by name.
+		expect(RELEASE_WORKFLOW).toContain("bun scripts/release-evidence.ts fetch");
+		expect(RELEASE_WORKFLOW).not.toContain("release-evidence.ts package");
+		// The published version is stamped from the tag before the tarball is
+		// built, and the candidate identity records it.
+		expect(RELEASE_WORKFLOW).toContain(
+			'bun scripts/stamp-version-from-tag.ts "$RELEASE_TAG"',
+		);
+		expect(RELEASE_WORKFLOW).toContain(
+			'.packageVersion == ($tag | ltrimstr("v"))',
+		);
 	});
 
 	it("rejects exact versions that are absent from the release toolchain policy", () => {

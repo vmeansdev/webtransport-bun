@@ -787,7 +787,7 @@ function validatePublishHandoff(
 			({ command, step }) =>
 				/\s--tag\s+"\$DIST_TAG"(?:\s|$)/.test(command) &&
 				commandLines(step).some((line) =>
-					/^DIST_TAG="\$\(node -p "require\('\.\/packages\/webtransport\/package\.json'\)\.version\.includes\('-'\) \? 'next' : 'latest'"\)"$/.test(
+					/^DIST_TAG="\$\(jq -er 'if \(\.packageVersion \| contains\("-"\)\) then "next" else "latest" end' "\$RUNNER_TEMP\/npm-publish-input\/candidate-identity\.json"\)"$/.test(
 						line,
 					),
 				),
