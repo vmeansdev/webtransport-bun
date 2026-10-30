@@ -969,7 +969,11 @@ function uploadCommand(args: Args): void {
 		return;
 	}
 	// Stage the validated buffers as read-only files in a private directory
-	// and upload only those.
+	// and upload only those. From the first upload attempt on, every exit goes
+	// through reconciliation: `gh release upload` may attach some files and
+	// then fail, or succeed and lose the response, so its exit status says
+	// nothing certain about what is attached.
+	let uploadFailure: string | undefined;
 	const stage = mkdtempSync(join(tmpdir(), "release-evidence-upload-"));
 	try {
 		chmodSync(stage, 0o700);
@@ -983,106 +987,159 @@ function uploadCommand(args: Args): void {
 			root,
 		);
 		if (uploaded.status !== 0)
-			throw new Error(
-				`gh release upload failed: ${uploaded.stderr.trim().split("\n")[0] ?? ""}`,
-			);
+			uploadFailure = `gh release upload failed: ${uploaded.stderr.trim().split("\n")[0] ?? ""}`;
+	} catch (error) {
+		uploadFailure = `gh release upload failed: ${error instanceof Error ? error.message : String(error)}`;
 	} finally {
 		rmSync(stage, { recursive: true, force: true });
 	}
-	// Read back what is attached now: every uploaded asset must carry exactly
-	// the validated bytes. A mismatching asset is deleted and the upload fails.
-	const attached = viewRelease(repository, tag, root);
-	// The release and its tag may have changed while the upload ran (promoted
-	// to a full release, made immutable, turned into a draft, retagged): the
-	// candidate-prerelease boundary is re-checked against the state after the
-	// upload, and on any change everything just uploaded is withdrawn.
-	const stateProblems: string[] = [];
-	if (!attached) stateProblems.push(`release ${tag} no longer exists`);
-	else {
-		if (!attached.isPrerelease)
-			stateProblems.push(`release ${tag} is no longer a pre-release`);
-		if (attached.isImmutable)
-			stateProblems.push(`release ${tag} became immutable`);
-		if (Boolean(attached.isDraft) !== Boolean(release?.isDraft))
-			stateProblems.push(`release ${tag} changed its draft state`);
+	reconcileUpload({
+		repository,
+		tag,
+		tagCommit,
+		root,
+		wasDraft: Boolean(release?.isDraft),
+		pending: pending.map(({ name, sha256 }) => ({ name, sha256 })),
+		uploadFailure,
+	});
+}
+
+/** Base delay of the read-back and delete retries (doubling per attempt).
+ * Tests shorten it through RELEASE_EVIDENCE_RETRY_MS. */
+function retryBaseMs(): number {
+	const raw = Number(process.env.RELEASE_EVIDENCE_RETRY_MS ?? "1000");
+	return Number.isFinite(raw) && raw >= 0 ? raw : 1000;
+}
+
+const RECONCILE_ATTEMPTS = 4;
+
+function withRetries<T>(attempt: () => T): T {
+	let lastError: unknown;
+	for (let i = 0; i < RECONCILE_ATTEMPTS; i += 1) {
+		try {
+			return attempt();
+		} catch (error) {
+			lastError = error;
+			if (i + 1 < RECONCILE_ATTEMPTS) Bun.sleepSync(retryBaseMs() * 2 ** i);
+		}
 	}
-	let tagNow: string | undefined;
+	throw lastError;
+}
+
+/**
+ * After any upload attempt, success or not: read the release back (with
+ * bounded retries) and accept only a verified state -- still a mutable,
+ * non-draft-changed pre-release whose tag points at the bound candidate,
+ * holding every asset this invocation uploaded with the validated digest.
+ * Anything else, including a read-back that cannot be completed, withdraws
+ * every asset name this invocation tried to attach (deletes retried), and
+ * fails naming what was withdrawn and what is still attached.
+ */
+function reconcileUpload(ctx: {
+	repository: string;
+	tag: string;
+	tagCommit: string;
+	root: string;
+	wasDraft: boolean;
+	pending: { name: string; sha256: string }[];
+	uploadFailure: string | undefined;
+}): void {
+	const { repository, tag, tagCommit, root, pending } = ctx;
+	const problems: string[] = ctx.uploadFailure ? [ctx.uploadFailure] : [];
 	try {
-		tagNow = remoteTagCommit(repository, tag, root);
-	} catch {
-		tagNow = undefined;
-	}
-	if (tagNow !== tagCommit)
-		stateProblems.push(
-			`tag ${tag} now points to ${tagNow ?? "<unresolvable>"}, not the evidence candidate ${tagCommit}`,
-		);
-	if (stateProblems.length > 0) {
-		const withdrawn: string[] = [];
-		const stranded: string[] = [];
-		for (const file of pending) {
-			if (!attached?.assets.some((asset) => asset.name === file.name)) continue;
-			const deleted = runGh(
-				[
-					"release",
-					"delete-asset",
-					tag,
-					file.name,
-					"--repo",
-					repository,
-					"--yes",
-				],
-				root,
-			);
-			(deleted.status === 0 ? withdrawn : stranded).push(file.name);
-		}
-		throw new Error(
-			[
-				`the release changed while evidence was being uploaded; refusing to leave evidence outside a candidate pre-release:`,
-				...stateProblems.map((p) => ` - ${p}`),
-				`withdrawn: ${withdrawn.join(", ") || "none"}`,
-				...(stranded.length > 0
-					? [
-							`STILL ATTACHED (could not be deleted; remove them by hand now): ${stranded.join(", ")}`,
-						]
-					: []),
-			].join("\n"),
-		);
-	}
-	const mismatched: string[] = [];
-	for (const file of pending) {
-		const remote = attached?.assets.find((asset) => asset.name === file.name);
-		const remoteDigest = remote?.digest
-			? remote.digest.replace(/^sha256:/, "")
-			: remote
-				? remoteSha256(repository, tag, file.name, root)
-				: undefined;
-		if (remoteDigest === file.sha256) continue;
-		mismatched.push(file.name);
-		if (remote) {
-			const deleted = runGh(
-				[
-					"release",
-					"delete-asset",
-					tag,
-					file.name,
-					"--repo",
-					repository,
-					"--yes",
-				],
-				root,
-			);
-			if (deleted.status !== 0)
-				mismatched.push(
-					`${file.name} (could not be deleted: delete it by hand)`,
+		const attached = withRetries(() => viewRelease(repository, tag, root));
+		if (!attached) problems.push(`release ${tag} no longer exists`);
+		else {
+			if (!attached.isPrerelease)
+				problems.push(`release ${tag} is no longer a pre-release`);
+			if (attached.isImmutable)
+				problems.push(`release ${tag} became immutable`);
+			if (Boolean(attached.isDraft) !== ctx.wasDraft)
+				problems.push(`release ${tag} changed its draft state`);
+			for (const file of pending) {
+				const remote = attached.assets.find(
+					(asset) => asset.name === file.name,
 				);
+				if (!remote) {
+					problems.push(`${file.name} is not attached`);
+					continue;
+				}
+				const digest = remote.digest
+					? remote.digest.replace(/^sha256:/, "")
+					: withRetries(() => {
+							const hashed = remoteSha256(repository, tag, file.name, root);
+							if (hashed === undefined)
+								throw new Error(`could not download ${file.name}`);
+							return hashed;
+						});
+				if (digest !== file.sha256)
+					problems.push(`${file.name} does not carry the validated bytes`);
+			}
 		}
-	}
-	if (mismatched.length > 0)
-		throw new Error(
-			`attached assets do not carry the validated bytes; deleted: ${mismatched.join(", ")}`,
+		const tagNow = withRetries(() => remoteTagCommit(repository, tag, root));
+		if (tagNow !== tagCommit)
+			problems.push(
+				`tag ${tag} now points to ${tagNow}, not the evidence candidate ${tagCommit}`,
+			);
+	} catch (error) {
+		problems.push(
+			`the release could not be read back to verify it (${error instanceof Error ? error.message.split("\n")[0] : String(error)})`,
 		);
-	log(
-		`attached ${pending.length} asset(s) to ${tag}; read back and digest-checked`,
+	}
+	if (problems.length === 0) {
+		log(
+			`attached ${pending.length} asset(s) to ${tag}; release state and every digest verified`,
+		);
+		return;
+	}
+	const withdrawn: string[] = [];
+	const absent: string[] = [];
+	const stranded: string[] = [];
+	for (const file of pending) {
+		let outcome: "deleted" | "absent" | "failed" = "failed";
+		try {
+			outcome = withRetries(() => {
+				const deleted = runGh(
+					[
+						"release",
+						"delete-asset",
+						tag,
+						file.name,
+						"--repo",
+						repository,
+						"--yes",
+					],
+					root,
+				);
+				if (deleted.status === 0) return "deleted" as const;
+				if (/not found|HTTP 404/i.test(deleted.stderr))
+					return "absent" as const;
+				throw new Error(
+					deleted.stderr.trim().split("\n")[0] ?? "delete failed",
+				);
+			});
+		} catch {
+			outcome = "failed";
+		}
+		(outcome === "deleted"
+			? withdrawn
+			: outcome === "absent"
+				? absent
+				: stranded
+		).push(file.name);
+	}
+	throw new Error(
+		[
+			`upload to ${tag} could not be verified; every asset it tried to attach was withdrawn:`,
+			...problems.map((p) => ` - ${p}`),
+			`withdrawn: ${withdrawn.join(", ") || "none"}`,
+			`not attached: ${absent.join(", ") || "none"}`,
+			...(stranded.length > 0
+				? [
+						`STILL ATTACHED (could not be deleted; remove them by hand now): ${stranded.join(", ")}`,
+					]
+				: []),
+		].join("\n"),
 	);
 }
 

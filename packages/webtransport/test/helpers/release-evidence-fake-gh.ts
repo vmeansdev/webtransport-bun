@@ -65,6 +65,14 @@ type State = {
 		isDraft?: boolean;
 		tagCommit?: string;
 	} | null;
+	/** `release upload` attaches only this many files, then fails. */
+	uploadFailAfter?: number | null;
+	/** The next N `release view` calls after an upload fail with HTTP 502. */
+	viewFailuresAfterUpload?: number;
+	/** Pending `release view` failures (set from viewFailuresAfterUpload). */
+	viewFailures?: number;
+	/** Every `release delete-asset` fails with HTTP 500. */
+	deleteFails?: boolean;
 	/** Base64 of the exact bytes of every file `release upload` was given,
 	 * read when it was invoked. */
 	uploadedBytes?: Record<string, string>;
@@ -180,6 +188,10 @@ if (group === "release") {
 	const tag = subject as string;
 	const release = state.releases[tag];
 	if (command === "view") {
+		if ((state.viewFailures ?? 0) > 0) {
+			state.viewFailures = (state.viewFailures as number) - 1;
+			fail("HTTP 502: Server Error");
+		}
 		if (state.mutateOnView) {
 			writeFileSync(state.mutateOnView.path, state.mutateOnView.content);
 			state.mutateOnView = null;
@@ -221,7 +233,17 @@ if (group === "release") {
 			.filter(
 				(arg, index, all) => arg !== "--repo" && all[index - 1] !== "--repo",
 			);
+		let attachedCount = 0;
 		for (const file of files) {
+			if (
+				state.uploadFailAfter !== undefined &&
+				state.uploadFailAfter !== null &&
+				attachedCount >= state.uploadFailAfter
+			) {
+				state.viewFailures = state.viewFailuresAfterUpload ?? 0;
+				fail(`HTTP 502: upload of ${basename(file)} failed`);
+			}
+			attachedCount += 1;
 			const name = basename(file);
 			if (
 				release.assets.some((asset) => asset.name === name) &&
@@ -253,11 +275,13 @@ if (group === "release") {
 			if (tagCommit) state.tags[tag] = tagCommit;
 			state.afterUpload = null;
 		}
+		state.viewFailures = state.viewFailuresAfterUpload ?? 0;
 		save();
 		process.exit(0);
 	}
 	if (command === "delete-asset") {
 		if (!release) fail("release not found");
+		if (state.deleteFails) fail("HTTP 500: Internal Server Error");
 		const name = args[3] as string;
 		if (!release.assets.some((asset) => asset.name === name))
 			fail(`asset ${name} not found`);

@@ -180,13 +180,17 @@ All through `bun scripts/release-evidence.ts`:
    whole upload. Every file is read once; those validated buffers are staged
    as read-only files in a private temporary directory and only the staged
    copies are given to `gh`, so a file replaced after validation is never
-   what gets published. After uploading, `upload` reads the release back and
-   digest-checks every attached asset; one that does not carry the validated
-   bytes is deleted and the upload fails. The read-back also re-checks the
-   release and its tag: if the release stopped being a pre-release, became
-   immutable, changed its draft state or disappeared, or the tag moved off
-   the candidate while the upload ran, every asset just uploaded is deleted
-   (any that cannot be is named for manual removal) and the upload fails. The release job's own attachments outside `upload` (the
+   what gets published. Every upload attempt, whatever its exit status
+   (`gh release upload` can attach some files and then fail, or succeed and
+   lose the response), ends in one reconciliation: the release and its tag
+   are read back with bounded retries, and the upload succeeds only when the
+   release is verified to still be a mutable pre-release in the same draft
+   state whose tag points at the candidate, holding every uploaded asset with
+   its validated digest. Otherwise -- including when the read-back itself
+   cannot be completed -- every asset name the invocation tried to attach is
+   deleted (deletes retried) and the upload fails, listing what was
+   withdrawn, what was never attached, and anything STILL ATTACHED that must
+   be removed by hand. The release job's own attachments outside `upload` (the
    interop report and the parity record) pass the same privacy re-scan and
    content allowlist through `release-evidence.ts scan` first.
 6. **Record.** Mark claims `passed` with the manifest entry ids and commit the

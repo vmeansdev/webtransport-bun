@@ -367,6 +367,7 @@ function makeFixture(version = "1.0.0"): Fixture {
 	const env: Record<string, string> = {
 		...(process.env as Record<string, string>),
 		RELEASE_EVIDENCE_GH: JSON.stringify([process.execPath, FAKE_GH]),
+		RELEASE_EVIDENCE_RETRY_MS: "1",
 		FAKE_GH_STATE: statePath,
 	};
 	for (const key of ["GITHUB_REPOSITORY", "GITHUB_RUN_ID", "GITHUB_SHA"])
@@ -3164,7 +3165,7 @@ describe("release evidence lifecycle", () => {
 			const upload = cli(fixture, "upload", "--create-prerelease", "--execute");
 			expect(upload.status, what).toBe(1);
 			expect(upload.stderr, what).toContain(
-				"the release changed while evidence was being uploaded",
+				"could not be verified; every asset it tried to attach was withdrawn",
 			);
 			expect(upload.stderr, what).toContain(message);
 			expect(upload.stderr, what).toContain(
@@ -3179,6 +3180,99 @@ describe("release evidence lifecycle", () => {
 		}
 	});
 
+	it("upload reconciles every failure path after the first upload attempt", () => {
+		/** A candidate with two evidence assets ready to upload. */
+		const twoAssets = (hooks: Record<string, unknown>) => {
+			const fixture = makeFixture();
+			cli(fixture, "bind", "--commit", fixture.commit, "--tag", TAG);
+			expect(fetchIwa(fixture).status).toBe(0);
+			const artifact = writeTree(
+				temp("wt-evidence-native-"),
+				nativeGates(fixture.commit),
+			);
+			writeState(fixture, (state) => {
+				state.runs["41"] = runView(
+					fixture,
+					41,
+					{ workflowName: "test" },
+					artifact,
+					"release-evidence-native-gates",
+				);
+			});
+			expect(
+				cli(
+					fixture,
+					"fetch",
+					"--run",
+					"41",
+					"--artifact",
+					"release-evidence-native-gates",
+					"--claim",
+					"native-local-gates",
+				).status,
+			).toBe(0);
+			const names = manifest(fixture).entries.map((e) => e.asset);
+			expect(names).toHaveLength(2);
+			writeState(fixture, (state) => {
+				Object.assign(state, hooks);
+			});
+			const upload = cli(fixture, "upload", "--create-prerelease", "--execute");
+			const state = readState(fixture);
+			const deletes = state.calls
+				.filter((c) => c[0] === "release" && c[1] === "delete-asset")
+				.map((c) => c[3]);
+			return { upload, names, state, deletes };
+		};
+
+		// gh attaches the first file, then exits nonzero on the second.
+		const partial = twoAssets({ uploadFailAfter: 1 });
+		expect(partial.upload.status).toBe(1);
+		expect(partial.upload.stderr).toContain("gh release upload failed");
+		expect(partial.upload.stderr).toContain(`withdrawn: ${partial.names[0]}`);
+		expect(partial.upload.stderr).toContain(
+			`not attached: ${partial.names[1]}`,
+		);
+		expect(new Set(partial.deletes)).toEqual(new Set(partial.names));
+		expect(partial.state.releases[TAG]?.assets).toEqual([]);
+
+		// A transient 502 on the read-back is retried; the upload succeeds.
+		const transient = twoAssets({ viewFailuresAfterUpload: 1 });
+		expect(transient.upload.status, transient.upload.stderr).toBe(0);
+		expect(transient.upload.stdout).toContain(
+			"release state and every digest verified",
+		);
+		expect(transient.deletes).toEqual([]);
+		expect(
+			transient.state.releases[TAG]?.assets.map((a) => a.name).sort(),
+		).toEqual([...transient.names].sort());
+
+		// The read-back never succeeds: the state is unverifiable, so every
+		// asset is withdrawn.
+		const unreadable = twoAssets({ viewFailuresAfterUpload: 100 });
+		expect(unreadable.upload.status).toBe(1);
+		expect(unreadable.upload.stderr).toContain(
+			"the release could not be read back to verify it",
+		);
+		expect(new Set(unreadable.deletes)).toEqual(new Set(unreadable.names));
+		expect(unreadable.state.releases[TAG]?.assets).toEqual([]);
+		expect(unreadable.upload.stderr).not.toContain("STILL ATTACHED");
+
+		// ... and when the deletes fail too, the stranded assets are named.
+		const stranded = twoAssets({
+			viewFailuresAfterUpload: 100,
+			deleteFails: true,
+		});
+		expect(stranded.upload.status).toBe(1);
+		expect(stranded.upload.stderr).toContain(
+			"STILL ATTACHED (could not be deleted; remove them by hand now)",
+		);
+		for (const name of stranded.names)
+			expect(stranded.upload.stderr).toContain(name);
+		// Each delete was retried.
+		expect(stranded.deletes.length).toBeGreaterThan(stranded.names.length);
+		expect(stranded.state.releases[TAG]?.assets).toHaveLength(2);
+	});
+
 	it("upload deletes an attached asset whose read-back digest differs and fails", () => {
 		const fixture = makeFixture();
 		cli(fixture, "bind", "--commit", fixture.commit, "--tag", TAG);
@@ -3188,9 +3282,7 @@ describe("release evidence lifecycle", () => {
 		});
 		const upload = cli(fixture, "upload", "--create-prerelease", "--execute");
 		expect(upload.status).toBe(1);
-		expect(upload.stderr).toContain(
-			"attached assets do not carry the validated bytes",
-		);
+		expect(upload.stderr).toContain("does not carry the validated bytes");
 		const state = readState(fixture);
 		expect(
 			state.calls.some((c) => c[0] === "release" && c[1] === "delete-asset"),
