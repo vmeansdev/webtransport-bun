@@ -687,3 +687,32 @@ export function findEncodedPayloadViolations(
 	}
 	return violations;
 }
+
+/**
+ * Playwright's JSON report records `config.metadata` (and each project's
+ * copy): on CI that includes `gitCommit` (author and committer names and
+ * e-mail addresses, the commit subject and body) and `ci` links. None of it
+ * is evidence and the author identity is personal data, so a report keeps
+ * only `actualWorkers` there. Applied at the generation boundary
+ * (evidence-sanitizer.ts); the release evidence content schema refuses
+ * anything else.
+ */
+export function pruneReportMetadata(document: unknown): unknown {
+	if (document === null || typeof document !== "object") return document;
+	const config = (document as { config?: unknown }).config;
+	if (config === null || typeof config !== "object") return document;
+	const prune = (holder: Record<string, unknown>) => {
+		const metadata = holder.metadata;
+		if (metadata === null || typeof metadata !== "object") return;
+		const workers = (metadata as { actualWorkers?: unknown }).actualWorkers;
+		holder.metadata =
+			typeof workers === "number" ? { actualWorkers: workers } : {};
+	};
+	prune(config as Record<string, unknown>);
+	const projects = (config as { projects?: unknown }).projects;
+	if (Array.isArray(projects))
+		for (const project of projects)
+			if (project !== null && typeof project === "object")
+				prune(project as Record<string, unknown>);
+	return document;
+}

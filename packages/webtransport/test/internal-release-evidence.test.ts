@@ -35,6 +35,7 @@ import {
 	distTagFor,
 	stampedVersion,
 } from "../../../scripts/stamp-version-from-tag.ts";
+import { pruneReportMetadata } from "../../../tools/interop/evidence-privacy.ts";
 
 const PROJECT_ROOT = join(import.meta.dir, "..", "..", "..");
 const CLI = join(PROJECT_ROOT, "scripts", "release-evidence.ts");
@@ -1212,6 +1213,47 @@ describe("evidence content allowlist", () => {
 			expect(result.ok).toBe(false);
 		});
 	}
+
+	it("refuses CI git metadata in a Playwright report until the sanitizer prunes it", () => {
+		const report = playwrightReport();
+		const withGit = {
+			...report,
+			config: {
+				...report.config,
+				metadata: {
+					actualWorkers: 1,
+					ci: {
+						commitHash: commit,
+						buildHref: "https://github.com/x/y/actions/runs/1",
+					},
+					gitCommit: {
+						author: {
+							name: "Someone",
+							email: "someone@example.invalid",
+							time: 1,
+						},
+					},
+				},
+			},
+		};
+		expect(
+			contentProblems(
+				[member("r/interop.json", withGit)],
+				filesFor("chromium-native-interop"),
+			).join("\n"),
+		).toContain("unknown field");
+		expect(
+			contentProblems(
+				[
+					member(
+						"r/interop.json",
+						pruneReportMetadata(structuredClone(withGit)),
+					),
+				],
+				filesFor("chromium-native-interop"),
+			),
+		).toEqual([]);
+	});
 
 	it("refuses an unknown extra field, recursively", () => {
 		const evidence = { ...iwaEvidence(commit), extra: "harmless" };

@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import type { Reporter } from "@playwright/test/reporter";
 import {
 	findPrivacyViolations,
+	pruneReportMetadata,
 	sanitizeEvidenceDocument,
 } from "./evidence-privacy.ts";
 
@@ -32,7 +33,7 @@ export default class EvidenceSanitizer implements Reporter {
 	async onExit(): Promise<void> {
 		if (!existsSync(this.outputFile)) return;
 		const sanitized = sanitizeEvidenceDocument(
-			JSON.parse(readFileSync(this.outputFile, "utf8")),
+			pruneReportMetadata(JSON.parse(readFileSync(this.outputFile, "utf8"))),
 			repoRoot,
 		);
 		writeFileSync(this.outputFile, `${JSON.stringify(sanitized, null, 2)}\n`);
@@ -56,7 +57,7 @@ export default class EvidenceSanitizer implements Reporter {
  */
 export function sanitizeEvidenceFile(path: string, root = repoRoot): number {
 	const sanitized = sanitizeEvidenceDocument(
-		JSON.parse(readFileSync(path, "utf8")),
+		pruneReportMetadata(JSON.parse(readFileSync(path, "utf8"))),
 		root,
 	);
 	writeFileSync(path, `${JSON.stringify(sanitized, null, 2)}\n`);

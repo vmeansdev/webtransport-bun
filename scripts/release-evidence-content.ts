@@ -470,7 +470,7 @@ const playwrightReport = obj({
 			),
 			quiet: bool,
 			reporter: arr(
-				arr(oneOf(path(), obj({ outputFile: path() }, ["outputFile"])), 2),
+				arr(oneOf(path(), nul, obj({ outputFile: path() }, ["outputFile"])), 2),
 				10,
 			),
 			reportSlowTests: nullable(obj({ max: int, threshold: int })),
