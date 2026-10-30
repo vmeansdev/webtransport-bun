@@ -182,7 +182,11 @@ All through `bun scripts/release-evidence.ts`:
    copies are given to `gh`, so a file replaced after validation is never
    what gets published. After uploading, `upload` reads the release back and
    digest-checks every attached asset; one that does not carry the validated
-   bytes is deleted and the upload fails. The release job's own attachments outside `upload` (the
+   bytes is deleted and the upload fails. The read-back also re-checks the
+   release and its tag: if the release stopped being a pre-release, became
+   immutable, changed its draft state or disappeared, or the tag moved off
+   the candidate while the upload ran, every asset just uploaded is deleted
+   (any that cannot be is named for manual removal) and the upload fails. The release job's own attachments outside `upload` (the
    interop report and the parity record) pass the same privacy re-scan and
    content allowlist through `release-evidence.ts scan` first.
 6. **Record.** Mark claims `passed` with the manifest entry ids and commit the

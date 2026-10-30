@@ -57,6 +57,14 @@ type State = {
 	/** Store different bytes than the file given to `release upload`, as a
 	 * corrupted or swapped upload would. */
 	corruptUpload?: boolean;
+	/** Applied to the release right after an upload: models the release
+	 * being promoted, frozen or retagged while evidence was uploading. */
+	afterUpload?: {
+		isPrerelease?: boolean;
+		isImmutable?: boolean;
+		isDraft?: boolean;
+		tagCommit?: string;
+	} | null;
 	/** Base64 of the exact bytes of every file `release upload` was given,
 	 * read when it was invoked. */
 	uploadedBytes?: Record<string, string>;
@@ -238,6 +246,12 @@ if (group === "release") {
 				size: readFileSync(stored).length,
 				digest: `sha256:${sha256(stored)}`,
 			});
+		}
+		if (state.afterUpload) {
+			const { tagCommit, ...flags } = state.afterUpload;
+			Object.assign(release, flags);
+			if (tagCommit) state.tags[tag] = tagCommit;
+			state.afterUpload = null;
 		}
 		save();
 		process.exit(0);

@@ -992,6 +992,62 @@ function uploadCommand(args: Args): void {
 	// Read back what is attached now: every uploaded asset must carry exactly
 	// the validated bytes. A mismatching asset is deleted and the upload fails.
 	const attached = viewRelease(repository, tag, root);
+	// The release and its tag may have changed while the upload ran (promoted
+	// to a full release, made immutable, turned into a draft, retagged): the
+	// candidate-prerelease boundary is re-checked against the state after the
+	// upload, and on any change everything just uploaded is withdrawn.
+	const stateProblems: string[] = [];
+	if (!attached) stateProblems.push(`release ${tag} no longer exists`);
+	else {
+		if (!attached.isPrerelease)
+			stateProblems.push(`release ${tag} is no longer a pre-release`);
+		if (attached.isImmutable)
+			stateProblems.push(`release ${tag} became immutable`);
+		if (Boolean(attached.isDraft) !== Boolean(release?.isDraft))
+			stateProblems.push(`release ${tag} changed its draft state`);
+	}
+	let tagNow: string | undefined;
+	try {
+		tagNow = remoteTagCommit(repository, tag, root);
+	} catch {
+		tagNow = undefined;
+	}
+	if (tagNow !== tagCommit)
+		stateProblems.push(
+			`tag ${tag} now points to ${tagNow ?? "<unresolvable>"}, not the evidence candidate ${tagCommit}`,
+		);
+	if (stateProblems.length > 0) {
+		const withdrawn: string[] = [];
+		const stranded: string[] = [];
+		for (const file of pending) {
+			if (!attached?.assets.some((asset) => asset.name === file.name)) continue;
+			const deleted = runGh(
+				[
+					"release",
+					"delete-asset",
+					tag,
+					file.name,
+					"--repo",
+					repository,
+					"--yes",
+				],
+				root,
+			);
+			(deleted.status === 0 ? withdrawn : stranded).push(file.name);
+		}
+		throw new Error(
+			[
+				`the release changed while evidence was being uploaded; refusing to leave evidence outside a candidate pre-release:`,
+				...stateProblems.map((p) => ` - ${p}`),
+				`withdrawn: ${withdrawn.join(", ") || "none"}`,
+				...(stranded.length > 0
+					? [
+							`STILL ATTACHED (could not be deleted; remove them by hand now): ${stranded.join(", ")}`,
+						]
+					: []),
+			].join("\n"),
+		);
+	}
 	const mismatched: string[] = [];
 	for (const file of pending) {
 		const remote = attached?.assets.find((asset) => asset.name === file.name);

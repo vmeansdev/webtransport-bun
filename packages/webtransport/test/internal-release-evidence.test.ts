@@ -3143,6 +3143,42 @@ describe("release evidence lifecycle", () => {
 		expect(cli(fixture, "verify", "--integrity-only").status).toBe(0);
 	});
 
+	it("upload withdraws its assets when the release stops being the candidate pre-release mid-upload", () => {
+		const cases: [string, Record<string, unknown>, string][] = [
+			["promoted", { isPrerelease: false }, "is no longer a pre-release"],
+			["frozen", { isImmutable: true }, "became immutable"],
+			["drafted", { isDraft: true }, "changed its draft state"],
+			[
+				"retagged",
+				{ tagCommit: "d".repeat(40) },
+				`now points to ${"d".repeat(40)}`,
+			],
+		];
+		for (const [what, change, message] of cases) {
+			const fixture = makeFixture();
+			cli(fixture, "bind", "--commit", fixture.commit, "--tag", TAG);
+			expect(fetchIwa(fixture).status).toBe(0);
+			writeState(fixture, (state) => {
+				Object.assign(state, { afterUpload: change });
+			});
+			const upload = cli(fixture, "upload", "--create-prerelease", "--execute");
+			expect(upload.status, what).toBe(1);
+			expect(upload.stderr, what).toContain(
+				"the release changed while evidence was being uploaded",
+			);
+			expect(upload.stderr, what).toContain(message);
+			expect(upload.stderr, what).toContain(
+				"withdrawn: evidence-iwa-direct-sockets-iwa-42-1.json",
+			);
+			const state = readState(fixture);
+			expect(
+				state.calls.some((c) => c[0] === "release" && c[1] === "upload"),
+				what,
+			).toBe(true);
+			expect(state.releases[TAG]?.assets, what).toEqual([]);
+		}
+	});
+
 	it("upload deletes an attached asset whose read-back digest differs and fails", () => {
 		const fixture = makeFixture();
 		cli(fixture, "bind", "--commit", fixture.commit, "--tag", TAG);
