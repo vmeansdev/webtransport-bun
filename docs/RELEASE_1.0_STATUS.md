@@ -2,7 +2,10 @@
 
 Canonical release truth: `docs/release-status.json`.
 
-Package version: `1.0.0-rc.1`.
+Package version: committed base `1.0.0`; published versions are stamped
+from the release tag (`v1.0.0-rc.N` → `1.0.0-rc.N` on npm `next`, `v1.0.0` →
+`1.0.0` on npm `latest`). The latest published release candidate is
+`1.0.0-rc.1`.
 
 **Coupled GA model:** `1.0.0` only when every `gaRequired: true` claim is
 `passed` with commit-bound evidence and
@@ -63,14 +66,16 @@ Follow-on decisions (2026-10-30):
   `bench-bandwidth` runs is a later follow-up; until then their artifacts are
   pulled in with `release-evidence.ts fetch`.
 
-**Open question (versioning):** `publish.yml` publishes a tag only when it
-equals `v<package.json version>`. With the GA tag on the candidate commit, that
-commit's `package.json` must say `1.0.0`, so an rc tag on the same commit
-(`v1.0.0-rc.N`, accepted by the evidence tooling as a pre-release of `1.0.0`)
-cannot be published to npm by the current workflow; conversely a candidate at
-`1.0.0-rc.N` cannot be released as `v1.0.0` without a new commit. Options:
-stamp the package version from the tag at build time, accept that the final
-rc is not published to npm, or bump to `1.0.0` and re-run the evidence. Tracked files under
+**Decision (2026-10-30): the version comes from the tag.** The committed
+`packages/webtransport/package.json` carries the base version (`1.0.0`). The
+release workflow stamps the version from the pushed tag before building the
+tarball (`scripts/stamp-version-from-tag.ts`): `v1.0.0-rc.N` builds
+`1.0.0-rc.N` (npm `next`), `v1.0.0` on the same commit builds `1.0.0` (npm
+`latest`). Any tag other than `v<base>` or `v<base>-<pre-release>` is refused
+by the release build and by `publish.yml`, which also checks that the tarball
+and its `candidate-identity.json` (which records tag, commit and
+`packageVersion`) carry the stamped version. Evidence verification accepts the
+rc tag and the GA tag on the same candidate commit. Tracked files under
 `.release-evidence/` and `.bench-evidence/` stay refused by CI
 (`scripts/check-tracked-hygiene.sh`).
 
@@ -102,7 +107,7 @@ single-source scale scripts it replaced are not release evidence.
 
 ## What is safe to say today
 
-- Package remains `1.0.0-rc.1`; readiness remains `pending`.
+- The latest published package is `1.0.0-rc.1`; readiness remains `pending`.
 - No gate is currently `passed` in `docs/release-status.json`; earlier passes
   were bound to a commit that no longer exists and are history, not evidence.
 - Promote refuses until every `gaRequired` claim passes at a new candidate.

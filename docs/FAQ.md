@@ -63,7 +63,7 @@ no BigInt interop or JSON-serialization surprises.
 
 ## Is this production-ready?
 
-Not yet. The package remains `1.0.0-rc.1`, and both the native and WASM
+Not yet. The latest published package is `1.0.0-rc.1`, and both the native and WASM
 surfaces remain release candidates. Local implementation gates have useful
 coverage, but the immutable multi-platform/runtime matrix, release coverage and
 fuzz evidence, >=10k diverse-source scale proof, 24-hour and 72-hour soaks, and

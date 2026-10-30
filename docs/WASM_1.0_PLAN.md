@@ -3,7 +3,8 @@
 Current release truth lives in `docs/release-status.json`. This document is the
 working plan for the `/wasm` candidate under a **coupled** package 1.0.0.
 
-Package version: `1.0.0-rc.1`.
+Package version: latest published `1.0.0-rc.1` (committed base `1.0.0`;
+published versions are stamped from release tags).
 
 Worktree label: `feat/wasm-1.0`.
 

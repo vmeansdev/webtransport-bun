@@ -54,13 +54,16 @@ is refused:
 
 All through `bun scripts/release-evidence.ts`:
 
-1. **Freeze and tag.** Push the `vX.Y.Z-rc.N` tag on the candidate commit.
-   The tag-triggered `release` workflow publishes the pre-release (`prerelease`
-   is set for any hyphenated tag; `publish.yml` puts the rc on npm under the
-   `next` dist-tag, never `latest`). Its `evidence-assets` job scrubs and
-   attaches the run's interop, fuzz, distributed-scale and package-identity
-   evidence plus a `release-evidence-fragment-release-<run>-<attempt>.json`
-   manifest fragment. The job is `continue-on-error`: a refused bundle never
+1. **Freeze and tag.** The committed `packages/webtransport/package.json`
+   carries the base version (`X.Y.Z`); the published version is stamped from
+   the tag at build time (`scripts/stamp-version-from-tag.ts`). Push the
+   `vX.Y.Z-rc.N` tag on the candidate commit. The tag-triggered `release`
+   workflow builds `X.Y.Z-rc.N`, publishes the pre-release (`prerelease` is set
+   for any hyphenated tag), and `publish.yml` puts it on npm under the `next`
+   dist-tag, never `latest`. Its `evidence-assets` job fetches the run's own
+   interop, fuzz, distributed-scale and package-identity artifacts, scrubs and
+   attaches them plus a
+   `release-evidence-fragment-release-<run>-<attempt>.json` manifest fragment. The job is `continue-on-error`: a refused bundle never
    blocks the release or the rc publish, but the failure stays on the run.
 2. **Bind.** `bind --commit <candidate-sha> --tag vX.Y.Z-rc.N` records the
    candidate, the package version at that commit and the registry's sha256 in
@@ -72,11 +75,14 @@ All through `bun scripts/release-evidence.ts`:
    `fetch --run <run-id> --artifact <name> --claim <claim-id>`. Local runs
    (interactive IWA proof, bare-metal soaks, review records) come in with
    `package --claim <claim-id> --input <file-or-dir> --local "<what ran where>"`.
-   Provenance is never self-attested: `fetch` and `package --run-id` read the
-   run back from the Actions API and refuse a run in another repository or
-   workflow, one that did not build the candidate, or one that did not succeed
-   (the only in-progress run accepted is the release run packaging its own
-   evidence from inside itself).
+   Provenance is never self-attested: CI evidence enters only through `fetch`,
+   which reads the run back from the Actions API (refusing a run in another
+   repository or workflow, one that did not build the candidate, or one that
+   did not succeed; the only in-progress run accepted is the release run
+   fetching its own artifacts from inside itself), downloads the named
+   artifact itself, and records the artifact's id, name and digest; verify
+   re-checks them against the run's artifact listing. `package` accepts local
+   producers only.
 4. **Scrub.** `package` and `fetch` rewrite the checkout path to `<repo>`, then
    run the evidence-privacy scanner over every file. It refuses, without
    echoing the value: credential-shaped values or keys; environment dumps, by
@@ -84,8 +90,11 @@ All through `bun scripts/release-evidence.ts`:
    `GITHUB_*`, `*_TOKEN`, …) and by structure (three or more
    environment-shaped names that are not documented `WT_*`/`WEBTRANSPORT_*`
    knobs); the local login and hostname; host paths; and any of these hidden
-   behind base64/base64url, hex, percent-encoding or gzip (decoded and
-   rescanned recursively, bounded). Remaining plain host paths may be replaced
+   behind base64/base64url, hex, percent-encoding or gzip. Encodings are
+   rejoined across whitespace, line wraps and split JSON strings, decoded at
+   every alignment, inflated when compressed (a tar.gz inside is read), and
+   rescanned; anything still decodable after four layers, and any zip/xz/
+   zstd/7z/bzip2 payload, is refused rather than accepted. Remaining plain host paths may be replaced
    by a marker only with `--redact-host-paths`; everything else is always
    refused. Binary files are refused because they cannot be scanned. Bundles
    are canonical: a single gzip member without header extras or trailing
@@ -112,7 +121,10 @@ All through `bun scripts/release-evidence.ts`:
    downloaded assets and refuses unless HEAD is the candidate or a descendant
    that changed only the evidence record; there is no override. It sets
    readiness `ready` and writes a **promotion lock** into the manifest: the tag
-   commit and the sha256 of every evidence asset on the pre-release.
+   commit and the sha256 of every evidence asset on the pre-release. Both
+   records are replaced atomically, lock first; a promotion interrupted
+   between them is completed by rerunning promote (which re-verifies the lock
+   against the release), and rerunning a finished promotion changes nothing.
 8. **Do not edit the pre-release after promotion.** The
    `release-evidence-verify` workflow re-verifies daily and on every change to
    the record (`verify --require-ready` once promoted, `verify
@@ -125,12 +137,13 @@ All through `bun scripts/release-evidence.ts`:
    npm `latest` publish) is refused unless the record is promoted, the GA tag
    is the candidate commit, and the pre-release still matches the lock.
 
-The candidate tag must be `v<package version>` or a pre-release of it: a
-candidate whose `package.json` says `1.0.0` may carry the rc tag `v1.0.0-rc.N`
-on the same commit, which is what lets `v1.0.0` point at the candidate. Note
-that `publish.yml` publishes only a tag equal to `v<package version>`, so on
-such a commit the rc tag's npm publish is refused; see
-`docs/RELEASE_1.0_STATUS.md`.
+Tags and versions: the candidate is bound with its pre-release tag
+`v<base>-rc.N`, and the GA tag `v<base>` goes on the same commit. Both build
+from the committed base version, stamped from the tag: the rc publishes
+`<base>-rc.N` to `next`, GA publishes `<base>` to `latest`. The release build
+and `publish.yml` refuse any other tag, and the published tarball's
+`candidate-identity.json` records the tag, the commit and the stamped
+`packageVersion`.
 
 ## Required gates (automated)
 

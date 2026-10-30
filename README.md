@@ -107,7 +107,9 @@ Detailed migration playbook:
 
 ## Status
 - Native surface is a release candidate: `1.0.0-rc.1`.
-- Version: `1.0.0-rc.1`. The canonical release status lives in
+- Version: `1.0.0-rc.1` (latest published release candidate; release tags
+  stamp the published version over the committed base `1.0.0`). The canonical
+  release status lives in
   `docs/release-status.json`; the native root entrypoint and `/wasm` are
   candidate surfaces, not stable/GA.
 - Configured release targets: Bun (`>= 1.3.14`), Node, and Deno. Candidate support remains unclaimed until the matching entries in
