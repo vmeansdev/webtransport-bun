@@ -1307,6 +1307,10 @@ mod tests {
     /// mark-map rules share one test.
     #[test]
     fn the_reports_ring_is_fifo_owner_scoped_bounded_and_accounts_for_every_failure() {
+        // The submit tests release an orphaned job through `record_report`,
+        // which moves `DEFERRED_FAILURES` under this test's delta; without
+        // this lock the closing identity failed whenever they overlapped.
+        let _serial = SUBMIT_TESTS.lock().unwrap_or_else(|p| p.into_inner());
         let failures_before = DEFERRED_FAILURES.load(Ordering::Relaxed);
         let dropped_at_start = reports_dropped();
         // Owner ids unique to this test: the ring is process-wide and the test
@@ -1738,6 +1742,9 @@ mod tests {
         let clumps = std::cell::RefCell::new(Vec::<Vec<String>>::new());
         let departures = std::cell::RefCell::new(Vec::<Instant>::new());
         let released = std::cell::RefCell::new(Vec::<usize>::new());
+        // The schedule starts no earlier than this: the first clump's
+        // departure time is `now` at the first `next_txtime` call.
+        let started = Instant::now();
         drain_paced(
             &cfg,
             &mut core,
@@ -1768,11 +1775,20 @@ mod tests {
             targets,
             "every target is sent exactly once, in the caller's order"
         );
-        for pair in departures.into_inner().windows(2) {
-            let gap = pair[1] - pair[0];
+        // Paced means never ahead of the schedule: clump k departs no earlier
+        // than k intervals after the schedule began. Two clumps may still
+        // leave back to back -- a clump that left late (the thread was
+        // descheduled) is followed by one whose slot has already come, and
+        // `next_txtime` deliberately sends that at once instead of resetting
+        // the cadence (see CATCHUP_CLUMPS) -- so the gap between neighbours
+        // is not a bound; that assumption made this test fail on a loaded
+        // Windows runner with clumps 8.3us apart (test run 41085720203).
+        for (k, departed) in departures.into_inner().into_iter().enumerate() {
+            let earliest = cfg.interval() * k as u32;
+            let elapsed = departed - started;
             assert!(
-                gap >= cfg.interval() / 2,
-                "clumps departed {gap:?} apart, which is not a paced burst unit"
+                elapsed >= earliest,
+                "clump {k} departed {elapsed:?} after the start, ahead of its slot at {earliest:?}"
             );
         }
     }
