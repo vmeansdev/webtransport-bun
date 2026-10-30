@@ -30,6 +30,17 @@
  * a regression likely to be caught, not certain — the deterministic guard for
  * the same defect is `classify_batch_poll` / `TerminalLatch` in
  * `crates/native/src/client_stream.rs`, which are unit-tested directly.
+ *
+ * ## Accounting
+ *
+ * A reset can overtake the stream's WebTransport header: the client resets
+ * one macrotask after opening, and RESET_STREAM discards whatever of the
+ * stream was still unsent, header included. The server then cannot attribute
+ * the stream to a session and drops it without surfacing it, so it is never
+ * accepted (observed 1/20 runs under CPU load, 1 of 200 streams; macOS CI run
+ * 41070430710). Every stream the server *accepted* must still reach a
+ * terminal — that is what keeps the EOF assertion from being vacuous — and
+ * almost all streams must be accepted, so the race is still exercised.
  */
 
 import { describe, expect, it } from "bun:test";
@@ -44,11 +55,9 @@ const body = `
 	const CHUNK = 512;
 
 	const outcomes = [];
-	let resolveAll;
-	const all = new Promise((r) => { resolveAll = r; });
+	let accepted = 0;
 	const note = (o) => {
 		outcomes.push(o);
-		if (outcomes.length === STREAMS) resolveAll();
 	};
 
 	const server = createServer({
@@ -57,6 +66,7 @@ const body = `
 		tls: { certPem: "", keyPem: "" },
 		onSession: async (session) => {
 			for await (const duplex of session.incomingBidirectionalStreams) {
+				accepted++;
 				// Drain concurrently: the swallow needs the batch loop to be
 				// running when the reset is processed, so the reader must not
 				// wait for the writer.
@@ -91,8 +101,21 @@ const body = `
 		stream[WT_RESET](42);
 	}
 
-	await Promise.race([all, Bun.sleep(30000)]);
-	report({ outcomes, streams: STREAMS });
+	// Done when every stream is accounted for, or when every accepted stream
+	// has reached a terminal and nothing new has arrived for two seconds.
+	const deadline = Date.now() + 30000;
+	let settledSince = 0;
+	let settledAt = -1;
+	while (Date.now() < deadline && outcomes.length < STREAMS) {
+		if (outcomes.length === accepted) {
+			if (settledAt !== accepted) { settledAt = accepted; settledSince = Date.now(); }
+			else if (Date.now() - settledSince >= 2000) break;
+		} else {
+			settledAt = -1;
+		}
+		await Bun.sleep(25);
+	}
+	report({ outcomes, streams: STREAMS, accepted });
 	client.close();
 	server.close();
 	process.exit(0);
@@ -113,11 +136,15 @@ describe("receive batching and a peer reset", () => {
 		) as {
 			outcomes: { end: string; bytes: number; code?: string }[];
 			streams: number;
+			accepted: number;
 		};
 
-		// Every stream must have been accounted for: a silent hang would make
-		// the EOF assertion vacuous rather than satisfied.
-		expect(res.outcomes.length).toBe(res.streams);
+		// Every accepted stream must have been accounted for: a silent hang
+		// would make the EOF assertion vacuous rather than satisfied. Only a
+		// stream whose reset overtook its header may go unaccepted (see the
+		// header), and those must stay rare or the race is not exercised.
+		expect(res.outcomes.length).toBe(res.accepted);
+		expect(res.accepted).toBeGreaterThanOrEqual(res.streams - 5);
 
 		const clean = res.outcomes.filter((o) => o.end === "eof");
 		expect(clean).toEqual([]);
