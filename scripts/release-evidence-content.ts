@@ -54,14 +54,119 @@ function looksEncoded(joined: string): boolean {
 	);
 }
 
+/** Gap between two words of natural language: one space, optionally after
+ * sentence punctuation or before/after a bracket or quote. Any other run of
+ * non-alphabet characters is ignorable to a permissive decoder
+ * (`Buffer.from(text, "base64")` skips every one of them), so it joins the
+ * chunks on either side into one run. */
+const NATURAL_GAP = /^[,.;:!?)\]"'`]{0,2} ["'([`]?$/;
+
+/** Window over the alphabet-only projection that is decoded and measured. */
+const PROJECTION_WINDOW = 32;
+/** Decoded bytes this printable are text someone encoded. */
+const PRINTABLE_SHARE = 0.9;
+/** Character-class churn of a projected window that only encoded data has
+ * (base64 averages ~0.65, hex ~0.47) ... */
+const PROJECTED_CHURN = 0.45;
+/** ... when this share of its chunks are not words, numbers or hex literals.
+ * Natural text (log lines with counters and addresses included) consists of
+ * such tokens; base64 cut into short chunks mostly does not. */
+const NON_WORD_SHARE = 0.3;
+
+/** A token natural text is made of: a word (any case), a number with an
+ * optional short unit (`31Mb`, `1.5s`), a word with a short numeric suffix
+ * (`h3`, `node22`), or a 0x-prefixed hex literal. */
+function wordlike(chunk: string): boolean {
+	return chunk
+		.split(/[+/=_-]+/)
+		.filter((part) => part.length > 0)
+		.every((part) =>
+			/^(?:[A-Za-z]+|[0-9]+[A-Za-z]{0,3}|[A-Za-z]+[0-9]{1,3}|0x[0-9A-Fa-f]+)$/.test(
+				part,
+			),
+		);
+}
+
+function churn(alnum: string): number {
+	if (alnum.length < 2) return 0;
+	let transitions = 0;
+	for (let i = 1; i < alnum.length; i += 1)
+		if (charClass(alnum[i] as string) !== charClass(alnum[i - 1] as string))
+			transitions += 1;
+	return transitions / (alnum.length - 1);
+}
+
+function printableShare(bytes: Uint8Array): number {
+	if (bytes.length === 0) return 0;
+	let printable = 0;
+	for (const byte of bytes)
+		if (
+			(byte >= 0x20 && byte <= 0x7e) ||
+			byte === 9 ||
+			byte === 10 ||
+			byte === 13
+		)
+			printable += 1;
+	return printable / bytes.length;
+}
+
+/** Whether some alignment of `projection` decodes (base64 or hex) to mostly
+ * printable text. */
+function decodesToText(projection: string): boolean {
+	const b64 = projection
+		.replace(/=/g, "")
+		.replace(/-/g, "+")
+		.replace(/_/g, "/");
+	for (let offset = 0; offset < 4; offset += 1) {
+		const usable = b64.slice(offset);
+		const chars = usable.slice(0, usable.length - (usable.length % 4));
+		if (chars.length < 24) continue;
+		if (printableShare(Buffer.from(chars, "base64")) >= PRINTABLE_SHARE)
+			return true;
+	}
+	if (/^[0-9a-fA-F]+$/.test(projection))
+		for (let offset = 0; offset < 2; offset += 1) {
+			const usable = projection.slice(offset);
+			const chars = usable.slice(0, usable.length - (usable.length % 2));
+			if (chars.length < 24) continue;
+			if (printableShare(Buffer.from(chars, "hex")) >= PRINTABLE_SHARE)
+				return true;
+		}
+	return false;
+}
+
 /**
- * Why `text` contains an opaque run, or `undefined`. Chunks of the base64/hex
- * alphabet separated by exactly one other character are joined first, so
- * `TE9L!QUxJ!U0Vf`, `TE9L.QUxJ`, `TE9L,QUxJ` and `TE9L QUxJ` are all one run.
+ * Why `text` contains an opaque run, or `undefined`. Fail closed against
+ * encodings split up to defeat a scanner:
+ *
+ * 1. Chunks of the base64/hex alphabet separated by any run of other
+ *    characters (`!`, `!!`, `.,:`, `  `, a newline, …) are one run unless the
+ *    gap is a natural word gap (one space, with optional punctuation). A run
+ *    of 24+ characters with the churn of encoded data is refused.
+ * 2. The alphabet-only projection of the whole text — every gap removed,
+ *    word gaps included, exactly what a permissive decoder sees — is scanned
+ *    in windows: a window that decodes to mostly printable text, or that has
+ *    the character-class churn only encoded data has, is refused.
  */
 export function opaqueRunReason(text: string): string | undefined {
+	const chunks: { chunk: string; gapBefore: string }[] = [];
+	let chunk = "";
+	let gap = "";
+	for (const char of text) {
+		if (ALPHABET.test(char)) {
+			if (chunk === "") {
+				chunks.push({ chunk: "", gapBefore: gap });
+				gap = "";
+			}
+			chunk += char;
+			(chunks[chunks.length - 1] as { chunk: string }).chunk = chunk;
+		} else {
+			chunk = "";
+			gap += char;
+		}
+	}
+	// 1. runs joined across every gap that is not a natural word gap
 	let joined = "";
-	let gap = 0;
 	const flush = (): string | undefined => {
 		const found =
 			joined.length >= OPAQUE_RUN_LENGTH && looksEncoded(joined)
@@ -70,19 +175,49 @@ export function opaqueRunReason(text: string): string | undefined {
 		joined = "";
 		return found;
 	};
-	for (const char of text) {
-		if (ALPHABET.test(char)) {
-			joined += char;
-			gap = 0;
-			continue;
-		}
-		gap += 1;
-		if (gap > 1) {
+	for (const [index, { chunk: part, gapBefore }] of chunks.entries()) {
+		if (index > 0 && NATURAL_GAP.test(gapBefore)) {
 			const found = flush();
 			if (found) return found;
 		}
+		joined += part;
 	}
-	return flush();
+	const last = flush();
+	if (last) return last;
+	// 2. the projection a permissive decoder reconstructs
+	const projection = chunks.map((c) => c.chunk).join("");
+	if (projection.length < OPAQUE_RUN_LENGTH) return undefined;
+	const windows =
+		projection.length <= PROJECTION_WINDOW
+			? [projection]
+			: Array.from(
+					{
+						length: Math.floor((projection.length - PROJECTION_WINDOW) / 4) + 1,
+					},
+					(_, i) => projection.slice(i * 4, i * 4 + PROJECTION_WINDOW),
+				);
+	for (const window of windows)
+		if (decodesToText(window))
+			return "encoded text across separators (its alphabet-only projection decodes to printable text)";
+	// Chunks joined across word gaps: refused when they do not read as
+	// natural text (too many non-word tokens) and churn like encoded data.
+	const parts = chunks.map((c) => c.chunk);
+	for (let start = 0; start < parts.length; start += 1) {
+		let joinedLength = 0;
+		let end = start;
+		while (end < parts.length && joinedLength < PROJECTION_WINDOW)
+			joinedLength += (parts[end++] as string).length;
+		if (joinedLength < OPAQUE_RUN_LENGTH) break;
+		const span = parts.slice(start, end);
+		const nonWords = span.filter((part) => !wordlike(part)).length;
+		const alnum = span.join("").replace(/[^A-Za-z0-9]/g, "");
+		if (
+			nonWords / span.length >= NON_WORD_SHARE &&
+			churn(alnum) >= PROJECTED_CHURN
+		)
+			return "encoded-looking characters across separators";
+	}
+	return undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -182,7 +317,7 @@ function stringProblem(value: string, s: StringKind): string | undefined {
 			const segments = value
 				.split("/")
 				.filter((seg) => !/^[0-9a-f]{40}$/.test(seg));
-			return opaqueRunReason(segments.join("  "));
+			return opaqueRunReason(segments.join(" "));
 		}
 		case "symbol":
 			// Compiler-mangled names; charset-restricted and still decode-rescanned.
@@ -217,7 +352,8 @@ function stringProblem(value: string, s: StringKind): string | undefined {
 				const reason = opaqueRunReason(line);
 				if (reason) return `line ${index + 1}: ${reason}`;
 			}
-			return undefined;
+			// A decoder also joins chunks spread over several lines.
+			return opaqueRunReason(value);
 		}
 	}
 }
@@ -613,68 +749,73 @@ const coverageSummary = obj(
 	},
 	["instantiations", "branches", "mcdc", "regions"],
 );
-const llvmCovExport = obj({
-	data: arr(
-		obj(
-			{
-				files: arr(
-					obj(
-						{
-							filename: path(1024),
-							segments: arr(numberTuple, 10_000_000),
-							branches: arr(numberTuple, 10_000_000),
-							mcdc_records: arr(
-								arr(oneOf(num, bool, arr(oneOf(num, bool), 64)), 64),
-								1_000_000,
-							),
-							expansions: arr(
-								obj(
-									{
-										filenames: arr(path(1024), 100),
-										source_region: numberTuple,
-										target_regions: arr(numberTuple, 1_000_000),
-										branches: arr(numberTuple, 1_000_000),
-										mcdc_records: arr(
-											arr(oneOf(num, bool, arr(oneOf(num, bool), 64)), 64),
-											1_000_000,
-										),
-									},
-									["branches", "mcdc_records"],
+const llvmCovExport = obj(
+	{
+		data: arr(
+			obj(
+				{
+					files: arr(
+						obj(
+							{
+								filename: path(1024),
+								segments: arr(numberTuple, 10_000_000),
+								branches: arr(numberTuple, 10_000_000),
+								mcdc_records: arr(
+									arr(oneOf(num, bool, arr(oneOf(num, bool), 64)), 64),
+									1_000_000,
 								),
-								1_000_000,
-							),
-							summary: coverageSummary,
-						},
-						["segments", "branches", "mcdc_records", "expansions"],
+								expansions: arr(
+									obj(
+										{
+											filenames: arr(path(1024), 100),
+											source_region: numberTuple,
+											target_regions: arr(numberTuple, 1_000_000),
+											branches: arr(numberTuple, 1_000_000),
+											mcdc_records: arr(
+												arr(oneOf(num, bool, arr(oneOf(num, bool), 64)), 64),
+												1_000_000,
+											),
+										},
+										["branches", "mcdc_records"],
+									),
+									1_000_000,
+								),
+								summary: coverageSummary,
+							},
+							["segments", "branches", "mcdc_records", "expansions"],
+						),
+						100_000,
 					),
-					100_000,
-				),
-				functions: arr(
-					obj(
-						{
-							name: str({ kind: "symbol", max: 4096 }),
-							count: int,
-							regions: arr(numberTuple, 1_000_000),
-							branches: arr(numberTuple, 1_000_000),
-							mcdc_records: arr(
-								arr(oneOf(num, bool, arr(oneOf(num, bool), 64)), 64),
-								1_000_000,
-							),
-							filenames: arr(path(1024), 100),
-						},
-						["branches", "mcdc_records"],
+					functions: arr(
+						obj(
+							{
+								name: str({ kind: "symbol", max: 4096 }),
+								count: int,
+								regions: arr(numberTuple, 1_000_000),
+								branches: arr(numberTuple, 1_000_000),
+								mcdc_records: arr(
+									arr(oneOf(num, bool, arr(oneOf(num, bool), 64)), 64),
+									1_000_000,
+								),
+								filenames: arr(path(1024), 100),
+							},
+							["branches", "mcdc_records"],
+						),
+						10_000_000,
 					),
-					10_000_000,
-				),
-				totals: coverageSummary,
-			},
-			["functions"],
+					totals: coverageSummary,
+				},
+				["functions"],
+			),
+			16,
 		),
-		16,
-	),
-	type: lit("llvm.coverage.json.export"),
-	version: ident(16),
-});
+		type: lit("llvm.coverage.json.export"),
+		version: ident(16),
+		// cargo-llvm-cov's own stamp on the export.
+		cargo_llvm_cov: obj({ version: ident(32), manifest_path: path(1024) }),
+	},
+	["cargo_llvm_cov"],
+);
 
 const distributedScale = obj(
 	{

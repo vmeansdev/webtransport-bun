@@ -351,11 +351,12 @@ const FREE_STANDING_RUN = 24;
 /** Base64/base64url text, possibly wrapped or chunked by whitespace. Hex is a
  * subset of this alphabet and gets its own pass. */
 const BASE64_GROUP = /[A-Za-z0-9+/_=-]+(?:\s+[A-Za-z0-9+/_=-]+)*/g;
-/** Chunks split by single punctuation characters (`TE9L!QUxJ.U0Vf`):
- * permissive decoders such as Buffer.from(…, "base64") skip the separators,
- * so the scanner rejoins them the same way. */
+/** Chunks split by any run of other characters (`TE9L!QUxJ`, `TE9L!!QUxJ`,
+ * `TE9L.,:QUxJ`, `TE9L - - QUxJ`): permissive decoders such as
+ * Buffer.from(…, "base64") skip every non-alphabet character, so the scanner
+ * rejoins the chunks the same way, however many separators lie between. */
 const BASE64_PUNCTUATED_GROUP =
-	/[A-Za-z0-9+/_=-]+(?:[^A-Za-z0-9+/_=-][A-Za-z0-9+/_=-]+)+/g;
+	/[A-Za-z0-9+/_=-]+(?:[^A-Za-z0-9+/_=-]+[A-Za-z0-9+/_=-]+)+/g;
 const HEX_GROUP = /[0-9A-Fa-f]+(?:\s+[0-9A-Fa-f]+)*/g;
 
 /** Archive and compression formats that are not inflated here: finding one
