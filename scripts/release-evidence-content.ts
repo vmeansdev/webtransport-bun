@@ -918,7 +918,64 @@ const noChangeConfirmation = obj(
 	["confirmedAt", "notes"],
 );
 
+/** tools/interop/tests/fault-matrix.spec.ts output (UdpFaultProfile /
+ * FaultStats from tools/interop/udp-fault-proxy.ts). */
+const faultProfile = obj(
+	{
+		name: ident(64),
+		seed: int,
+		lossRate: num,
+		duplicateRate: num,
+		reorderRate: num,
+		delayMs: num,
+		jitterMs: num,
+		reorderExtraMs: num,
+		burstLoss: obj({ startPacket: int, packetCount: int }),
+		blackHole: obj({ startMs: num, durationMs: num }),
+	},
+	[
+		"lossRate",
+		"duplicateRate",
+		"reorderRate",
+		"delayMs",
+		"jitterMs",
+		"reorderExtraMs",
+		"burstLoss",
+		"blackHole",
+	],
+);
+const faultMatrixEvidence = obj(
+	{
+		schemaVersion: int,
+		status: lit("running", "passed", "failed"),
+		sourceCommit: oneOf(sha40, lit("local-unbound")),
+		startedAt: iso,
+		finishedAt: iso,
+		scenarios: arr(
+			obj({
+				profile: faultProfile,
+				stats: obj({
+					seen: int,
+					forwarded: int,
+					dropped: int,
+					duplicated: int,
+					delayed: int,
+					reordered: int,
+					blackHoled: int,
+					burstDropped: int,
+				}),
+				payload: ident(128),
+				durationMs: num,
+			}),
+			100,
+		),
+		error: log(64 * 1024),
+	},
+	["finishedAt", "error"],
+);
+
 export const JSON_SCHEMAS: Record<string, Schema> = {
+	"fault-matrix-evidence": faultMatrixEvidence,
 	"command-record": commandRecord,
 	"command-summary": commandSummary,
 	"playwright-report": playwrightReport,

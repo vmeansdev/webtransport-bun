@@ -168,6 +168,58 @@ jobs:
           path: tools/interop/interop-evidence-wasm.json
           if-no-files-found: error
           retention-days: 90
+  fault-matrix:
+    # CI producer for the fault-matrix release claim: the seeded user-space UDP
+    # fault matrix (tools/interop/tests/fault-matrix.spec.ts) against the native
+    # addon server, with the sanitized Playwright JSON report beside the
+    # matrix's own evidence record.
+    name: Seeded UDP fault matrix (Chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action resolved 2026-07-21
+        with:
+          toolchain: 1.95.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.14"
+      - name: Install deps
+        run: bun install --frozen-lockfile
+      - name: Build native addon
+        run: bun run build:native
+      - name: Install interop deps and Chromium
+        run: cd tools/interop && bun install --frozen-lockfile && bun run install:browsers && bun run prepare:interop
+      - name: Run the fault matrix
+        env:
+          INTEROP_EVIDENCE: "1"
+          WT_FAULT_EVIDENCE_PATH: ${{ runner.temp }}/fault-evidence/fault-matrix.json
+        run: cd tools/interop && bun run playwright test -c playwright.fault.config.ts
+        timeout-minutes: 20
+      - name: Verify and collect the fault-matrix evidence
+        if: always()
+        run: |
+          cd tools/interop
+          if [ -f fault-matrix-report.json ]; then
+            bun run verify-evidence.ts --interop fault-matrix-report.json
+            mkdir -p "$RUNNER_TEMP/fault-evidence"
+            cp fault-matrix-report.json "$RUNNER_TEMP/fault-evidence/"
+          fi
+      - name: Upload fault-matrix evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 resolved 2026-07-22
+        with:
+          name: release-evidence-fault-matrix
+          path: ${{ runner.temp }}/fault-evidence/
+          if-no-files-found: warn
+          retention-days: 90
+
   test:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40

@@ -15,7 +15,20 @@ export default defineConfig({
 	workers: 1,
 	timeout: 180_000,
 	retries: 0,
-	reporter: [["list"]],
+	// INTEROP_EVIDENCE=1 is the CI producer for the fault-matrix release
+	// claim: the JSON report is rewritten in place by the evidence sanitizer
+	// (allowlisted fields only) and shipped beside fault-matrix.json.
+	reporter:
+		process.env.INTEROP_EVIDENCE === "1"
+			? [
+					["list"],
+					["json", { outputFile: "fault-matrix-report.json" }],
+					[
+						"./evidence-sanitizer.ts",
+						{ outputFile: "fault-matrix-report.json" },
+					],
+				]
+			: [["list"]],
 	use: {
 		browserName: "chromium",
 		launchOptions: {

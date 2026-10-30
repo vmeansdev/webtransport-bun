@@ -54,6 +54,7 @@ export type ProofKind =
 			platforms?: string[];
 	  }
 	| { kind: "playwright-report"; minExpected?: number }
+	| { kind: "fault-matrix"; profiles: string[] }
 	| { kind: "fuzz-release-smoke" }
 	| { kind: "llvm-cov-floors" }
 	| { kind: "distributed-scale"; minSessions: number }
@@ -85,6 +86,7 @@ export type ProofContext = {
 const PROOF_KINDS = new Set([
 	"command-records",
 	"playwright-report",
+	"fault-matrix",
 	"fuzz-release-smoke",
 	"llvm-cov-floors",
 	"distributed-scale",
@@ -133,6 +135,14 @@ export function validateRegistry(value: unknown): string[] {
 		if (!isObject(claim.proof) || !PROOF_KINDS.has(claim.proof.kind as string))
 			errors.push(`${at}.proof: unknown proof kind`);
 		else {
+			const profiles = claim.proof.profiles;
+			if (
+				claim.proof.kind === "fault-matrix" &&
+				(!Array.isArray(profiles) ||
+					profiles.length === 0 ||
+					!profiles.every((p) => typeof p === "string" && p.length > 0))
+			)
+				errors.push(`${at}.proof.profiles: must list the fault profiles`);
 			const files = claim.proof.files;
 			if (!Array.isArray(files) || files.length === 0)
 				errors.push(
@@ -304,6 +314,67 @@ function playwrightReport(
 		if (specs.length === 0) problems.push(`${name}: no test specs`);
 		if (specs.some((s) => s.ok !== true))
 			problems.push(`${name}: a spec is not ok`);
+	}
+	return problems;
+}
+
+/**
+ * The seeded UDP fault matrix (tools/interop/tests/fault-matrix.spec.ts):
+ * its own evidence record must show every registered profile ran, recovered
+ * (the bidi payload round-tripped) and actually injected its fault, bound to
+ * the candidate; the run's Playwright report must show the case passed.
+ */
+function faultMatrix(
+	ctx: ProofContext,
+	spec: Extract<ProofSpec, { kind: "fault-matrix" }>,
+): string[] {
+	const docs = parsedJson(ctx.members);
+	const records = docs.filter(
+		(d) =>
+			isObject(d.doc) &&
+			Array.isArray((d.doc as Record<string, unknown>).scenarios),
+	);
+	if (records.length !== 1)
+		return ["expected exactly one fault-matrix evidence record"];
+	const report = playwrightReport(
+		{ ...ctx, members: ctx.members.filter((m) => m.name !== records[0]?.name) },
+		{ kind: "playwright-report", minExpected: 1, files: [] },
+	);
+	const problems = report.map((problem) => `report: ${problem}`);
+	const record = records[0]?.doc as Record<string, unknown>;
+	if (record.status !== "passed")
+		problems.push("fault matrix status is not passed");
+	if (record.sourceCommit !== ctx.commit)
+		problems.push("fault matrix sourceCommit is not the candidate");
+	const scenarios = (record.scenarios as unknown[]).filter(isObject);
+	const names = scenarios.map((s) =>
+		isObject(s.profile) ? s.profile.name : undefined,
+	);
+	if (JSON.stringify(names) !== JSON.stringify(spec.profiles))
+		problems.push(
+			`fault matrix scenarios are not exactly ${spec.profiles.join(", ")}`,
+		);
+	for (const scenario of scenarios) {
+		const profile = isObject(scenario.profile) ? scenario.profile : {};
+		const stats = isObject(scenario.stats) ? scenario.stats : {};
+		const name = String(profile.name);
+		if (scenario.payload !== `fault-matrix-${name}`)
+			problems.push(`${name}: payload did not round-trip`);
+		const injected = (key: string) =>
+			typeof stats[key] === "number" && (stats[key] as number) > 0;
+		if (profile.lossRate && !injected("dropped"))
+			problems.push(`${name}: no loss injected`);
+		if (profile.duplicateRate && !injected("duplicated"))
+			problems.push(`${name}: no duplication injected`);
+		if (profile.reorderRate && !injected("reordered"))
+			problems.push(`${name}: no reordering injected`);
+		if ((profile.delayMs || profile.jitterMs) && !injected("delayed"))
+			problems.push(`${name}: no delay injected`);
+		if (profile.burstLoss && !injected("burstDropped"))
+			problems.push(`${name}: no burst loss injected`);
+		if (profile.blackHole && !injected("blackHoled"))
+			problems.push(`${name}: no black hole injected`);
+		if (!injected("forwarded")) problems.push(`${name}: nothing was forwarded`);
 	}
 	return problems;
 }
@@ -658,6 +729,8 @@ export function validateClaimProof(
 			return commandRecords(ctx, spec);
 		case "playwright-report":
 			return playwrightReport(ctx, spec);
+		case "fault-matrix":
+			return faultMatrix(ctx, spec);
 		case "fuzz-release-smoke":
 			return fuzzReleaseSmoke(ctx);
 		case "llvm-cov-floors":

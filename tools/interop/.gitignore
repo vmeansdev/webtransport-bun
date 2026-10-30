@@ -6,6 +6,7 @@ out
 dist
 interop-evidence.json
 interop-evidence-wasm.json
+fault-matrix-report.json
 *.tgz
 
 # code coverage
