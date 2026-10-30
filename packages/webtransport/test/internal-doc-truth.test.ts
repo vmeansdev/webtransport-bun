@@ -115,7 +115,7 @@ function validStatus() {
 		manifest: {
 			schemaVersion: 1,
 			repository: "example/webtransport-bun",
-			packageVersion: "1.0.0-rc.2",
+			packageVersion: "1.0.0",
 			candidate: { commit: COMMIT, tag: "v1.0.0-rc.2" },
 			claimRegistrySha256: "b".repeat(64),
 			promotion: null as null | Record<string, unknown>,

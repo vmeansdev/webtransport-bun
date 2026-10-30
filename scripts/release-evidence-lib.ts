@@ -19,6 +19,7 @@ import {
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	renameSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
@@ -71,6 +72,9 @@ export const CLAIM_ID = /^[a-z0-9][a-z0-9-]*$/;
 
 export type EvidenceStatus = "passed" | "failed";
 
+/** The run artifact the evidence bytes were downloaded from. */
+export type RunArtifact = { id: number; name: string; digest: string };
+
 export type GithubActionsProducer = {
 	kind: "github-actions";
 	repository: string;
@@ -79,6 +83,7 @@ export type GithubActionsProducer = {
 	runAttempt: number;
 	url: string;
 	headSha: string;
+	artifact: RunArtifact;
 };
 
 export type LocalProducer = {
@@ -194,10 +199,25 @@ function validateProducer(value: unknown, location: string, errors: string[]) {
 				"runAttempt",
 				"url",
 				"headSha",
+				"artifact",
 			],
 			location,
 			errors,
 		);
+		const artifact = value.artifact;
+		if (
+			!isObject(artifact) ||
+			!Number.isSafeInteger(artifact.id) ||
+			(artifact.id as number) <= 0 ||
+			typeof artifact.name !== "string" ||
+			!/^[A-Za-z0-9._-]+$/.test(artifact.name) ||
+			typeof artifact.digest !== "string" ||
+			!/^sha256:[0-9a-f]{64}$/.test(artifact.digest) ||
+			Object.keys(artifact).length !== 3
+		)
+			errors.push(
+				`${location}.artifact: must be {id, name, digest: sha256:<hex>} of the run artifact`,
+			);
 		if (
 			typeof value.repository !== "string" ||
 			!REPOSITORY.test(value.repository)
@@ -553,8 +573,13 @@ export function baseVersion(version: string): string {
  * `v1.0.0` can later point at the same commit).
  */
 export function tagMatchesVersion(tag: string, version: string): boolean {
-	if (tag === `v${version}`) return true;
-	return !version.includes("-") && tag.startsWith(`v${version}-`);
+	if (!/^\d+\.\d+\.\d+$/.test(version)) return false;
+	return (
+		tag === `v${version}` ||
+		new RegExp(
+			`^v${version.replaceAll(".", "\\.")}-[0-9A-Za-z][0-9A-Za-z.-]*$`,
+		).test(tag)
+	);
 }
 
 export function readJsonFile(path: string): unknown {
@@ -579,13 +604,21 @@ export function serializeManifest(manifest: Manifest): string {
 	return `${JSON.stringify(sorted, null, "\t")}\n`;
 }
 
+/** Write via a sibling temporary file and rename, so a crash never leaves a
+ * truncated record behind. */
+export function writeFileAtomic(path: string, text: string): void {
+	const temporary = `${path}.${process.pid}.${Date.now()}.tmp`;
+	writeFileSync(temporary, text);
+	renameSync(temporary, path);
+}
+
 export function writeManifest(path: string, manifest: Manifest): void {
 	const errors = validateManifest(manifest);
 	if (errors.length > 0)
 		throw new Error(
 			`refusing to write an invalid manifest:\n - ${errors.join("\n - ")}`,
 		);
-	writeFileSync(path, serializeManifest(manifest));
+	writeFileAtomic(path, serializeManifest(manifest));
 }
 
 /** Add entries; an identical re-add is a no-op, a conflicting one is refused. */
@@ -950,10 +983,9 @@ export function scrubFile(
 		if (isRefuseAlways(violation.reason) || !options.redactHostPaths)
 			problems.push(`${name}:${violation.line}: ${violation.reason}`);
 	}
-	rerooted.split(/\r?\n/).forEach((line, index) => {
-		const reason = encodedPayloadReason(line, options.forbiddenLiterals);
-		if (reason) problems.push(`${name}:${index + 1}: ${reason}`);
-	});
+	// The whole text, not line by line: encodings are routinely wrapped.
+	const encoded = encodedPayloadReason(rerooted, options.forbiddenLiterals);
+	if (encoded) problems.push(`${name}: ${encoded}`);
 	if (problems.length > 0) return { ok: false, problems };
 	const output = options.redactHostPaths
 		? rerooted.split("\n").map(redactTextLine).join("\n")
@@ -1424,7 +1456,37 @@ type RunView = {
 	status?: string;
 	conclusion?: string;
 	workflowName?: string;
+	artifacts?: ListedArtifact[];
 };
+
+export type ListedArtifact = {
+	id: number;
+	name: string;
+	digest: string | null;
+	expired?: boolean;
+};
+
+/** The run's artifact listing from the Actions API (metadata, including the
+ * digest, outlives the artifact's retention). */
+export function listRunArtifacts(
+	repository: string,
+	runId: string,
+	root: string,
+): ListedArtifact[] {
+	const value = ghJson(
+		["api", `repos/${repository}/actions/runs/${runId}/artifacts?per_page=100`],
+		root,
+	);
+	const artifacts = isObject(value) ? value.artifacts : undefined;
+	if (!Array.isArray(artifacts))
+		throw new Error(`run ${runId} artifact listing could not be read`);
+	return artifacts.filter(isObject).map((artifact) => ({
+		id: Number(artifact.id),
+		name: String(artifact.name),
+		digest: typeof artifact.digest === "string" ? artifact.digest : null,
+		expired: artifact.expired === true,
+	}));
+}
 
 /** Re-check a GitHub Actions producer against the Actions API. */
 function producerFailures(
@@ -1455,6 +1517,7 @@ function producerFailures(
 				],
 				root,
 			) as RunView;
+			run.artifacts = listRunArtifacts(repository, key, root);
 		} catch (error) {
 			run = error instanceof Error ? error : new Error(String(error));
 		}
@@ -1477,6 +1540,17 @@ function producerFailures(
 	)
 		failures.push(
 			`evidence ${entry.id}: run ${key} did not complete successfully`,
+		);
+	const listed = (run.artifacts ?? []).filter(
+		(artifact) => artifact.id === producer.artifact.id,
+	);
+	if (
+		listed.length !== 1 ||
+		listed[0]?.name !== producer.artifact.name ||
+		listed[0]?.digest !== producer.artifact.digest
+	)
+		failures.push(
+			`evidence ${entry.id}: artifact ${producer.artifact.name} (${producer.artifact.id}) is not in run ${key} with the recorded digest`,
 		);
 	return failures;
 }

@@ -407,8 +407,16 @@ function npmPublishIdentity(ctx: ProofContext): string[] {
 		!/^[0-9a-f]{64}$/.test(doc.tarballSha256)
 	)
 		problems.push("candidate-identity.json has no tarball digest");
-	if (typeof doc.tag !== "string" || !/^v\d+\.\d+\.\d+/.test(doc.tag))
+	if (
+		typeof doc.tag !== "string" ||
+		!/^v\d+\.\d+\.\d+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?$/.test(doc.tag)
+	)
 		problems.push("candidate-identity.json has no release tag");
+	// The published version is stamped from the tag at build time.
+	else if (doc.packageVersion !== doc.tag.slice(1))
+		problems.push(
+			"candidate-identity.json packageVersion is not the version stamped from its tag",
+		);
 	return problems;
 }
 

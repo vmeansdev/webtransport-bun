@@ -22,14 +22,14 @@
 			"$ref": "#/$defs/repository"
 		},
 		"packageVersion": {
-			"description": "packages/webtransport version at the candidate commit; the tag is v<packageVersion>.",
+			"description": "Base version (X.Y.Z) committed in packages/webtransport/package.json at the candidate; published versions are stamped from the tag.",
 			"oneOf": [
 				{
 					"type": "null"
 				},
 				{
 					"type": "string",
-					"pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?$"
+					"pattern": "^\\d+\\.\\d+\\.\\d+$"
 				}
 			]
 		},
@@ -203,7 +203,8 @@
 				"runId",
 				"runAttempt",
 				"url",
-				"headSha"
+				"headSha",
+				"artifact"
 			],
 			"properties": {
 				"kind": {
@@ -231,6 +232,26 @@
 				"headSha": {
 					"description": "The run's head commit; equals the entry commit.",
 					"$ref": "#/$defs/commit"
+				},
+				"artifact": {
+					"description": "The run artifact the evidence bytes were downloaded from; verify re-checks it against the run's artifact listing.",
+					"type": "object",
+					"additionalProperties": false,
+					"required": ["id", "name", "digest"],
+					"properties": {
+						"id": {
+							"type": "integer",
+							"minimum": 1
+						},
+						"name": {
+							"type": "string",
+							"pattern": "^[A-Za-z0-9._-]+$"
+						},
+						"digest": {
+							"type": "string",
+							"pattern": "^sha256:[0-9a-f]{64}$"
+						}
+					}
 				}
 			}
 		},

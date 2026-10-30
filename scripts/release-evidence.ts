@@ -7,14 +7,16 @@
  * (`docs/release-evidence-manifest.json`). See docs/RELEASE_CHECKLIST.md.
  *
  *   bind     --commit <sha> --tag <vX.Y.Z-rc.N> [--package-version <v>] [--reset]
- *   package  --claim <id>... --input <path>... (--run-id <n> --workflow <name> | --local <description>)
- *            (--run-id is read back from the Actions API: same repository and
- *            workflow, head SHA = candidate, concluded success -- or the
- *            in-progress run packaging its own evidence from inside itself)
+ *   package  --claim <id>... --input <path>... --local <description>   (local producers only)
  *            [--id <entry-id>] [--status passed|failed] [--bundle] [--out-dir <dir>]
  *            [--fragment <file> --commit <sha> [--tag <tag>]] [--repo-root <path>...]
  *            [--redact-host-paths] [--forbid <literal>...]
- *   fetch    --run <id> --artifact <name> [--select <subpath>...] --claim <id>... [package options]
+ *   fetch    --run <id> --artifact <name> [--workflow <name>] [--select <subpath>...] --claim <id>...
+ *            [--fragment <file> --commit <sha> [--tag <tag>]] [--out-dir <dir>] [--repo-root <path>...]
+ *            [--redact-host-paths]   (CI evidence: the run is read back from the Actions API --
+ *            same repository/workflow, head SHA = candidate, concluded success, or the in-progress
+ *            run packaging its own evidence from inside itself -- and the bytes are the named
+ *            artifact's, whose id/name/digest are recorded and re-checked by verify)
  *   import   --fragment <file>... | --from-release
  *   upload   [--tag <tag>] [--assets-dir <dir>] [--fragment <file>] [--create-prerelease] [--execute]
  *   verify   [--ga-tag <vX.Y.Z>] [--require-ready | --integrity-only] [--json]
@@ -60,8 +62,10 @@ import {
 	FRAGMENT_ASSET_NAME,
 	FRAGMENT_KIND,
 	type Fragment,
+	type GithubActionsProducer,
 	ghJson,
 	inspectMembers,
+	listRunArtifacts,
 	loadManifest,
 	loadWorkingRegistry,
 	MANIFEST_RELATIVE_PATH,
@@ -175,6 +179,10 @@ function bind(args: Args): void {
 		throw new UsageError("--tag must look like v1.0.0-rc.2");
 	const packageVersion =
 		one(args, "--package-version") ?? packageVersionAt(root, commit);
+	if (!tag.includes("-"))
+		throw new UsageError(
+			"--tag must be the candidate pre-release tag (vX.Y.Z-rc.N); the GA tag is checked with verify --ga-tag",
+		);
 	if (!tagMatchesVersion(tag, packageVersion))
 		throw new Error(
 			`tag ${tag} does not name the candidate package version ${packageVersion}`,
@@ -457,22 +465,25 @@ function localForbiddenLiterals(args: Args, repository: string): string[] {
 type RunJob = { name?: string; status?: string; conclusion?: string };
 
 /**
- * Provenance for `package --run-id`: the run is read back from the Actions
- * API, never self-attested. It must be in this repository, be the named
- * workflow, have built the candidate, and have succeeded. The one exception
- * is the run packaging its own evidence (the release workflow's
- * evidence-assets job): it is still in progress, so it must be this very
- * process's run (GITHUB_RUN_ID/GITHUB_SHA/GITHUB_REPOSITORY) and every job
- * that has finished so far must have succeeded.
+ * Provenance for CI evidence: the run is read back from the Actions API,
+ * never self-attested. It must be in this repository, be the expected
+ * workflow (when one is named), have built the candidate, and have succeeded.
+ * The one exception is the run packaging its own evidence (the release
+ * workflow's evidence-assets job): it is still in progress, so it must be this
+ * very process's run (GITHUB_RUN_ID/GITHUB_SHA/GITHUB_REPOSITORY) and every
+ * job that has finished so far must have succeeded. The named artifact must
+ * be listed on the run exactly once, with a digest; that identity is recorded
+ * and re-checked by verify.
  */
 function verifiedRunProducer(
 	root: string,
 	repository: string,
 	runId: string,
-	workflow: string,
+	workflow: string | undefined,
 	commit: string,
 	status: string,
-): Producer {
+	artifactName: string,
+): GithubActionsProducer {
 	const run = ghJson(
 		[
 			"run",
@@ -495,7 +506,7 @@ function verifiedRunProducer(
 	};
 	if (String(run.databaseId) !== runId)
 		throw new Error(`run ${runId} could not be read back`);
-	if (run.workflowName !== workflow)
+	if (workflow !== undefined && run.workflowName !== workflow)
 		throw new Error(
 			`run ${runId} is workflow ${run.workflowName}, not ${workflow}`,
 		);
@@ -526,63 +537,52 @@ function verifiedRunProducer(
 		if (failed.length > 0)
 			throw new Error(`run ${runId} has ${failed.length} unsuccessful job(s)`);
 	}
+	const listed = listRunArtifacts(repository, runId, root).filter(
+		(artifact) => artifact.name === artifactName,
+	);
+	const artifact = listed[0];
+	if (listed.length !== 1 || !artifact)
+		throw new Error(
+			`run ${runId} lists ${listed.length} artifact(s) named ${artifactName}; expected exactly one`,
+		);
+	if (artifact.expired) throw new Error(`artifact ${artifactName} has expired`);
+	if (!artifact.digest || !/^sha256:[0-9a-f]{64}$/.test(artifact.digest))
+		throw new Error(`artifact ${artifactName} has no sha256 digest`);
 	return {
 		kind: "github-actions",
 		repository,
-		workflow,
+		workflow: run.workflowName,
 		runId: Number(runId),
 		runAttempt: run.attempt,
 		url: `https://github.com/${repository}/actions/runs/${runId}`,
 		headSha: run.headSha,
+		artifact: { id: artifact.id, name: artifact.name, digest: artifact.digest },
 	};
 }
 
+/** `package` is for local producers only. CI evidence must be the bytes of a
+ * named artifact of the producing run, so it comes in through `fetch`. */
 function packageCommand(args: Args): void {
 	const root = rootOf(args);
 	const target = loadTarget(args, root, one(args, "--repo"));
 	const inputs = many(args, "--input");
 	if (inputs.length === 0)
 		throw new UsageError("at least one --input is required");
-	const runId = one(args, "--run-id");
-	const local = one(args, "--local");
-	if ((runId === undefined) === (local === undefined))
+	if (one(args, "--run-id") !== undefined)
 		throw new UsageError(
-			"name the producer with exactly one of --run-id or --local",
+			"package --run-id is not accepted: CI evidence must be downloaded from the run's artifact with `fetch --run <id> --artifact <name>`",
 		);
-	let producer: Producer;
-	let forbidden: string[];
-	if (runId !== undefined) {
-		const repository = one(args, "--repo") ?? targetRepository(target);
-		const workflow = required(args, "--workflow");
-		if (!/^\d+$/.test(runId))
-			throw new UsageError("--run-id must be a positive integer");
-		producer = verifiedRunProducer(
-			root,
-			repository,
-			runId,
-			workflow,
-			targetCommit(target),
-			one(args, "--status") ?? "passed",
-		);
-		forbidden = many(args, "--forbid");
-	} else {
-		producer = { kind: "local", description: local as string };
-		forbidden = localForbiddenLiterals(args, targetRepository(target));
-	}
-	packageEvidence(args, root, target, { inputs, producer, forbidden });
+	const local = one(args, "--local");
+	if (local === undefined)
+		throw new UsageError("name the local producer with --local <description>");
+	packageEvidence(args, root, target, {
+		inputs,
+		producer: { kind: "local", description: local },
+		forbidden: localForbiddenLiterals(args, targetRepository(target)),
+	});
 }
 
 // --------------------------------------------------------------------------- fetch
-
-type RunView = {
-	databaseId: number;
-	headSha: string;
-	status: string;
-	conclusion: string;
-	url: string;
-	workflowName: string;
-	attempt: number;
-};
 
 function fetchCommand(args: Args): void {
 	const root = rootOf(args);
@@ -597,29 +597,15 @@ function fetchCommand(args: Args): void {
 	const artifact = required(args, "--artifact");
 	if (!/^[A-Za-z0-9._-]+$/.test(artifact))
 		throw new UsageError("--artifact must be a plain artifact name");
-	const run = ghJson(
-		[
-			"run",
-			"view",
-			runId,
-			"--repo",
-			repository,
-			"--json",
-			"databaseId,headSha,status,conclusion,url,workflowName,attempt",
-		],
+	const producer = verifiedRunProducer(
 		root,
-	) as RunView;
-	if (run.status !== "completed")
-		throw new Error(`run ${runId} is ${run.status}, not completed`);
-	const status = one(args, "--status") ?? "passed";
-	if (status === "passed" && run.conclusion !== "success")
-		throw new Error(
-			`run ${runId} concluded ${run.conclusion}; it cannot be passed evidence`,
-		);
-	if (run.headSha !== commit)
-		throw new Error(
-			`run ${runId} built ${run.headSha}, not the candidate ${commit}`,
-		);
+		repository,
+		runId,
+		one(args, "--workflow"),
+		commit,
+		one(args, "--status") ?? "passed",
+		artifact,
+	);
 
 	const work = mkdtempSync(join(tmpdir(), "release-evidence-fetch-"));
 	try {
@@ -654,20 +640,12 @@ function fetchCommand(args: Args): void {
 					});
 		packageEvidence(args, root, target, {
 			inputs,
-			producer: {
-				kind: "github-actions",
-				repository,
-				workflow: run.workflowName,
-				runId: Number(runId),
-				runAttempt: run.attempt,
-				url: `https://github.com/${repository}/actions/runs/${runId}`,
-				headSha: run.headSha,
-			},
+			producer,
 			forbidden: many(args, "--forbid"),
 			// One run can upload several artifacts (a soak segment and its
 			// aggregate), so the artifact name is part of the default id.
 			defaultId:
-				`${many(args, "--claim")[0] ?? "evidence"}-${slug(artifact)}-${runId}-${run.attempt}`.slice(
+				`${many(args, "--claim")[0] ?? "evidence"}-${slug(artifact)}-${runId}-${producer.runAttempt}`.slice(
 					0,
 					120,
 				),

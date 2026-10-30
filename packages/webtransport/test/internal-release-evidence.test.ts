@@ -30,6 +30,10 @@ import {
 	scrubFile,
 	validateManifest,
 } from "../../../scripts/release-evidence-lib.ts";
+import {
+	distTagFor,
+	stampedVersion,
+} from "../../../scripts/stamp-version-from-tag.ts";
 
 const PROJECT_ROOT = join(import.meta.dir, "..", "..", "..");
 const CLI = join(PROJECT_ROOT, "scripts", "release-evidence.ts");
@@ -144,7 +148,7 @@ type Fixture = {
 	env: Record<string, string>;
 };
 
-function makeFixture(version = "1.0.0-rc.2"): Fixture {
+function makeFixture(version = "1.0.0"): Fixture {
 	const root = temp("wt-evidence-repo-");
 	mkdirSync(join(root, "docs"), { recursive: true });
 	mkdirSync(join(root, "packages", "webtransport"), { recursive: true });
@@ -482,6 +486,7 @@ function runView(
 	id: number,
 	overrides: Record<string, unknown> = {},
 	artifact?: string,
+	artifactName = "fuzz-evidence",
 ) {
 	return {
 		databaseId: id,
@@ -492,7 +497,7 @@ function runView(
 		workflowName: "fuzz",
 		attempt: 1,
 		jobs: [],
-		artifacts: artifact ? { "fuzz-evidence": artifact } : {},
+		artifacts: artifact ? { [artifactName]: artifact } : {},
 		...overrides,
 	};
 }
@@ -590,6 +595,79 @@ describe("release evidence privacy scrubbing", () => {
 			{ who: b64("octocat-login@laptop.local") },
 		],
 		["a property name that is a token", "key.json", { [FAKE_TOKEN]: 1 }],
+		[
+			"newline-wrapped base64 of a token",
+			"wrapped.log",
+			`${(b64(`LOKALISE_API_TOKEN=${FAKE_TOKEN}`).match(/.{1,12}/g) ?? []).join("\n")}\n`,
+		],
+		[
+			"space-chunked base64 (the reviewer's payload)",
+			"chunked.json",
+			{ note: "TE9LQUxJ U0VfQVBJ X1RPS0VO PXNlY3Jl dA==" },
+		],
+		[
+			"base64 chunks split across array elements",
+			"split.json",
+			{ parts: b64(`GITHUB_TOKEN=${FAKE_TOKEN}`).match(/.{1,8}/g) ?? [] },
+		],
+		[
+			"base64 behind unrelated words",
+			"prefixed.log",
+			`see attachment xyz ${b64("HOME=/home/runner")} end\n`,
+		],
+		[
+			"a base64 tar.gz carrying an env line",
+			"tgz.json",
+			{
+				bundle: b64(
+					createTarGz([
+						{
+							name: "x/env.txt",
+							data: new TextEncoder().encode(
+								`LOKALISE_API_TOKEN=${FAKE_TOKEN}\n`,
+							),
+						},
+					]),
+				),
+			},
+		],
+		[
+			"a base64 zip",
+			"zip.json",
+			{
+				blob: b64(
+					Buffer.concat([
+						Buffer.from([0x50, 0x4b, 0x03, 0x04]),
+						Buffer.alloc(40, 7),
+					]),
+				),
+			},
+		],
+		[
+			"a token under five layers of base64",
+			"deep.json",
+			{
+				x: [1, 2, 3, 4, 5].reduce(
+					(acc) => b64(acc),
+					`GITHUB_TOKEN=${FAKE_TOKEN}`,
+				),
+			},
+		],
+		[
+			"benign text under six layers of base64 (fail closed)",
+			"deeper.json",
+			{
+				x: [1, 2, 3, 4, 5, 6].reduce(
+					(acc) => b64(acc),
+					"just an ordinary sentence of text",
+				),
+			},
+		],
+		[
+			"an escaped-newline-wrapped token",
+			"escaped.log",
+			`${(b64(`GITHUB_TOKEN=${FAKE_TOKEN}`).match(/.{1,10}/g) ?? []).join("\\n")}\n`,
+		],
 	];
 	for (const [label, name, body] of refused) {
 		it(`refuses ${label} without echoing it`, () => {
@@ -782,6 +860,62 @@ describe("manifest and claim registry contract", () => {
 		).toContain("packageVersion");
 	});
 
+	it("stamps the published version from the tag", () => {
+		expect(stampedVersion("v1.0.0-rc.2", "1.0.0")).toBe("1.0.0-rc.2");
+		expect(stampedVersion("v1.0.0", "1.0.0")).toBe("1.0.0");
+		expect(distTagFor("1.0.0-rc.2")).toBe("next");
+		expect(distTagFor("1.0.0")).toBe("latest");
+		for (const [tag, committed] of [
+			["v1.0.1", "1.0.0"],
+			["v1.0.0-", "1.0.0"],
+			["v1.0.0rc1", "1.0.0"],
+			["1.0.0", "1.0.0"],
+			["v1.0.0-rc.2", "1.0.0-rc.1"],
+		] as const)
+			expect(() => stampedVersion(tag, committed)).toThrow();
+	});
+
+	it("binds the published identity to the stamped version", () => {
+		const commit = "0123456789abcdef0123456789abcdef01234567";
+		const identity = (tag: string, packageVersion: string) => ({
+			name: "candidate-identity.json",
+			data: new TextEncoder().encode(
+				JSON.stringify({
+					schemaVersion: 1,
+					repository: REPO,
+					workflowPath: ".github/workflows/release.yml",
+					releaseRunId: 5,
+					releaseRunAttempt: 1,
+					candidateCommit: commit,
+					tag,
+					packageVersion,
+					tarball: "webtransport-1.0.0-rc.2.tgz",
+					tarballSha256: "a".repeat(64),
+				}),
+			),
+		});
+		const claim: RegisteredClaim = {
+			id: "package-artifact",
+			surface: "release",
+			gaRequired: true,
+			proof: { kind: "npm-publish-identity" },
+		};
+		const ctx = (member: { name: string; data: Uint8Array }) => ({
+			commit,
+			producerKind: "github-actions" as const,
+			members: [member],
+			root: PROJECT_ROOT,
+		});
+		expect(
+			validateClaimProof(claim, ctx(identity("v1.0.0-rc.2", "1.0.0-rc.2"))),
+		).toEqual([]);
+		expect(
+			validateClaimProof(claim, ctx(identity("v1.0.0-rc.2", "1.0.0"))).join(
+				"\n",
+			),
+		).toContain("stamped from its tag");
+	});
+
 	it("pins every release-status claim in the committed registry", () => {
 		const registry = JSON.parse(
 			readFileSync(join(PROJECT_ROOT, "docs", "release-claims.json"), "utf8"),
@@ -881,7 +1015,7 @@ describe("release evidence lifecycle", () => {
 		expect(result.status, result.stderr).toBe(0);
 		const bound = manifest(fixture);
 		expect(bound.candidate).toEqual({ commit: fixture.commit, tag: TAG });
-		expect(bound.packageVersion).toBe("1.0.0-rc.2");
+		expect(bound.packageVersion).toBe("1.0.0");
 		expect(bound.claimRegistrySha256).toBe(
 			createHash("sha256")
 				.update(readFileSync(join(fixture.root, "docs", "release-claims.json")))
@@ -891,10 +1025,16 @@ describe("release evidence lifecycle", () => {
 			readFileSync(join(fixture.root, "docs", "release-status.json"), "utf8"),
 		);
 		expect(status.candidate.commit).toBe(fixture.commit);
+		// The tag must name the committed base version...
 		expect(
-			cli(fixture, "bind", "--commit", fixture.commit, "--tag", "v1.0.0-rc.3")
+			cli(fixture, "bind", "--commit", fixture.commit, "--tag", "v1.0.1-rc.1")
 				.status,
 		).toBe(1);
+		// ...and be the candidate pre-release, not the GA tag.
+		expect(
+			cli(fixture, "bind", "--commit", fixture.commit, "--tag", "v1.0.0")
+				.status,
+		).toBe(2);
 	});
 
 	it("packages, uploads, verifies and promotes, then locks the release", () => {
@@ -928,10 +1068,51 @@ describe("release evidence lifecycle", () => {
 		]);
 		const locked = cli(fixture, "verify", "--require-ready");
 		expect(locked.status, locked.stderr).toBe(0);
-		// A second promotion of the same record is refused.
+		// Rerunning a completed promotion re-verifies and changes nothing.
+		const again = run(fixture, PROMOTE, "--root", fixture.root);
+		expect(again.status, again.stderr).toBe(0);
+		expect(again.stdout).toContain("already promoted");
+	});
+
+	it("completes a promotion interrupted between its two writes", () => {
+		const statusPath = (fixture: Fixture) =>
+			join(fixture.root, "docs", "release-status.json");
+		// Crash after the lock was written, before the status.
+		const lockedOnly = makeFixture();
+		readyCandidate(lockedOnly);
+		expect(run(lockedOnly, PROMOTE, "--root", lockedOnly.root).status).toBe(0);
+		editStatus(lockedOnly, (status) => {
+			status.candidate.readiness = "pending";
+		});
+		const resumed = run(lockedOnly, PROMOTE, "--root", lockedOnly.root);
+		expect(resumed.status, resumed.stderr).toBe(0);
 		expect(
-			run(fixture, PROMOTE, "--root", fixture.root, "--dry-run").status,
-		).toBe(1);
+			JSON.parse(readFileSync(statusPath(lockedOnly), "utf8")).candidate
+				.readiness,
+		).toBe("ready");
+		expect(cli(lockedOnly, "verify", "--require-ready").status).toBe(0);
+		// The status says ready but the lock never landed.
+		const readyOnly = makeFixture();
+		readyCandidate(readyOnly);
+		editStatus(readyOnly, (status) => {
+			status.candidate.commit = readyOnly.commit;
+			status.candidate.readiness = "ready";
+		});
+		const completed = run(readyOnly, PROMOTE, "--root", readyOnly.root);
+		expect(completed.status, completed.stderr).toBe(0);
+		expect(manifest(readyOnly).promotion).not.toBeNull();
+		expect(cli(readyOnly, "verify", "--require-ready").status).toBe(0);
+		// A resumed promotion still refuses a release changed in between.
+		const tampered = makeFixture();
+		readyCandidate(tampered);
+		expect(run(tampered, PROMOTE, "--root", tampered.root).status).toBe(0);
+		editStatus(tampered, (status) => {
+			status.candidate.readiness = "pending";
+		});
+		writeState(tampered, (state) => {
+			state.tags[TAG] = "c".repeat(40);
+		});
+		expect(run(tampered, PROMOTE, "--root", tampered.root).status).toBe(1);
 	});
 
 	it("detects an evidence asset added after promotion", () => {
@@ -1231,7 +1412,7 @@ describe("release evidence lifecycle", () => {
 		expect(ok.status, ok.stderr).toBe(0);
 		const entry = manifest(fixture).entries[0];
 		expect(entry?.id).toBe("fuzz-gates-fuzz-evidence-11-1");
-		expect(entry?.producer).toEqual({
+		expect(entry?.producer).toMatchObject({
 			kind: "github-actions",
 			repository: REPO,
 			workflow: "fuzz",
@@ -1239,40 +1420,61 @@ describe("release evidence lifecycle", () => {
 			runAttempt: 1,
 			url: `https://github.com/${REPO}/actions/runs/11`,
 			headSha: fixture.commit,
+			artifact: { id: 1101, name: "fuzz-evidence" },
 		});
 	});
 
-	it("package --run-id reads the run back instead of trusting the caller", () => {
+	it("takes CI evidence only from the run's own artifact", () => {
 		const fixture = makeFixture();
 		cli(fixture, "bind", "--commit", fixture.commit, "--tag", TAG);
-		const dir = writeTree(inputDir(fixture, "fuzz"), {
+		const forged = writeTree(inputDir(fixture, "forged"), {
+			"release-smoke.json": fuzzSmoke(),
+		});
+		const artifact = writeTree(temp("wt-evidence-artifact-"), {
 			"release-smoke.json": fuzzSmoke(),
 		});
 		writeState(fixture, (state) => {
-			state.runs["21"] = runView(fixture, 21, {
-				status: "in_progress",
-				conclusion: "",
-			});
-			state.runs["22"] = runView(fixture, 22, { workflowName: "test" });
-			state.runs["23"] = runView(fixture, 23);
-			state.runs["24"] = runView(fixture, 24, { conclusion: "failure" });
+			state.runs["21"] = runView(
+				fixture,
+				21,
+				{ status: "in_progress", conclusion: "" },
+				artifact,
+			);
+			state.runs["22"] = runView(fixture, 22, {}, artifact);
+			state.runs["23"] = runView(fixture, 23, {}, artifact);
 		});
-		const pack = (runId: string, env: Record<string, string> = {}) =>
+		// Local bytes can never be stamped with a run's provenance.
+		const package_ = cli(
+			fixture,
+			"package",
+			"--claim",
+			"fuzz-gates",
+			"--input",
+			forged,
+			"--run-id",
+			"23",
+			"--workflow",
+			"fuzz",
+		);
+		expect(package_.status).toBe(2);
+		expect(package_.stderr).toContain("fetch --run");
+		const fetch = (
+			runId: string,
+			extra: string[] = [],
+			env: Record<string, string> = {},
+		) =>
 			spawnSync(
 				process.execPath,
 				[
 					CLI,
-					"package",
+					"fetch",
+					"--run",
+					runId,
+					"--artifact",
+					"fuzz-evidence",
 					"--claim",
 					"fuzz-gates",
-					"--id",
-					`fuzz-gates-run-${runId}-${Object.keys(env).length}`,
-					"--input",
-					dir,
-					"--run-id",
-					runId,
-					"--workflow",
-					"fuzz",
+					...extra,
 					"--root",
 					fixture.root,
 				],
@@ -1282,44 +1484,87 @@ describe("release evidence lifecycle", () => {
 					encoding: "utf8",
 				},
 			);
-		expect(pack("99").status).toBe(1);
-		expect(pack("21").stderr).toContain("only a completed run");
-		expect(pack("22").stderr).toContain("is workflow test");
-		expect(pack("24").stderr).toContain("concluded failure");
-		// The in-progress run may package its own evidence from inside itself.
-		const self = pack("21", {
+		expect(fetch("21").stderr).toContain("only a completed run");
+		expect(fetch("22", ["--workflow", "release"]).stderr).toContain(
+			"is workflow fuzz",
+		);
+		expect(fetch("22", ["--artifact", "missing-artifact"]).status).not.toBe(0);
+		// The in-progress run may fetch its own artifacts from inside itself.
+		const self = fetch("21", [], {
 			GITHUB_RUN_ID: "21",
 			GITHUB_SHA: fixture.commit,
 			GITHUB_REPOSITORY: REPO,
 		});
 		expect(self.status, self.stderr).toBe(0);
-		const done = pack("23");
+		const done = fetch("23");
 		expect(done.status, done.stderr).toBe(0);
+		const entry = manifest(fixture).entries.find(
+			(e) => e.id === "fuzz-gates-fuzz-evidence-23-1",
+		);
+		const recorded = entry?.producer.artifact as {
+			id: number;
+			name: string;
+			digest: string;
+		};
+		expect(recorded.name).toBe("fuzz-evidence");
+		expect(recorded.id).toBe(2301);
+		expect(recorded.digest).toMatch(/^sha256:[0-9a-f]{64}$/);
+		// Verify re-checks the artifact against the run's listing.
+		expect(
+			cli(fixture, "upload", "--create-prerelease", "--execute").status,
+		).toBe(0);
+		writeState(fixture, (state) => {
+			(state.runs["21"] as Record<string, unknown>).status = "completed";
+			(state.runs["21"] as Record<string, unknown>).conclusion = "success";
+		});
+		const intact = cli(fixture, "verify", "--integrity-only");
+		expect(intact.status, intact.stderr).toBe(0);
+		writeState(fixture, (state) => {
+			(state.runs["23"] as Record<string, unknown>).artifactListing = [
+				{
+					id: 2301,
+					name: "fuzz-evidence",
+					digest: `sha256:${"0".repeat(64)}`,
+					expired: false,
+				},
+			];
+		});
+		const swapped = cli(fixture, "verify", "--integrity-only");
+		expect(swapped.status).toBe(1);
+		expect(swapped.stderr).toContain("with the recorded digest");
 	});
 
 	it("imports a CI fragment attached to the pre-release into the manifest", () => {
 		const fixture = makeFixture();
 		cli(fixture, "bind", "--commit", fixture.commit, "--tag", TAG);
+		const interop = writeTree(temp("wt-evidence-artifact-"), {
+			"interop-evidence.json": playwrightReport(),
+		});
 		writeState(fixture, (state) => {
-			state.runs["77"] = runView(fixture, 77, { workflowName: "release" });
+			state.runs["77"] = runView(
+				fixture,
+				77,
+				{ workflowName: "release" },
+				interop,
+				"interop-evidence",
+			);
 		});
 		const outDir = join(fixture.root, ".release-evidence", "ci");
 		const fragment = join(
 			outDir,
 			"release-evidence-fragment-release-77-1.json",
 		);
-		const dir = writeTree(inputDir(fixture, "interop"), {
-			"interop-evidence.json": playwrightReport(),
-		});
 		const packaged = cli(
 			fixture,
-			"package",
+			"fetch",
 			"--claim",
 			"chromium-native-interop",
-			"--input",
-			dir,
-			"--run-id",
+			"--id",
+			"chromium-native-interop-release-77-1",
+			"--run",
 			"77",
+			"--artifact",
+			"interop-evidence",
 			"--workflow",
 			"release",
 			"--repo",

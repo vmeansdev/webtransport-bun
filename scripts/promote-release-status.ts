@@ -18,6 +18,9 @@
  * the evidence record (the manifest and release-status.json). There is no
  * override.
  *
+ * A promotion interrupted between its two writes is completed by rerunning
+ * it; rerunning a completed promotion re-verifies and changes nothing.
+ *
  * On success it records a promotion lock in the manifest -- the tag commit and
  * the sha256 of every evidence asset on the release -- and sets readiness
  * `ready`. `release-evidence.ts verify` (scheduled, and in the GA release
@@ -27,7 +30,6 @@
  *   bun scripts/promote-release-status.ts [--dry-run] [--root <dir>]
  */
 import { spawnSync } from "node:child_process";
-import { writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
 	DEFAULT_ROOT,
@@ -38,6 +40,7 @@ import {
 	runGit,
 	STATUS_RELATIVE_PATH,
 	verifyRelease,
+	writeFileAtomic,
 	writeManifest,
 } from "./release-evidence-lib.ts";
 
@@ -104,29 +107,43 @@ function main() {
 	if (report.mode !== "release")
 		refuse(["promotion requires assets downloaded from the release"]);
 	const status = loadStatus(root);
-	const failures = [...report.failures];
-	if (manifest.promotion)
-		failures.push(
-			"the manifest is already promoted; bind a new candidate to start over",
-		);
+	// A promotion interrupted between its two writes leaves exactly one of
+	// these inconsistencies; a rerun completes it (the lock itself is still
+	// verified against the release) instead of refusing.
+	const HALF_WRITTEN = [
+		"manifest is promoted but release-status readiness is not ready",
+		"release-status is ready but the manifest has no promotion lock",
+	];
+	const failures = report.failures.filter((f) => !HALF_WRITTEN.includes(f));
 	for (const warning of report.warnings)
 		console.warn(`promote-release-status: warning: ${warning}`);
 	if (failures.length > 0) refuse(failures);
 
+	const alreadyLocked = manifest.promotion !== null;
+	const alreadyReady = status.candidate.readiness === "ready";
+	if (alreadyLocked && alreadyReady) {
+		console.log(
+			`promote-release-status: already promoted (${report.tag} at ${commit}); the release still matches the lock`,
+		);
+		return;
+	}
+
 	status.candidate.commit = commit;
 	status.candidate.readiness = "ready";
-	manifest.promotion = {
-		tag: manifest.candidate.tag as string,
-		tagCommit: commit,
-		verifiedAt: new Date().toISOString(),
-		assets: report.releaseAssets,
-	};
+	if (!alreadyLocked)
+		manifest.promotion = {
+			tag: manifest.candidate.tag as string,
+			tagCommit: commit,
+			verifiedAt: new Date().toISOString(),
+			assets: report.releaseAssets,
+		};
 
 	if (dryRun) {
 		console.log(
 			JSON.stringify(
 				{
 					wouldWrite: true,
+					completesInterruptedPromotion: alreadyLocked || alreadyReady,
 					commit,
 					tag: report.tag,
 					verifiedAssets: report.verifiedEntries,
@@ -140,9 +157,11 @@ function main() {
 		process.exit(0);
 	}
 
+	// Each file is replaced atomically; the lock goes first, and a crash
+	// before the status write is completed by the next run.
 	const statusPath = join(root, STATUS_RELATIVE_PATH);
-	writeManifest(manifestPath, manifest);
-	writeFileSync(statusPath, `${JSON.stringify(status, null, "\t")}\n`);
+	if (!alreadyLocked) writeManifest(manifestPath, manifest);
+	writeFileAtomic(statusPath, `${JSON.stringify(status, null, "\t")}\n`);
 	console.log(
 		`promote-release-status: readiness=ready commit=${commit} tag=${report.tag} (${report.releaseAssets.length} assets locked)`,
 	);
@@ -163,7 +182,7 @@ function main() {
 		status.candidate.readiness = "pending";
 		manifest.promotion = null;
 		writeManifest(manifestPath, manifest);
-		writeFileSync(statusPath, `${JSON.stringify(status, null, "\t")}\n`);
+		writeFileAtomic(statusPath, `${JSON.stringify(status, null, "\t")}\n`);
 		process.exit(1);
 	}
 }

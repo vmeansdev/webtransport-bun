@@ -34,6 +34,12 @@ type Run = {
 	workflowName: string;
 	attempt: number;
 	artifacts: Record<string, string>;
+	artifactListing?: {
+		id: number;
+		name: string;
+		digest: string | null;
+		expired: boolean;
+	}[];
 };
 type State = {
 	repo: string;
@@ -82,7 +88,45 @@ function globToRegExp(pattern: string): RegExp {
 
 const [group, command, subject] = args;
 
+/** Artifact listing: ids and digests derived from the artifact directory,
+ * so replacing an artifact's bytes changes its digest. A run can override
+ * the listing with `artifactListing` to model tampering. */
+function artifactListing(run: Run) {
+	if (run.artifactListing) return run.artifactListing;
+	return Object.entries(run.artifacts).map(([name, dir], index) => {
+		const hash = createHash("sha256");
+		const walk = (path: string) => {
+			for (const entry of readdirSync(path, { withFileTypes: true }).sort(
+				(a, b) => a.name.localeCompare(b.name),
+			)) {
+				const child = join(path, entry.name);
+				if (entry.isDirectory()) walk(child);
+				else hash.update(entry.name).update(readFileSync(child));
+			}
+		};
+		if (existsSync(dir)) walk(dir);
+		return {
+			id: run.databaseId * 100 + index + 1,
+			name,
+			digest: `sha256:${hash.digest("hex")}`,
+			expired: false,
+		};
+	});
+}
+
 if (group === "api") {
+	const artifactsMatch =
+		/^repos\/([^/]+\/[^/]+)\/actions\/runs\/(\d+)\/artifacts(?:\?.*)?$/.exec(
+			command ?? "",
+		);
+	if (artifactsMatch) {
+		if (artifactsMatch[1] !== state.repo) fail("HTTP 404: Not Found");
+		const run = state.runs[artifactsMatch[2] as string];
+		if (!run) fail("HTTP 404: Not Found");
+		save();
+		console.log(JSON.stringify({ artifacts: artifactListing(run) }));
+		process.exit(0);
+	}
 	const match = /^repos\/([^/]+\/[^/]+)\/commits\/(.+)$/.exec(command ?? "");
 	if (!match || match[1] !== state.repo) fail("HTTP 404: Not Found");
 	const sha = state.tags[decodeURIComponent(match[2] as string)];
@@ -174,7 +218,7 @@ if (group === "run") {
 	const run = state.runs[subject as string];
 	if (!run) fail("HTTP 404: run not found");
 	if (command === "view") {
-		const { artifacts: _artifacts, ...view } = run;
+		const { artifacts: _artifacts, artifactListing: _listing, ...view } = run;
 		save();
 		console.log(JSON.stringify(view));
 		process.exit(0);
