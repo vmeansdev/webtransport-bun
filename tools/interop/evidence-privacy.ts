@@ -11,7 +11,7 @@
  * the whole point of the check is that the value must not be reproduced.
  */
 
-import { gunzipSync } from "node:zlib";
+import { inflateRawSync, constants as zlibConstants } from "node:zlib";
 
 /** Credential-shaped key names. Kept narrower than the interop environment
  * allowlist because structural report keys legitimately contain words such as
@@ -331,149 +331,317 @@ export function containsForbiddenLiteral(
 // encoded. Every encoded-looking run above a size threshold is decoded and
 // the result is scanned again with the same rules, recursively but bounded.
 
-/** Shortest encoded run that is decoded and rescanned. */
+/** Shortest encoded run (after joining whitespace-wrapped chunks) that is
+ * decoded and rescanned. */
 export const ENCODED_PAYLOAD_MIN_LENGTH = 16;
-const MAX_DECODE_DEPTH = 4;
+/** Decoding layers followed; anything still decodable below this is refused,
+ * never accepted. */
+export const MAX_DECODE_DEPTH = 4;
 const MAX_DECODED_BYTES = 1024 * 1024;
+/** Shortest printable run extracted from decoded bytes for rescanning. */
+const MIN_PRINTABLE_RUN = 8;
+/** A printable run this long is rescanned wherever it appears in decoded
+ * noise; a shorter one only when it is at least half of what was decoded.
+ * Decoding ordinary text (identifiers, symbol names) yields noise with
+ * occasional short printable runs; those are not payloads, and rescanning
+ * them would only produce false refusals. Inflated content is real data and
+ * is always rescanned down to MIN_PRINTABLE_RUN. */
+const FREE_STANDING_RUN = 24;
 
-const BASE64_RUN = /[A-Za-z0-9+/_-]{16,}={0,2}/g;
-const HEX_RUN = /(?:[0-9A-Fa-f]{2}){8,}/g;
+/** Base64/base64url text, possibly wrapped or chunked by whitespace. Hex is a
+ * subset of this alphabet and gets its own pass. */
+const BASE64_GROUP = /[A-Za-z0-9+/_=-]+(?:\s+[A-Za-z0-9+/_=-]+)*/g;
+const HEX_GROUP = /[0-9A-Fa-f]+(?:\s+[0-9A-Fa-f]+)*/g;
 
-function isGzip(bytes: Uint8Array): boolean {
-	return bytes.length >= 18 && bytes[0] === 0x1f && bytes[1] === 0x8b;
+/** Archive and compression formats that are not inflated here: finding one
+ * inside an encoded payload means the payload cannot be proven clean. */
+const OPAQUE_MAGICS: readonly (readonly number[])[] = [
+	[0x50, 0x4b, 0x03, 0x04], // zip
+	[0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00], // xz
+	[0x28, 0xb5, 0x2f, 0xfd], // zstd
+	[0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c], // 7z
+	[0x31, 0x41, 0x59, 0x26, 0x53, 0x59], // bzip2 block
+];
+
+function indexOfBytes(
+	haystack: Uint8Array,
+	needle: readonly number[],
+	from = 0,
+): number {
+	outer: for (let i = from; i + needle.length <= haystack.length; i += 1) {
+		for (let j = 0; j < needle.length; j += 1)
+			if (haystack[i + j] !== needle[j]) continue outer;
+		return i;
+	}
+	return -1;
 }
 
-/** Text worth rescanning: valid UTF-8 and overwhelmingly printable. Random
- * bytes (hashes, certificate fingerprints, nonces) decode to neither. */
-function printableText(bytes: Uint8Array): string | undefined {
-	if (bytes.length === 0) return undefined;
-	let text: string;
-	try {
-		text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-	} catch {
-		return undefined;
+/** Printable ASCII runs (with tab/newline) inside arbitrary bytes, like
+ * `strings`: the plaintext of an aligned encoded payload survives intact even
+ * when the bytes around it are noise from neighbouring text. */
+function printableRuns(bytes: Uint8Array, fromNoise = true): string[] {
+	const runs: string[] = [];
+	let start = -1;
+	const flush = (end: number) => {
+		const length = end - start;
+		if (
+			start >= 0 &&
+			length >= MIN_PRINTABLE_RUN &&
+			(!fromNoise || length >= FREE_STANDING_RUN || length * 2 >= bytes.length)
+		)
+			runs.push(Buffer.from(bytes.subarray(start, end)).toString("latin1"));
+		start = -1;
+	};
+	for (let i = 0; i < bytes.length; i += 1) {
+		const b = bytes[i] as number;
+		const printable =
+			(b >= 0x20 && b <= 0x7e) || b === 9 || b === 10 || b === 13;
+		if (printable) {
+			if (start < 0) start = i;
+		} else flush(i);
 	}
-	let printable = 0;
-	for (const char of text) {
-		const code = char.codePointAt(0) ?? 0;
-		if (code === 9 || code === 10 || code === 13 || code >= 32) printable += 1;
-	}
-	return printable / [...text].length >= 0.9 ? text : undefined;
+	flush(bytes.length);
+	return runs;
 }
 
-function decodeBase64(run: string): Uint8Array | undefined {
-	const normalized = run
-		.replaceAll("-", "+")
-		.replaceAll("_", "/")
-		.replace(/=+$/, "");
-	if (normalized.length % 4 === 1) return undefined;
-	try {
-		return new Uint8Array(Buffer.from(normalized, "base64"));
-	} catch {
-		return undefined;
+/** Inflate a gzip member starting at `offset`, ignoring what follows it.
+ * `undefined` when the bytes are not a deflate stream (random data that
+ * happens to contain the gzip magic); a truncated stream yields what it
+ * inflates to; output beyond the bound throws. */
+function inflateGzipAt(
+	bytes: Uint8Array,
+	offset: number,
+): Uint8Array | undefined {
+	const flags = bytes[offset + 3] as number;
+	if ((flags & 0xe0) !== 0) return undefined;
+	let cursor = offset + 10;
+	if (flags & 0x04) {
+		const extra =
+			(bytes[cursor] as number) | ((bytes[cursor + 1] as number) << 8);
+		cursor += 2 + extra;
 	}
-}
-
-/** Marker for compressed content that could not be fully inflated within
- * the bound; it cannot be proven clean, so it is refused. */
-const UNSCANNABLE = "\u0000unscannable-compressed-payload";
-
-function gunzipBounded(bytes: Uint8Array): Uint8Array | undefined {
+	if (flags & 0x08) while (cursor < bytes.length && bytes[cursor++] !== 0) {}
+	if (flags & 0x10) while (cursor < bytes.length && bytes[cursor++] !== 0) {}
+	if (flags & 0x02) cursor += 2;
+	if (cursor >= bytes.length) return undefined;
 	try {
 		return new Uint8Array(
-			gunzipSync(bytes, { maxOutputLength: MAX_DECODED_BYTES }),
+			inflateRawSync(bytes.subarray(cursor), {
+				finishFlush: zlibConstants.Z_SYNC_FLUSH,
+				maxOutputLength: MAX_DECODED_BYTES,
+			}),
 		);
-	} catch {
+	} catch (error) {
+		if (
+			error instanceof RangeError ||
+			(error as { code?: string }).code === "ERR_BUFFER_TOO_LARGE"
+		)
+			throw new CompressedTooLarge();
 		return undefined;
 	}
 }
 
-/** Decoded payloads embedded in `text` that deserve a rescan. */
-function decodedCandidates(text: string): string[] {
-	const out: string[] = [];
-	const consider = (bytes: Uint8Array | undefined) => {
-		if (!bytes || bytes.length === 0) return;
-		let raw: Uint8Array | undefined = bytes;
-		if (isGzip(bytes) && bytes[2] === 0x08) {
-			raw = gunzipBounded(bytes);
-			if (!raw) {
-				out.push(UNSCANNABLE);
-				return;
-			}
-		}
-		const decoded = printableText(raw);
-		if (decoded !== undefined) out.push(decoded);
-	};
-	for (const match of text.matchAll(BASE64_RUN)) {
-		consider(decodeBase64(match[0]));
-	}
-	for (const match of text.matchAll(HEX_RUN)) {
-		consider(new Uint8Array(Buffer.from(match[0], "hex")));
-	}
-	for (const token of text.split(/\s+/)) {
-		if (token.length < ENCODED_PAYLOAD_MIN_LENGTH) continue;
-		if (!/%[0-9A-Fa-f]{2}/.test(token)) continue;
+class CompressedTooLarge extends Error {}
+
+function containsGzip(bytes: Uint8Array): boolean {
+	for (
+		let at = indexOfBytes(bytes, [0x1f, 0x8b, 0x08]);
+		at >= 0;
+		at = indexOfBytes(bytes, [0x1f, 0x8b, 0x08], at + 1)
+	) {
 		try {
-			const decoded = decodeURIComponent(token.replaceAll("+", " "));
-			if (decoded !== token) out.push(decoded);
+			const inflated = inflateGzipAt(bytes, at);
+			if (inflated && inflated.length > 0) return true;
 		} catch {
-			// malformed escapes: nothing decodable to rescan
+			return true;
+		}
+	}
+	return false;
+}
+
+type Probe = { forbiddenLiterals: readonly string[]; depth: number };
+
+/** Inspect decoded bytes: compressed streams are inflated and inspected,
+ * opaque archives are refused, printable runs are rescanned as text. */
+function inspectDecodedBytes(
+	bytes: Uint8Array,
+	probe: Probe,
+	fromNoise = true,
+): string | undefined {
+	if (bytes.length === 0) return undefined;
+	for (const magic of OPAQUE_MAGICS)
+		if (indexOfBytes(bytes, magic) >= 0)
+			return "an archive that cannot be scanned";
+	for (
+		let at = indexOfBytes(bytes, [0x1f, 0x8b, 0x08]);
+		at >= 0;
+		at = indexOfBytes(bytes, [0x1f, 0x8b, 0x08], at + 1)
+	) {
+		let inflated: Uint8Array | undefined;
+		try {
+			inflated = inflateGzipAt(bytes, at);
+		} catch {
+			return "compressed content too large to scan";
+		}
+		if (!inflated || inflated.length === 0) continue;
+		if (probe.depth + 1 >= MAX_DECODE_DEPTH)
+			return "encoded content nested too deep to scan";
+		const reason = inspectDecodedBytes(
+			inflated,
+			{ ...probe, depth: probe.depth + 1 },
+			false,
+		);
+		if (reason) return reason;
+	}
+	for (const run of printableRuns(bytes, fromNoise)) {
+		const reason = decodedTextReason(run, probe.forbiddenLiterals);
+		if (reason) return reason;
+		const nested = encodedReason(run, { ...probe, depth: probe.depth + 1 });
+		if (nested) return nested;
+	}
+	return undefined;
+}
+
+function base64Candidates(text: string): Uint8Array[] {
+	const out: Uint8Array[] = [];
+	for (const match of text.matchAll(BASE64_GROUP)) {
+		const compact = match[0].replace(/\s+/g, "");
+		if (compact.length < ENCODED_PAYLOAD_MIN_LENGTH) continue;
+		// The whole group (wrapped or chunked encodings, rejoined) and each
+		// whitespace-separated token on its own (an encoding next to words).
+		const tokens = match[0]
+			.split(/\s+/)
+			.filter((token) => token.length >= ENCODED_PAYLOAD_MIN_LENGTH);
+		const pieces =
+			tokens.length > 1 || tokens[0] !== compact
+				? [compact, ...tokens]
+				: [compact];
+		for (const segment of pieces.flatMap((piece) => piece.split(/=+/))) {
+			if (segment.length < MIN_PRINTABLE_RUN) continue;
+			const normalized = segment.replaceAll("-", "+").replaceAll("_", "/");
+			// Every alignment: the payload need not start where the group does.
+			for (let offset = 0; offset < 4; offset += 1) {
+				const aligned = normalized.slice(offset);
+				const usable = aligned.slice(0, aligned.length - (aligned.length % 4));
+				if (usable.length >= 8)
+					out.push(new Uint8Array(Buffer.from(usable, "base64")));
+			}
 		}
 	}
 	return out;
+}
+
+function hexCandidates(text: string): Uint8Array[] {
+	const out: Uint8Array[] = [];
+	for (const match of text.matchAll(HEX_GROUP)) {
+		const compact = match[0].replace(/\s+/g, "");
+		if (compact.length < ENCODED_PAYLOAD_MIN_LENGTH) continue;
+		for (let offset = 0; offset < 2; offset += 1) {
+			const aligned = compact.slice(offset);
+			out.push(
+				new Uint8Array(
+					Buffer.from(
+						aligned.slice(0, aligned.length - (aligned.length % 2)),
+						"hex",
+					),
+				),
+			);
+		}
+	}
+	return out;
+}
+
+function percentCandidates(text: string): string[] {
+	if (!/%[0-9A-Fa-f]{2}/.test(text)) return [];
+	const decode = (value: string) =>
+		value.replace(/%([0-9A-Fa-f]{2})/g, (_, hex: string) =>
+			String.fromCharCode(Number.parseInt(hex, 16)),
+		);
+	return [decode(text), decode(text.replace(/\s+/g, ""))];
+}
+
+function encodedReason(text: string, probe: Probe): string | undefined {
+	if (text.length < ENCODED_PAYLOAD_MIN_LENGTH) return undefined;
+	// Escaped line breaks wrap encodings just like real ones.
+	const normalized = text.replace(/\\[nrt]/g, " ");
+	const binary = [
+		...base64Candidates(normalized),
+		...hexCandidates(normalized),
+	];
+	const textual = percentCandidates(normalized);
+	if (probe.depth >= MAX_DECODE_DEPTH) {
+		// Fail closed: anything still decoding to readable or compressed
+		// content at the depth limit is refused, not waved through.
+		const decodable =
+			binary.some(
+				(bytes) => printableRuns(bytes).length > 0 || containsGzip(bytes),
+			) || textual.some((decoded) => decoded !== normalized);
+		return decodable ? "encoded content nested too deep to scan" : undefined;
+	}
+	for (const bytes of binary) {
+		const reason = inspectDecodedBytes(bytes, probe);
+		if (reason) return reason;
+	}
+	for (const decoded of textual) {
+		if (decoded === normalized) continue;
+		const reason = decodedTextReason(decoded, probe.forbiddenLiterals);
+		if (reason) return reason;
+		const nested = encodedReason(decoded, { ...probe, depth: probe.depth + 1 });
+		if (nested) return nested;
+	}
+	return undefined;
 }
 
 function decodedTextReason(
 	text: string,
 	forbiddenLiterals: readonly string[],
 ): string | undefined {
-	if (text === UNSCANNABLE) return "compressed content that cannot be scanned";
 	if (containsForbiddenLiteral(text, forbiddenLiterals))
 		return "forbidden identifier";
-	try {
-		const document = JSON.parse(text) as unknown;
-		if (document !== null && typeof document === "object") {
-			const violation =
-				findPrivacyViolations(document)[0] ??
-				findEnvironmentDumpViolations(document)[0];
-			if (violation) return violation.reason;
+	const trimmed = text.trim();
+	if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+		try {
+			const document = JSON.parse(trimmed) as unknown;
+			if (document !== null && typeof document === "object") {
+				const violation =
+					findPrivacyViolations(document)[0] ??
+					findEnvironmentDumpViolations(document)[0];
+				if (violation) return violation.reason;
+			}
+		} catch {
+			// not JSON; fall through to the line rules
 		}
-	} catch {
-		// not JSON; fall through to the line rules
 	}
 	return findTextPrivacyViolations(text)[0]?.reason;
 }
 
 /**
  * Why `text` hides an unsafe payload behind an encoding, or `undefined`.
- * Base64/base64url (optionally gzip inside), hex, and percent-encoding are
- * decoded and rescanned up to `MAX_DECODE_DEPTH` levels deep.
+ * Base64/base64url (whitespace-wrapped or chunked, any alignment), hex,
+ * percent-encoding, and gzip found inside them are decoded and rescanned up
+ * to `MAX_DECODE_DEPTH` layers; deeper nesting and opaque archives are
+ * refused.
  */
 export function encodedPayloadReason(
 	text: string,
 	forbiddenLiterals: readonly string[] = [],
-	depth = 0,
 ): string | undefined {
-	if (depth >= MAX_DECODE_DEPTH || text.length < ENCODED_PAYLOAD_MIN_LENGTH)
-		return undefined;
-	for (const decoded of decodedCandidates(text)) {
-		const reason = decodedTextReason(decoded, forbiddenLiterals);
-		if (reason) return `encoded payload hides ${reason}`;
-		const nested = encodedPayloadReason(decoded, forbiddenLiterals, depth + 1);
-		if (nested) return nested;
-	}
-	return undefined;
+	const reason = encodedReason(text, { forbiddenLiterals, depth: 0 });
+	return reason ? `encoded payload hides ${reason}` : undefined;
 }
 
 /** Every string (values and property names) in a JSON document whose encoded
- * content is unsafe. Diagnostics carry pointers only. */
+ * content is unsafe, plus all strings joined (an encoding can be split across
+ * array elements or fields). Diagnostics carry pointers only. */
 export function findEncodedPayloadViolations(
 	document: unknown,
 	forbiddenLiterals: readonly string[] = [],
 ): PrivacyViolation[] {
 	const violations: PrivacyViolation[] = [];
+	const strings: string[] = [];
 	const visit = (node: unknown, pointer: string): void => {
 		if (typeof node === "string") {
+			strings.push(node);
 			const reason = encodedPayloadReason(node, forbiddenLiterals);
 			if (reason) violations.push({ pointer: pointer || "/", reason });
 			return;
@@ -486,6 +654,7 @@ export function findEncodedPayloadViolations(
 		}
 		if (node === null || typeof node !== "object") return;
 		for (const [key, entry] of Object.entries(node)) {
+			strings.push(key);
 			const childPointer = `${pointer}/${escapePointerToken(key)}`;
 			const keyReason = encodedPayloadReason(key, forbiddenLiterals);
 			if (keyReason) {
@@ -499,5 +668,10 @@ export function findEncodedPayloadViolations(
 		}
 	};
 	visit(document, "");
+	if (violations.length === 0) {
+		const joined = encodedPayloadReason(strings.join("\n"), forbiddenLiterals);
+		if (joined)
+			violations.push({ pointer: "/ (strings joined)", reason: joined });
+	}
 	return violations;
 }
