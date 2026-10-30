@@ -2,10 +2,14 @@
  * P0.4: Boundary correctness for limits/rate gates.
  * Tests exact semantics: at limit succeeds, at limit+1 fails.
  */
-import { describe, it, expect } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import { connect, createServer, E_LIMIT_EXCEEDED } from "../src/index.js";
 import { forEachWithTimeout } from "./helpers/harness.js";
 import { nextPort } from "./helpers/network.js";
+
+/** Close code the native server sends when it refuses a session at
+ * maxSessions (LIMIT_EXCEEDED_CLOSE_CODE in crates/native/src/lib.rs). */
+const LIMIT_EXCEEDED_CLOSE_CODE = 3992;
 
 async function connectWithRetry(
 	url: string,
@@ -162,16 +166,46 @@ describe("limit boundaries (P0.4)", () => {
 			}
 			expect(accepted.length).toBe(limit);
 
-			await expect(
-				connect(`https://127.0.0.1:${port}`, {
-					tls: { insecureSkipVerify: true },
-				}),
-			).rejects.toMatchObject({ code: E_LIMIT_EXCEEDED });
+			// The server refuses the limit+1 session by accepting the CONNECT and
+			// immediately closing the connection with LIMIT_EXCEEDED (3992). The
+			// client usually sees that close before `connect` settles and rejects
+			// with E_LIMIT_EXCEEDED, but on a loaded runner the 200 response can win
+			// the race and `connect` resolves first. Either way the session must be
+			// refused: a resolved one has to close with the limit code at once and
+			// never count against the server's session total.
+			const overflow = await connect(`https://127.0.0.1:${port}`, {
+				tls: { insecureSkipVerify: true },
+			}).then(
+				(session) => ({ session }),
+				(error: unknown) => ({ error }),
+			);
+			if ("error" in overflow) {
+				expect(overflow.error).toMatchObject({ code: E_LIMIT_EXCEEDED });
+			} else {
+				const info = await Promise.race([
+					overflow.session.closed,
+					Bun.sleep(5000).then(() => "still open after 5s" as const),
+				]);
+				expect(info).toMatchObject({
+					code: LIMIT_EXCEEDED_CLOSE_CODE,
+					reason: "E_LIMIT_EXCEEDED",
+				});
+			}
+
+			// The cap held: only the admitted sessions are live, and both of them
+			// are still open.
+			const m = server.metricsSnapshot();
+			expect(m.sessionsActive).toBe(limit);
+			expect(m.limitExceededCount).toBeGreaterThanOrEqual(1);
+			for (const session of accepted) {
+				const ended = await Promise.race([
+					session.closed.then(() => true),
+					Bun.sleep(0).then(() => false),
+				]);
+				expect(ended).toBe(false);
+			}
 
 			for (const session of accepted) session.close();
-
-			const m = server.metricsSnapshot();
-			expect(m.limitExceededCount).toBeGreaterThanOrEqual(1);
 		} finally {
 			await server.close();
 		}
