@@ -45,6 +45,7 @@ import {
 	registrySha256,
 	validateClaimProof,
 } from "./release-claims.ts";
+import { contentProblems } from "./release-evidence-content.ts";
 
 export const DEFAULT_ROOT = resolve(import.meta.dir, "..");
 export const MANIFEST_RELATIVE_PATH = "docs/release-evidence-manifest.json";
@@ -1138,8 +1139,20 @@ export function inspectMembers(
 			for (const failure of artifactSemanticFailures(document))
 				problems.push(`${member.name}: ${failure}`);
 	}
+	// Content is allowlisted whatever the recorded outcome: a failed entry is
+	// published too, so it may only contain what its proof kind declares.
+	const contentRefused = new Set<string>();
+	for (const claimId of target.claimIds) {
+		const claim = registry.claims.find((c) => c.id === claimId);
+		if (!claim) continue;
+		for (const problem of contentProblems(members, claim.proof.files)) {
+			contentRefused.add(claimId);
+			problems.push(`${claimId} content: ${problem}`);
+		}
+	}
 	if (target.status !== "passed") return problems;
 	for (const claimId of target.claimIds) {
+		if (contentRefused.has(claimId)) continue;
 		const claim = registry.claims.find((c) => c.id === claimId);
 		if (!claim) {
 			problems.push(

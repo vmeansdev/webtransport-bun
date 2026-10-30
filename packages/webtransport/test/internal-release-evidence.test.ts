@@ -23,6 +23,7 @@ import {
 	type RegisteredClaim,
 	validateClaimProof,
 } from "../../../scripts/release-claims.ts";
+import { contentProblems } from "../../../scripts/release-evidence-content.ts";
 import {
 	createTar,
 	createTarGz,
@@ -89,25 +90,39 @@ const REGISTRY: { schemaVersion: 1; claims: RegisteredClaim[] } = {
 			proof: {
 				kind: "command-records",
 				commandPatterns: ["cargo test", "bun test"],
+				files: [
+					{ match: "commands/*.json", schema: "command-record" },
+					{ match: "summary.json", schema: "command-summary" },
+				],
 			},
 		},
 		{
 			id: "iwa-direct-sockets",
 			surface: "wasm",
 			gaRequired: true,
-			proof: { kind: "iwa-proof" },
+			proof: {
+				kind: "iwa-proof",
+				files: [{ match: "evidence*.json", schema: "iwa-evidence" }],
+			},
 		},
 		{
 			id: "fuzz-gates",
 			surface: "release",
 			gaRequired: false,
-			proof: { kind: "fuzz-release-smoke" },
+			proof: {
+				kind: "fuzz-release-smoke",
+				files: [{ match: "release-smoke.json", schema: "fuzz-release-smoke" }],
+			},
 		},
 		{
 			id: "chromium-native-interop",
 			surface: "native",
 			gaRequired: false,
-			proof: { kind: "playwright-report", minExpected: 1 },
+			proof: {
+				kind: "playwright-report",
+				minExpected: 1,
+				files: [{ match: "*.json", schema: "playwright-report" }],
+			},
 		},
 	],
 };
@@ -377,7 +392,12 @@ function fuzzSmoke() {
 	return {
 		createdAt: "2026-10-29T10:00:00.000Z",
 		fixedDurationSecs: 60,
-		toolchain: { rust: "1.95.0", cargo: "cargo 1.95.0", cargoFuzz: "0.13.1" },
+		toolchain: {
+			rust: "1.95.0",
+			cargo: "cargo 1.95.0 (a1b2c3d4e 2026-07-01)",
+			cargoFuzz: "cargo-fuzz 0.13.1",
+			llvmSymbolizer: "[redacted-host-path]",
+		},
 		corpora: [
 			{
 				target: "h3_frame",
@@ -396,20 +416,127 @@ function fuzzSmoke() {
 	};
 }
 
+/** Shape of a real Playwright 1.58 JSON report (sanitized). */
 function playwrightReport() {
+	const location = { file: "interop.pw.ts", line: 12, column: 3 };
 	return {
 		config: {
-			webServer: { env: { WEBTRANSPORT_INTEROP_HOST: "127.0.0.1" } },
+			configFile: "<repo>/tools/interop/playwright.config.ts",
+			rootDir: "<repo>/tools/interop/tests",
+			forbidOnly: false,
+			fullyParallel: false,
+			globalSetup: null,
+			globalTeardown: null,
+			globalTimeout: 0,
+			grep: {},
+			grepInvert: null,
+			maxFailures: 0,
+			metadata: { actualWorkers: 1 },
+			preserveOutput: "always",
+			projects: [
+				{
+					outputDir: "<repo>/tools/interop/test-results",
+					repeatEach: 1,
+					retries: 0,
+					metadata: { actualWorkers: 1 },
+					id: "",
+					name: "",
+					testDir: "<repo>/tools/interop/tests",
+					testIgnore: [],
+					testMatch: ["**/*.@(spec|test).?(c|m)[jt]s?(x)"],
+					timeout: 30000,
+				},
+			],
+			quiet: false,
+			reporter: [
+				["json", { outputFile: "interop-evidence.json" }],
+				[
+					"<repo>/tools/interop/evidence-sanitizer.ts",
+					{ outputFile: "interop-evidence.json" },
+				],
+			],
+			reportSlowTests: { max: 5, threshold: 300000 },
+			runAgents: "none",
+			shard: null,
+			tags: [],
+			updateSnapshots: "missing",
+			updateSourceMethod: "patch",
+			version: "1.58.2",
+			workers: 1,
+			webServer: {
+				command: "bun run addon-server.ts",
+				cwd: "<repo>/tools/interop",
+				url: "http://127.0.0.1:4434",
+				env: {
+					WEBTRANSPORT_INTEROP_HOST: "127.0.0.1",
+					WT_IDLE_TIMEOUT_MS: "60000",
+				},
+				reuseExistingServer: false,
+				timeout: 30000,
+			},
 		},
 		suites: [
 			{
 				title: "interop.pw.ts",
-				specs: [{ title: "datagram echo", ok: true, tests: [] }],
-				suites: [],
+				file: "interop.pw.ts",
+				column: 0,
+				line: 0,
+				specs: [],
+				suites: [
+					{
+						title: "Chromium native interop",
+						file: "interop.pw.ts",
+						line: 5,
+						column: 6,
+						specs: [
+							{
+								title: "close … propagates to client",
+								ok: true,
+								tags: [],
+								tests: [
+									{
+										timeout: 30000,
+										annotations: [],
+										expectedStatus: "passed",
+										projectId: "",
+										projectName: "",
+										results: [
+											{
+												workerIndex: 0,
+												parallelIndex: 0,
+												status: "passed",
+												duration: 412,
+												errors: [],
+												stdout: [{ text: "datagram echo ok (64 bytes)\n" }],
+												stderr: [],
+												retry: 0,
+												startTime: "2026-10-30T10:54:50.679Z",
+												annotations: [],
+												attachments: [],
+											},
+										],
+										status: "expected",
+									},
+								],
+								id: "4bb17c2992a2b9ccc470-b943d8b34dac2aaa2236",
+								file: "interop.pw.ts",
+								line: location.line,
+								column: location.column,
+							},
+						],
+					},
+				],
 			},
 		],
 		errors: [],
-		stats: { expected: 1, unexpected: 0, flaky: 0, skipped: 0 },
+		stats: {
+			startTime: "2026-10-30T10:54:49.978Z",
+			duration: 727.4,
+			expected: 1,
+			skipped: 0,
+			unexpected: 0,
+			flaky: 0,
+		},
 	};
 }
 
@@ -457,11 +584,31 @@ function editStatus(fixture: Fixture, mutate: (status: StatusFixture) => void) {
 function readyCandidate(fixture: Fixture, tag = TAG) {
 	const bound = cli(fixture, "bind", "--commit", fixture.commit, "--tag", tag);
 	expect(bound.status, bound.stderr).toBe(0);
-	let result = packageLocal(
+	// Tool output comes from the Actions run that produced it.
+	const artifact = writeTree(
+		temp("wt-evidence-native-"),
+		nativeGates(fixture.commit),
+	);
+	writeState(fixture, (state) => {
+		state.runs["41"] = runView(
+			fixture,
+			41,
+			{ workflowName: "test" },
+			artifact,
+			"release-evidence-native-gates",
+		);
+	});
+	let result = cli(
 		fixture,
+		"fetch",
+		"--run",
+		"41",
+		"--artifact",
+		"release-evidence-native-gates",
+		"--claim",
 		"native-local-gates",
-		"native-local-gates-local-1",
-		writeTree(inputDir(fixture, "native"), nativeGates(fixture.commit)),
+		"--id",
+		"native-local-gates-test-41-1",
 	);
 	expect(result.status, result.stderr).toBe(0);
 	result = packageLocal(
@@ -476,7 +623,7 @@ function readyCandidate(fixture: Fixture, tag = TAG) {
 	result = cli(fixture, "upload", "--create-prerelease", "--execute");
 	expect(result.status, result.stderr).toBe(0);
 	passClaims(fixture, {
-		"native-local-gates": "native-local-gates-local-1",
+		"native-local-gates": "native-local-gates-test-41-1",
 		"iwa-direct-sockets": "iwa-direct-sockets-local-1",
 	});
 }
@@ -902,7 +1049,12 @@ describe("manifest and claim registry contract", () => {
 			id: "package-artifact",
 			surface: "release",
 			gaRequired: true,
-			proof: { kind: "npm-publish-identity" },
+			proof: {
+				kind: "npm-publish-identity",
+				files: [
+					{ match: "candidate-identity.json", schema: "npm-publish-identity" },
+				],
+			},
 		};
 		const ctx = (member: { name: string; data: Uint8Array }) => ({
 			commit,
@@ -959,18 +1111,21 @@ describe("manifest and claim registry contract", () => {
 		expect(
 			validateClaimProof(
 				iwa,
-				ctx([json("e.json", { commit, status: "passed" })]),
+				ctx([json("evidence.json", { commit, status: "passed" })]),
 			).length,
 		).toBeGreaterThan(0);
 		// Real-format proof, but from the wrong commit.
 		expect(
 			validateClaimProof(
 				iwa,
-				ctx([json("e.json", iwaEvidence("f".repeat(40)))]),
+				ctx([json("evidence.json", iwaEvidence("f".repeat(40)))]),
 			).join("\n"),
 		).toContain("sourceCommit");
 		expect(
-			validateClaimProof(iwa, ctx([json("e.json", iwaEvidence(commit))])),
+			validateClaimProof(
+				iwa,
+				ctx([json("evidence.json", iwaEvidence(commit))]),
+			),
 		).toEqual([]);
 		// A Playwright report carries no commit: only an Actions run binds it.
 		expect(
@@ -995,11 +1150,355 @@ describe("manifest and claim registry contract", () => {
 		).toBeGreaterThan(0);
 		// Command records must actually run the gate's commands.
 		const partial = [
-			json("c.json", nativeGates(commit)["commands/cargo-test.json"]),
+			json(
+				"commands/cargo-test.json",
+				nativeGates(commit)["commands/cargo-test.json"],
+			),
 		];
+		expect(
+			validateClaimProof(native, ctx(partial, "github-actions")).join("\n"),
+		).toContain("bun test");
+		// ...and command records are tool output: never accepted from --local.
 		expect(validateClaimProof(native, ctx(partial)).join("\n")).toContain(
-			"bun test",
+			"GitHub Actions run",
 		);
+	});
+});
+
+// ---- content allowlist -----------------------------------------------------
+
+describe("evidence content allowlist", () => {
+	const commit = "0123456789abcdef0123456789abcdef01234567";
+	const realRegistry = JSON.parse(
+		readFileSync(join(PROJECT_ROOT, "docs", "release-claims.json"), "utf8"),
+	) as { claims: RegisteredClaim[] };
+	const filesFor = (claimId: string) => {
+		const claim = realRegistry.claims.find((c) => c.id === claimId);
+		if (!claim) throw new Error(claimId);
+		return claim.proof.files;
+	};
+	const member = (name: string, value: unknown) => ({
+		name,
+		data: new TextEncoder().encode(
+			typeof value === "string" ? value : JSON.stringify(value, null, 2),
+		),
+	});
+	const secret = Buffer.from("LOKALISE_API_TOKEN=supersecretvalue").toString(
+		"base64",
+	);
+	const chunked = (separator: string) =>
+		(secret.match(/.{1,4}/g) ?? []).join(separator);
+
+	for (const separator of ["!", ".", ",", ":", " "]) {
+		it(`refuses base64 split by ${JSON.stringify(separator)} in a free-text field`, () => {
+			const gates = nativeGates(commit);
+			const record = {
+				...gates["commands/cargo-test.json"],
+				command: ["cargo", "test", chunked(separator)],
+			};
+			const problems = contentProblems(
+				[member("ci/commands/cargo-test.json", record)],
+				filesFor("native-local-gates"),
+			);
+			expect(problems.join("\n")).toContain("opaque run");
+			expect(problems.join("\n")).not.toContain(secret.slice(0, 8));
+		});
+		it(`the scanner also rejoins base64 split by ${JSON.stringify(separator)}`, () => {
+			const result = scrubFile(
+				"proof.json",
+				new TextEncoder().encode(JSON.stringify({ note: chunked(separator) })),
+				{ repoRoots: [], redactHostPaths: false, forbiddenLiterals: [] },
+			);
+			expect(result.ok).toBe(false);
+		});
+	}
+
+	it("refuses an unknown extra field, recursively", () => {
+		const evidence = { ...iwaEvidence(commit), extra: "harmless" };
+		expect(
+			contentProblems(
+				[member("iwa/evidence.json", evidence)],
+				filesFor("iwa-direct-sockets"),
+			).join("\n"),
+		).toContain("unknown field");
+		const nested = iwaEvidence(commit);
+		(nested.functional as Record<string, unknown>).note = "x";
+		expect(
+			contentProblems(
+				[member("iwa/evidence.json", nested)],
+				filesFor("iwa-direct-sockets"),
+			).join("\n"),
+		).toContain("unknown field");
+	});
+
+	it("refuses files a proof kind does not declare, and logs outside their grammar", () => {
+		expect(
+			contentProblems(
+				[
+					member("iwa/evidence.json", iwaEvidence(commit)),
+					member("iwa/origin.txt", "isolated-app://x\n"),
+				],
+				filesFor("iwa-direct-sockets"),
+			).join("\n"),
+		).toContain("not a file this proof kind may contain");
+		expect(
+			contentProblems(
+				[
+					member(
+						"coverage/bun/lcov.info",
+						`SF:src/a.ts\nDA:1,1\nNOTE:${chunked("")}\nend_of_record\n`,
+					),
+				],
+				[{ match: "lcov.info", schema: "lcov" }],
+			).join("\n"),
+		).toContain("outside the lcov grammar");
+	});
+
+	it("refuses a digest-shaped value outside a declared digest field", () => {
+		const review = {
+			schemaVersion: 1,
+			kind: "review",
+			commit,
+			reviewer: "codex",
+			scope: `release ${"a1b2c3d4".repeat(4)}`,
+			verdict: "pass",
+			findings: { P0: 0, P1: 0, P2: 0, P3: 0, P4: 0 },
+		};
+		expect(
+			contentProblems(
+				[member("review.json", review)],
+				filesFor("auto-review-zero-p0-p4"),
+			).join("\n"),
+		).toContain("opaque run");
+	});
+
+	it("accepts real output of every proof kind", () => {
+		const cases: [string, { name: string; data: Uint8Array }[]][] = [
+			[
+				"native-local-gates",
+				Object.entries(nativeGates(commit)).map(([name, value]) =>
+					member(`release-evidence-native-gates/${name}`, value),
+				),
+			],
+			[
+				"chromium-native-interop",
+				[member("interop-evidence/interop-evidence.json", playwrightReport())],
+			],
+			[
+				"fuzz-gates",
+				[
+					member("fuzz/release-smoke.json", {
+						...fuzzSmoke(),
+						commandResults: [
+							{
+								command: [
+									"rustup",
+									"run",
+									"1.95.0",
+									"cargo",
+									"fuzz",
+									"run",
+									"h3_frame",
+									"--fuzz-dir",
+									".",
+								],
+								exitCode: 0,
+								stdout: "",
+								stderr: [
+									"   Compiling ring v0.17.8",
+									"    Finished `release` profile [optimized + debuginfo] target(s) in 1m 02s",
+									"     Running `target/x86_64-unknown-linux-gnu/release/h3_frame -max_total_time=60 -timeout=10`",
+									"INFO: Running with entropic power schedule (0xFF, 100).",
+									"INFO: Seed: 3141592653",
+									"INFO: Loaded 1 modules   (12345 inline 8-bit counters): 12345 [0x55d5c8a0b2c0, 0x55d5c8a0e2f1),",
+									"#2\tINITED cov: 1234 ft: 2345 corp: 12/1024b exec/s: 0 rss: 31Mb",
+									"#65536\tpulse  cov: 1301 ft: 2511 corp: 40/3Kb lim: 4096 exec/s: 21845 rss: 64Mb",
+									"Done 1310720 runs in 61 second(s)",
+								].join("\n"),
+								stdoutBytes: 0,
+								stderrBytes: 600,
+								durationMs: 61234.5,
+								timeoutMs: 90000,
+								timedOut: false,
+								timeoutSignal: null,
+								drainTimeoutMs: 5000,
+								drainDurationMs: 1.2,
+								drainTimedOut: false,
+							},
+						],
+					}),
+				],
+			],
+			[
+				"coverage-gates",
+				[
+					member("coverage-artifacts/native-coverage.json", {
+						data: [
+							{
+								files: [
+									{
+										filename: "<repo>/crates/native/src/limits.rs",
+										segments: [[1, 1, 5, true, true, false]],
+										branches: [[3, 5, 3, 20, 1, 0, 0, 0, 4]],
+										expansions: [],
+										summary: {
+											lines: { count: 10, covered: 9, percent: 90 },
+											functions: { count: 2, covered: 2, percent: 100 },
+											regions: {
+												count: 4,
+												covered: 4,
+												notcovered: 0,
+												percent: 100,
+											},
+											branches: {
+												count: 2,
+												covered: 2,
+												notcovered: 0,
+												percent: 100,
+											},
+										},
+									},
+								],
+								functions: [
+									{
+										name: "_RNvMs0_NtCsiQbL8HVQ6bn_6native6limitsNtB5_6Limits3new",
+										count: 5,
+										regions: [[1, 1, 3, 2, 5, 0, 0, 0]],
+										branches: [],
+										filenames: ["<repo>/crates/native/src/limits.rs"],
+									},
+								],
+								totals: {
+									lines: { count: 10, covered: 9, percent: 90 },
+									functions: { count: 2, covered: 2, percent: 100 },
+								},
+							},
+						],
+						type: "llvm.coverage.json.export",
+						version: "2.0.1",
+					}),
+					member(
+						"coverage-artifacts/bun/lcov.info",
+						"TN:\nSF:packages/webtransport/src/backend.ts\nFN:12,createBackend\nFNDA:3,createBackend\nFNF:1\nFNH:1\nDA:12,3\nDA:13,3\nLF:2\nLH:2\nend_of_record\n",
+					),
+				],
+			],
+			[
+				"package-artifact",
+				[
+					member("npm-publish-input-1/candidate-identity.json", {
+						schemaVersion: 1,
+						repository: REPO,
+						workflowPath: ".github/workflows/release.yml",
+						releaseRunId: 5,
+						releaseRunAttempt: 1,
+						candidateCommit: commit,
+						tag: "v1.0.0-rc.2",
+						packageVersion: "1.0.0-rc.2",
+						tarball: "webtransport-bun-webtransport-1.0.0-rc.2.tgz",
+						tarballSha256: "a".repeat(64),
+					}),
+				],
+			],
+			[
+				"soak-24h",
+				[
+					member("soak/soak-aggregate-0123456789ab-5x.json", {
+						mode: "aggregate",
+						status: "pass",
+						segmentCount: 1,
+						expectedSegmentCount: 1,
+						candidateCommit: commit,
+						seed: "campaign-2026-10-30",
+						continuityTokenDigest: "b".repeat(64),
+						source: { head: commit, dirty: false },
+						workflowSource: { ref: "refs/tags/v1.0.0-rc.2", sha: commit },
+						runnerType: "self-hosted",
+						runnerMode: "dedicated",
+						runnerProfile: "large",
+						rates: { sessions: 500, datagramsPerSec: 500, streamsPerSec: 5 },
+						thresholds: {
+							maxSessionErrors: 0,
+							maxDatagramErrors: 0,
+							maxStreamErrors: 0,
+							rssTrendMaxRel: 0.1,
+							rssTrendMinAbsMb: 32,
+							rssCeilMb: 1750,
+							maxGapMs: 60000,
+						},
+						debugKnobs: {
+							heapDebug: false,
+							heapDebugIntervalMs: 0,
+							committedAbortMb: 2200,
+						},
+						h7Delivery: {
+							datagramBatchRequested: 64,
+							datagramBatchResolved: 64,
+							payloadDeliveryRequested: "default",
+							payloadDeliveryResolved: "default",
+							diagnosticsEnabled: false,
+						},
+						datagramsSent: 1000,
+						datagramsReceived: 1000,
+						deliveryRatio: 1,
+						toolchain: {
+							bun: "1.3.14",
+							rustc: "rustc 1.95.0 (a1b2c3d4e 2026-07-01)",
+							cc: { path: "/usr/bin/cc", version: "cc (Ubuntu 13.2.0) 13.2.0" },
+							cxx: {
+								path: "/usr/bin/c++",
+								version: "c++ (Ubuntu 13.2.0) 13.2.0",
+							},
+						},
+						segments: [
+							{
+								index: 1,
+								file: "soak-segment-01-of-01.json",
+								finalStateHash: "c".repeat(64),
+								startedAtMs: 1,
+								endedAtMs: 86400001,
+								status: "pass",
+							},
+						],
+						totalDurationSeconds: 86400,
+						aggregateHash: "d".repeat(64),
+					}),
+				],
+			],
+			[
+				"iwa-direct-sockets",
+				[member("iwa/evidence.json", iwaEvidence(commit))],
+			],
+			[
+				"auto-review-zero-p0-p4",
+				[
+					member("review/review.json", {
+						schemaVersion: 1,
+						kind: "review",
+						commit,
+						reviewer: "codex architect + critic",
+						scope: "full repository at the candidate",
+						verdict: "pass",
+						findings: { P0: 0, P1: 0, P2: 0, P3: 0, P4: 0 },
+					}),
+				],
+			],
+			[
+				"final-no-change-confirmation",
+				[
+					member("freeze/no-change.json", {
+						schemaVersion: 1,
+						kind: "no-change-confirmation",
+						commit,
+						frozenAt: "2026-10-30T00:00:00.000Z",
+						verdict: "pass",
+						changedFilesSinceFreeze: [],
+					}),
+				],
+			],
+		];
+		for (const [claimId, members] of cases)
+			expect(contentProblems(members, filesFor(claimId)), claimId).toEqual([]);
 	});
 });
 
@@ -1050,7 +1549,7 @@ describe("release evidence lifecycle", () => {
 				.sort(),
 		).toEqual([
 			"evidence-iwa-direct-sockets-local-1.json",
-			"evidence-native-local-gates-local-1.tar.gz",
+			"evidence-native-local-gates-test-41-1.tar.gz",
 		]);
 		expect(readState(fixture).releases[TAG]?.isPrerelease).toBe(true);
 		const verify = cli(fixture, "verify");
@@ -1068,7 +1567,7 @@ describe("release evidence lifecycle", () => {
 		});
 		expect(manifest(fixture).promotion?.assets.map((a) => a.name)).toEqual([
 			"evidence-iwa-direct-sockets-local-1.json",
-			"evidence-native-local-gates-local-1.tar.gz",
+			"evidence-native-local-gates-test-41-1.tar.gz",
 		]);
 		const locked = cli(fixture, "verify", "--require-ready");
 		expect(locked.status, locked.stderr).toBe(0);
@@ -1263,6 +1762,42 @@ describe("release evidence lifecycle", () => {
 		expect(promote.stderr).toContain("beyond the evidence record");
 	});
 
+	it("upload resolves the tag and refuses another candidate's pre-release", () => {
+		const fixture = makeFixture();
+		cli(fixture, "bind", "--commit", fixture.commit, "--tag", TAG);
+		expect(
+			packageLocal(
+				fixture,
+				"iwa-direct-sockets",
+				"iwa-direct-sockets-local-1",
+				writeTree(inputDir(fixture, "iwa"), {
+					"evidence.json": iwaEvidence(fixture.commit),
+				}),
+			).status,
+		).toBe(0);
+		writeState(fixture, (state) => {
+			state.tags[TAG] = "9".repeat(40);
+		});
+		const moved = cli(fixture, "upload", "--create-prerelease", "--execute");
+		expect(moved.status).toBe(1);
+		expect(moved.stderr).toContain(`tag ${TAG} points to ${"9".repeat(40)}`);
+		writeState(fixture, (state) => {
+			state.tags["v1.0.0-rc.9"] = "8".repeat(40);
+		});
+		const other = cli(
+			fixture,
+			"upload",
+			"--tag",
+			"v1.0.0-rc.9",
+			"--create-prerelease",
+			"--execute",
+		);
+		expect(other.status).toBe(1);
+		const calls = readState(fixture).calls.map((c) => `${c[0]} ${c[1]}`);
+		expect(calls).not.toContain("release create");
+		expect(calls).not.toContain("release upload");
+	});
+
 	it("verify fails when the tag does not point at the candidate", () => {
 		const fixture = makeFixture();
 		readyCandidate(fixture);
@@ -1307,9 +1842,11 @@ describe("release evidence lifecycle", () => {
 		expect(
 			packageLocal(
 				fixture,
-				"native-local-gates",
-				"native-local-gates-local-1",
-				writeTree(inputDir(fixture, "n"), nativeGates(fixture.commit)),
+				"iwa-direct-sockets",
+				"iwa-direct-sockets-local-1",
+				writeTree(inputDir(fixture, "n"), {
+					"evidence.json": iwaEvidence(fixture.commit),
+				}),
 			).status,
 		).toBe(0);
 		const missing = cli(fixture, "upload", "--execute");
@@ -1333,7 +1870,7 @@ describe("release evidence lifecycle", () => {
 		const result = packageLocal(
 			fixture,
 			"native-local-gates",
-			"native-local-gates-local-1",
+			"native-local-gates-test-41-1",
 			dir,
 		);
 		expect(result.status).toBe(1);
@@ -1352,11 +1889,11 @@ describe("release evidence lifecycle", () => {
 		const refusedEmpty = packageLocal(
 			fixture,
 			"native-local-gates",
-			"native-local-gates-local-1",
+			"native-local-gates-test-41-1",
 			empty,
 		);
 		expect(refusedEmpty.status).toBe(1);
-		expect(refusedEmpty.stderr).toContain("native-local-gates proof");
+		expect(refusedEmpty.stderr).toContain("native-local-gates content");
 		const gates = nativeGates(fixture.commit);
 		gates["commands/bun-test.json"].exitCode = 3;
 		const failed = writeTree(inputDir(fixture, "failed"), gates);

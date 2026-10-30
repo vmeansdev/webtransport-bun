@@ -79,6 +79,7 @@ import {
 	type ReleaseStatus,
 	readJsonFile,
 	registryTextAt,
+	remoteTagCommit,
 	runGh,
 	SHA40,
 	STATUS_RELATIVE_PATH,
@@ -735,6 +736,8 @@ function uploadCommand(args: Args): void {
 	let entries: ManifestEntry[];
 	let repository: string;
 	let tag: string | null;
+	/** The commit the evidence being uploaded is bound to. */
+	let boundCommit: string | null;
 	const extraFiles: string[] = [];
 	if (fragmentPath) {
 		const fragment = readJsonFile(resolve(fragmentPath));
@@ -749,12 +752,14 @@ function uploadCommand(args: Args): void {
 		entries = typed.entries;
 		repository = typed.repository;
 		tag = typed.tag;
+		boundCommit = typed.commit;
 		extraFiles.push(resolve(fragmentPath));
 	} else {
 		const manifest = loadManifest(manifestPath(root));
 		entries = manifest.entries;
 		repository = manifest.repository;
 		tag = manifest.candidate.tag;
+		boundCommit = manifest.candidate.commit;
 	}
 	repository = one(args, "--repo") ?? repository;
 	tag = one(args, "--tag") ?? tag;
@@ -764,6 +769,18 @@ function uploadCommand(args: Args): void {
 		throw new Error(
 			`evidence is attached to a candidate pre-release; ${tag} is not a pre-release tag`,
 		);
+	// Evidence goes only to the pre-release of the commit it is bound to: the
+	// tag is resolved on GitHub, never trusted from the command line.
+	const tagCommit = remoteTagCommit(repository, tag, root);
+	if (boundCommit === null || tagCommit !== boundCommit)
+		throw new Error(
+			`tag ${tag} points to ${tagCommit}, not the evidence candidate ${boundCommit ?? "<unbound>"}`,
+		);
+	for (const entry of entries)
+		if (entry.commit !== tagCommit)
+			throw new Error(
+				`${entry.asset} is bound to ${entry.commit}, but tag ${tag} points to ${tagCommit}`,
+			);
 	const assetsDir = resolve(
 		one(args, "--assets-dir") ?? defaultAssetsDir(root),
 	);

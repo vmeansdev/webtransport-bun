@@ -23,9 +23,30 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
+import {
+	CONTENT_SCHEMA_NAMES,
+	contentProblems,
+	type DeclaredFile,
+} from "./release-evidence-content.ts";
+
 export const CLAIM_REGISTRY_RELATIVE_PATH = "docs/release-claims.json";
 
-export type ProofSpec =
+export type ProofSpec = ProofKind & {
+	/** The files a bundle for this proof may contain, each with its content
+	 * schema (scripts/release-evidence-content.ts). Anything else is refused. */
+	files: DeclaredFile[];
+};
+
+/** Proof kinds a local (operator-run) producer may carry: inherently human
+ * work. Everything else is tool output and must come from a GitHub Actions
+ * run through `fetch`. */
+export const LOCAL_PROOF_KINDS: ReadonlySet<string> = new Set([
+	"iwa-proof",
+	"review-record",
+	"no-change-confirmation",
+]);
+
+export type ProofKind =
 	| {
 			kind: "command-records";
 			minRecords?: number;
@@ -111,6 +132,27 @@ export function validateRegistry(value: unknown): string[] {
 			errors.push(`${at}.gaRequired: must be a boolean`);
 		if (!isObject(claim.proof) || !PROOF_KINDS.has(claim.proof.kind as string))
 			errors.push(`${at}.proof: unknown proof kind`);
+		else {
+			const files = claim.proof.files;
+			if (!Array.isArray(files) || files.length === 0)
+				errors.push(
+					`${at}.proof.files: must declare the files a bundle may contain`,
+				);
+			else
+				files.forEach((file, fileIndex) => {
+					if (
+						!isObject(file) ||
+						Object.keys(file).sort().join(",") !== "match,schema" ||
+						typeof file.match !== "string" ||
+						!/^[A-Za-z0-9._*/-]+$/.test(file.match) ||
+						typeof file.schema !== "string" ||
+						!CONTENT_SCHEMA_NAMES.has(file.schema)
+					)
+						errors.push(
+							`${at}.proof.files[${fileIndex}]: must be {match: <glob>, schema: <known content schema>}`,
+						);
+				});
+		}
 	});
 	return errors;
 }
@@ -150,7 +192,7 @@ function requireProvenance(ctx: ProofContext, what: string): string[] {
 	return ctx.producerKind === "github-actions"
 		? []
 		: [
-				`${what} output carries no commit; it must come from a GitHub Actions run (fetch or the release workflow) whose head SHA binds it to the candidate`,
+				`${what} is tool output; it must be fetched from the GitHub Actions run that produced it (release-evidence.ts fetch), whose head SHA binds it to the candidate`,
 			];
 }
 
@@ -602,6 +644,15 @@ export function validateClaimProof(
 	ctx: ProofContext,
 ): string[] {
 	const spec = claim.proof;
+	// Content is allowlisted before any outcome is read: undeclared files,
+	// unknown fields and untyped values are refused outright.
+	const content = contentProblems(ctx.members, spec.files);
+	if (content.length > 0) return content;
+	// Tool output is only evidence when an Actions run produced it.
+	if (!LOCAL_PROOF_KINDS.has(spec.kind)) {
+		const provenance = requireProvenance(ctx, spec.kind);
+		if (provenance.length > 0) return provenance;
+	}
 	switch (spec.kind) {
 		case "command-records":
 			return commandRecords(ctx, spec);

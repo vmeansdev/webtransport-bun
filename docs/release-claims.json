@@ -7,7 +7,17 @@
 			"gaRequired": true,
 			"proof": {
 				"kind": "command-records",
-				"commandPatterns": ["cargo test", "bun test"]
+				"commandPatterns": ["cargo test", "bun test"],
+				"files": [
+					{
+						"match": "commands/*.json",
+						"schema": "command-record"
+					},
+					{
+						"match": "summary.json",
+						"schema": "command-summary"
+					}
+				]
 			}
 		},
 		{
@@ -16,7 +26,17 @@
 			"gaRequired": true,
 			"proof": {
 				"kind": "command-records",
-				"commandPatterns": ["test:wasm"]
+				"commandPatterns": ["test:wasm"],
+				"files": [
+					{
+						"match": "commands/*.json",
+						"schema": "command-record"
+					},
+					{
+						"match": "summary.json",
+						"schema": "command-summary"
+					}
+				]
 			}
 		},
 		{
@@ -26,7 +46,17 @@
 			"proof": {
 				"kind": "command-records",
 				"minRecords": 3,
-				"platforms": ["linux", "darwin", "win32"]
+				"platforms": ["linux", "darwin", "win32"],
+				"files": [
+					{
+						"match": "commands/*.json",
+						"schema": "command-record"
+					},
+					{
+						"match": "summary.json",
+						"schema": "command-summary"
+					}
+				]
 			}
 		},
 		{
@@ -35,7 +65,17 @@
 			"gaRequired": true,
 			"proof": {
 				"kind": "command-records",
-				"commandPatterns": ["test-package-artifact"]
+				"commandPatterns": ["test-package-artifact"],
+				"files": [
+					{
+						"match": "commands/*.json",
+						"schema": "command-record"
+					},
+					{
+						"match": "summary.json",
+						"schema": "command-summary"
+					}
+				]
 			}
 		},
 		{
@@ -44,7 +84,13 @@
 			"gaRequired": true,
 			"proof": {
 				"kind": "playwright-report",
-				"minExpected": 1
+				"minExpected": 1,
+				"files": [
+					{
+						"match": "*.json",
+						"schema": "playwright-report"
+					}
+				]
 			}
 		},
 		{
@@ -53,7 +99,13 @@
 			"gaRequired": true,
 			"proof": {
 				"kind": "playwright-report",
-				"minExpected": 1
+				"minExpected": 1,
+				"files": [
+					{
+						"match": "*.json",
+						"schema": "playwright-report"
+					}
+				]
 			}
 		},
 		{
@@ -61,7 +113,13 @@
 			"surface": "wasm",
 			"gaRequired": true,
 			"proof": {
-				"kind": "iwa-proof"
+				"kind": "iwa-proof",
+				"files": [
+					{
+						"match": "evidence*.json",
+						"schema": "iwa-evidence"
+					}
+				]
 			}
 		},
 		{
@@ -70,7 +128,13 @@
 			"gaRequired": true,
 			"proof": {
 				"kind": "playwright-report",
-				"minExpected": 1
+				"minExpected": 1,
+				"files": [
+					{
+						"match": "*.json",
+						"schema": "playwright-report"
+					}
+				]
 			}
 		},
 		{
@@ -78,7 +142,21 @@
 			"surface": "release",
 			"gaRequired": true,
 			"proof": {
-				"kind": "llvm-cov-floors"
+				"kind": "llvm-cov-floors",
+				"files": [
+					{
+						"match": "native-coverage.json",
+						"schema": "llvm-cov-export"
+					},
+					{
+						"match": "wasm-coverage.json",
+						"schema": "llvm-cov-export"
+					},
+					{
+						"match": "lcov.info",
+						"schema": "lcov"
+					}
+				]
 			}
 		},
 		{
@@ -86,7 +164,13 @@
 			"surface": "release",
 			"gaRequired": true,
 			"proof": {
-				"kind": "fuzz-release-smoke"
+				"kind": "fuzz-release-smoke",
+				"files": [
+					{
+						"match": "release-smoke.json",
+						"schema": "fuzz-release-smoke"
+					}
+				]
 			}
 		},
 		{
@@ -95,7 +179,13 @@
 			"gaRequired": false,
 			"proof": {
 				"kind": "distributed-scale",
-				"minSessions": 10000
+				"minSessions": 10000,
+				"files": [
+					{
+						"match": "distributed-scale-artifact.json",
+						"schema": "distributed-scale-artifact"
+					}
+				]
 			}
 		},
 		{
@@ -103,7 +193,13 @@
 			"surface": "release",
 			"gaRequired": true,
 			"proof": {
-				"kind": "npm-publish-identity"
+				"kind": "npm-publish-identity",
+				"files": [
+					{
+						"match": "candidate-identity.json",
+						"schema": "npm-publish-identity"
+					}
+				]
 			}
 		},
 		{
@@ -112,7 +208,17 @@
 			"gaRequired": true,
 			"proof": {
 				"kind": "command-records",
-				"commandPatterns": ["audit signatures"]
+				"commandPatterns": ["audit signatures"],
+				"files": [
+					{
+						"match": "commands/*.json",
+						"schema": "command-record"
+					},
+					{
+						"match": "summary.json",
+						"schema": "command-summary"
+					}
+				]
 			}
 		},
 		{
@@ -121,7 +227,13 @@
 			"gaRequired": true,
 			"proof": {
 				"kind": "soak-aggregate",
-				"hours": 24
+				"hours": 24,
+				"files": [
+					{
+						"match": "soak-aggregate-*.json",
+						"schema": "soak-aggregate"
+					}
+				]
 			}
 		},
 		{
@@ -130,7 +242,13 @@
 			"gaRequired": true,
 			"proof": {
 				"kind": "soak-aggregate",
-				"hours": 72
+				"hours": 72,
+				"files": [
+					{
+						"match": "soak-aggregate-*.json",
+						"schema": "soak-aggregate"
+					}
+				]
 			}
 		},
 		{
@@ -138,7 +256,13 @@
 			"surface": "release",
 			"gaRequired": true,
 			"proof": {
-				"kind": "review-record"
+				"kind": "review-record",
+				"files": [
+					{
+						"match": "*.json",
+						"schema": "review-record"
+					}
+				]
 			}
 		},
 		{
@@ -146,7 +270,13 @@
 			"surface": "release",
 			"gaRequired": true,
 			"proof": {
-				"kind": "no-change-confirmation"
+				"kind": "no-change-confirmation",
+				"files": [
+					{
+						"match": "*.json",
+						"schema": "no-change-confirmation"
+					}
+				]
 			}
 		},
 		{
@@ -155,7 +285,17 @@
 			"gaRequired": true,
 			"proof": {
 				"kind": "command-records",
-				"commandPatterns": ["qpack"]
+				"commandPatterns": ["qpack"],
+				"files": [
+					{
+						"match": "commands/*.json",
+						"schema": "command-record"
+					},
+					{
+						"match": "summary.json",
+						"schema": "command-summary"
+					}
+				]
 			}
 		},
 		{
@@ -164,7 +304,17 @@
 			"gaRequired": true,
 			"proof": {
 				"kind": "command-records",
-				"commandPatterns": ["multi-session"]
+				"commandPatterns": ["multi-session"],
+				"files": [
+					{
+						"match": "commands/*.json",
+						"schema": "command-record"
+					},
+					{
+						"match": "summary.json",
+						"schema": "command-summary"
+					}
+				]
 			}
 		},
 		{
@@ -173,7 +323,17 @@
 			"gaRequired": true,
 			"proof": {
 				"kind": "command-records",
-				"commandPatterns": ["0rtt"]
+				"commandPatterns": ["0rtt"],
+				"files": [
+					{
+						"match": "commands/*.json",
+						"schema": "command-record"
+					},
+					{
+						"match": "summary.json",
+						"schema": "command-summary"
+					}
+				]
 			}
 		},
 		{
@@ -182,7 +342,17 @@
 			"gaRequired": true,
 			"proof": {
 				"kind": "command-records",
-				"commandPatterns": ["facade"]
+				"commandPatterns": ["facade"],
+				"files": [
+					{
+						"match": "commands/*.json",
+						"schema": "command-record"
+					},
+					{
+						"match": "summary.json",
+						"schema": "command-summary"
+					}
+				]
 			}
 		}
 	]

@@ -102,13 +102,19 @@ function validStatus() {
 					id: "native-local",
 					surface: "native",
 					gaRequired: true,
-					proof: { kind: "command-records" },
+					proof: {
+						kind: "command-records",
+						files: [{ match: "commands/*.json", schema: "command-record" }],
+					},
 				},
 				{
 					id: "wasm-browser",
 					surface: "wasm",
 					gaRequired: true,
-					proof: { kind: "iwa-proof" },
+					proof: {
+						kind: "iwa-proof",
+						files: [{ match: "evidence*.json", schema: "iwa-evidence" }],
+					},
 				},
 			],
 		},
