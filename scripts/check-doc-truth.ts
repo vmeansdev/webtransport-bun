@@ -302,7 +302,8 @@ function checkEvidence(status: ReleaseStatus): Map<string, EvidenceEntry> {
  * cannot add, drop, or downgrade a gate.
  */
 function checkClaimRegistry(status: ReleaseStatus): void {
-	const location = relative(ROOT, CLAIM_REGISTRY_PATH);
+	// Messages name the registry by its repository path on every platform.
+	const location = "docs/release-claims.json";
 	const text = readText(CLAIM_REGISTRY_PATH);
 	if (text === undefined) return;
 	let registry: unknown;
