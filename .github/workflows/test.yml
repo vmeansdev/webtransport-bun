@@ -102,13 +102,33 @@ jobs:
       - name: Build native (for wasm-native-interop)
         run: bun run build:native
       - name: Build wasm + wasm-dist + full wasm Bun suite
-        run: bun run test:wasm
+        # Recorded as release evidence (wasm-local-gates).
+        run: bun scripts/record-command.ts --out "$RUNNER_TEMP/release-evidence" --name test-wasm -- bun run test:wasm
         env:
           WEBTRANSPORT_REQUIRE_WASM: "1"
       - name: Wasm native interop (requires pkg + native)
         run: bun run test:wasm:interop
         env:
           WEBTRANSPORT_REQUIRE_WASM: "1"
+      - name: Wasm protocol gates (recorded release evidence)
+        # One record per WASM GA claim: dynamic QPACK, multi-session, 0-RTT and
+        # the W3C facade, each its own suite run against the built package.
+        run: |
+          set -euo pipefail
+          bun scripts/record-command.ts --out "$RUNNER_TEMP/release-evidence" --name wasm-qpack -- bun test packages/webtransport/test/wasm-qpack-options.test.ts
+          bun scripts/record-command.ts --out "$RUNNER_TEMP/release-evidence" --name wasm-multi-session -- bun test packages/webtransport/test/wasm-multi-session.test.ts
+          bun scripts/record-command.ts --out "$RUNNER_TEMP/release-evidence" --name wasm-0rtt -- bun test packages/webtransport/test/wasm-0rtt.test.ts
+          bun scripts/record-command.ts --out "$RUNNER_TEMP/release-evidence" --name wasm-facade -- bun test packages/webtransport/test/wasm-facade.test.ts packages/webtransport/test/wasm-facade-options.test.ts
+        env:
+          WEBTRANSPORT_REQUIRE_WASM: "1"
+          WEBTRANSPORT_REQUIRE_WASM_DIST: "1"
+      - name: Upload wasm release evidence command records
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 resolved 2026-07-22
+        with:
+          name: release-evidence-wasm-gates
+          path: ${{ runner.temp }}/release-evidence/
+          if-no-files-found: error
+          retention-days: 90
       - name: Hole test — delete pkg and expect wasm suite red
         run: |
           rm -rf crates/wasm/pkg
@@ -132,8 +152,22 @@ jobs:
       - name: Rebuild wasm after hole test
         run: bun run build:wasm && bun run build:wasm:dist
       - name: Interop (Chromium native client -> wasm server)
-        run: cd tools/interop && bun install --frozen-lockfile && bun run install:browsers && bun run playwright test -c playwright.wasm.config.ts
+        # INTEROP_EVIDENCE=1 writes the sanitized JSON report that is the
+        # chromium-wasm-interop claim's evidence.
+        run: |
+          cd tools/interop
+          bun install --frozen-lockfile
+          bun run install:browsers
+          INTEROP_EVIDENCE=1 bun run playwright test -c playwright.wasm.config.ts
+          bun run verify-evidence.ts --interop interop-evidence-wasm.json
         timeout-minutes: 6
+      - name: Upload wasm interop evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 resolved 2026-07-22
+        with:
+          name: release-evidence-wasm-interop
+          path: tools/interop/interop-evidence-wasm.json
+          if-no-files-found: error
+          retention-days: 90
   test:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
@@ -173,7 +207,8 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace -- -D clippy::all
       - name: cargo test
-        run: cargo test --workspace
+        # Recorded as release evidence (native-local-gates, cross-platform-matrix).
+        run: bun scripts/record-command.ts --out "$RUNNER_TEMP/release-evidence" --name "cargo-test-${{ runner.os }}" -- cargo test --workspace
       - name: Build test-fixture binaries
         # The adversarial-protocol suite spawns crates/adversary. Build it in a
         # visible, retryable step so its existsSync guard passes — building it
@@ -190,7 +225,10 @@ jobs:
       - name: Unit tests
         # Wasm Bun suites are ubuntu-only (wasm job). Exclude them here so
         # existsSync(pkg) skipIf cannot false-green the OS/bun matrix.
+        # Recorded as release evidence (native-local-gates, cross-platform-matrix).
         run: >
+          bun scripts/record-command.ts --out "$RUNNER_TEMP/release-evidence"
+          --name "bun-test-${{ runner.os }}" --
           bun test packages/
           --path-ignore-patterns='**/wasm-*.test.ts'
           --path-ignore-patterns='**/webtransport-like.test.ts'
@@ -221,6 +259,14 @@ jobs:
           bun add file:$GITHUB_WORKSPACE/packages/webtransport
           echo 'import { createServer } from "@webtransport-bun/webtransport"; const s = createServer({ port: 19999, tls: { certPem: "", keyPem: "" }, onSession: () => {} }); console.log("ok"); s.close().then(() => process.exit(0));' > smoke.ts
           bun run smoke.ts
+      - name: Upload release evidence command records
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 resolved 2026-07-22
+        with:
+          name: release-evidence-native-gates-${{ matrix.os }}
+          path: ${{ runner.temp }}/release-evidence/
+          if-no-files-found: warn
+          retention-days: 90
 
   # Heavy load and stress campaigns run once on a dedicated Linux runner rather
   # than in the 6-way test matrix: they flood the transport (handshake/stream/
@@ -371,9 +417,54 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
       - name: Build and smoke the exact tarball in every supported runtime
-        run: |
-          bun scripts/test-package-artifact.ts build \
-            --verify-reproducible \
-            --runtime bun \
-            --runtime node \
-            --runtime deno
+        # Recorded as release evidence (runtime-consumers).
+        run: >
+          bun scripts/record-command.ts --out "$RUNNER_TEMP/release-evidence"
+          --name "package-consumers-${{ runner.os }}-node${{ matrix.node-version }}" --
+          bun scripts/test-package-artifact.ts build
+          --verify-reproducible
+          --runtime bun
+          --runtime node
+          --runtime deno
+      - name: Upload release evidence command record
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 resolved 2026-07-22
+        with:
+          name: release-evidence-runtime-consumers-${{ matrix.os }}-node${{ matrix.node-version }}
+          path: ${{ runner.temp }}/release-evidence/
+          if-no-files-found: warn
+          retention-days: 90
+
+  release-evidence:
+    name: Collect matrix release evidence
+    # Joins the per-lane command records into the two artifacts the
+    # cross-platform-matrix and runtime-consumers claims are fetched from
+    # (`bun scripts/release-evidence.ts fetch --run <this run> --artifact ...`).
+    needs: [test, package-consumers]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-evidence-native-gates-*
+          path: cross-platform
+          merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-evidence-runtime-consumers-*
+          path: runtime-consumers
+          merge-multiple: true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 resolved 2026-07-22
+        with:
+          name: release-evidence-cross-platform
+          path: cross-platform/
+          if-no-files-found: error
+          retention-days: 90
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 resolved 2026-07-22
+        with:
+          name: release-evidence-runtime-consumers
+          path: runtime-consumers/
+          if-no-files-found: error
+          retention-days: 90

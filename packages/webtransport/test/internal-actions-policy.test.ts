@@ -433,6 +433,31 @@ jobs:
 		expect(result.stderr).toContain("must explicitly grant contents: read");
 	});
 
+	it("produces CI evidence artifacts for the command-record claims", () => {
+		const workflow = parseWorkflow(TEST_WORKFLOW);
+		const collector = workflow.jobs?.["release-evidence"];
+		expect(collector?.needs).toEqual(["test", "package-consumers"]);
+		const expr = (inner: string) => `$${"{{"} ${inner} }}`;
+		for (const artifact of [
+			`release-evidence-native-gates-${expr("matrix.os")}`,
+			`release-evidence-runtime-consumers-${expr("matrix.os")}-node${expr("matrix.node-version")}`,
+			"release-evidence-wasm-gates",
+			"release-evidence-wasm-interop",
+			"release-evidence-cross-platform",
+			"release-evidence-runtime-consumers",
+		])
+			expect(TEST_WORKFLOW).toContain(`name: ${artifact}`);
+		for (const recorded of [
+			`--name "cargo-test-${expr("runner.os")}" -- cargo test --workspace`,
+			"--name test-wasm -- bun run test:wasm",
+			"--name wasm-qpack --",
+			"--name wasm-multi-session --",
+			"--name wasm-0rtt --",
+			"--name wasm-facade --",
+		])
+			expect(TEST_WORKFLOW).toContain(recorded);
+	});
+
 	it("publishes pre-release versions to the next dist-tag only", () => {
 		expect(PUBLISH_WORKFLOW).toContain(
 			'if (.packageVersion | contains("-")) then "next" else "latest" end',
