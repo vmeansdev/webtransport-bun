@@ -351,6 +351,11 @@ const FREE_STANDING_RUN = 24;
 /** Base64/base64url text, possibly wrapped or chunked by whitespace. Hex is a
  * subset of this alphabet and gets its own pass. */
 const BASE64_GROUP = /[A-Za-z0-9+/_=-]+(?:\s+[A-Za-z0-9+/_=-]+)*/g;
+/** Chunks split by single punctuation characters (`TE9L!QUxJ.U0Vf`):
+ * permissive decoders such as Buffer.from(…, "base64") skip the separators,
+ * so the scanner rejoins them the same way. */
+const BASE64_PUNCTUATED_GROUP =
+	/[A-Za-z0-9+/_=-]+(?:[^A-Za-z0-9+/_=-][A-Za-z0-9+/_=-]+)+/g;
 const HEX_GROUP = /[0-9A-Fa-f]+(?:\s+[0-9A-Fa-f]+)*/g;
 
 /** Archive and compression formats that are not inflated here: finding one
@@ -504,7 +509,14 @@ function inspectDecodedBytes(
 
 function base64Candidates(text: string): Uint8Array[] {
 	const out: Uint8Array[] = [];
-	for (const match of text.matchAll(BASE64_GROUP)) {
+	const groups = [
+		...[...text.matchAll(BASE64_GROUP)].map((m) => m[0]),
+		...[...text.matchAll(BASE64_PUNCTUATED_GROUP)].map((m) =>
+			m[0].replace(/[^A-Za-z0-9+/_=-]/g, " "),
+		),
+	];
+	for (const group of groups) {
+		const match = [group] as const;
 		const compact = match[0].replace(/\s+/g, "");
 		if (compact.length < ENCODED_PAYLOAD_MIN_LENGTH) continue;
 		// The whole group (wrapped or chunked encodings, rejoined) and each
