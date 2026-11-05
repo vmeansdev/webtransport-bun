@@ -16,7 +16,7 @@ concurrency:
 jobs:
   security:
     name: Security gates (blocking)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
       contents: read
@@ -53,7 +53,7 @@ jobs:
 
   codeql:
     name: CodeQL
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       security-events: write
@@ -77,7 +77,7 @@ jobs:
   parity:
     name: Parity (W3C facade)
     needs: [security, codeql]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
       contents: read
@@ -109,7 +109,7 @@ jobs:
   interop:
     name: Interop (Chromium)
     needs: [security, codeql]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
       contents: read
@@ -148,7 +148,7 @@ jobs:
   fuzz:
     name: Fuzz smoke (blocking)
     needs: [security, codeql]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 35
     permissions:
       contents: read
@@ -180,7 +180,7 @@ jobs:
   coverage:
     name: Coverage floors (blocking)
     needs: [security, codeql]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
       contents: read
@@ -213,7 +213,7 @@ jobs:
   bench-regress:
     name: Benchmark regression (blocking)
     needs: [security, codeql]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
       contents: read
@@ -244,7 +244,7 @@ jobs:
   distributed-scale:
     name: Distributed scale >=10k sessions (blocking)
     needs: [security, codeql]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
       contents: read
@@ -277,7 +277,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: linux-x64
             rust_target: ""
           - os: macos-latest
@@ -343,11 +343,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             node-version: "18.20.4"
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             node-version: "20.19.0"
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             node-version: "22.23.1"
           - os: macos-latest
             node-version: "18.20.4"
@@ -413,7 +413,7 @@ jobs:
         fuzz,
         package-consumers,
       ]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     permissions:
       actions: read
@@ -623,7 +623,7 @@ jobs:
     needs: [release]
     continue-on-error: true
     if: startsWith(github.ref, 'refs/tags/v') && contains(github.ref_name, '-')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       actions: read

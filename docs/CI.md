@@ -14,14 +14,18 @@ Canonical release truth: `docs/release-status.json`. CI evidence feeds that mani
 |------------------|----------------|--------------|
 | `darwin-arm64`   | `macos-latest` | aarch64      |
 | `darwin-x64`     | `macos-latest` | x86_64       |
-| `linux-x64`      | `ubuntu-latest`| x86_64       |
+| `linux-x64`      | `ubuntu-24.04`| x86_64       |
 | `win32-x64-msvc` | `windows-latest` | x86_64    |
 
 ## Workflows
 
+### Runner image pin
+
+Every Linux job in every workflow runs on `ubuntu-24.04`, never `ubuntu-latest`. In November 2026 GitHub moved `ubuntu-latest` to Ubuntu 26.04, and the pinned Playwright (`@playwright/test` 1.58.2 in `tools/interop`) refuses to install Chromium there ("Playwright does not support chromium on ubuntu26.04-x64"), which broke every Chromium job (release `interop`, test `test`/`wasm`/`fault-matrix`, `iwa`). The pin also keeps release evidence reproducible on one image. Upgrading Playwright to a release that supports Ubuntu 26.04 can lift the pin later; that change moves the producer workflow sha256s in `docs/release-claims.json`, so it is a reviewed change made before a candidate is tagged, never during evidence collection.
+
 ### test.yml (push, pull_request, workflow_dispatch)
 
-**test** job — matrix: `{ubuntu-latest, macos-latest, windows-latest}` × `{1.3.14}`
+**test** job — matrix: `{ubuntu-24.04, macos-latest, windows-latest}` × `{1.3.14}`
 
 Deterministic suites only; the heavy load/stress campaigns live in the
 dedicated `load` job below so shared-runner UDP contention cannot fail the
@@ -35,11 +39,11 @@ six-way matrix.
 5. Interop — Playwright Chromium (`cd tools/interop && bun run playwright test`)
 6. Smoke test — `bun add` from built package
 
-**fault-matrix** job — `ubuntu-latest` only
+**fault-matrix** job — `ubuntu-24.04` only
 
 Runs the seeded user-space UDP fault matrix (`tools/interop/playwright.fault.config.ts`, seven profiles: loss, duplication, reordering, fixed delay, jitter, burst loss, black-hole recovery) against the native addon server with `INTEROP_EVIDENCE=1`, verifies the sanitized Playwright report with `verify-evidence.ts --interop`, and uploads it with the matrix's own `fault-matrix.json` as `release-evidence-fault-matrix` (the `fault-matrix` claim's producer).
 
-**load** job — `ubuntu-latest` only, `LOAD_CLIENT_PROBE_TIMEOUT_MS=15000` job-wide
+**load** job — `ubuntu-24.04` only, `LOAD_CLIENT_PROBE_TIMEOUT_MS=15000` job-wide
 
 1. Build reference + load-client
 2. Load-addon test (`bun run test:load-addon`)
@@ -53,19 +57,19 @@ Runs the seeded user-space UDP fault matrix (`tools/interop/playwright.fault.con
 Test log hygiene:
 - Set `WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN=1` in CI test jobs to suppress repeated dev-only TLS warning logs when tests intentionally use `tls.insecureSkipVerify: true`.
 
-**package-consumers** job — matrix: `{ubuntu-latest, macos-latest, windows-latest}`
+**package-consumers** job — matrix: `{ubuntu-24.04, macos-latest, windows-latest}`
 
 1. Builds the exact npm tarball with the current-platform native addon and the production WASM export.
 2. Verifies a reproducible logical package manifest and SHA-256-covered prebuilds.
 3. Installs the tarball with lifecycle scripts disabled.
 4. Runs the same native addon load, datagram, unidirectional-stream, bidirectional-stream, and deterministic-close smoke under exact Bun, Node, and Deno versions.
 
-**parity** job — `ubuntu-latest`
+**parity** job — `ubuntu-24.04`
 
 1. Build native addon + install deps
 2. Run W3C facade parity suite (`bun run test:parity`)
 
-**soak** job — `ubuntu-latest`, 2-minute soak (`SOAK_DURATION=120`). **soak-long** workflow (1h/2h/24h/72h) — trigger via workflow_dispatch; each run retains `soak-artifacts-seg-*.json`/CSV plus logs, and the final segment emits the validated `.release-evidence/soak-aggregate-<duration>h.json` campaign record.
+**soak** job — `ubuntu-24.04`, 2-minute soak (`SOAK_DURATION=120`). **soak-long** workflow (1h/2h/24h/72h) — trigger via workflow_dispatch; each run retains `soak-artifacts-seg-*.json`/CSV plus logs, and the final segment emits the validated `.release-evidence/soak-aggregate-<duration>h.json` campaign record.
 
 #### H7 hosted closure lane
 

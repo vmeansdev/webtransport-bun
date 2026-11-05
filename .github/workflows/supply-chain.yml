@@ -19,7 +19,7 @@ jobs:
   audit-signatures:
     name: Record npm audit signatures for the published version
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: read

@@ -25,11 +25,11 @@
 			"producers": [
 				{
 					"workflow": ".github/workflows/test.yml",
-					"workflowSha256": "6bc23eda6167d68fc7c9e3056e5e3588d195b75c9f1645b2f60b82db3245d083",
+					"workflowSha256": "45c256853ab88c5578c68585ece24acd90336b9bb10fe5d5d249853b1b53a7e0",
 					"jobs": [
 						"test"
 					],
-					"artifact": "release-evidence-native-gates-ubuntu-latest"
+					"artifact": "release-evidence-native-gates-ubuntu-24.04"
 				}
 			]
 		},
@@ -56,7 +56,7 @@
 			"producers": [
 				{
 					"workflow": ".github/workflows/test.yml",
-					"workflowSha256": "6bc23eda6167d68fc7c9e3056e5e3588d195b75c9f1645b2f60b82db3245d083",
+					"workflowSha256": "45c256853ab88c5578c68585ece24acd90336b9bb10fe5d5d249853b1b53a7e0",
 					"jobs": [
 						"wasm"
 					],
@@ -90,7 +90,7 @@
 			"producers": [
 				{
 					"workflow": ".github/workflows/test.yml",
-					"workflowSha256": "6bc23eda6167d68fc7c9e3056e5e3588d195b75c9f1645b2f60b82db3245d083",
+					"workflowSha256": "45c256853ab88c5578c68585ece24acd90336b9bb10fe5d5d249853b1b53a7e0",
 					"jobs": [
 						"release-evidence"
 					],
@@ -121,7 +121,7 @@
 			"producers": [
 				{
 					"workflow": ".github/workflows/test.yml",
-					"workflowSha256": "6bc23eda6167d68fc7c9e3056e5e3588d195b75c9f1645b2f60b82db3245d083",
+					"workflowSha256": "45c256853ab88c5578c68585ece24acd90336b9bb10fe5d5d249853b1b53a7e0",
 					"jobs": [
 						"release-evidence"
 					],
@@ -146,7 +146,7 @@
 			"producers": [
 				{
 					"workflow": ".github/workflows/release.yml",
-					"workflowSha256": "8116b6ffe05f711201771aea33d23dcd257d5c278f6b12b69f9f06c2582c8dce",
+					"workflowSha256": "e17cf0ecc89bfa7e19946cf84bf0fb6b44b6a29307872dce0b5921418400d465",
 					"jobs": [
 						"interop"
 					],
@@ -171,7 +171,7 @@
 			"producers": [
 				{
 					"workflow": ".github/workflows/test.yml",
-					"workflowSha256": "6bc23eda6167d68fc7c9e3056e5e3588d195b75c9f1645b2f60b82db3245d083",
+					"workflowSha256": "45c256853ab88c5578c68585ece24acd90336b9bb10fe5d5d249853b1b53a7e0",
 					"jobs": [
 						"wasm"
 					],
@@ -195,7 +195,7 @@
 			"producers": [
 				{
 					"workflow": ".github/workflows/iwa.yml",
-					"workflowSha256": "44bd3239ed7a1e5d6273d3a553fee5384cd4842ae30e34c18738337f83ca0b7f",
+					"workflowSha256": "396f20038193cf7361b53c967e3ba007de8929c84bb98ed7970ded8ea0255e88",
 					"jobs": [
 						"iwa-interop"
 					],
@@ -232,7 +232,7 @@
 			"producers": [
 				{
 					"workflow": ".github/workflows/test.yml",
-					"workflowSha256": "6bc23eda6167d68fc7c9e3056e5e3588d195b75c9f1645b2f60b82db3245d083",
+					"workflowSha256": "45c256853ab88c5578c68585ece24acd90336b9bb10fe5d5d249853b1b53a7e0",
 					"jobs": [
 						"fault-matrix"
 					],
@@ -264,7 +264,7 @@
 			"producers": [
 				{
 					"workflow": ".github/workflows/coverage.yml",
-					"workflowSha256": "38e6a7b904a68878872ec380a96b6065bc88085f19788c01f630a4da1ba2e02b",
+					"workflowSha256": "751e7e865ecdbbaf446ae8ded6474e0cbfac2b17a34569da3dacd121666d1817",
 					"jobs": [
 						"coverage"
 					],
@@ -272,7 +272,7 @@
 				},
 				{
 					"workflow": ".github/workflows/release.yml",
-					"workflowSha256": "8116b6ffe05f711201771aea33d23dcd257d5c278f6b12b69f9f06c2582c8dce",
+					"workflowSha256": "e17cf0ecc89bfa7e19946cf84bf0fb6b44b6a29307872dce0b5921418400d465",
 					"jobs": [
 						"coverage"
 					],
@@ -296,7 +296,7 @@
 			"producers": [
 				{
 					"workflow": ".github/workflows/release.yml",
-					"workflowSha256": "8116b6ffe05f711201771aea33d23dcd257d5c278f6b12b69f9f06c2582c8dce",
+					"workflowSha256": "e17cf0ecc89bfa7e19946cf84bf0fb6b44b6a29307872dce0b5921418400d465",
 					"jobs": [
 						"fuzz"
 					],
@@ -304,7 +304,7 @@
 				},
 				{
 					"workflow": ".github/workflows/fuzz.yml",
-					"workflowSha256": "bdece1c731ca6d9747d95fe88d98ec02846dcbf14a0f3094285dacaeda9b288c",
+					"workflowSha256": "ad106abf2e67e3ee6df74750dcd98b414dcf7468c9f0645eb1f30585f561366d",
 					"jobs": [
 						"fuzz"
 					],
@@ -329,7 +329,7 @@
 			"producers": [
 				{
 					"workflow": ".github/workflows/release.yml",
-					"workflowSha256": "8116b6ffe05f711201771aea33d23dcd257d5c278f6b12b69f9f06c2582c8dce",
+					"workflowSha256": "e17cf0ecc89bfa7e19946cf84bf0fb6b44b6a29307872dce0b5921418400d465",
 					"jobs": [
 						"distributed-scale"
 					],
@@ -353,7 +353,7 @@
 			"producers": [
 				{
 					"workflow": ".github/workflows/release.yml",
-					"workflowSha256": "8116b6ffe05f711201771aea33d23dcd257d5c278f6b12b69f9f06c2582c8dce",
+					"workflowSha256": "e17cf0ecc89bfa7e19946cf84bf0fb6b44b6a29307872dce0b5921418400d465",
 					"jobs": [
 						"release"
 					],
@@ -386,7 +386,7 @@
 			"producers": [
 				{
 					"workflow": ".github/workflows/supply-chain.yml",
-					"workflowSha256": "2356fe6590fcd04c994a63632c102613a891a1ca7a9bda0a8da773bdc62f89d7",
+					"workflowSha256": "e63d1563befead441f547d16c19311c10f8cf5064848b7334ab8b6aef585615e",
 					"jobs": [
 						"audit-signatures"
 					],
@@ -495,7 +495,7 @@
 			"producers": [
 				{
 					"workflow": ".github/workflows/test.yml",
-					"workflowSha256": "6bc23eda6167d68fc7c9e3056e5e3588d195b75c9f1645b2f60b82db3245d083",
+					"workflowSha256": "45c256853ab88c5578c68585ece24acd90336b9bb10fe5d5d249853b1b53a7e0",
 					"jobs": [
 						"wasm"
 					],
@@ -526,7 +526,7 @@
 			"producers": [
 				{
 					"workflow": ".github/workflows/test.yml",
-					"workflowSha256": "6bc23eda6167d68fc7c9e3056e5e3588d195b75c9f1645b2f60b82db3245d083",
+					"workflowSha256": "45c256853ab88c5578c68585ece24acd90336b9bb10fe5d5d249853b1b53a7e0",
 					"jobs": [
 						"wasm"
 					],
@@ -557,7 +557,7 @@
 			"producers": [
 				{
 					"workflow": ".github/workflows/test.yml",
-					"workflowSha256": "6bc23eda6167d68fc7c9e3056e5e3588d195b75c9f1645b2f60b82db3245d083",
+					"workflowSha256": "45c256853ab88c5578c68585ece24acd90336b9bb10fe5d5d249853b1b53a7e0",
 					"jobs": [
 						"wasm"
 					],
@@ -588,7 +588,7 @@
 			"producers": [
 				{
 					"workflow": ".github/workflows/test.yml",
-					"workflowSha256": "6bc23eda6167d68fc7c9e3056e5e3588d195b75c9f1645b2f60b82db3245d083",
+					"workflowSha256": "45c256853ab88c5578c68585ece24acd90336b9bb10fe5d5d249853b1b53a7e0",
 					"jobs": [
 						"wasm"
 					],

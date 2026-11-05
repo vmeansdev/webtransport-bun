@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   trivy-fs:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: read
@@ -34,7 +34,7 @@ jobs:
           exit-code: "1"
 
   trivy-deps:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: read

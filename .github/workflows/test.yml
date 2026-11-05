@@ -14,7 +14,7 @@ concurrency:
 jobs:
   parity:
     name: Parity (W3C facade)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: read
@@ -38,7 +38,7 @@ jobs:
       - name: Parity tests
         run: bun run test:parity
   soak:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 18
     permissions:
       contents: read
@@ -71,7 +71,7 @@ jobs:
         timeout-minutes: 12
   wasm:
     name: WASM backend + Chromium interop
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
       contents: read
@@ -174,7 +174,7 @@ jobs:
     # addon server, with the sanitized Playwright JSON report beside the
     # matrix's own evidence record.
     name: Seeded UDP fault matrix (Chromium)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: read
@@ -235,7 +235,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-24.04, macos-latest, windows-latest]
         bun: ["1.3.14"]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -331,7 +331,7 @@ jobs:
   # deliberately for a candidate (release-status.json / T11), not per push.
   load:
     name: Load and stress campaigns
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: read
@@ -396,11 +396,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             node-version: "18.20.4"
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             node-version: "20.19.0"
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             node-version: "22.23.1"
           - os: macos-latest
             node-version: "18.20.4"
@@ -495,7 +495,7 @@ jobs:
     # cross-platform-matrix and runtime-consumers claims are fetched from
     # (`bun scripts/release-evidence.ts fetch --run <this run> --artifact ...`).
     needs: [test, package-consumers]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       actions: read

@@ -53,4 +53,4 @@ credential-shaped values, and absolute host paths in the web-server environment.
 
 Interop tests may fail locally with "Opening handshake failed" in some environments (e.g. Cursor
 sandbox, macOS firewall, or QUIC being blocked). The **acceptance criterion is CI on Linux**.
-Run `bun run test` in this directory; CI runs the same suite on `ubuntu-latest` and `macos-latest`.
+Run `bun run test` in this directory; CI runs the same suite on `ubuntu-24.04` and `macos-latest`.

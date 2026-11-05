@@ -267,9 +267,9 @@ describe("GitHub Actions release policy", () => {
 			),
 		).toEqual(
 			new Set([
-				"ubuntu-latest:18.20.4",
-				"ubuntu-latest:20.19.0",
-				"ubuntu-latest:22.23.1",
+				"ubuntu-24.04:18.20.4",
+				"ubuntu-24.04:20.19.0",
+				"ubuntu-24.04:22.23.1",
 				"macos-latest:18.20.4",
 				"macos-latest:20.19.0",
 				"macos-latest:22.23.1",
@@ -320,9 +320,9 @@ describe("GitHub Actions release policy", () => {
 			),
 		).toEqual(
 			new Set([
-				"ubuntu-latest:18.20.4",
-				"ubuntu-latest:20.19.0",
-				"ubuntu-latest:22.23.1",
+				"ubuntu-24.04:18.20.4",
+				"ubuntu-24.04:20.19.0",
+				"ubuntu-24.04:22.23.1",
 				"macos-latest:18.20.4",
 				"macos-latest:20.19.0",
 				"macos-latest:22.23.1",
@@ -1170,13 +1170,13 @@ jobs:
 			],
 			[
 				"job working directory",
-				"    runs-on: ubuntu-latest\n    timeout-minutes: 25",
-				"    runs-on: ubuntu-latest\n    defaults:\n      run:\n        working-directory: /tmp\n    timeout-minutes: 25",
+				"    runs-on: ubuntu-24.04\n    timeout-minutes: 25",
+				"    runs-on: ubuntu-24.04\n    defaults:\n      run:\n        working-directory: /tmp\n    timeout-minutes: 25",
 			],
 			[
 				"quoted job shell",
-				"    runs-on: ubuntu-latest\n    timeout-minutes: 25",
-				'    runs-on: ubuntu-latest\n    "defaults":\n      "run":\n        "shell": bash --noprofile --norc --init-file /tmp/attacker {0}\n    timeout-minutes: 25',
+				"    runs-on: ubuntu-24.04\n    timeout-minutes: 25",
+				'    runs-on: ubuntu-24.04\n    "defaults":\n      "run":\n        "shell": bash --noprofile --norc --init-file /tmp/attacker {0}\n    timeout-minutes: 25',
 			],
 		] as const;
 		const accepted: string[] = [];

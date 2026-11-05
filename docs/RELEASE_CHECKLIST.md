@@ -95,7 +95,7 @@ artifact the glob accepts.
 
 | Claim | Producer (workflow / job) | Artifact to fetch |
 |---|---|---|
-| `native-local-gates` | `test.yml` / `test` (ubuntu-latest), recorded `cargo test` + `bun test` | `release-evidence-native-gates-ubuntu-latest` |
+| `native-local-gates` | `test.yml` / `test` (ubuntu-24.04), recorded `cargo test` + `bun test` | `release-evidence-native-gates-ubuntu-24.04` |
 | `cross-platform-matrix` | `test.yml` / `test` matrix (Linux, macOS, Windows), joined by `release-evidence` | `release-evidence-cross-platform` |
 | `runtime-consumers` | `test.yml` / `package-consumers` matrix, joined by `release-evidence` | `release-evidence-runtime-consumers` |
 | `wasm-local-gates`, `wasm-dynamic-qpack`, `wasm-multi-session`, `wasm-0rtt`, `wasm-facade-parity` | `test.yml` / `wasm` (recorded `test:wasm` and the four focused suites) | `release-evidence-wasm-gates` |
