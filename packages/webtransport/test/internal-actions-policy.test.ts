@@ -484,6 +484,43 @@ jobs:
 		);
 	});
 
+	it("stages the npm version for maintainer approval and never publishes it directly", () => {
+		expect(PUBLISH_WORKFLOW).toContain(
+			'npm stage publish "$TARBALL" --ignore-scripts --access public --provenance --tag "$DIST_TAG"',
+		);
+		expect(PUBLISH_WORKFLOW).toContain(
+			'echo "stage_id=$STAGE_ID" >> "$GITHUB_OUTPUT"',
+		);
+		expect(PUBLISH_WORKFLOW).toContain('>> "$GITHUB_STEP_SUMMARY"');
+		expect(PUBLISH_WORKFLOW).toContain(
+			"stage_id: ${{ steps.stage.outputs.stage_id }}",
+		);
+		expect(PUBLISH_WORKFLOW).toContain('node-version: "22.23.1"');
+		expect(PUBLISH_WORKFLOW).toContain("npm install --global npm@11.18.0");
+		expect(runPolicy(PUBLISH_WORKFLOW, "publish.yml").status).toBe(0);
+		// A direct publish is refused even with provenance and the dist-tag.
+		const direct = runPolicy(
+			mutatePublishWorkflow(
+				'npm stage publish "$TARBALL" --ignore-scripts',
+				'npm publish "$TARBALL" --ignore-scripts',
+			),
+			"publish.yml",
+		);
+		expect(direct.status).toBe(1);
+		expect(direct.stderr).toContain(
+			"npm publishing must stage the version (npm stage publish)",
+		);
+		// A staged publish without provenance is refused too.
+		const unproven = runPolicy(
+			mutatePublishWorkflow(
+				"--access public --provenance --tag",
+				"--access public --tag",
+			),
+			"publish.yml",
+		);
+		expect(unproven.status).toBe(1);
+	});
+
 	it("gates stable releases on the promoted evidence record", () => {
 		const workflow = parseWorkflow(RELEASE_WORKFLOW);
 		const steps = (workflow.jobs?.release?.steps ?? []) as Array<
@@ -544,6 +581,12 @@ jobs:
 		expect(supply).toContain("--name npm-audit-signatures");
 		expect(supply).toContain("npm audit signatures");
 		expect(supply).toContain("name: release-evidence-supply-chain");
+		// publish.yml only stages: the audit refuses until the version is live.
+		const refuse = supply.indexOf("Refuse until the version is live on npm");
+		expect(refuse).toBeGreaterThan(-1);
+		expect(refuse).toBeLessThan(supply.indexOf("--name npm-install-published"));
+		expect(supply).toContain('if [ "$LIVE" != "$VERSION" ]; then');
+		expect(supply).toContain("is not live on npm yet");
 		expect(supply).not.toMatch(/contents:\s*write|id-token|secrets\./);
 	});
 

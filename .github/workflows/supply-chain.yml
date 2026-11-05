@@ -42,6 +42,19 @@ jobs:
           set -euo pipefail
           VERSION="$(bun scripts/stamp-version-from-tag.ts "$GITHUB_REF_NAME" --check)"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Refuse until the version is live on npm
+        # publish.yml only stages the version; it becomes public when a
+        # maintainer approves the staged version with 2FA. Auditing before that
+        # would fail on a missing version, so refuse with the reason instead.
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          LIVE="$(npm view "@webtransport-bun/webtransport@$VERSION" version --registry=https://registry.npmjs.org/ 2>/dev/null || true)"
+          if [ "$LIVE" != "$VERSION" ]; then
+            echo "::error::@webtransport-bun/webtransport@$VERSION is not live on npm yet. publish.yml only stages it: approve the staged version with 2FA (npmjs.com or npm stage approve <stage-id>), then dispatch supply-chain.yml on $GITHUB_REF_NAME again."
+            exit 1
+          fi
       - name: Install the published version and audit its signatures
         env:
           VERSION: ${{ steps.version.outputs.version }}

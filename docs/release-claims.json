@@ -386,7 +386,7 @@
 			"producers": [
 				{
 					"workflow": ".github/workflows/supply-chain.yml",
-					"workflowSha256": "e63d1563befead441f547d16c19311c10f8cf5064848b7334ab8b6aef585615e",
+					"workflowSha256": "13992bc882849f22d59bb2b4b74f6417e80e37d8abb0eacdd5511367d83c48a3",
 					"jobs": [
 						"audit-signatures"
 					],

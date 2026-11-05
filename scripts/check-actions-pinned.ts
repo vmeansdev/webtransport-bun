@@ -594,7 +594,9 @@ function validatePublishHandoff(
 	);
 	const publishJobs = jobs.filter((job) =>
 		stepBlocks(lines, job).some((step) =>
-			commandLines(step).some((line) => /\b(?:npm|bun)\s+publish\b/.test(line)),
+			commandLines(step).some((line) =>
+				/\b(?:npm\s+stage|npm|bun)\s+publish\b/.test(line),
+			),
 		),
 	);
 	const job = publishJobs.length === 1 ? publishJobs[0] : undefined;
@@ -738,10 +740,10 @@ function validatePublishHandoff(
 		),
 	);
 	const publishCommands = allCommands.filter(({ command }) =>
-		/\b(?:npm|bun)\s+publish\b/.test(command),
+		/\b(?:npm\s+stage|npm|bun)\s+publish\b/.test(command),
 	);
 	const canonicalPublishes = publishCommands.filter(({ command }) =>
-		/^(?:npm|bun)\s+publish\b/.test(command),
+		/^(?:npm\s+stage|npm|bun)\s+publish\b/.test(command),
 	);
 	const finalPublishes = canonicalPublishes.filter(
 		({ command }) => !/\s--dry-run(?:\s|$)/.test(command),
@@ -752,7 +754,7 @@ function validatePublishHandoff(
 			stepSection(step, "env").get("TARBALL") === VERIFIED_TARBALL_EXPRESSION &&
 			stepSection(step, "env").get("BOUND_DIGEST") ===
 				VERIFIED_DIGEST_EXPRESSION &&
-			/^(?:npm|bun)\s+publish\s+(?:"\$TARBALL"|'\$TARBALL'|\$TARBALL|"\$\{TARBALL\}"|'\$\{TARBALL\}'|\$\{TARBALL\})(?:\s|$)/.test(
+			/^(?:npm\s+stage|npm|bun)\s+publish\s+(?:"\$TARBALL"|'\$TARBALL'|\$TARBALL|"\$\{TARBALL\}"|'\$\{TARBALL\}'|\$\{TARBALL\})(?:\s|$)/.test(
 				command,
 			),
 	);
@@ -792,6 +794,15 @@ function validatePublishHandoff(
 					),
 				),
 		);
+	// The npm trusted publisher is stage-only: the one real upload must stage
+	// the version (live only after a maintainer approves it with 2FA), so the
+	// workflow can never make a version public by itself.
+	if (finalPublish && !/^npm\s+stage\s+publish\b/.test(finalPublish.command)) {
+		add(
+			job.start,
+			"npm publishing must stage the version (npm stage publish); a maintainer approves it with 2FA",
+		);
+	}
 	if (!distTagged) {
 		add(
 			job.start,
@@ -931,8 +942,8 @@ function scanWorkflow(path: string): Violation[] {
 			);
 		}
 		const publishesNpm =
-			/^\s*(?:-\s*)?run:\s*(?:npm|bun)\s+publish\b/m.test(text) ||
-			/^\s+(?:npm|bun)\s+publish\b/m.test(text);
+			/^\s*(?:-\s*)?run:\s*(?:npm\s+stage|npm|bun)\s+publish\b/m.test(text) ||
+			/^\s+(?:npm\s+stage|npm|bun)\s+publish\b/m.test(text);
 		if (publishesNpm) {
 			if (!hasPermission(block, "id-token", "write")) {
 				add(job.start, `publish job ${job.name} must grant id-token: write`);
@@ -943,7 +954,9 @@ function scanWorkflow(path: string): Violation[] {
 					`publish job ${job.name} must explicitly grant contents: read`,
 				);
 			}
-			if (!/\b(?:npm|bun)\s+publish\b[^\n]*--provenance\b/.test(text)) {
+			if (
+				!/\b(?:npm\s+stage|npm|bun)\s+publish\b[^\n]*--provenance\b/.test(text)
+			) {
 				add(
 					job.start,
 					`publish job ${job.name} must publish with --provenance`,

@@ -29,6 +29,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     environment: npm-publish
+    outputs:
+      stage_id: ${{ steps.stage.outputs.stage_id }}
     permissions:
       actions: read
       contents: read
@@ -202,8 +204,13 @@ jobs:
             echo "::error::Tarball changed before npm dry-run"
             exit 1
           fi
-          npm publish "$TARBALL" --dry-run --ignore-scripts --access public --tag "$DIST_TAG" --registry=https://registry.npmjs.org/
-      - name: Publish to npm with trusted publishing and provenance
+          npm stage publish "$TARBALL" --dry-run --ignore-scripts --access public --tag "$DIST_TAG" --registry=https://registry.npmjs.org/
+      - name: Stage on npm with trusted publishing and provenance
+        # The npm trusted publisher for this workflow is stage-only: the version
+        # is uploaded with provenance but stays unavailable until a maintainer
+        # approves the staged version with 2FA (npmjs.com, or
+        # `npm stage approve <stage-id>`). The stage id is the job output.
+        id: stage
         env:
           TARBALL: ${{ steps.candidate.outputs.tarball }}
           BOUND_DIGEST: ${{ steps.candidate.outputs.digest }}
@@ -219,4 +226,23 @@ jobs:
             echo "::error::Tarball changed before registry upload"
             exit 1
           fi
-          npm publish "$TARBALL" --ignore-scripts --access public --provenance --tag "$DIST_TAG" --registry=https://registry.npmjs.org/
+          npm stage publish "$TARBALL" --ignore-scripts --access public --provenance --tag "$DIST_TAG" --registry=https://registry.npmjs.org/ | tee "$RUNNER_TEMP/npm-stage-publish.log"
+          STAGE_ID="$(sed -n 's/^+ .* (staged with id \([^)]*\))$/\1/p' "$RUNNER_TEMP/npm-stage-publish.log")"
+          if [ -z "$STAGE_ID" ]; then
+            # The version is staged either way (npm exited 0); failing here
+            # would only block a rerun, which npm refuses for a staged version.
+            echo "::warning::npm did not report a stage id; find the staged version on npmjs.com or with npm stage list"
+            STAGE_ID="unreported"
+          fi
+          PKG_VERSION="$(jq -er '.packageVersion' "$IDENTITY")"
+          echo "stage_id=$STAGE_ID" >> "$GITHUB_OUTPUT"
+          echo "::notice::Staged @webtransport-bun/webtransport@$PKG_VERSION (dist-tag $DIST_TAG) as stage id $STAGE_ID; approve it with 2FA to publish"
+          {
+            echo "### Staged on npm (awaiting maintainer approval)"
+            echo ""
+            echo "- Package: \`@webtransport-bun/webtransport@$PKG_VERSION\`"
+            echo "- Dist-tag: \`$DIST_TAG\`"
+            echo "- Stage id: \`$STAGE_ID\`"
+            echo ""
+            echo "Approve on npmjs.com or with \`npm stage approve $STAGE_ID\` (2FA). Dispatch supply-chain.yml on the tag only after the version is live."
+          } >> "$GITHUB_STEP_SUMMARY"

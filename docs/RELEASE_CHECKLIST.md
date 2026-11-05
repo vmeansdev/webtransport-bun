@@ -110,7 +110,7 @@ artifact the glob accepts.
 | `auto-review-zero-p0-p4` | human review record, `--local` | |
 | `final-no-change-confirmation` | human freeze record, `--local` | |
 | `fault-matrix` | `test.yml` / `fault-matrix` (`playwright.fault.config.ts` with `INTEROP_EVIDENCE=1`: JSON reporter + sanitizer) | `release-evidence-fault-matrix` |
-| `supply-chain-provenance` | `supply-chain.yml` / `audit-signatures`, dispatched on the rc tag after `publish.yml` published it (`gh workflow run supply-chain.yml --ref v1.0.0-rc.N`): recorded `npm install` of the exact published version plus `npm audit signatures` | `release-evidence-supply-chain` |
+| `supply-chain-provenance` | `supply-chain.yml` / `audit-signatures`, dispatched on the rc tag after the staged version was approved and is live (`gh workflow run supply-chain.yml --ref v1.0.0-rc.N`): recorded `npm install` of the exact published version plus `npm audit signatures` | `release-evidence-supply-chain` |
 
 ### Flow
 
@@ -121,12 +121,21 @@ All through `bun scripts/release-evidence.ts`:
    the tag at build time (`scripts/stamp-version-from-tag.ts`). Push the
    `vX.Y.Z-rc.N` tag on the candidate commit. The tag-triggered `release`
    workflow builds `X.Y.Z-rc.N`, publishes the pre-release (`prerelease` is set
-   for any hyphenated tag), and `publish.yml` puts it on npm under the `next`
-   dist-tag, never `latest`. Its `evidence-assets` job fetches the run's own
+   for any hyphenated tag), and `publish.yml` **stages** it on npm (`npm stage
+   publish`, with provenance) under the `next` dist-tag, never `latest`. A
+   staged version is not public: the job summary and the job output
+   `stage_id` give its stage id. The release workflow's `evidence-assets` job fetches the run's own
    interop, fuzz, distributed-scale and package-identity artifacts, scrubs and
    attaches them plus a
    `release-evidence-fragment-release-<run>-<attempt>.json` manifest fragment. The job is `continue-on-error`: a refused bundle never
    blocks the release or the rc publish, but the failure stays on the run.
+1a. **Approve the staged version.** A maintainer (Nikita) reviews the staged
+   version and approves it with 2FA, on npmjs.com or with
+   `npm stage approve <stage-id>` (the npm trusted publisher is stage-only and
+   cannot list or approve; `npm stage list @webtransport-bun/webtransport`
+   shows pending versions). Only then is the version live, and only then is
+   `supply-chain.yml` dispatched on the tag: it refuses, with that reason,
+   while the version is still staged.
 2. **Bind.** `bind --commit <candidate-sha> --tag vX.Y.Z-rc.N` records the
    candidate, the package version at that commit and the registry's sha256 in
    the manifest and the candidate in `release-status.json`. Binding a different
