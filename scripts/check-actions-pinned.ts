@@ -496,11 +496,21 @@ function hasExactEntries(
 /** Any npm/bun invocation with a `publish` argument anywhere in the same
  * command, whatever options precede it (`npm --silent publish`,
  * `npm --loglevel warn publish`, `npm stage publish`). */
+/** `publish` as a shell word (not part of a name like npm-publish-input). */
+const PUBLISH_WORD = /(?:^|[^\w-])publish(?![\w.-])/;
+/** Shell constructs that could assemble a publish command at run time. */
+const SHELL_INDIRECTION =
+	/(?:^|[\s;&|(`])(?:eval|exec|source|xargs|npx|pnpm|yarn|env)\s|\b(?:ba|z|da|k)?sh\s+-c\b|\bnode\s+(?:-e|--eval|-p|--print)\b|\bnpm\s+(?:exec|x|run-script|run)\b|\bbun\s+(?:-e|--eval|x)\b|\bbunx\b/;
 /** The only two publish commands publish.yml may run, byte for byte. */
 const EXACT_STAGE_COMMANDS = [
 	'npm stage publish "$TARBALL" --dry-run --ignore-scripts --access public --tag "$DIST_TAG" --registry=https://registry.npmjs.org/',
 	'npm stage publish "$TARBALL" --ignore-scripts --access public --provenance --tag "$DIST_TAG" --registry=https://registry.npmjs.org/ --json > "$RUNNER_TEMP/npm-stage-publish.json"',
 ];
+/** A command as the shell would spell its words: quotes and backslashes
+ * removed, so `p""ublish`, `pub'l'ish` and `n\pm` read as `publish`/`npm`. */
+function shellWords(command: string): string {
+	return command.replace(/["'\\]/g, "");
+}
 const ANY_PUBLISH = /\b(?:npm|bun|npx)\b[^\n;&|]*\spublish(?=\s|$)/;
 
 function immediatelyRechecksDigest(
@@ -604,9 +614,36 @@ function validatePublishHandoff(
 	);
 	const publishJobs = jobs.filter((job) =>
 		stepBlocks(lines, job).some((step) =>
-			commandLines(step).some((line) => ANY_PUBLISH.test(line)),
+			logicalCommands(step).some(
+				(command) =>
+					!/^echo\s/.test(command) && ANY_PUBLISH.test(shellWords(command)),
+			),
 		),
 	);
+	// Every job in this workflow, not just the one found above: a command
+	// that mentions publish must be one of the two reviewed staging commands,
+	// and shell indirection is refused anywhere in the file.
+	for (const otherJob of jobs) {
+		const stray = stepBlocks(lines, otherJob).flatMap((step) =>
+			logicalCommands(step).filter(
+				(command) =>
+					!/^echo\s/.test(command) &&
+					PUBLISH_WORD.test(shellWords(command)) &&
+					!EXACT_STAGE_COMMANDS.includes(command),
+			),
+		);
+		const indirect = stepBlocks(lines, otherJob).flatMap((step) =>
+			logicalCommands(step).filter((command) =>
+				SHELL_INDIRECTION.test(shellWords(command)),
+			),
+		);
+		if (stray.length > 0 || indirect.length > 0) {
+			add(
+				otherJob.start,
+				"npm publishing must stage the version (npm stage publish); a maintainer approves it with 2FA",
+			);
+		}
+	}
 	const job = publishJobs.length === 1 ? publishJobs[0] : undefined;
 	const block = job ? lines.slice(job.start, job.end + 1) : [];
 	const jobCondition = job ? jobScalar(lines, job, "if") : "";
@@ -726,14 +763,12 @@ function validatePublishHandoff(
 	);
 	const strayPublish = logical.filter(
 		({ command }) =>
-			/(?:^|[\s"'=;(|&])publish(?:$|[\s"';)|&])/.test(command) &&
+			PUBLISH_WORD.test(shellWords(command)) &&
 			!/^echo\s/.test(command) &&
 			!EXACT_STAGE_COMMANDS.includes(command),
 	);
 	const indirection = logical.filter(({ command }) =>
-		/(?:^|[\s;&|(])(?:eval|xargs|npx|pnpm|yarn)\s|\b(?:ba|z|da)?sh\s+-c\b|\bnode\s+(?:-e|--eval|-p|--print)\b|\bnpm\s+(?:exec|x)\b/.test(
-			command,
-		),
+		SHELL_INDIRECTION.test(shellWords(command)),
 	);
 	if (strayPublish.length > 0 || indirection.length > 0) {
 		add(

@@ -569,6 +569,38 @@ jobs:
 			);
 			expect(variant.status).toBe(1);
 		}
+		// Reviewed (s3): quote-split words and a second job that publishes
+		// through a line continuation are refused.
+		for (const replacement of [
+			'npm p""ublish "$TARBALL" --dry-run',
+			"npm pub'l'ish \"$TARBALL\" --dry-run",
+			'n\\pm stage publish "$TARBALL" --dry-run --tag latest',
+		]) {
+			const quoted = runPolicy(
+				mutatePublishWorkflow(
+					'npm stage publish "$TARBALL" --dry-run',
+					replacement,
+				),
+				"publish.yml",
+			);
+			expect(quoted.status).toBe(1);
+		}
+		const secondJob = runPolicy(
+			`${PUBLISH_WORKFLOW.trimEnd()}
+  sneaky:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Publish elsewhere
+        run: |
+          npm \\
+            publish "$TARBALL" --provenance --tag "$DIST_TAG"
+`,
+			"publish.yml",
+		);
+		expect(secondJob.status).toBe(1);
 		// Prose that merely mentions publish.yml is not a publish command.
 		expect(runPolicy(SUPPLY_CHAIN_WORKFLOW, "supply-chain.yml").status).toBe(0);
 		// A staged publish without provenance is refused too.
