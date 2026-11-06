@@ -23,6 +23,10 @@ const TEST_WORKFLOW = readFileSync(
 	join(PROJECT_ROOT, ".github", "workflows", "test.yml"),
 	"utf8",
 );
+const SUPPLY_CHAIN_WORKFLOW = readFileSync(
+	join(PROJECT_ROOT, ".github", "workflows", "supply-chain.yml"),
+	"utf8",
+);
 const SOAK_WORKFLOW = readFileSync(
 	join(PROJECT_ROOT, ".github", "workflows", "soak-long.yml"),
 	"utf8",
@@ -510,6 +514,35 @@ jobs:
 		expect(direct.stderr).toContain(
 			"npm publishing must stage the version (npm stage publish)",
 		);
+		// A dry run whose flag is flipped back off is a real publish: refused.
+		const flipped = runPolicy(
+			mutatePublishWorkflow(
+				'npm stage publish "$TARBALL" --dry-run',
+				'npm publish "$TARBALL" --dry-run --no-dry-run',
+			),
+			"publish.yml",
+		);
+		expect(flipped.status).toBe(1);
+		expect(flipped.stderr).toContain(
+			"npm publishing must stage the version (npm stage publish)",
+		);
+		// So is a staged dry run flipped off, and options before `publish`.
+		for (const replacement of [
+			'npm stage publish "$TARBALL" --dry-run --no-dry-run',
+			'npm --silent publish "$TARBALL" --dry-run',
+			'npm --loglevel warn publish "$TARBALL" --dry-run',
+		]) {
+			const sneaky = runPolicy(
+				mutatePublishWorkflow(
+					'npm stage publish "$TARBALL" --dry-run',
+					replacement,
+				),
+				"publish.yml",
+			);
+			expect(sneaky.status).toBe(1);
+		}
+		// Prose that merely mentions publish.yml is not a publish command.
+		expect(runPolicy(SUPPLY_CHAIN_WORKFLOW, "supply-chain.yml").status).toBe(0);
 		// A staged publish without provenance is refused too.
 		const unproven = runPolicy(
 			mutatePublishWorkflow(

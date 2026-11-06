@@ -493,6 +493,11 @@ function hasExactEntries(
 	);
 }
 
+/** Any npm/bun invocation with a `publish` argument anywhere in the same
+ * command, whatever options precede it (`npm --silent publish`,
+ * `npm --loglevel warn publish`, `npm stage publish`). */
+const ANY_PUBLISH = /\b(?:npm|bun|npx)\b[^\n;&|]*\spublish(?=\s|$)/;
+
 function immediatelyRechecksDigest(
 	step: StepBlock,
 	publishCommand: string,
@@ -594,9 +599,7 @@ function validatePublishHandoff(
 	);
 	const publishJobs = jobs.filter((job) =>
 		stepBlocks(lines, job).some((step) =>
-			commandLines(step).some((line) =>
-				/\b(?:npm\s+stage|npm|bun)\s+publish\b/.test(line),
-			),
+			commandLines(step).some((line) => ANY_PUBLISH.test(line)),
 		),
 	);
 	const job = publishJobs.length === 1 ? publishJobs[0] : undefined;
@@ -740,11 +743,24 @@ function validatePublishHandoff(
 		),
 	);
 	const publishCommands = allCommands.filter(({ command }) =>
-		/\b(?:npm\s+stage|npm|bun)\s+publish\b/.test(command),
+		ANY_PUBLISH.test(command),
 	);
 	const canonicalPublishes = publishCommands.filter(({ command }) =>
 		/^(?:npm\s+stage|npm|bun)\s+publish\b/.test(command),
 	);
+	// Every publish -- the dry run included -- is `npm stage publish` with no
+	// way to flip the dry run back off: whatever npm makes of the flags, the
+	// most any command in this job can do is stage a version.
+	const unstaged = publishCommands.filter(
+		({ command }) =>
+			!/^npm\s+stage\s+publish\s/.test(command) ||
+			/--no-dry-run\b|--dry-run=|--no-provenance\b|--provenance=/.test(command),
+	);
+	if (unstaged.length > 0)
+		add(
+			job.start,
+			"npm publishing must stage the version (npm stage publish); a maintainer approves it with 2FA",
+		);
 	const finalPublishes = canonicalPublishes.filter(
 		({ command }) => !/\s--dry-run(?:\s|$)/.test(command),
 	);
@@ -794,15 +810,6 @@ function validatePublishHandoff(
 					),
 				),
 		);
-	// The npm trusted publisher is stage-only: the one real upload must stage
-	// the version (live only after a maintainer approves it with 2FA), so the
-	// workflow can never make a version public by itself.
-	if (finalPublish && !/^npm\s+stage\s+publish\b/.test(finalPublish.command)) {
-		add(
-			job.start,
-			"npm publishing must stage the version (npm stage publish); a maintainer approves it with 2FA",
-		);
-	}
 	if (!distTagged) {
 		add(
 			job.start,
@@ -941,9 +948,15 @@ function scanWorkflow(path: string): Violation[] {
 				`job ${job.name} checks out source and must explicitly grant contents: read`,
 			);
 		}
-		const publishesNpm =
-			/^\s*(?:-\s*)?run:\s*(?:npm\s+stage|npm|bun)\s+publish\b/m.test(text) ||
-			/^\s+(?:npm\s+stage|npm|bun)\s+publish\b/m.test(text);
+		// Step names and comments are prose, not commands.
+		const publishesNpm = text.split("\n").some((line) => {
+			const trimmed = line.trim();
+			return (
+				!/^(?:-\s*)?name\s*:/.test(trimmed) &&
+				!trimmed.startsWith("#") &&
+				ANY_PUBLISH.test(trimmed)
+			);
+		});
 		if (publishesNpm) {
 			if (!hasPermission(block, "id-token", "write")) {
 				add(job.start, `publish job ${job.name} must grant id-token: write`);

@@ -226,13 +226,19 @@ jobs:
             echo "::error::Tarball changed before registry upload"
             exit 1
           fi
-          npm stage publish "$TARBALL" --ignore-scripts --access public --provenance --tag "$DIST_TAG" --registry=https://registry.npmjs.org/ | tee "$RUNNER_TEMP/npm-stage-publish.log"
-          STAGE_ID="$(sed -n 's/^+ .* (staged with id \([^)]*\))$/\1/p' "$RUNNER_TEMP/npm-stage-publish.log")"
+          npm stage publish "$TARBALL" --ignore-scripts --access public --provenance --tag "$DIST_TAG" --registry=https://registry.npmjs.org/ --json > "$RUNNER_TEMP/npm-stage-publish.json"
+          # npm's JSON report of the staged package carries its stage id.
+          STAGE_ID="$(jq -r '[.. | objects | .stageId? | strings] | first // empty' "$RUNNER_TEMP/npm-stage-publish.json")"
           if [ -z "$STAGE_ID" ]; then
-            # The version is staged either way (npm exited 0); failing here
-            # would only block a rerun, which npm refuses for a staged version.
-            echo "::warning::npm did not report a stage id; find the staged version on npmjs.com or with npm stage list"
-            STAGE_ID="unreported"
+            # npm exited 0, so the version is staged; fail loudly so nobody
+            # mistakes this run for complete. A rerun cannot restage it.
+            echo "::error::The version was staged but npm reported no stage id. Find it with npm stage list @webtransport-bun/webtransport (maintainer login) or on npmjs.com, then approve it with 2FA."
+            {
+              echo "### Staged on npm, stage id NOT reported"
+              echo ""
+              echo "Find the staged version with \`npm stage list @webtransport-bun/webtransport\` or on npmjs.com and approve it with 2FA. Do not rerun this job."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
           fi
           PKG_VERSION="$(jq -er '.packageVersion' "$IDENTITY")"
           echo "stage_id=$STAGE_ID" >> "$GITHUB_OUTPUT"
