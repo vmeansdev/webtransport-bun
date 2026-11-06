@@ -541,6 +541,34 @@ jobs:
 			);
 			expect(sneaky.status).toBe(1);
 		}
+		// Reviewed (s2): flags that npm reads last, `--provenance false`, a
+		// publish split across a shell continuation, and shell indirection are
+		// all refused.
+		for (const [search, replacement] of [
+			[
+				'--provenance --tag "$DIST_TAG"',
+				'--provenance false --tag "$DIST_TAG"',
+			],
+			[
+				'--provenance --tag "$DIST_TAG" --registry',
+				'--provenance --tag "$DIST_TAG" --tag latest --registry',
+			],
+			[
+				'npm stage publish "$TARBALL" --dry-run',
+				'npm \\\n          publish "$TARBALL" --dry-run',
+			],
+			[
+				'npm stage publish "$TARBALL" --dry-run',
+				'eval "npm publish $TARBALL" #',
+			],
+			['npm stage publish "$TARBALL" --dry-run', 'bash -c "npm publish" #'],
+		] as const) {
+			const variant = runPolicy(
+				mutatePublishWorkflow(search, replacement),
+				"publish.yml",
+			);
+			expect(variant.status).toBe(1);
+		}
 		// Prose that merely mentions publish.yml is not a publish command.
 		expect(runPolicy(SUPPLY_CHAIN_WORKFLOW, "supply-chain.yml").status).toBe(0);
 		// A staged publish without provenance is refused too.

@@ -496,6 +496,11 @@ function hasExactEntries(
 /** Any npm/bun invocation with a `publish` argument anywhere in the same
  * command, whatever options precede it (`npm --silent publish`,
  * `npm --loglevel warn publish`, `npm stage publish`). */
+/** The only two publish commands publish.yml may run, byte for byte. */
+const EXACT_STAGE_COMMANDS = [
+	'npm stage publish "$TARBALL" --dry-run --ignore-scripts --access public --tag "$DIST_TAG" --registry=https://registry.npmjs.org/',
+	'npm stage publish "$TARBALL" --ignore-scripts --access public --provenance --tag "$DIST_TAG" --registry=https://registry.npmjs.org/ --json > "$RUNNER_TEMP/npm-stage-publish.json"',
+];
 const ANY_PUBLISH = /\b(?:npm|bun|npx)\b[^\n;&|]*\spublish(?=\s|$)/;
 
 function immediatelyRechecksDigest(
@@ -710,6 +715,32 @@ function validatePublishHandoff(
 	const allCommands = steps.flatMap((step) =>
 		commandLines(step).map((command) => ({ command, step })),
 	);
+	// Exact allowlist, on shell-continuation-joined commands: any command in
+	// this job that mentions `publish` as a word (outside echo prose) must be
+	// byte-identical to one of the two reviewed staging commands, so no flag
+	// order, repeated --tag, `--provenance false`, preceding option or line
+	// continuation can turn it into something else. Shell indirection that
+	// could hide a publish is refused outright.
+	const logical = steps.flatMap((step) =>
+		logicalCommands(step).map((command) => ({ command, step })),
+	);
+	const strayPublish = logical.filter(
+		({ command }) =>
+			/(?:^|[\s"'=;(|&])publish(?:$|[\s"';)|&])/.test(command) &&
+			!/^echo\s/.test(command) &&
+			!EXACT_STAGE_COMMANDS.includes(command),
+	);
+	const indirection = logical.filter(({ command }) =>
+		/(?:^|[\s;&|(])(?:eval|xargs|npx|pnpm|yarn)\s|\b(?:ba|z|da)?sh\s+-c\b|\bnode\s+(?:-e|--eval|-p|--print)\b|\bnpm\s+(?:exec|x)\b/.test(
+			command,
+		),
+	);
+	if (strayPublish.length > 0 || indirection.length > 0) {
+		add(
+			job.start,
+			"npm publishing must stage the version (npm stage publish); a maintainer approves it with 2FA",
+		);
+	}
 	const alternateAcquisition = allCommands.some(({ command }) => {
 		if (/\b(?:curl|wget)\b/.test(command)) return true;
 		if (/\bgh\s+release\s+download\b/.test(command)) return true;
@@ -948,15 +979,13 @@ function scanWorkflow(path: string): Violation[] {
 				`job ${job.name} checks out source and must explicitly grant contents: read`,
 			);
 		}
-		// Step names and comments are prose, not commands.
-		const publishesNpm = text.split("\n").some((line) => {
-			const trimmed = line.trim();
-			return (
-				!/^(?:-\s*)?name\s*:/.test(trimmed) &&
-				!trimmed.startsWith("#") &&
-				ANY_PUBLISH.test(trimmed)
-			);
-		});
+		// Only run commands count (step names and comments are prose), joined
+		// across shell line continuations.
+		const publishesNpm = stepBlocks(lines, job).some((step) =>
+			logicalCommands(step).some(
+				(command) => !/^echo\s/.test(command) && ANY_PUBLISH.test(command),
+			),
+		);
 		if (publishesNpm) {
 			if (!hasPermission(block, "id-token", "write")) {
 				add(job.start, `publish job ${job.name} must grant id-token: write`);
