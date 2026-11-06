@@ -227,6 +227,8 @@ jobs:
         run: cargo install cargo-llvm-cov --version 0.8.7 --locked
       - name: Install deps
         run: bun install --frozen-lockfile
+      - name: Prepare coverage artifact directory
+        run: mkdir -p coverage
       - name: Native coverage
         run: cargo llvm-cov --workspace --branch --json --output-path coverage/native-coverage.json
       - name: Upload coverage artifacts
@@ -368,8 +370,6 @@ jobs:
         shell: bash
     env:
       WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN: "1"
-      CC_wasm32_unknown_unknown: clang
-      AR_wasm32_unknown_unknown: llvm-ar
     strategy:
       fail-fast: false
       matrix:
@@ -412,9 +412,42 @@ jobs:
       - uses: denoland/setup-deno@e95548e56dfa95d4e1a28d6f422fafe75c4c26fb # v2.0.3
         with:
           deno-version: "2.9.3"
+      # Toolchain setup mirrors test.yml's green package-consumers job.
+      # ring's wasm32 C build needs an LLVM clang with the wasm32 backend; the
+      # default system/Apple clang cannot target wasm32. Match the wasm job's
+      # toolchain per OS and export the exact CC/AR into the environment.
+      - name: Install wasm C toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y clang lld llvm
+          echo "CC_wasm32_unknown_unknown=clang" >> "$GITHUB_ENV"
+          echo "AR_wasm32_unknown_unknown=llvm-ar" >> "$GITHUB_ENV"
+      - name: Install wasm C toolchain (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install llvm
+          LLVM_BIN="$(brew --prefix llvm)/bin"
+          echo "CC_wasm32_unknown_unknown=$LLVM_BIN/clang" >> "$GITHUB_ENV"
+          echo "AR_wasm32_unknown_unknown=$LLVM_BIN/llvm-ar" >> "$GITHUB_ENV"
+      - name: Install wasm C toolchain (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          # LLVM ships preinstalled on windows-latest runners.
+          LLVM_BIN="/c/Program Files/LLVM/bin"
+          echo "CC_wasm32_unknown_unknown=$LLVM_BIN/clang.exe" >> "$GITHUB_ENV"
+          echo "AR_wasm32_unknown_unknown=$LLVM_BIN/llvm-ar.exe" >> "$GITHUB_ENV"
       - name: Install exact release tooling
         run: |
-          npm install --global npm@11.18.0
+          # npm@11 requires Node >=20.17; the package's engine floor is Node 18
+          # (bundled npm 10), so pin a Node-appropriate npm rather than breaking
+          # the Node-18 consumer lane with EBADENGINE.
+          NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
+          if [ "$NODE_MAJOR" -ge 20 ]; then
+            npm install --global npm@11.18.0
+          else
+            npm install --global npm@10.9.4
+          fi
           cargo install wasm-bindgen-cli --locked --version 0.2.121
       - name: Install dependencies
         run: bun install --frozen-lockfile
