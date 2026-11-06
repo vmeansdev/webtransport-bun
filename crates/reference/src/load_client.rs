@@ -820,6 +820,17 @@ struct SessionLoad {
 /// `maxSessions` (`LIMIT_EXCEEDED_CLOSE_CODE` in crates/native/src/lib.rs).
 const LIMIT_EXCEEDED_CLOSE_CODE: u64 = 3992;
 
+/// After a stream or datagram on a just-accepted session fails, wait briefly
+/// for the session's close reason: at capacity the server closes it with
+/// E_LIMIT_EXCEEDED, and that close can arrive after the client's first
+/// stream already failed with "not connected".
+async fn refused_after_accept(conn: &wtransport::Connection) -> bool {
+    match tokio::time::timeout(Duration::from_millis(500), conn.closed()).await {
+        Ok(reason) => is_admission_refusal(&reason),
+        Err(_) => false,
+    }
+}
+
 fn is_admission_refusal(reason: &wtransport::error::ConnectionError) -> bool {
     matches!(
         reason,
@@ -1009,6 +1020,14 @@ async fn run_session(
                 };
                 stream_sequence = stream_sequence.wrapping_add(1);
                 if let Err(e) = result {
+                    if refused_after_accept(&conn).await {
+                        // The session was refused at the cap, not admitted; its
+                        // first stream only lost the race with that close.
+                        counters.sessions_ok.fetch_sub(1, Ordering::Relaxed);
+                        counters.sessions_err.fetch_add(1, Ordering::Relaxed);
+                        eprintln!("load-client: session refused after CONNECT accept: {e}");
+                        return;
+                    }
                     counters.streams_err.fetch_add(1, Ordering::Relaxed);
                     eprintln!("load-client: stream workload failed: {e}");
                 }

@@ -616,19 +616,8 @@ describe("Task 14 distributed scale evidence", () => {
 				...valid,
 				acceptedSessions: 1,
 				rejectedSessions: 2,
-				limitExceededDelta: 2,
-				admissionShedCount: 2,
 			}),
 		).toContain("overload phase admitted sessions beyond the configured cap");
-		// A client that counted a session before the server's E_LIMIT_EXCEEDED
-		// close landed is not an admission when the server shed every attempt.
-		expect(
-			evaluateOverloadEvidence({
-				...valid,
-				acceptedSessions: 1,
-				rejectedSessions: 2,
-			}),
-		).toEqual([]);
 		expect(
 			evaluateOverloadEvidence({
 				...valid,

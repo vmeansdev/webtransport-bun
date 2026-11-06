@@ -1766,14 +1766,7 @@ export function evaluateOverloadEvidence(evidence: OverloadEvidence): string[] {
 	if (evidence.rejectedSessions <= 0) {
 		failures.push("overload phase did not reject any admission");
 	}
-	// The server is the authority on admission: it counts every refusal at the
-	// cap. A client can still count a refused session as connected, because at
-	// capacity the server accepts the CONNECT and then closes it with
-	// E_LIMIT_EXCEEDED, and that close can lose the race with the client's first
-	// stream or datagram. So a session counts as admitted beyond the cap only
-	// when the server shed fewer attempts than were made.
-	const shed = evidence.limitExceededDelta + evidence.rateLimitedDelta;
-	if (evidence.acceptedSessions > 0 && shed < evidence.attemptedSessions) {
+	if (evidence.acceptedSessions > 0) {
 		failures.push("overload phase admitted sessions beyond the configured cap");
 	}
 	if (
