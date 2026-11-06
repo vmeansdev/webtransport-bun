@@ -496,6 +496,18 @@ function hasExactEntries(
 /** Any npm/bun invocation with a `publish` argument anywhere in the same
  * command, whatever options precede it (`npm --silent publish`,
  * `npm --loglevel warn publish`, `npm stage publish`). */
+/** An `echo` of prose: nothing chained after it (outside its quoted text)
+ * and no command substitution inside it. A trailing redirect into the job
+ * summary or output file is allowed. */
+function isPlainEcho(command: string): boolean {
+	if (!/^echo\s/.test(command)) return false;
+	if (/\$\(/.test(command) || /(?<!\\)`/.test(command)) return false;
+	const unquoted = command
+		.replace(/"(?:[^"\\]|\\.)*"/g, '""')
+		.replace(/'[^']*'/g, "''")
+		.replace(/\s*>>?\s*""\s*$/, "");
+	return !/[;&|<>]/.test(unquoted);
+}
 /** `publish` as a shell word (not part of a name like npm-publish-input). */
 const PUBLISH_WORD = /(?:^|[^\w-])publish(?![\w.-])/;
 /** Shell constructs that could assemble a publish command at run time. */
@@ -616,7 +628,7 @@ function validatePublishHandoff(
 		stepBlocks(lines, job).some((step) =>
 			logicalCommands(step).some(
 				(command) =>
-					!/^echo\s/.test(command) && ANY_PUBLISH.test(shellWords(command)),
+					!isPlainEcho(command) && ANY_PUBLISH.test(shellWords(command)),
 			),
 		),
 	);
@@ -627,7 +639,7 @@ function validatePublishHandoff(
 		const stray = stepBlocks(lines, otherJob).flatMap((step) =>
 			logicalCommands(step).filter(
 				(command) =>
-					!/^echo\s/.test(command) &&
+					!isPlainEcho(command) &&
 					PUBLISH_WORD.test(shellWords(command)) &&
 					!EXACT_STAGE_COMMANDS.includes(command),
 			),
@@ -764,7 +776,7 @@ function validatePublishHandoff(
 	const strayPublish = logical.filter(
 		({ command }) =>
 			PUBLISH_WORD.test(shellWords(command)) &&
-			!/^echo\s/.test(command) &&
+			!isPlainEcho(command) &&
 			!EXACT_STAGE_COMMANDS.includes(command),
 	);
 	const indirection = logical.filter(({ command }) =>
@@ -1018,7 +1030,7 @@ function scanWorkflow(path: string): Violation[] {
 		// across shell line continuations.
 		const publishesNpm = stepBlocks(lines, job).some((step) =>
 			logicalCommands(step).some(
-				(command) => !/^echo\s/.test(command) && ANY_PUBLISH.test(command),
+				(command) => !isPlainEcho(command) && ANY_PUBLISH.test(command),
 			),
 		);
 		if (publishesNpm) {

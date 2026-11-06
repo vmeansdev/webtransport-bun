@@ -601,6 +601,15 @@ jobs:
 			"publish.yml",
 		);
 		expect(secondJob.status).toBe(1);
+		// Reviewed (s4): an echo with a chained command is not prose.
+		const chained = runPolicy(
+			mutatePublishWorkflow(
+				'npm stage publish "$TARBALL" --dry-run',
+				'echo "publishing"; npm publish "$TARBALL" --dry-run',
+			),
+			"publish.yml",
+		);
+		expect(chained.status).toBe(1);
 		// Prose that merely mentions publish.yml is not a publish command.
 		expect(runPolicy(SUPPLY_CHAIN_WORKFLOW, "supply-chain.yml").status).toBe(0);
 		// A staged publish without provenance is refused too.
