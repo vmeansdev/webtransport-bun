@@ -39,7 +39,9 @@ describe("wasm client <-> native server interop (P5)", () => {
 				// Native addon unavailable: nothing to interop against here.
 				return;
 			}
-			const PORT = 47844;
+			// Own port: webtransport-like.test.ts binds 47844 in the same `bun test`
+			// process, and both claiming it failed coverage with AddrInUse.
+			const PORT = 47849;
 			const cert = generateCert(wasm, "localhost", 14);
 
 			const server = createServer({
