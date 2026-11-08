@@ -240,7 +240,10 @@ jobs:
           retention-days: 90
 
   bench-regress:
-    name: Benchmark regression (blocking)
+    # Advisory per Nikita (2026-11-08): no approved baseline exists and bench
+    # is not a release-status claim. It runs and attaches its evidence but
+    # cannot block a release.
+    name: Benchmark regression (advisory)
     needs: [security, codeql]
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -262,6 +265,7 @@ jobs:
       - name: Build native addon
         run: bun run build:native
       - name: Benchmark regression against the approved baseline
+        continue-on-error: true
         run: bun run bench:regress
       - name: Upload benchmark regression evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 resolved 2026-07-22
@@ -272,7 +276,11 @@ jobs:
           retention-days: 90
 
   distributed-scale:
-    name: Distributed scale >=10k sessions (blocking)
+    # Advisory per Nikita (2026-11-08): scale-10k-multisource is gaRequired
+    # false and a hosted runner cannot carry 10k sessions; capacity is covered
+    # by the G1-G11 gate ruling. It runs and attaches its evidence but cannot
+    # block a release.
+    name: Distributed scale >=10k sessions (advisory)
     needs: [security, codeql]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -294,6 +302,7 @@ jobs:
       - name: Build native addon
         run: bun run build:native
       - name: Distributed scale campaign (>=10k sessions)
+        continue-on-error: true
         run: bun tools/load/distributed-scale.ts
       - name: Upload distributed scale evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 resolved 2026-07-22
