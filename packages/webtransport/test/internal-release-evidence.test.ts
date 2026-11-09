@@ -1821,6 +1821,20 @@ describe("evidence content allowlist", () => {
 				filesFor("chromium-native-interop"),
 			).join("\n"),
 		).toContain("unknown field");
+		// Inherited Object.prototype names are not declared fields either.
+		for (const raw of [
+			'{"constructor":{"source":"secret"}}',
+			'{"toString":"secret"}',
+			'{"__proto__":{"source":"secret"}}',
+		]) {
+			report.config.webServer.wait = { stdout: JSON.parse(raw) };
+			expect(
+				contentProblems(
+					[member("r/interop.json", report)],
+					filesFor("chromium-native-interop"),
+				).join("\n"),
+			).toContain("unknown field");
+		}
 	});
 
 	it("refuses an unknown extra field, recursively", () => {

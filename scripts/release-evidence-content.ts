@@ -372,11 +372,13 @@ export function schemaProblems(
 				return [`${at}: must be an object`];
 			const problems: string[] = [];
 			const record = value as Record<string, unknown>;
+			// Own keys only: `in` would treat inherited names (constructor,
+			// toString, __proto__) as declared and let their values through.
 			for (const key of Object.keys(record))
-				if (!(key in schema.props))
+				if (!Object.hasOwn(schema.props, key))
 					problems.push(`${at}: unknown field (refused)`);
 			for (const [key, child] of Object.entries(schema.props)) {
-				if (!(key in record)) {
+				if (!Object.hasOwn(record, key)) {
 					if (!schema.optional?.includes(key))
 						problems.push(`${at}: missing field ${key}`);
 					continue;
