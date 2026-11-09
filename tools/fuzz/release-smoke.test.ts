@@ -87,6 +87,21 @@ describe("Task 14 fuzz release smoke", () => {
 		).toBe(
 			"#5\tNEW    cov: 679 ft: 680 corp: 2/34b L: 17/17 MS: <elided>\n#6\tpulse",
 		);
+		expect(
+			printableOutput(
+				"INFO: Loaded 1 modules (5581 inline 8-bit counters): 5581 [0x55e27b9e38b8, 0x55e27b9e4e85), \n\tNEW_FUNC[1/4]: 0x5615858551b1 in parse",
+			),
+		).toBe(
+			"INFO: Loaded 1 modules (5581 inline 8-bit counters): 5581 [0x<addr>,0x<addr>), \n\tNEW_FUNC[1/4]: 0x<addr> in parse",
+		);
+		// Other tools' output that merely resembles those shapes is untouched.
+		for (const line of [
+			"error MS: 3 malformed records",
+			"expected 0xdeadbeef12345678, received 0x0",
+			"test frame at 0x5594e485c248 failed",
+		]) {
+			expect(printableOutput(line)).toBe(line);
+		}
 	});
 
 	test("settles deterministically when a timed-out command leaves descendant-held pipes open", async () => {

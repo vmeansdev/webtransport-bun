@@ -202,25 +202,28 @@ function collectOutput(stream: ReadableStream<Uint8Array> | undefined | null) {
 // Command output is published as release evidence, whose content check
 // refuses control characters. Ask tools not to colour, then strip any ANSI
 // escape sequences that remain and replace other control characters
-// (keeping tab, LF and CR). libFuzzer prints ASLR pointer ranges such as
-// [0x5594e485c248,0x5594e485d248); they carry no evidence and read as an
-// opaque encoded run, so they are replaced with a fixed token.
-// Its progress lines also end with the mutation sequence and dictionary
-// entries (" MS: 5 ChangeBinInt-CopyPart-... DE: \"\\000\"-"), which read the
-// same way and are elided; the coverage/corpus/exec counters stay.
+// (keeping tab, LF and CR). Two libFuzzer shapes read as opaque encoded
+// runs and carry no evidence, so they are rewritten only in that exact form:
+// ASLR pointer ranges "[0x5594e485c248, 0x5594e485d248)" become
+// "[0x<addr>,0x<addr>)", a "\tNEW_FUNC[1/4]: 0x5615858551b1" address becomes
+// 0x<addr>, and the mutation/dictionary suffix of a progress
+// line ("#5\tNEW ... MS: 3 CMP-CrossOver- DE: ...") becomes " MS: <elided>".
+// Coverage/corpus/exec counters stay; other tools' output is untouched.
 const ANSI_ESCAPE =
 	// biome-ignore lint/suspicious/noControlCharactersInRegex: matching control characters is the point.
 	/\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007\u001b]*(?:\u0007|\u001b\\)|[@-Z\\-_])/g;
 // biome-ignore lint/suspicious/noControlCharactersInRegex: matching control characters is the point.
 const CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g;
-const MUTATIONS = / MS: \d+ [^\n]*/g;
-const POINTER = /\b0x[0-9a-fA-F]{8,}\b/g;
+const MUTATIONS = /^(#\d+\t[A-Z][A-Z ]*\S[^\n]*?) MS: \d+ [^\n]*$/gm;
+const POINTER_RANGE = /\[0x[0-9a-fA-F]{6,}, ?0x[0-9a-fA-F]{6,}\)/g;
+const NEW_FUNC = /^(\tNEW_FUNC\[\d+\/\d+\]: )0x[0-9a-fA-F]{6,}/gm;
 export function printableOutput(text: string): string {
 	return text
 		.replace(ANSI_ESCAPE, "")
 		.replace(CONTROL, "\uFFFD")
-		.replace(POINTER, "0x<addr>")
-		.replace(MUTATIONS, " MS: <elided>");
+		.replace(POINTER_RANGE, "[0x<addr>,0x<addr>)")
+		.replace(NEW_FUNC, "$10x<addr>")
+		.replace(MUTATIONS, "$1 MS: <elided>");
 }
 
 export async function runCommand(
