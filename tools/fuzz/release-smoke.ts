@@ -202,26 +202,37 @@ function collectOutput(stream: ReadableStream<Uint8Array> | undefined | null) {
 // Command output is published as release evidence, whose content check
 // refuses control characters. Ask tools not to colour, then strip any ANSI
 // escape sequences that remain and replace other control characters
-// (keeping tab, LF and CR). Two libFuzzer shapes read as opaque encoded
-// runs and carry no evidence, so they are rewritten only in that exact form:
-// ASLR pointer ranges "[0x5594e485c248, 0x5594e485d248)" become
-// "[0x<addr>,0x<addr>)", a "\tNEW_FUNC[1/4]: 0x5615858551b1" address becomes
-// 0x<addr>, and the mutation/dictionary suffix of a progress
-// line ("#5\tNEW ... MS: 3 CMP-CrossOver- DE: ...") becomes " MS: <elided>".
-// Coverage/corpus/exec counters stay; other tools' output is untouched.
+// (keeping tab, LF and CR).
+//
+// For cargo-fuzz runs only (`libFuzzer: true`), three libFuzzer shapes that
+// read as opaque encoded runs and carry no evidence are rewritten, each only
+// in libFuzzer's own line grammar:
+// - "INFO: Loaded 1 modules (5581 inline 8-bit counters): 5581
+//   [0x55e27b9e38b8, 0x55e27b9e4e85)" and the "PC tables" form: the pointer
+//   range becomes [0x<addr>,0x<addr>);
+// - "\tNEW_FUNC[1/4]: 0x5615858551b1 ...": the address becomes 0x<addr>;
+// - "#5\tNEW    cov: 679 ft: 680 corp: 2/34b ... MS: 3 CMP-CrossOver- DE: ..."
+//   (NEW, REDUCE, pulse, RELOAD events): the mutation/dictionary suffix
+//   becomes " MS: <elided>".
+// Coverage/corpus/exec counters stay. No other command's output is rewritten.
 const ANSI_ESCAPE =
 	// biome-ignore lint/suspicious/noControlCharactersInRegex: matching control characters is the point.
 	/\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007\u001b]*(?:\u0007|\u001b\\)|[@-Z\\-_])/g;
 // biome-ignore lint/suspicious/noControlCharactersInRegex: matching control characters is the point.
 const CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g;
-const MUTATIONS = /^(#\d+\t[A-Z][A-Z ]*\S[^\n]*?) MS: \d+ [^\n]*$/gm;
-const POINTER_RANGE = /\[0x[0-9a-fA-F]{6,}, ?0x[0-9a-fA-F]{6,}\)/g;
-const NEW_FUNC = /^(\tNEW_FUNC\[\d+\/\d+\]: )0x[0-9a-fA-F]{6,}/gm;
-export function printableOutput(text: string): string {
-	return text
-		.replace(ANSI_ESCAPE, "")
-		.replace(CONTROL, "\uFFFD")
-		.replace(POINTER_RANGE, "[0x<addr>,0x<addr>)")
+const LOADED_RANGE =
+	/^(INFO: Loaded \d+ (?:modules|PC tables) +\(\d+ [^)\n]*\): \d+ )\[0x[0-9a-fA-F]+, ?0x[0-9a-fA-F]+\)/gm;
+const NEW_FUNC = /^(\tNEW_FUNC\[\d+\/\d+\]: )0x[0-9a-fA-F]+/gm;
+const MUTATIONS =
+	/^(#\d+\t(?:NEW|REDUCE|pulse|RELOAD) +cov: \d+ ft: \d+ corp: \d+\/\d+[bKM]b?[^\n]*?) MS: \d+ [^\n]*$/gm;
+export function printableOutput(
+	text: string,
+	options: { libFuzzer?: boolean } = {},
+): string {
+	const printable = text.replace(ANSI_ESCAPE, "").replace(CONTROL, "\uFFFD");
+	if (!options.libFuzzer) return printable;
+	return printable
+		.replace(LOADED_RANGE, "$1[0x<addr>,0x<addr>)")
 		.replace(NEW_FUNC, "$10x<addr>")
 		.replace(MUTATIONS, "$1 MS: <elided>");
 }
@@ -233,6 +244,8 @@ export async function runCommand(
 		env?: Record<string, string>;
 		timeoutMs?: number;
 		drainTimeoutMs?: number;
+		/** cargo-fuzz run: also rewrite libFuzzer's address/mutation shapes. */
+		libFuzzer?: boolean;
 	} = {},
 ): Promise<CommandResult> {
 	const started = performance.now();
@@ -293,8 +306,12 @@ export async function runCommand(
 	return {
 		command,
 		exitCode,
-		stdout: printableOutput(stdoutResult.text),
-		stderr: printableOutput(stderrResult.text),
+		stdout: printableOutput(stdoutResult.text, {
+			libFuzzer: options.libFuzzer,
+		}),
+		stderr: printableOutput(stderrResult.text, {
+			libFuzzer: options.libFuzzer,
+		}),
 		stdoutBytes: stdoutResult.bytes,
 		stderrBytes: stderrResult.bytes,
 		durationMs: Number((performance.now() - started).toFixed(3)),
@@ -386,6 +403,7 @@ async function main() {
 			cwd: import.meta.dir,
 			env: commonEnv,
 			timeoutMs: fuzzCommandTimeoutMs,
+			libFuzzer: true,
 		});
 		commandResults.push(result);
 		if (result.timedOut) {

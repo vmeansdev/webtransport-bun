@@ -73,32 +73,39 @@ describe("Task 14 fuzz release smoke", () => {
 		expect(printableOutput("a\tb\r\nc\u001b]8;;http://x\u0007d")).toBe(
 			"a\tb\r\ncd",
 		);
+		const lf = { libFuzzer: true };
 		expect(
 			printableOutput(
-				"INFO: Loaded 1 PC tables (256 PCs): 256 [0x5594e485c248,0x5594e485d248), exit 0x1",
+				"INFO: Loaded 1 PC tables (256 PCs): 256 [0x5594e485c248,0x5594e485d248), \nINFO: Loaded 1 modules   (5581 inline 8-bit counters): 5581 [0x55e27b9e38b8, 0x55e27b9e4e85), \n\tNEW_FUNC[1/4]: 0x5615858551b1 in parse",
+				lf,
 			),
 		).toBe(
-			"INFO: Loaded 1 PC tables (256 PCs): 256 [0x<addr>,0x<addr>), exit 0x1",
+			"INFO: Loaded 1 PC tables (256 PCs): 256 [0x<addr>,0x<addr>), \nINFO: Loaded 1 modules   (5581 inline 8-bit counters): 5581 [0x<addr>,0x<addr>), \n\tNEW_FUNC[1/4]: 0x<addr> in parse",
 		);
 		expect(
 			printableOutput(
-				'#5\tNEW    cov: 679 ft: 680 corp: 2/34b L: 17/17 MS: 3 CMP-ChangeBinInt-CrossOver- DE: "\\000\\001"-\n#6\tpulse',
+				'#5\tNEW    cov: 679 ft: 680 corp: 2/34b lim: 17 exec/s: 0 rss: 42Mb L: 17/17 MS: 3 CMP-ChangeBinInt-CrossOver- DE: "\\000\\001"-\n#29\tREDUCE cov: 8 ft: 9 corp: 1/15b L: 15/15 MS: 5 ChangeBinInt-EraseBytes-\n#64\tpulse  cov: 8 ft: 9 corp: 1/15b',
+				lf,
 			),
 		).toBe(
-			"#5\tNEW    cov: 679 ft: 680 corp: 2/34b L: 17/17 MS: <elided>\n#6\tpulse",
+			"#5\tNEW    cov: 679 ft: 680 corp: 2/34b lim: 17 exec/s: 0 rss: 42Mb L: 17/17 MS: <elided>\n#29\tREDUCE cov: 8 ft: 9 corp: 1/15b L: 15/15 MS: <elided>\n#64\tpulse  cov: 8 ft: 9 corp: 1/15b",
 		);
-		expect(
-			printableOutput(
-				"INFO: Loaded 1 modules (5581 inline 8-bit counters): 5581 [0x55e27b9e38b8, 0x55e27b9e4e85), \n\tNEW_FUNC[1/4]: 0x5615858551b1 in parse",
-			),
-		).toBe(
-			"INFO: Loaded 1 modules (5581 inline 8-bit counters): 5581 [0x<addr>,0x<addr>), \n\tNEW_FUNC[1/4]: 0x<addr> in parse",
-		);
-		// Other tools' output that merely resembles those shapes is untouched.
+		// Look-alikes are untouched, even in cargo-fuzz output, and nothing is
+		// rewritten in any other command's output.
 		for (const line of [
 			"error MS: 3 malformed records",
+			"#7\tERROR details MS: 3 malformed records",
+			"#7\tNEW details MS: 3 malformed records",
 			"expected 0xdeadbeef12345678, received 0x0",
 			"test frame at 0x5594e485c248 failed",
+			"range [0x5594e485c248, 0x5594e485d248) overlaps",
+			"\tNEW_FUNC 0x5615858551b1",
+		]) {
+			expect(printableOutput(line, lf)).toBe(line);
+		}
+		for (const line of [
+			"INFO: Loaded 1 PC tables (256 PCs): 256 [0x5594e485c248,0x5594e485d248), ",
+			"#5\tNEW    cov: 679 ft: 680 corp: 2/34b L: 17/17 MS: 3 CMP-",
 		]) {
 			expect(printableOutput(line)).toBe(line);
 		}
