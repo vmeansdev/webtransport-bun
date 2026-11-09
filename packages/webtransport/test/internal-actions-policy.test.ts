@@ -727,7 +727,8 @@ jobs:
 			  }
 			| undefined;
 		expect(evidence).toBeDefined();
-		expect(evidence?.needs).toEqual(["release"]);
+		// distributed-scale only supplies the advisory campaign outcome.
+		expect(evidence?.needs).toEqual(["release", "distributed-scale"]);
 		expect(evidence?.if).toContain("contains(github.ref_name, '-')");
 		expect(evidence?.permissions).toEqual({
 			actions: "read",
