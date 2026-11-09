@@ -1794,6 +1794,35 @@ describe("evidence content allowlist", () => {
 		).toEqual([]);
 	});
 
+	it("accepts Playwright's serialized webServer.wait and nothing inside it", () => {
+		// playwright.config.ts waits on a stdout RegExp, which the JSON reporter
+		// serializes as {}. The v1.0.0-rc.4 release scan refused that report.
+		const report = playwrightReport() as {
+			config: { webServer: Record<string, unknown> };
+		};
+		report.config.webServer.wait = { stdout: {} };
+		expect(
+			contentProblems(
+				[member("r/interop.json", report)],
+				filesFor("chromium-native-interop"),
+			),
+		).toEqual([]);
+		report.config.webServer.wait = { stdout: { source: "secret" } };
+		expect(
+			contentProblems(
+				[member("r/interop.json", report)],
+				filesFor("chromium-native-interop"),
+			).join("\n"),
+		).toContain("unknown field");
+		report.config.webServer.wait = { timeout: 5 };
+		expect(
+			contentProblems(
+				[member("r/interop.json", report)],
+				filesFor("chromium-native-interop"),
+			).join("\n"),
+		).toContain("unknown field");
+	});
+
 	it("refuses an unknown extra field, recursively", () => {
 		const evidence = { ...iwaEvidence(commit), extra: "harmless" };
 		expect(

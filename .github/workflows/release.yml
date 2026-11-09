@@ -757,7 +757,7 @@ jobs:
           for binary in \
             webtransport-native.darwin-arm64.node \
             webtransport-native.darwin-x64.node \
-            webtransport-native.linux-x64.node \
+            webtransport-native.linux-x64-gnu.node \
             webtransport-native.win32-x64-msvc.node; do
             test -f "prebuilds/$binary" || {
               echo "::error::Missing required release prebuild prebuilds/$binary"

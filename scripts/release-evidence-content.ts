@@ -639,8 +639,15 @@ const playwrightReport = obj({
 						stdout: ident(16),
 						stderr: ident(16),
 						name: ident(64),
+						// Playwright's readiness wait: a RegExp, which JSON-serializes
+						// to an empty object, so nothing but `{}` is accepted.
+						wait: obj(
+							{ stdout: obj({}, []), stderr: obj({}, []) },
+							["stdout", "stderr"],
+						),
 					},
 					[
+						"wait",
 						"command",
 						"cwd",
 						"url",
