@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-import { runCommand } from "./release-smoke.ts";
+import { printableOutput, runCommand } from "./release-smoke.ts";
 
 describe("Task 14 fuzz release smoke", () => {
 	test("defines a cargo-fuzz target for every required attack surface", () => {
@@ -56,6 +56,37 @@ describe("Task 14 fuzz release smoke", () => {
 		expect(source).toContain("drainTimedOut");
 		expect(source).toContain("stdoutBytes");
 		expect(source).toContain("stderrBytes");
+	});
+
+	test("records command output without colour or control characters", async () => {
+		// The v1.0.0-rc.5 evidence upload refused cargo's coloured stderr.
+		const result = await runCommand(
+			[
+				"/bin/sh",
+				"-c",
+				'printf "%s|" "$CARGO_TERM_COLOR" "$NO_COLOR"; printf "\\033[1m\\033[33mwarning\\033[0m: x\\a\\n" 1>&2',
+			],
+			{ env: { CARGO_TERM_COLOR: "always" } },
+		);
+		expect(result.stdout).toBe("never|1|");
+		expect(result.stderr).toBe("warning: x\uFFFD\n");
+		expect(printableOutput("a\tb\r\nc\u001b]8;;http://x\u0007d")).toBe(
+			"a\tb\r\ncd",
+		);
+		expect(
+			printableOutput(
+				"INFO: Loaded 1 PC tables (256 PCs): 256 [0x5594e485c248,0x5594e485d248), exit 0x1",
+			),
+		).toBe(
+			"INFO: Loaded 1 PC tables (256 PCs): 256 [0x<addr>,0x<addr>), exit 0x1",
+		);
+		expect(
+			printableOutput(
+				'#5\tNEW    cov: 679 ft: 680 corp: 2/34b L: 17/17 MS: 3 CMP-ChangeBinInt-CrossOver- DE: "\\000\\001"-\n#6\tpulse',
+			),
+		).toBe(
+			"#5\tNEW    cov: 679 ft: 680 corp: 2/34b L: 17/17 MS: <elided>\n#6\tpulse",
+		);
 	});
 
 	test("settles deterministically when a timed-out command leaves descendant-held pipes open", async () => {

@@ -486,6 +486,11 @@ jobs:
     needs: [security, codeql]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    outputs:
+      # success only when the campaign itself passed; evidence-assets packages
+      # the scale evidence only then (a failed advisory run's artifact carries
+      # raw multi-line client stderr the evidence content check refuses).
+      campaign: ${{ steps.campaign.outcome }}
     permissions:
       contents: read
     env:
@@ -504,6 +509,7 @@ jobs:
       - name: Build native addon
         run: bun run build:native
       - name: Distributed scale campaign (>=10k sessions)
+        id: campaign
         continue-on-error: true
         run: bun tools/load/distributed-scale.ts
       - name: Upload distributed scale evidence
@@ -897,7 +903,7 @@ jobs:
     # or interop assets; the failure stays visible on this job. Coverage
     # evidence comes from coverage.yml (the floor gate needs the native, wasm
     # and Bun reports), pulled in with `release-evidence.ts fetch`.
-    needs: [release]
+    needs: [release, distributed-scale]
     continue-on-error: true
     if: startsWith(github.ref, 'refs/tags/v') && contains(github.ref_name, '-')
     runs-on: ubuntu-24.04
@@ -919,6 +925,7 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
           CANDIDATE_COMMIT: ${{ github.sha }}
           RELEASE_TAG: ${{ github.ref_name }}
+          SCALE_CAMPAIGN: ${{ needs.distributed-scale.outputs.campaign }}
         run: |
           set -euo pipefail
           OUT="$RUNNER_TEMP/evidence-assets"
@@ -931,7 +938,12 @@ jobs:
           }
           pull --claim chromium-native-interop --artifact interop-evidence --select interop-evidence.json
           pull --claim fuzz-gates --artifact fuzz-evidence --select .release-evidence/fuzz --bundle
-          pull --claim scale-10k-multisource --artifact distributed-scale-evidence --bundle
+          # Advisory: packaged only when the campaign passed.
+          if [ "$SCALE_CAMPAIGN" = "success" ]; then
+            pull --claim scale-10k-multisource --artifact distributed-scale-evidence --bundle
+          else
+            echo "::warning::distributed-scale campaign did not pass ($SCALE_CAMPAIGN); scale-10k-multisource evidence not attached"
+          fi
           pull --claim package-artifact --artifact "npm-publish-input-$RUN_ATTEMPT" --select candidate-identity.json
           echo "EVIDENCE_FRAGMENT=$FRAGMENT" >> "$GITHUB_ENV"
           echo "EVIDENCE_OUT=$OUT" >> "$GITHUB_ENV"

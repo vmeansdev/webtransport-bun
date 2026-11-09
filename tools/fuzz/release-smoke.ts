@@ -199,6 +199,30 @@ function collectOutput(stream: ReadableStream<Uint8Array> | undefined | null) {
 	};
 }
 
+// Command output is published as release evidence, whose content check
+// refuses control characters. Ask tools not to colour, then strip any ANSI
+// escape sequences that remain and replace other control characters
+// (keeping tab, LF and CR). libFuzzer prints ASLR pointer ranges such as
+// [0x5594e485c248,0x5594e485d248); they carry no evidence and read as an
+// opaque encoded run, so they are replaced with a fixed token.
+// Its progress lines also end with the mutation sequence and dictionary
+// entries (" MS: 5 ChangeBinInt-CopyPart-... DE: \"\\000\"-"), which read the
+// same way and are elided; the coverage/corpus/exec counters stay.
+const ANSI_ESCAPE =
+	// biome-ignore lint/suspicious/noControlCharactersInRegex: matching control characters is the point.
+	/\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007\u001b]*(?:\u0007|\u001b\\)|[@-Z\\-_])/g;
+// biome-ignore lint/suspicious/noControlCharactersInRegex: matching control characters is the point.
+const CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g;
+const MUTATIONS = / MS: \d+ [^\n]*/g;
+const POINTER = /\b0x[0-9a-fA-F]{8,}\b/g;
+export function printableOutput(text: string): string {
+	return text
+		.replace(ANSI_ESCAPE, "")
+		.replace(CONTROL, "\uFFFD")
+		.replace(POINTER, "0x<addr>")
+		.replace(MUTATIONS, " MS: <elided>");
+}
+
 export async function runCommand(
 	command: string[],
 	options: {
@@ -216,6 +240,8 @@ export async function runCommand(
 		env: {
 			...process.env,
 			...options.env,
+			CARGO_TERM_COLOR: "never",
+			NO_COLOR: "1",
 		},
 	});
 	const stdoutCollector = collectOutput(proc.stdout);
@@ -264,8 +290,8 @@ export async function runCommand(
 	return {
 		command,
 		exitCode,
-		stdout: stdoutResult.text,
-		stderr: stderrResult.text,
+		stdout: printableOutput(stdoutResult.text),
+		stderr: printableOutput(stderrResult.text),
 		stdoutBytes: stdoutResult.bytes,
 		stderrBytes: stderrResult.bytes,
 		durationMs: Number((performance.now() - started).toFixed(3)),
