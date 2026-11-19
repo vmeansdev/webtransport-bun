@@ -49,6 +49,21 @@ export function distTagFor(version: string): "next" | "latest" {
 	return version.includes("-") ? "next" : "latest";
 }
 
+export function committedVersion(): string {
+	return (JSON.parse(readFileSync(PACKAGE_JSON, "utf8")) as { version: string })
+		.version;
+}
+
+/** Rewrite only the version field, keeping the file's formatting. */
+export function writePackageVersion(version: string): void {
+	const text = readFileSync(PACKAGE_JSON, "utf8");
+	if (JSON.parse(text).version === version) return;
+	const next = text.replace(/("version"\s*:\s*")[^"]*(")/, `$1${version}$2`);
+	if (JSON.parse(next).version !== version)
+		throw new Error("could not rewrite the package version");
+	writeFileSync(PACKAGE_JSON, next);
+}
+
 if (import.meta.main) {
 	const [tag, flag] = Bun.argv.slice(2);
 	if (!tag || (flag !== undefined && flag !== "--check")) {
@@ -57,23 +72,15 @@ if (import.meta.main) {
 		);
 		process.exit(2);
 	}
-	const text = readFileSync(PACKAGE_JSON, "utf8");
-	const pkg = JSON.parse(text) as { version: string };
 	let version: string;
 	try {
-		version = stampedVersion(tag, pkg.version);
+		version = stampedVersion(tag, committedVersion());
 	} catch (error) {
 		console.error(
 			`stamp-version-from-tag: ${error instanceof Error ? error.message : String(error)}`,
 		);
 		process.exit(1);
 	}
-	if (flag !== "--check" && version !== pkg.version) {
-		// Replace only the version field, keeping the file's formatting.
-		const next = text.replace(/("version"\s*:\s*")[^"]*(")/, `$1${version}$2`);
-		if (JSON.parse(next).version !== version)
-			throw new Error("could not rewrite the package version");
-		writeFileSync(PACKAGE_JSON, next);
-	}
+	if (flag !== "--check") writePackageVersion(version);
 	console.log(version);
 }

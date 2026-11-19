@@ -1,0 +1,363 @@
+# Canary and nightly channels (docs/BRANCHING.md).
+#
+# canary:  every development commit whose push `test` run went green.
+# nightly: once a day, development's newest commit with a green push `test` run,
+#          when it differs from the current nightly.
+#
+# Each build stamps <base>-<channel>.<order>.g<sha7>
+# (scripts/release-channel.ts), builds the same prebuilds and tarball a release
+# would, publishes it to npm under the channel's dist-tag (when enabled), and
+# only then fast-forwards the `canary` / `nightly` branch and replaces the
+# rolling `channel-canary` / `channel-nightly` GitHub pre-release. A channel
+# branch therefore always names the commit its channel currently serves.
+name: channels
+on:
+  workflow_run:
+    workflows: [test]
+    types: [completed]
+    branches: [development]
+  schedule:
+    - cron: "30 2 * * *"
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "Channel to build from development's newest green commit"
+        required: true
+        default: "nightly"
+        type: choice
+        options:
+          - canary
+          - nightly
+
+permissions: {}
+
+concurrency:
+  group: channels-${{ github.event_name == 'workflow_run' && 'canary' || github.event_name == 'schedule' && 'nightly' || inputs.channel }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve channel commit and version
+    if: >-
+      github.repository == 'vmeansdev/webtransport-bun' && (
+        (github.event_name == 'workflow_run' &&
+         github.event.workflow_run.conclusion == 'success' &&
+         github.event.workflow_run.event == 'push' &&
+         github.event.workflow_run.head_branch == 'development' &&
+         github.event.workflow_run.head_repository.full_name == github.repository) ||
+        github.event_name == 'schedule' ||
+        (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/development'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      channel: ${{ steps.resolve.outputs.channel }}
+      commit: ${{ steps.resolve.outputs.commit }}
+      version: ${{ steps.resolve.outputs.version }}
+      build: ${{ steps.resolve.outputs.build }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: development
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.14"
+      - name: Resolve
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          INPUT_CHANNEL: ${{ inputs.channel }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            workflow_run) CHANNEL=canary; COMMIT="$RUN_SHA" ;;
+            schedule) CHANNEL=nightly; COMMIT="" ;;
+            workflow_dispatch) CHANNEL="$INPUT_CHANNEL"; COMMIT="" ;;
+            *) echo "::error::Unexpected event $EVENT"; exit 1 ;;
+          esac
+          if [ "$CHANNEL" != canary ] && [ "$CHANNEL" != nightly ]; then
+            echo "::error::Unknown channel $CHANNEL"
+            exit 1
+          fi
+          if [ -z "$COMMIT" ]; then
+            COMMIT="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow test.yml \
+              --branch development --event push --status success --limit 1 \
+              --json headSha --jq '.[0].headSha // ""')"
+          fi
+          if [[ ! "$COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::No green development commit to build for $CHANNEL"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$COMMIT" origin/development; then
+            echo "::error::$COMMIT is not on development"
+            exit 1
+          fi
+          BUILD=true
+          if git fetch --no-tags origin "+refs/heads/$CHANNEL:refs/remotes/origin/$CHANNEL" 2>/dev/null; then
+            CURRENT="$(git rev-parse "origin/$CHANNEL")"
+            if git merge-base --is-ancestor "$COMMIT" "$CURRENT"; then
+              echo "::notice::$CHANNEL already serves $CURRENT, which contains $COMMIT; nothing to build"
+              BUILD=false
+            elif ! git merge-base --is-ancestor "$CURRENT" "$COMMIT"; then
+              echo "::error::$CHANNEL ($CURRENT) is not an ancestor of $COMMIT; the channel branch diverged from development"
+              exit 1
+            fi
+          fi
+          git checkout --quiet --detach "$COMMIT"
+          VERSION="$(bun scripts/release-channel.ts version "$CHANNEL" "$COMMIT")"
+          {
+            echo "channel=$CHANNEL"
+            echo "commit=$COMMIT"
+            echo "version=$VERSION"
+            echo "build=$BUILD"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice::$CHANNEL $VERSION from $COMMIT (build=$BUILD)"
+
+  build:
+    needs: [resolve]
+    if: needs.resolve.outputs.build == 'true'
+    uses: ./.github/workflows/build-prebuilds.yml
+    permissions:
+      contents: read
+    with:
+      ref: ${{ needs.resolve.outputs.commit }}
+
+  package:
+    name: Package and smoke the channel tarball
+    needs: [resolve, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      CHANNEL: ${{ needs.resolve.outputs.channel }}
+      COMMIT: ${{ needs.resolve.outputs.commit }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: prebuilds-*
+          path: prebuilds
+          merge-multiple: true
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action resolved 2026-07-21
+        with:
+          toolchain: 1.95.0
+          targets: wasm32-unknown-unknown
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.3.14"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4 resolved 2026-07-22
+        with:
+          node-version: "22.23.1"
+      - uses: denoland/setup-deno@e95548e56dfa95d4e1a28d6f422fafe75c4c26fb # v2.0.3
+        with:
+          deno-version: "2.9.3"
+      - name: Install wasm C toolchain
+        run: |
+          sudo apt-get update && sudo apt-get install -y clang lld llvm
+          echo "CC_wasm32_unknown_unknown=clang" >> "$GITHUB_ENV"
+          echo "AR_wasm32_unknown_unknown=llvm-ar" >> "$GITHUB_ENV"
+      - name: Install exact release tooling
+        run: |
+          npm install --global npm@11.18.0
+          cargo install wasm-bindgen-cli --locked --version 0.2.121
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Regenerate combined SHA256SUMS (all targets)
+        run: |
+          set -euo pipefail
+          for binary in \
+            webtransport-native.darwin-arm64.node \
+            webtransport-native.darwin-x64.node \
+            webtransport-native.linux-x64-gnu.node \
+            webtransport-native.win32-x64-msvc.node; do
+            test -f "prebuilds/$binary" || {
+              echo "::error::Missing required prebuild prebuilds/$binary"
+              exit 1
+            }
+          done
+          bun scripts/write-sha256sums.ts prebuilds
+          (cd prebuilds && shasum -a 256 -c SHA256SUMS)
+      - name: Stamp the channel version and build the tarball
+        run: |
+          set -euo pipefail
+          # Stamped in this job (not taken from resolve) so the version is
+          # derived from the checked-out commit; a different result means the
+          # date rolled over between jobs, which is refused rather than guessed.
+          STAMPED="$(bun scripts/release-channel.ts stamp "$CHANNEL" "$COMMIT")"
+          if [ "$STAMPED" != "$VERSION" ]; then
+            echo "::error::Stamped $STAMPED but resolve chose $VERSION; rerun the workflow"
+            exit 1
+          fi
+          bun scripts/test-package-artifact.ts build \
+            --prebuilds-dir prebuilds \
+            --require-release-targets \
+            --verify-reproducible \
+            --runtime bun \
+            --runtime node \
+            --runtime deno
+      - name: Bind the channel publish input
+        run: |
+          set -euo pipefail
+          mapfile -t TARBALLS < <(find packages/webtransport -maxdepth 1 -name '*.tgz' -type f -print)
+          if [ "${#TARBALLS[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one npm tarball, found ${#TARBALLS[@]}"
+            exit 1
+          fi
+          TARBALL="${TARBALLS[0]}"
+          TARBALL_NAME="$(basename "$TARBALL")"
+          test "$(tar -xzOf "$TARBALL" package/package.json | jq -er '.version')" = "$VERSION"
+          OUTPUT_DIR="$RUNNER_TEMP/channel-publish-input"
+          mkdir -p "$OUTPUT_DIR"
+          cp "$TARBALL" "$OUTPUT_DIR/$TARBALL_NAME"
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg channel "$CHANNEL" \
+            --arg commit "$COMMIT" \
+            --arg packageVersion "$VERSION" \
+            --arg tarball "$TARBALL_NAME" \
+            --arg tarballSha256 "$(shasum -a 256 "$TARBALL" | cut -d' ' -f1)" \
+            --argjson runId "$GITHUB_RUN_ID" \
+            --argjson runAttempt "$GITHUB_RUN_ATTEMPT" \
+            '{schemaVersion: 1, repository: $repository, workflowPath: ".github/workflows/channels.yml", runId: $runId, runAttempt: $runAttempt, channel: $channel, commit: $commit, packageVersion: $packageVersion, tarball: $tarball, tarballSha256: $tarballSha256}' \
+            > "$OUTPUT_DIR/channel-identity.json"
+          cp prebuilds/*.node prebuilds/SHA256SUMS "$OUTPUT_DIR/"
+      - name: Upload channel publish input
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 resolved 2026-07-22
+        with:
+          name: channel-publish-input
+          path: ${{ runner.temp }}/channel-publish-input/
+          if-no-files-found: error
+          retention-days: 14
+
+  npm:
+    name: Publish to npm (${{ needs.resolve.outputs.channel }})
+    needs: [resolve, package]
+    # Off until the npm trusted publisher for channels.yml + npm-channels
+    # exists (docs/BRANCHING.md, "npm setup"); the skip is announced by the
+    # npm-disabled job so it never passes silently.
+    if: vars.CHANNELS_NPM_PUBLISH == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: npm-channels
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      CHANNEL: ${{ needs.resolve.outputs.channel }}
+      COMMIT: ${{ needs.resolve.outputs.commit }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: channel-publish-input
+          path: ${{ runner.temp }}/channel-publish-input
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4 resolved 2026-07-22
+        with:
+          node-version: "22.23.1"
+      - name: Install exact npm CLI
+        run: npm install --global npm@11.18.0
+      - name: Publish the bound tarball under the channel dist-tag
+        run: |
+          set -euo pipefail
+          INPUT_DIR="$RUNNER_TEMP/channel-publish-input"
+          IDENTITY="$INPUT_DIR/channel-identity.json"
+          jq -e \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg channel "$CHANNEL" \
+            --arg commit "$COMMIT" \
+            --arg version "$VERSION" \
+            '.schemaVersion == 1 and .repository == $repository and .channel == $channel and .commit == $commit and .packageVersion == $version and (.packageVersion | test("^[0-9]+\\.[0-9]+\\.[0-9]+-(canary|nightly)\\.[0-9]+\\.g[0-9a-f]{7}$")) and (.packageVersion | contains("-" + $channel + "."))' \
+            "$IDENTITY" >/dev/null || { echo "::error::Channel identity does not match this run"; exit 1; }
+          TARBALL="$INPUT_DIR/$(jq -er '.tarball' "$IDENTITY")"
+          test "$(shasum -a 256 "$TARBALL" | cut -d' ' -f1)" = "$(jq -er '.tarballSha256' "$IDENTITY")"
+          test "$(tar -xzOf "$TARBALL" package/package.json | jq -er '.version')" = "$VERSION"
+          REG="https://registry.npmjs.org/"
+          if npm view "@webtransport-bun/webtransport@$VERSION" version --registry="$REG" >/dev/null 2>&1; then
+            echo "::notice::$VERSION is already on npm; nothing to publish"
+            exit 0
+          fi
+          # The dist-tag is the channel, never latest or next.
+          npm publish "$TARBALL" --ignore-scripts --access public --provenance --tag "$CHANNEL" --registry="$REG"
+
+  npm-disabled:
+    name: npm publishing disabled for channels
+    needs: [resolve, package]
+    if: vars.CHANNELS_NPM_PUBLISH != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Announce the skipped npm publish
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          echo "::warning::$VERSION was not published to npm: repository variable CHANNELS_NPM_PUBLISH is not 'true' (docs/BRANCHING.md, npm setup)"
+          echo "### npm publish skipped for \`$VERSION\` (CHANNELS_NPM_PUBLISH is not enabled)" >> "$GITHUB_STEP_SUMMARY"
+
+  promote:
+    name: Advance ${{ needs.resolve.outputs.channel }} and its pre-release
+    needs: [resolve, package, npm, npm-disabled]
+    # Exactly one of npm / npm-disabled runs; promote only when it succeeded.
+    if: >-
+      always() && needs.package.result == 'success' &&
+      ((needs.npm.result == 'success' && needs.npm-disabled.result == 'skipped') ||
+       (needs.npm.result == 'skipped' && needs.npm-disabled.result == 'success'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CHANNEL: ${{ needs.resolve.outputs.channel }}
+      COMMIT: ${{ needs.resolve.outputs.commit }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: channel-publish-input
+          path: ${{ runner.temp }}/channel-publish-input
+      - name: Fast-forward the channel branch
+        run: |
+          set -euo pipefail
+          # force=false: GitHub refuses anything but a fast-forward.
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$CHANNEL" >/dev/null 2>&1; then
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/git/refs/heads/$CHANNEL" \
+              -f sha="$COMMIT" -F force=false >/dev/null
+          else
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/heads/$CHANNEL" -f sha="$COMMIT" >/dev/null
+          fi
+      - name: Replace the rolling GitHub pre-release
+        run: |
+          set -euo pipefail
+          TAG="channel-$CHANNEL"
+          INPUT_DIR="$RUNNER_TEMP/channel-publish-input"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+          fi
+          NOTES="$RUNNER_TEMP/notes.md"
+          {
+            echo "Rolling **$CHANNEL** build \`$VERSION\` from \`$COMMIT\`."
+            echo ""
+            echo "Unreleased: built from development, not a release candidate. See docs/BRANCHING.md."
+            echo ""
+            echo "\`\`\`"
+            echo "bun add @webtransport-bun/webtransport@$CHANNEL"
+            echo "\`\`\`"
+          } > "$NOTES"
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --target "$COMMIT" --prerelease --latest=false \
+            --title "$CHANNEL $VERSION" --notes-file "$NOTES" \
+            "$INPUT_DIR"/*.tgz "$INPUT_DIR"/*.node "$INPUT_DIR/SHA256SUMS" "$INPUT_DIR/channel-identity.json"
