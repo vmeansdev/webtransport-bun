@@ -831,6 +831,18 @@ async fn refused_after_accept(conn: &wtransport::Connection) -> bool {
     }
 }
 
+/// Move a session counted at `connect()` from ok to refused.
+///
+/// At capacity the server accepts the CONNECT and then closes the connection
+/// with E_LIMIT_EXCEEDED, so `connect()` can return before that close lands.
+/// Every path that sees the session end has to come through here, or the
+/// overload gate reads the refusal as an admission beyond the cap.
+fn count_refused_after_accept(counters: &Counters, detail: &dyn std::fmt::Display) {
+    counters.sessions_ok.fetch_sub(1, Ordering::Relaxed);
+    counters.sessions_err.fetch_add(1, Ordering::Relaxed);
+    eprintln!("load-client: session refused after CONNECT accept: {detail}");
+}
+
 fn is_admission_refusal(reason: &wtransport::error::ConnectionError) -> bool {
     matches!(
         reason,
@@ -877,12 +889,7 @@ async fn run_session(
         tokio::select! {
             reason = conn.closed() => {
                 if is_admission_refusal(&reason) {
-                    // At capacity the server accepts the CONNECT and then closes
-                    // with E_LIMIT_EXCEEDED, so `connect()` can return before that
-                    // close lands. The session was refused, not admitted.
-                    counters.sessions_ok.fetch_sub(1, Ordering::Relaxed);
-                    counters.sessions_err.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("load-client: session refused after CONNECT accept: {reason}");
+                    count_refused_after_accept(counters, &reason);
                     return;
                 }
                 break;
@@ -975,7 +982,15 @@ async fn run_session(
                             }
                         }
                     }
-                    Err(_) => break,
+                    Err(e) => {
+                        // A refusal close fails this read too, and `select!`
+                        // may pick it over the `closed()` branch above.
+                        if refused_after_accept(&conn).await {
+                            count_refused_after_accept(counters, &e);
+                            return;
+                        }
+                        break;
+                    }
                 }
             }
             _ = st_ticker.tick() => {
@@ -1021,11 +1036,7 @@ async fn run_session(
                 stream_sequence = stream_sequence.wrapping_add(1);
                 if let Err(e) = result {
                     if refused_after_accept(&conn).await {
-                        // The session was refused at the cap, not admitted; its
-                        // first stream only lost the race with that close.
-                        counters.sessions_ok.fetch_sub(1, Ordering::Relaxed);
-                        counters.sessions_err.fetch_add(1, Ordering::Relaxed);
-                        eprintln!("load-client: session refused after CONNECT accept: {e}");
+                        count_refused_after_accept(counters, &e);
                         return;
                     }
                     counters.streams_err.fetch_add(1, Ordering::Relaxed);
@@ -1085,8 +1096,8 @@ async fn run_reconnect_worker(
 #[cfg(test)]
 mod tests {
     use super::{
-        load_summary_json, parse_arrival_profile, parse_client_mode, parse_or_default,
-        ArrivalProfile, ClientMode, Counters, DatagramSchedule, LatencyProbe,
+        count_refused_after_accept, load_summary_json, parse_arrival_profile, parse_client_mode,
+        parse_or_default, ArrivalProfile, ClientMode, Counters, DatagramSchedule, LatencyProbe,
     };
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
@@ -1187,5 +1198,14 @@ mod tests {
         counters.reconnects_ok.store(3, Ordering::Relaxed);
         let summary = load_summary_json(ClientMode::Reconnect, &counters);
         assert!(summary.contains("\"observedReconnects\":3"));
+    }
+
+    #[test]
+    fn a_refusal_after_accept_moves_the_session_from_ok_to_refused() {
+        let counters = Counters::default();
+        counters.sessions_ok.store(2, Ordering::Relaxed);
+        count_refused_after_accept(&counters, &"E_LIMIT_EXCEEDED");
+        assert_eq!(counters.sessions_ok.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.sessions_err.load(Ordering::Relaxed), 1);
     }
 }
