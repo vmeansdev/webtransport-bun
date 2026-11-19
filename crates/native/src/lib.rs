@@ -1260,6 +1260,22 @@ pub(crate) fn spawn_wtransport_server(
                                                 limits.clone(),
                                                 is_0rtt,
                                             );
+                                        // Owns the sessions_active slot taken at admission,
+                                        // the per-IP session slot and the registry entry
+                                        // from here on. Several exits below return before
+                                        // the datagram task starts — the session can be
+                                        // removed while this task awaits the deferred
+                                        // 0-RTT confirmation or the lifecycle send — and
+                                        // each one must give the slot back, or
+                                        // sessions_active stays inflated and server
+                                        // close times out waiting for it.
+                                        let session_counters = SessionCounters {
+                                            id: id.clone(),
+                                            owner_server_id,
+                                            peer_ip: peer_ip_addr,
+                                            metrics: Arc::clone(&metrics),
+                                            released: false,
+                                        };
                                         // Replay-safety gate. The session request is
                                         // the replayable unit of 0-RTT, so by default
                                         // the onSession lifecycle event is deferred
@@ -1735,13 +1751,7 @@ pub(crate) fn spawn_wtransport_server(
                                                 // task exit, including a panic
                                                 // unwind (Drop). Normal paths call
                                                 // `counters.release()` explicitly.
-                                                let mut counters = SessionCounters {
-                                                    id: id.clone(),
-                                                    owner_server_id,
-                                                    peer_ip: peer_ip_for_release,
-                                                    metrics: m_dgram.clone(),
-                                                    released: false,
-                                                };
+                                                let mut counters = session_counters;
                                                 loop {
                                                     if crate::server_metrics::ServerMetrics::session_queue_cannot_fit(
                                                         &sm_dgram.queued_bytes,
@@ -2223,5 +2233,44 @@ mod server_udp_send_buffer_bytes_tests {
             assert!(err.contains("WEBTRANSPORT_NATIVE_SERVER_UDP_SNDBUF_BYTES"));
             assert!(err.contains(raw));
         }
+    }
+}
+
+#[cfg(test)]
+mod session_counters_tests {
+    use super::SessionCounters;
+    use crate::server_metrics::ServerMetrics;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    fn counters(metrics: &Arc<ServerMetrics>, id: &str) -> SessionCounters {
+        metrics.sessions_active.fetch_add(1, Ordering::SeqCst);
+        SessionCounters {
+            id: id.into(),
+            owner_server_id: u64::MAX - 7,
+            peer_ip: std::net::IpAddr::from([127, 0, 0, 1]),
+            metrics: Arc::clone(metrics),
+            released: false,
+        }
+    }
+
+    // An accept that returns early (its session was closed while it awaited
+    // 0-RTT confirmation or the lifecycle send) only drops the guard.
+    #[test]
+    fn dropping_an_unreleased_guard_gives_the_session_slot_back() {
+        let metrics = Arc::new(ServerMetrics::default());
+        drop(counters(&metrics, "sess-counters-drop"));
+        assert_eq!(metrics.sessions_active.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn release_then_drop_gives_the_slot_back_once() {
+        let metrics = Arc::new(ServerMetrics::default());
+        let _other = counters(&metrics, "sess-counters-other");
+        let mut guard = counters(&metrics, "sess-counters-release");
+        guard.release();
+        guard.release();
+        drop(guard);
+        assert_eq!(metrics.sessions_active.load(Ordering::SeqCst), 1);
     }
 }
