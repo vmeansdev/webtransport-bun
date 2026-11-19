@@ -268,7 +268,7 @@ GitHub release assets include the prebuilds, npm tarball, `parity-evidence.json`
 
 Before tagging an RC or stable release:
 
-1. **Require** the `test` workflow to have succeeded on the default branch (or release branch) for the commits you are releasing.
+1. **Require** the `test` workflow to have succeeded on `development` for the commit being merged into `main`, and on the `main` release-merge commit you tag (docs/BRANCHING.md, Releases).
 2. **Recommended**: Ensure at least 1–3 consecutive green `test` runs before tagging. For stable cuts, prefer a 14-day window of sustained green (no flaky reds, no force-push reverts).
 3. **Verify**: Check Actions → test workflow for recent runs on your branch.
 

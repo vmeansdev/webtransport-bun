@@ -167,11 +167,10 @@ Producer for the `supply-chain-provenance` claim. Dispatch it on the rc tag once
 - Successful completion of the tag-triggered release workflow triggers `publish.yml`; manual dispatch from `main` is reserved for retrying an exact successful release workflow run ID.
 
 ## Branch protection policy
-- `main` must reject direct pushes and force pushes.
-- `development` currently allows both regular pushes and force pushes.
-- Repository ruleset payload is checked in at `.github/rulesets/main-no-push.json`.
+- Branch model, channels and tags: docs/BRANCHING.md.
+- `development`, `main`, `canary` and `nightly` reject deletion and force-push (`.github/rulesets/protected-branches.json`); `v*` tags cannot be deleted or moved (`.github/rulesets/release-tags.json`).
 - Apply with GitHub CLI (repo admin):
-  - `gh api --method POST repos/<owner>/<repo>/rulesets --input .github/rulesets/main-no-push.json`
+  - `gh api --method POST repos/<owner>/<repo>/rulesets --input .github/rulesets/<file>.json`
 
 ## Immutable workflow and toolchain policy
 
@@ -187,7 +186,6 @@ Producer for the `supply-chain-provenance` claim. Dispatch it on the rc tag once
 3. Protect the GitHub `npm-publish` environment according to the release-approver policy.
 4. Verify the registry configuration with a release-candidate workflow run before creating the stable tag. The workflow intentionally has no fallback npm token path.
 
-## Canary strategy
-- Publish `vX.Y.Z-rc.N` for release candidates
-- Run extended soak (e.g. 24h) on rc before tagging stable
-- Prefer `bun add @scope/webtransport@rc` for canary testing
+## Canary and nightly channels
+- `channels.yml` builds `canary` from every development commit whose push `test` run is green and `nightly` once a day from development's newest green commit, publishing to npm `@canary` / `@nightly` and to the rolling `channel-canary` / `channel-nightly` pre-releases (docs/BRANCHING.md).
+- Release candidates stay tag-driven: `vX.Y.Z-rc.N` on `main`, npm `@next`; run the extended soak on the rc before tagging stable.

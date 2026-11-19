@@ -26,6 +26,10 @@
   - `cargo fmt`
   - `cargo clippy --all-targets -- -D warnings`
 
+## Branches
+- Branch off `development` (`feature/*`, `fix/*`, `chore/*`) and merge back into `development`; it is the default branch.
+- `main` only receives release merges; `canary` and `nightly` are moved by CI. See docs/BRANCHING.md.
+
 ## Adding features
 - Update docs/SPEC.md first (API/semantics)
 - Add tests in `packages/webtransport/test`
