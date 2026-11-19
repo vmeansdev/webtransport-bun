@@ -61,7 +61,7 @@ Canonical release truth: `docs/release-status.json`. The suites below are the ev
 - Observability invariants asserted in automated tests
 
 ### CI evidence (CI-EVIDENCE-A)
-- **Parity**: `bun run test:parity` runs in release pipeline; produces `parity-evidence.json` attached to release.
+- **Parity**: `bun scripts/parity-evidence.ts --backend native --backend wasm` runs every parity suite against both backends in the release pipeline and produces `parity-evidence.json` (per-backend, per-suite, per-test results parsed from the JUnit report, with the report's sha256) attached to release. `bun run test:parity` is the local native-only run.
 - **Interop**: `INTEROP_EVIDENCE=1 bun run playwright test` in release pipeline; produces `interop-evidence.json` attached to release.
 - **Release gate**: Release job fails if parity-evidence or interop-evidence is missing.
 - **Auditability**: Evidence files are linkable from GitHub release Assets per release.

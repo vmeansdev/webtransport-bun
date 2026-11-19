@@ -146,7 +146,7 @@
 			"producers": [
 				{
 					"workflow": ".github/workflows/release.yml",
-					"workflowSha256": "30a7efe6acddb3204c868e305dcc62c76be3fc166bb840b9bda03a42ffa65e86",
+					"workflowSha256": "b2b2332f073309e3c4059e586f2347197a031f8ba5dc8348c603a8cf7c434bb1",
 					"jobs": [
 						"interop"
 					],
@@ -272,7 +272,7 @@
 				},
 				{
 					"workflow": ".github/workflows/release.yml",
-					"workflowSha256": "30a7efe6acddb3204c868e305dcc62c76be3fc166bb840b9bda03a42ffa65e86",
+					"workflowSha256": "b2b2332f073309e3c4059e586f2347197a031f8ba5dc8348c603a8cf7c434bb1",
 					"jobs": [
 						"coverage"
 					],
@@ -296,7 +296,7 @@
 			"producers": [
 				{
 					"workflow": ".github/workflows/release.yml",
-					"workflowSha256": "30a7efe6acddb3204c868e305dcc62c76be3fc166bb840b9bda03a42ffa65e86",
+					"workflowSha256": "b2b2332f073309e3c4059e586f2347197a031f8ba5dc8348c603a8cf7c434bb1",
 					"jobs": [
 						"fuzz"
 					],
@@ -329,7 +329,7 @@
 			"producers": [
 				{
 					"workflow": ".github/workflows/release.yml",
-					"workflowSha256": "30a7efe6acddb3204c868e305dcc62c76be3fc166bb840b9bda03a42ffa65e86",
+					"workflowSha256": "b2b2332f073309e3c4059e586f2347197a031f8ba5dc8348c603a8cf7c434bb1",
 					"jobs": [
 						"distributed-scale"
 					],
@@ -353,7 +353,7 @@
 			"producers": [
 				{
 					"workflow": ".github/workflows/release.yml",
-					"workflowSha256": "30a7efe6acddb3204c868e305dcc62c76be3fc166bb840b9bda03a42ffa65e86",
+					"workflowSha256": "b2b2332f073309e3c4059e586f2347197a031f8ba5dc8348c603a8cf7c434bb1",
 					"jobs": [
 						"release"
 					],

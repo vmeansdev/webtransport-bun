@@ -112,7 +112,7 @@ docs/RELEASE_CHECKLIST.md: it does not replace the 24h/72h release soak.
 1. **security** — cargo audit, Trivy filesystem scan, Trivy library vulnerability scan (CRITICAL/HIGH blocking)
 2. **codeql** — CodeQL analysis (JS/TS + Rust)
 
-3. **parity** — W3C facade parity tests; produces `parity-evidence.json`
+3. **parity** — every `parity-*.test.ts` suite against the native and the wasm backend via `scripts/parity-evidence.ts`; produces `parity-evidence.json` from the runs' JUnit reports (per backend: exact command, exit code, per-suite and per-test results, sha256 of the raw report). `passed` is computed and the job fails unless both backends exited 0, reported tests, failed none, and every suite in the checkout had a passing test
 4. **interop** — Chromium WebTransport interop (P3.3); runs reconnect storms, mixed concurrency, close/reset semantics; uploads `interop-evidence.json`
 5. **build** — matrix: `{linux-x64, darwin-arm64, darwin-x64, win32-x64-msvc}` — builds native addon, generates prebuilds + SHA256 checksums, uploads artifacts
 5a. **fuzz**, **coverage** — blocking. fuzz runs the release fuzz smoke with fuzz.yml's setup; coverage is coverage.yml's job verbatim (native, wasm and Bun coverage plus the risk-module floor check) on the pinned 1.95.0 toolchain

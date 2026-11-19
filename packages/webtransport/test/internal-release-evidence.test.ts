@@ -3333,16 +3333,65 @@ describe("release evidence lifecycle", () => {
 		expect(state.releases[TAG]?.assets).toEqual([]);
 	});
 
+	/** scripts/parity-evidence.ts's record, one backend, one suite. */
+	const parityRecord = (ref: string) => ({
+		schemaVersion: 1,
+		suite: "parity",
+		passed: true,
+		commit: "a".repeat(40),
+		ref,
+		generatedAt: "2026-10-30T19:00:00.000Z",
+		platform: { os: "linux", arch: "x64", runtime: "bun" },
+		toolchain: { name: "bun", version: "1.3.14" },
+		expectedSuites: ["packages/webtransport/test/parity-baseline.test.ts"],
+		backends: [
+			{
+				backend: "native",
+				passed: true,
+				problems: [],
+				command: [
+					"bun",
+					"test",
+					"packages/webtransport/test/parity-baseline.test.ts",
+				],
+				env: {
+					WEBTRANSPORT_PARITY_BACKEND: "native",
+					WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN: "1",
+				},
+				exitCode: 0,
+				startedAt: "2026-10-30T18:59:50.000Z",
+				finishedAt: "2026-10-30T18:59:57.000Z",
+				durationMs: 7000,
+				reporter: { format: "junit", bytes: 1024, sha256: "b".repeat(64) },
+				totals: { tests: 1, passed: 1, failed: 0, skipped: 0 },
+				suites: [
+					{
+						file: "packages/webtransport/test/parity-baseline.test.ts",
+						tests: 1,
+						passed: 1,
+						failed: 0,
+						skipped: 0,
+						durationMs: 250,
+						cases: [
+							{
+								describe: ["parity baseline (Phase 0) [native]"],
+								name: "ready resolves",
+								status: "passed",
+								line: 12,
+								durationMs: 1.5,
+							},
+						],
+					},
+				],
+			},
+		],
+	});
+
 	it("scan gates release files attached outside upload", () => {
 		const dir = temp("wt-evidence-scan-");
 		writeFileSync(
 			join(dir, "parity-evidence.json"),
-			JSON.stringify({
-				suite: "parity",
-				passed: true,
-				timestamp: "2026-10-30T19:00:00Z",
-				ref: "v1.0.0-rc.2",
-			}),
+			JSON.stringify(parityRecord("v1.0.0-rc.2")),
 		);
 		const scan = (schema: string) =>
 			spawnSync(
@@ -3353,12 +3402,7 @@ describe("release evidence lifecycle", () => {
 		expect(scan("parity-evidence").status).toBe(0);
 		writeFileSync(
 			join(dir, "parity-evidence.json"),
-			JSON.stringify({
-				suite: "parity",
-				passed: true,
-				timestamp: "2026-10-30T19:00:00Z",
-				ref: "cache:/opt/actions-runner/_work/x/y",
-			}),
+			JSON.stringify(parityRecord("cache:/opt/actions-runner/_work/x/y")),
 		);
 		const leak = scan("parity-evidence");
 		expect(leak.status).toBe(1);

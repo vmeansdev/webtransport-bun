@@ -1124,6 +1124,59 @@ const faultMatrixEvidence = obj(
 	["finishedAt", "error"],
 );
 
+/** scripts/parity-evidence.ts output: release.yml's parity record, attached to
+ * every release. The raw JUnit report is digest-only (Bun writes the host name
+ * into it). */
+const parityCase = obj({
+	describe: arr(text(300), 16),
+	name: text(300),
+	status: lit("passed", "failed", "skipped", "todo"),
+	line: int,
+	durationMs: num,
+});
+const paritySuite = obj({
+	file: path(200),
+	tests: int,
+	passed: int,
+	failed: int,
+	skipped: int,
+	durationMs: num,
+	cases: arr(parityCase, 2000),
+});
+const parityBackend = obj({
+	backend: lit("native", "wasm"),
+	passed: bool,
+	problems: arr(text(400), 200),
+	command: arr(text(400), 64),
+	env: obj(
+		{
+			WEBTRANSPORT_PARITY_BACKEND: lit("native", "wasm"),
+			WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN: lit("1"),
+			WEBTRANSPORT_REQUIRE_WASM: lit("1"),
+		},
+		["WEBTRANSPORT_REQUIRE_WASM"],
+	),
+	exitCode: int,
+	startedAt: iso,
+	finishedAt: iso,
+	durationMs: num,
+	reporter: obj({ format: lit("junit"), bytes: int, sha256 }),
+	totals: obj({ tests: int, passed: int, failed: int, skipped: int }),
+	suites: arr(paritySuite, 100),
+});
+const parityEvidence = obj({
+	schemaVersion: int,
+	suite: lit("parity"),
+	passed: bool,
+	commit: sha40,
+	ref: ident(100),
+	generatedAt: iso,
+	platform,
+	toolchain: obj({ name: lit("bun"), version: ident(64) }),
+	expectedSuites: arr(path(200), 100),
+	backends: arr(parityBackend, 2),
+});
+
 export const JSON_SCHEMAS: Record<string, Schema> = {
 	"fault-matrix-evidence": faultMatrixEvidence,
 	"command-record": commandRecord,
@@ -1133,13 +1186,7 @@ export const JSON_SCHEMAS: Record<string, Schema> = {
 	"llvm-cov-export": llvmCovExport,
 	"distributed-scale-artifact": distributedScale,
 	"npm-publish-identity": npmPublishIdentity,
-	// release.yml's parity record, attached to every release.
-	"parity-evidence": obj({
-		suite: lit("parity"),
-		passed: bool,
-		timestamp: iso,
-		ref: ident(100),
-	}),
+	"parity-evidence": parityEvidence,
 	"soak-aggregate": soakAggregate,
 	"iwa-evidence": iwaEvidence,
 	"review-record": reviewRecord,
