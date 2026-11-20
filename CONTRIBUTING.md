@@ -27,7 +27,7 @@
   - `cargo clippy --all-targets -- -D warnings`
 
 ## Branches
-- Branch off `development` (`feature/*`, `fix/*`, `chore/*`) and merge back into `development`; it is the default branch.
+- Branch off `development` (`feature/*`, `fix/*`, `chore/*`) and open a pull request back into `development`; it is the default branch. Direct pushes to `development` and `main` are rejected, and a pull request merges once the required checks are green.
 - `main` only receives release merges; `canary` and `nightly` are moved by CI. See docs/BRANCHING.md.
 
 ## Adding features
