@@ -116,7 +116,11 @@ artifact the glob accepts.
 
 All through `bun scripts/release-evidence.ts`:
 
-1. **Freeze and tag.** The committed `packages/webtransport/package.json`
+1. **Freeze and tag.** First check, on the package's npm settings page, that
+   the `publish.yml` / `npm-publish` trusted publisher is not "Expired" (npm
+   expires a publisher that does not publish within about 48 hours of being
+   created, and the publish then fails with `ENEEDAUTH`); if it is, delete and
+   recreate it (stage-only) right before pushing the tag. The committed `packages/webtransport/package.json`
    carries the base version (`X.Y.Z`); the published version is stamped from
    the tag at build time (`scripts/stamp-version-from-tag.ts`). Push the
    `vX.Y.Z-rc.N` tag on the candidate commit. The tag-triggered `release`

@@ -65,6 +65,13 @@ stage-only one that `publish.yml` uses for releases:
 Until step 3, each channel build warns that it skipped npm and still moves the
 branch and the GitHub pre-release.
 
+npm lists a new trusted publisher as "Pending validation" and expires it unless
+it publishes within about 48 hours. An expired publisher makes `npm publish`
+fail with `ENEEDAUTH` (this is what failed the rc.5 publish). Create a publisher
+only when a publish will follow inside that window, and replace an expired one
+by deleting it and creating it again. The channels publisher stays valid as
+long as canary keeps publishing.
+
 This publisher can publish without a 2FA approval, which is what makes the
 channels automatic. npm cannot restrict a publisher to one dist-tag; the
 workflow refuses any version that is not `-canary.` / `-nightly.` and always
