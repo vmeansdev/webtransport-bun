@@ -1,9 +1,9 @@
 # Branches, channels and tags
 
 ```
-feature/*, fix/* ──► development ──(each green push)──► canary    npm @canary
+feature/*, fix/* ──(PR)──► development ──(each green push)──► canary    npm @canary
                           │        ──(daily, newest green)──► nightly   npm @nightly
-                          └──(release merge --no-ff)──► main ◄── v1.0.0-rc.N (npm @next)
+                          └──(release PR, merge commit)──► main ◄── v1.0.0-rc.N (npm @next)
                                                              ◄── v1.0.0     (npm @latest)
 ```
 
@@ -11,12 +11,12 @@ feature/*, fix/* ──► development ──(each green push)──► canary  
 
 | Branch | What it is | Who moves it |
 |---|---|---|
-| `development` | Integration branch and the repository's default branch. All work lands here. | Maintainer (merge or push; never force-pushed) |
+| `development` | Integration branch and the repository's default branch. All work lands here. | Pull requests only, merged when the required checks are green |
 | `canary` | The newest development commit that passed `test` and was built by `channels.yml`. | `channels.yml` only, fast-forward |
 | `nightly` | Development's newest green commit as of the daily build. | `channels.yml` only, fast-forward |
-| `main` | Stable line. Only release merges from development and hotfixes land here; every release and release candidate is tagged here. | Maintainer, release merges only |
+| `main` | Stable line. Only release merges from development and hotfixes land here; every release and release candidate is tagged here. | Release and hotfix pull requests only, merged with a merge commit |
 | `feature/*`, `fix/*`, `chore/*`, `release/*` | Short-lived work branches off development; deleted after merge. | Anyone |
-| `hotfix/*` | Off `main` (the released tag) for a fix to a shipped version; merged into `main`, then `main` is merged back into `development`. | Maintainer |
+| `hotfix/*` | Off `main` (the released tag) for a fix to a shipped version; merged into `main` by pull request, then a `main` → `development` pull request brings it back. | Maintainer |
 
 `canary` and `nightly` are never committed to directly: they only ever point at
 commits already on `development`, so `git log development..canary` is always
@@ -65,6 +65,13 @@ stage-only one that `publish.yml` uses for releases:
 Until step 3, each channel build warns that it skipped npm and still moves the
 branch and the GitHub pre-release.
 
+npm lists a new trusted publisher as "Pending validation" and expires it unless
+it publishes within about 48 hours. An expired publisher makes `npm publish`
+fail with `ENEEDAUTH` (this is what failed the rc.5 publish). Create a publisher
+only when a publish will follow inside that window, and replace an expired one
+by deleting it and creating it again. The channels publisher stays valid as
+long as canary keeps publishing.
+
 This publisher can publish without a 2FA approval, which is what makes the
 channels automatic. npm cannot restrict a publisher to one dist-tag; the
 workflow refuses any version that is not `-canary.` / `-nightly.` and always
@@ -73,7 +80,8 @@ branches' workflows from using it.
 
 ## Releases
 
-1. Merge `development` into `main` with `git merge --no-ff development`.
+1. Open a pull request from `development` to `main` and merge it with a merge
+   commit (not squash or rebase) once the required checks are green.
 2. Tag the merge commit `v<base>-rc.N` and push the tag. `release.yml` runs the
    gates, creates the pre-release and attaches the evidence; `publish.yml`
    stages the version on npm under `next` for 2FA approval.
@@ -96,8 +104,20 @@ No other tags are created.
 
 The rulesets in `.github/rulesets/` are applied to the repository:
 
-- `development`, `main`, `canary`, `nightly`: no deletion, no force-push.
-- `v*` tags: no deletion, no update.
+- `development`, `main`: no direct pushes. Changes land through pull requests
+  (no approval count, since there is one maintainer; review threads must be
+  resolved) whose required checks are green: the three `test` OS jobs, parity,
+  WASM + Chromium interop, the UDP fault matrix, load, soak, matrix release
+  evidence, coverage, both Trivy scans and both CodeQL analyses
+  (`integration-branches.json`). No one bypasses it; a check that must change
+  is changed in the ruleset file and re-applied.
+- `development`, `main`, `canary`, `nightly`: no deletion, no force-push
+  (`protected-branches.json`).
+- `v*` tags: no deletion, no update (`release-tags.json`).
+
+When a required job is renamed, update `integration-branches.json` in the same
+pull request and re-apply it, or every later pull request waits on a check
+that never reports.
 
 Apply one as a repository admin (a ruleset with the same name must be updated
 with `PUT .../rulesets/<id>` instead of created again):

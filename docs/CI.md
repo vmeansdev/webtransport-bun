@@ -168,6 +168,7 @@ Producer for the `supply-chain-provenance` claim. Dispatch it on the rc tag once
 
 ## Branch protection policy
 - Branch model, channels and tags: docs/BRANCHING.md.
+- `development` and `main` accept changes only through pull requests whose required checks are green (`.github/rulesets/integration-branches.json`).
 - `development`, `main`, `canary` and `nightly` reject deletion and force-push (`.github/rulesets/protected-branches.json`); `v*` tags cannot be deleted or moved (`.github/rulesets/release-tags.json`).
 - Apply with GitHub CLI (repo admin):
   - `gh api --method POST repos/<owner>/<repo>/rulesets --input .github/rulesets/<file>.json`

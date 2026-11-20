@@ -1,0 +1,90 @@
+{
+	"name": "Integration branches: changes land through green pull requests",
+	"target": "branch",
+	"enforcement": "active",
+	"bypass_actors": [],
+	"conditions": {
+		"ref_name": {
+			"include": ["refs/heads/development", "refs/heads/main"],
+			"exclude": []
+		}
+	},
+	"rules": [
+		{
+			"type": "pull_request",
+			"parameters": {
+				"required_approving_review_count": 0,
+				"dismiss_stale_reviews_on_push": false,
+				"require_code_owner_review": false,
+				"require_last_push_approval": false,
+				"required_review_thread_resolution": true,
+				"allowed_merge_methods": ["merge", "squash", "rebase"]
+			}
+		},
+		{
+			"type": "required_status_checks",
+			"parameters": {
+				"strict_required_status_checks_policy": false,
+				"do_not_enforce_on_create": false,
+				"required_status_checks": [
+					{
+						"context": "test (ubuntu-24.04, 1.3.14)",
+						"integration_id": 15368
+					},
+					{
+						"context": "test (macos-latest, 1.3.14)",
+						"integration_id": 15368
+					},
+					{
+						"context": "test (windows-latest, 1.3.14)",
+						"integration_id": 15368
+					},
+					{
+						"context": "Parity (W3C facade)",
+						"integration_id": 15368
+					},
+					{
+						"context": "WASM backend + Chromium interop",
+						"integration_id": 15368
+					},
+					{
+						"context": "Seeded UDP fault matrix (Chromium)",
+						"integration_id": 15368
+					},
+					{
+						"context": "Load and stress campaigns",
+						"integration_id": 15368
+					},
+					{
+						"context": "soak",
+						"integration_id": 15368
+					},
+					{
+						"context": "Collect matrix release evidence",
+						"integration_id": 15368
+					},
+					{
+						"context": "coverage",
+						"integration_id": 15368
+					},
+					{
+						"context": "trivy-fs",
+						"integration_id": 15368
+					},
+					{
+						"context": "trivy-deps",
+						"integration_id": 15368
+					},
+					{
+						"context": "Analyze (javascript-typescript)",
+						"integration_id": 15368
+					},
+					{
+						"context": "Analyze (rust)",
+						"integration_id": 15368
+					}
+				]
+			}
+		}
+	]
+}
