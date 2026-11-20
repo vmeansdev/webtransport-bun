@@ -17,8 +17,16 @@ const HEALTH_PORT = 4436;
 // Command channel, mirroring addon-server.ts so both backends get the same
 // Chromium close/reset coverage. Datagrams that are not commands are echoed.
 const CLOSE_SIGNAL = "__WT_CLOSE_4001__";
-/** `__WT_RESET_<code>__` — open a uni stream to the client and reset it with `code`. */
+/** `__WT_RESET_<code>__` — open a uni stream to the client, write one byte, and arm a reset with `code`. */
 const RESET_SIGNAL = /^__WT_RESET_(\d+)__$/;
+// The reset waits for __WT_RESET_FIRE__, which the client sends once it holds
+// the stream. Chromium drops a RESET_STREAM that reaches Blink before the
+// stream's accept reply (WebTransport::OnReceivedResetStream returns early when
+// the id is not in incoming_stream_map_, unlike OnIncomingStreamClosed, which
+// buffers that race); the two arrive on different Mojo pipes, so resetting
+// right after opening the stream intermittently loses the reset and the
+// client's read hangs.
+const RESET_FIRE_SIGNAL = "__WT_RESET_FIRE__";
 
 const pkgPath = fileURLToPath(
 	new URL("../../crates/wasm/pkg/webtransport_wasm.js", import.meta.url),
@@ -41,6 +49,7 @@ const { manager, certHashBase64 } = await serveOverUdp(
 		validityDays: 14,
 		onSession: (session) => {
 			const decoder = new TextDecoder();
+			let armedReset: Promise<() => void> | undefined;
 			// Datagram echo, minus the command channel.
 			session.onDatagram((d) => {
 				const text = decoder.decode(d);
@@ -51,10 +60,16 @@ const { manager, certHashBase64 } = await serveOverUdp(
 				const reset = RESET_SIGNAL.exec(text);
 				if (reset) {
 					const out = session.createUnidirectionalStream();
-					out
+					const code = Number(reset[1]);
+					armedReset = out
 						.writeAll(new Uint8Array([0x01]))
-						.then(() => out.reset(Number(reset[1])))
-						.catch(() => {});
+						.then(() => () => out.reset(code));
+					armedReset.catch(() => {});
+					return;
+				}
+				if (text === RESET_FIRE_SIGNAL) {
+					armedReset?.then((fire) => fire()).catch(() => {});
+					armedReset = undefined;
 					return;
 				}
 				session.sendDatagram(d);

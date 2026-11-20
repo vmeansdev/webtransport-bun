@@ -28,8 +28,16 @@ const HEALTH_PORT = resolveInteropHealthPort();
 const IDLE_TIMEOUT_MS = Number(process.env.WT_IDLE_TIMEOUT_MS ?? "60000");
 const WAIT_IDLE_TIMEOUT_MS = IDLE_TIMEOUT_MS + 5_000;
 const CLOSE_SIGNAL = "__WT_CLOSE_4001__";
-/** `__WT_RESET_<code>__` — open a uni stream to the client and reset it with `code`. */
+/** `__WT_RESET_<code>__` — open a uni stream to the client, write one byte, and arm a reset with `code`. */
 const RESET_SIGNAL = /^__WT_RESET_(\d+)__$/;
+// The reset waits for __WT_RESET_FIRE__, which the client sends once it holds
+// the stream. Chromium drops a RESET_STREAM that reaches Blink before the
+// stream's accept reply (WebTransport::OnReceivedResetStream returns early when
+// the id is not in incoming_stream_map_, unlike OnIncomingStreamClosed, which
+// buffers that race); the two arrive on different Mojo pipes, so resetting
+// right after opening the stream intermittently loses the reset and the
+// client's read hangs.
+const RESET_FIRE_SIGNAL = "__WT_RESET_FIRE__";
 const MAX_CLOSE_EVENTS = 200;
 
 type CloseEvent = {
@@ -207,6 +215,7 @@ const wtServer = createServer({
 		// Datagram echo
 		(async () => {
 			const decoder = new TextDecoder();
+			let armedReset: (() => void) | undefined;
 			await consumeIterable(
 				session.incomingDatagrams(),
 				activity,
@@ -222,7 +231,12 @@ const wtServer = createServer({
 						const code = Number(reset[1]);
 						const uni = await session.createUnidirectionalStream();
 						uni.write(new Uint8Array([0x01]));
-						(uni as unknown as Resettable)[WT_RESET](code);
+						armedReset = () => (uni as unknown as Resettable)[WT_RESET](code);
+						return;
+					}
+					if (text === RESET_FIRE_SIGNAL) {
+						armedReset?.();
+						armedReset = undefined;
 						return;
 					}
 					await session.sendDatagram(d);

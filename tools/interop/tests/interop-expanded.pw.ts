@@ -449,7 +449,6 @@ test.describe("P3.3 interop expansion", () => {
 				const incoming = wt.incomingUnidirectionalStreams.getReader();
 				const w = wt.datagrams.writable.getWriter();
 				await w.write(new TextEncoder().encode(`__WT_RESET_${code}__`));
-				w.releaseLock();
 
 				const { value: stream } = await readWithTimeout(
 					incoming,
@@ -457,6 +456,10 @@ test.describe("P3.3 interop expansion", () => {
 					"reset code incoming uni",
 				);
 				if (!stream) return { errorName: null, streamErrorCode: null };
+				// Chromium only delivers a reset for a stream it has already handed to
+				// script, so ask the server to fire it now (see the harness).
+				await w.write(new TextEncoder().encode("__WT_RESET_FIRE__"));
+				w.releaseLock();
 
 				const reader = (stream as ReadableStream<Uint8Array>).getReader();
 				try {
