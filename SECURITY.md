@@ -16,8 +16,9 @@ Canonical release truth: `docs/release-status.json`. This document defines the s
 - TLS verification enabled by default for client.
 - `insecureSkipVerify` requires explicit `tls.insecureSkipVerify: true`; emits warning log when used. Dev only — never use in production.
 - Native diagnostics are redacted by default (log payload/message/session metadata and panic details).
-  Use `createServer({ debug: true, ... })` only in trusted dev/debug environments to opt in to richer diagnostics.
-  Sensitive identifiers (session/peer metadata) remain redacted by design.
+  `createServer({ debug: true, ... })` turns redaction off: log events then carry the full
+  message plus `sessionId`, `peerIp` and `peerPort`. Use it only in trusted dev/debug
+  environments, and treat its logs as containing client IP addresses.
 2. Bounded resources
 - All buffering is bounded and accounted for.
 - There is always a cap that prevents unbounded memory growth.
@@ -79,8 +80,26 @@ Canonical release truth: `docs/release-status.json`. This document defines the s
 ## Environment variables affecting security diagnostics
 - `WEBTRANSPORT_LOG_EXPECTED_CHANNEL_CLOSES=1`: enables logging of expected (non-error) channel close events. Useful for debugging teardown ordering, but may produce noisy logs in production. Does not affect security enforcement.
 - `WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN=1`: suppresses the warning log emitted when `insecureSkipVerify` is used. Should only be set in CI/test environments.
-- `WEBTRANSPORT_SUPPRESS_LOG_CALLBACK_WARN=1`: suppresses the one-time warning when a log callback is not provided. Does not affect security enforcement.
+- `WEBTRANSPORT_SUPPRESS_LOG_CALLBACK_WARN=1`: suppresses the `log callback failed` warning printed when your `log` callback throws. Does not affect security enforcement.
 These variables control diagnostic verbosity only; they do not bypass rate limits, TLS verification, or resource caps.
+
+## Native 0-RTT / early data (anti-replay)
+
+Off by default on both sides. A server opts in with `createServer({ enable0Rtt: true })`
+and a client with `connect(url, { enable0Rtt: true })` (incompatible with
+`allowPooling`). A resuming client's CONNECT can then arrive as TLS early data, which an
+attacker who captured it can replay.
+
+- **Session delivery is deferred by default.** A 0-RTT session reaches `onSession` only
+  once the handshake is confirmed and the request is no longer replayable.
+  `allowEarlySession: true` delivers it earlier; set it only when everything `onSession`
+  does before `session.handshakeConfirmed` is true is strictly idempotent, and gate side
+  effects on that flag.
+- **Visibility.** Sessions report `has0Rtt` (early data was used), `accepted0Rtt` and
+  `handshakeConfirmed`.
+- **Tickets are per process.** Resumption state lives in memory; a restart or a request
+  landing on another instance falls back to a full handshake. `exportTicketVault` /
+  `importTicketVault` move tickets between client identities inside one process only.
 
 ## WASM 0-RTT / early data (anti-replay)
 

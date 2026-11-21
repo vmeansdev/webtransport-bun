@@ -15,7 +15,9 @@ Canonical release truth: `docs/release-status.json`. This page describes operati
 ## Recommended defaults
 - Keep maxSessions conservative initially (e.g., 200–500) until tested.
 - Keep per-session queued bytes low (<= 2 MiB).
-- Prefer backpressure over drops; enable drop policy only for datagrams if you accept loss.
+- Prefer backpressure over drops. Streams always apply backpressure; datagrams are
+  inherently lossy, and a full receive queue drops them (`E_QUEUE_FULL`, counted in
+  `datagramsDropped`) rather than stalling the session.
 
 ## WASM footguns (multi-session / 0-RTT / QPACK)
 
@@ -45,9 +47,10 @@ Canonical release truth: `docs/release-status.json`. This page describes operati
 ## Enforced caps
 - Datagram size: maxDatagramSize (must respect negotiated QUIC max)
 - Stream opens: maxStreamsPerSessionBidi, maxStreamsPerSessionUni, maxStreamsGlobal
-- WT sessions per QUIC connection: `wtMaxSessions` / `SETTINGS_WT_MAX_SESSIONS`
-  (pending client CONNECTs and server unlatched admitted CONNECTs count toward
-  the admission occupied set; see OPERATIONS CONNECT admission note)
+- WT sessions per QUIC connection (WASM backend only): `wtMaxSessions` /
+  `SETTINGS_WT_MAX_SESSIONS` (pending client CONNECTs and server unlatched
+  admitted CONNECTs count toward the admission occupied set; see the WASM
+  footguns section above). The native backend has no such option.
 
 ## Metrics to monitor
 - sessionsActive, handshakesInFlight, streamsActive
@@ -59,7 +62,11 @@ Canonical release truth: `docs/release-status.json`. This page describes operati
 
 See docs/METRICS.md for full metrics reference and structured log format.
 
-## Prometheus / OTel export
+## Prometheus export
+
+There is no built-in OpenTelemetry exporter. To feed OTel, scrape the Prometheus
+endpoint below with the collector's Prometheus receiver, or poll
+`metricsSnapshot()` and record the fields as OTel gauges/counters yourself.
 
 Use `metricsToPrometheus(snapshot)` to convert `server.metricsSnapshot()` to Prometheus text format. Wire to an HTTP endpoint:
 
@@ -256,13 +263,15 @@ startup on them.
 ## Diagnostics modes
 
 - **Default (recommended for production):** native diagnostics are redacted/minimal.
-- **Debug mode:** set `createServer({ debug: true, ... })` to enable richer native diagnostics.
-  Sensitive identifiers remain redacted; use only in trusted environments.
+- **Debug mode:** set `createServer({ debug: true, ... })` to turn native redaction off:
+  full messages plus `sessionId`, `peerIp` and `peerPort` in log events. Use only in
+  trusted environments.
 
 ## Tuning guide
 
 - **Low latency**: reduce maxQueuedBytesPerStream, use smaller datagrams, lower backpressureTimeoutMs
-- **Throughput**: increase per-session limits, larger highWaterMark on streams
+- **Throughput**: raise `maxQueuedBytesPerStream` / `maxQueuedBytesPerSession` (and the
+  QUIC windows that derive from them, see "Flow-control windows"), write larger chunks
 - **queuedBytesGlobal rising**: slow consumers or too many concurrent streams; reduce limits or scale out
 
 ### Flow-control windows
@@ -473,8 +482,12 @@ The rules that follow from the measurements, in order of leverage:
 1. **Keep the reader loop below ~80 % of a core.** On the reference hardware
    (dedicated Intel vCPU), 100 tunnels of the shape above cost 0.9–1.15
    cores of loop time — plan roughly **70 such streams per JS process** and
-   shard processes beyond that (`reusePort` + `quicLb` +
-   `reusePortSteering` is the supported multi-process shape). Watch the
+   shard processes beyond that. The simplest multi-process layout gives
+   each process its own port (or address) and hands clients the exact URL
+   through DNS or your own rendezvous. Sharing one port takes `reusePort` +
+   `quicLb` + `reusePortSteering` with the CID-steering eBPF program
+   (Linux, [`quic-lb.md`](quic-lb.md)); `reusePort` alone hashes the
+   4-tuple and breaks sessions on a client address change. Watch the
    loop's own utilization, not host CPU: the host can be 90 % idle while the
    one loop that matters is critical.
 2. **Drain latency-critical streams with a native sink

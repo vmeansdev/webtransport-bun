@@ -131,12 +131,15 @@ createServer({
 
 Security default:
 - Native log payloads are **redacted by default** (`msg` may be sanitized/omitted).
-- Sensitive identifiers (`sessionId`, `peerIp`, `peerPort`) are omitted by default and in debug mode.
+- Sensitive identifiers (`sessionId`, `peerIp`, `peerPort`) are omitted by default.
+  Debug mode (`debug: true`) includes them.
 
 ## Debug mode
 
-Set `debug: true` and provide a log hook that emits all levels. This opts in to richer
-native diagnostics for local debugging, while keeping sensitive identifiers redacted:
+Set `debug: true` and provide a log hook that emits all levels. This turns native
+redaction off for local debugging: messages are logged in full and events carry
+`sessionId`, `peerIp` and `peerPort`. Don't enable it where logs leave a trusted
+environment:
 
 ```ts
 createServer({
