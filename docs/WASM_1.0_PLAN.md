@@ -3,10 +3,10 @@
 Current release truth lives in `docs/release-status.json`. This document is the
 working plan for the `/wasm` candidate under a **coupled** package 1.0.0.
 
-Package version: latest published `1.0.0-rc.1` (committed base `1.0.0`;
-published versions are stamped from release tags).
-
-Worktree label: `feat/wasm-1.0`.
+Package version: committed base `1.0.0`; published versions are stamped from
+release tags and channel builds. npm `latest` is still the pre-1.0 `0.3.0`
+(no `/wasm` entrypoint); `/wasm` is installable only from the `canary` and
+`nightly` dist-tags.
 
 ## Coupled GA definition
 
@@ -29,8 +29,10 @@ Engine strategy: keep sans-IO `quinn-proto` + hand-rolled H3/WT in
 
 Honest-release phases **B2–B6 and C0** are landed. C1/C2 and D4 (promote
 script) are landed. Dual-surface production plan Phase 0 freezes this contract.
-Remaining work: protocol expansion (QPACK / multi-session / 0-RTT), facade
-parity, and shared evidence binding.
+The protocol expansion (dynamic QPACK, multi-session, 0-RTT) and facade parity
+are implemented. Remaining work is evidence: every release claim in
+`docs/release-status.json` is pending until it is re-proven at a new frozen
+candidate.
 
 ## Task status
 
@@ -41,8 +43,8 @@ parity, and shared evidence binding.
 | 6a | superseded by coupled protocol bar | `docs/WASM_PROTOCOL_SCOPE.md` |
 | 6b | landed (impl) | `crates/wasm/src/cert.rs`; `WasmCertRotator`; COMPATIBILITY |
 | 6c | harness landed; evidence pending deepen | `tools/interop/*`; IWA |
-| Protocol bar | in progress | `h3.rs`, `endpoint.rs`, TLS early-data |
-| Facade parity | **passed** on the rebound candidate | all 9 `parity-*.test.ts` via `webtransport-bun/portable` (native 67/0; wasm 64 pass/3 skip/0 fail) — evidence was bound to a pre-rewrite candidate and is archived outside the repo; to be regenerated at the next candidate |
+| Protocol bar | implemented; release claims **pending** | `h3.rs`, `endpoint.rs`, TLS early-data |
+| Facade parity | implemented; release claim `wasm-facade-parity` **pending** | all 9 `parity-*.test.ts` run through `@webtransport-bun/webtransport/portable` on both backends (`bun run test:parity`, and `WEBTRANSPORT_PARITY_BACKEND=wasm WEBTRANSPORT_REQUIRE_WASM=1 bun run test:parity` after `bun run build:wasm`; 74 pass / 0 fail on each as of 2026-11-22). The earlier pass was bound to a pre-rewrite candidate and is archived outside the repo; it must be regenerated at the next candidate |
 | 13-15 | tooling landed; **evidence pending** | coverage/fuzz/soak workflows |
 | 17 | pending final closure | `release-status.json`; promote tool |
 

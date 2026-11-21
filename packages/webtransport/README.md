@@ -9,11 +9,16 @@ the current candidate surface, not a stable/GA promise.
 ## Install
 
 ```bash
-bun add @webtransport-bun/webtransport
-npm i @webtransport-bun/webtransport
-pnpm add @webtransport-bun/webtransport
-yarn add @webtransport-bun/webtransport
+bun add @webtransport-bun/webtransport@canary
+npm i @webtransport-bun/webtransport@canary
+pnpm add @webtransport-bun/webtransport@canary
+yarn add @webtransport-bun/webtransport@canary
 ```
+
+This README documents the 1.0 surface, which is published only under the
+`canary` and `nightly` dist-tags. npm `latest` is still `0.3.0`, an older
+pre-1.0 API with the root entrypoint only (no `/wasm`, `/portable` or
+`/sink-reader`); no 1.0 release candidate is on npm and no 1.0 date is set.
 
 ## Requirements
 

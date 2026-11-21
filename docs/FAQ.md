@@ -63,8 +63,12 @@ no BigInt interop or JSON-serialization surprises.
 
 ## Is this production-ready?
 
-Not yet. The latest published package is `1.0.0-rc.1`, and both the native and WASM
-surfaces remain release candidates. Local implementation gates have useful
+Not yet. On npm, `latest` is still the pre-1.0 `0.3.0` (root entrypoint
+only); the 1.0 surface is installable only as
+`@webtransport-bun/webtransport@canary` or `@nightly`. No 1.0 release
+candidate is on npm (the `v1.0.0-rc.N` releases are git tags and GitHub
+pre-releases only), no 1.0 date is set, and both the native and WASM surfaces
+remain candidates. Local implementation gates have useful
 coverage, but the immutable multi-platform/runtime matrix, release coverage and
 fuzz evidence, >=10k diverse-source scale proof, 24-hour and 72-hour soaks, and
 the zero-P0-P4 independent-review/no-change confirmation are still required.

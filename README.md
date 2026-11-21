@@ -106,10 +106,17 @@ Detailed migration playbook:
 - AI-agent entrypoint: `llms.txt`
 
 ## Status
-- Native surface is a release candidate: `1.0.0-rc.1`.
-- Version: `1.0.0-rc.1` (latest published release candidate; release tags
-  stamp the published version over the committed base `1.0.0`). The canonical
-  release status lives in
+- npm `latest` is `0.3.0`, an older pre-1.0 API that exports only the root
+  (native) entrypoint: a plain
+  `bun add @webtransport-bun/webtransport` installs it, and `/wasm`,
+  `/portable` and `/sink-reader` do not exist there.
+- The 1.0 surface this README documents is published only under the `canary`
+  and `nightly` dist-tags (`bun add @webtransport-bun/webtransport@canary`).
+  No 1.0 release candidate is on npm: the `v1.0.0-rc.N` releases (up to
+  `v1.0.0-rc.5`) exist only as git tags and GitHub pre-releases. No 1.0
+  release date is set.
+- The committed package version is the base `1.0.0`; the release and channel
+  workflows stamp the published version. The canonical release status lives in
   `docs/release-status.json`; the native root entrypoint and `/wasm` are
   candidate surfaces, not stable/GA.
 - Configured release targets: Bun (`>= 1.3.14`), Node, and Deno. Candidate support remains unclaimed until the matching entries in
@@ -136,13 +143,17 @@ See `docs/COMPATIBILITY.md` for policy details.
 
 ### From package
 ```bash
-bun add @webtransport-bun/webtransport
-npm i @webtransport-bun/webtransport
-pnpm add @webtransport-bun/webtransport
-yarn add @webtransport-bun/webtransport
+bun add @webtransport-bun/webtransport@canary
+npm i @webtransport-bun/webtransport@canary
+pnpm add @webtransport-bun/webtransport@canary
+yarn add @webtransport-bun/webtransport@canary
 ```
 
-The npm package contains:
+`@canary` (and `@nightly`) carry the 1.0 surface this README documents. Without
+a tag you get npm `latest`, which is `0.3.0`: an older API with the root
+entrypoint only (see [Status](#status)).
+
+The 1.0 npm package contains:
 - `dist/` compiled JS + TypeScript declarations for the four entrypoints:
   `@webtransport-bun/webtransport` (native), `/wasm`, `/portable` and
   `/sink-reader`
@@ -154,13 +165,16 @@ Note: GitHub source zip/tar downloads are source snapshots and may not include g
 
 ### From local workspace (development)
 
-The package's entrypoints point at compiled `dist/`, and the addon is looked
-up in `prebuilds/` next to it, so build both before installing from a
-checkout:
+The package's entrypoints point at compiled `dist/`, the addon is looked up in
+`prebuilds/` next to it, and `/wasm` loads the engine from `wasm-dist/`, so
+build all three before installing from a checkout (the wasm step needs the
+Rust and `wasm-bindgen` toolchain described in `crates/wasm/build-wasm.sh`;
+skip it if you only use the native root entrypoint):
 
 ```bash
 bun install
 bun run build:native                       # addon -> crates/native/*.node
+bun run build:wasm:dist                    # wasm engine -> packages/webtransport/wasm-dist
 bun run --cwd packages/webtransport build  # TypeScript -> packages/webtransport/dist
 mkdir -p packages/webtransport/prebuilds
 cp crates/native/webtransport-native.*.node packages/webtransport/prebuilds/
@@ -171,6 +185,10 @@ Then, from your project:
 ```bash
 bun add file:/path/to/webtransport-bun/packages/webtransport
 ```
+
+`bun add file:` copies the package into your `node_modules` instead of
+linking it: after rebuilding the checkout, run `bun install` in your project
+again to refresh the copy with the new `dist/`, `prebuilds/` and `wasm-dist/`.
 
 Set `WEBTRANSPORT_NATIVE_ADDON_PATH=/path/to/webtransport-native.<platform>.node`
 to load an addon from anywhere else.
@@ -326,10 +344,7 @@ sendOrder, durable tickets, live TLS, metrics — IWA async `createServer` on
 
 ### 1) Install package
 ```bash
-bun add @webtransport-bun/webtransport
-npm i @webtransport-bun/webtransport
-pnpm add @webtransport-bun/webtransport
-yarn add @webtransport-bun/webtransport
+bun add @webtransport-bun/webtransport@canary   # 1.0 surface; plain `latest` is 0.3.0
 ```
 
 ### 2) Start a server
