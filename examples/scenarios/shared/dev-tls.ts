@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { X509Certificate } from "node:crypto";
 import {
 	existsSync,
 	mkdirSync,
@@ -11,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const DEV_CERT_DIR = resolve(import.meta.dir, "../.certs");
+const RENEW_WITHIN_MS = 24 * 60 * 60 * 1000;
 
 export type ScenarioTls = { certPem: string; keyPem: string; caPem: string };
 
@@ -22,6 +24,8 @@ export type ScenarioTls = { certPem: string; keyPem: string; caPem: string };
  * Otherwise a throwaway CA and an ECDSA P-256 leaf for localhost, 127.0.0.1
  * and ::1 are generated with openssl and kept in examples/scenarios/.certs/
  * (gitignored), so a server and a client started separately share one CA.
+ * They are valid for 14 days and regenerated once the leaf has less than a
+ * day left.
  * Clients trust that CA through `caPem`: certificate verification stays on.
  */
 export function scenarioTls(): ScenarioTls {
@@ -38,7 +42,7 @@ export function scenarioTls(): ScenarioTls {
 		join(DEV_CERT_DIR, f),
 	);
 	const [certPath, keyPath, caPath] = files as [string, string, string];
-	if (!files.every((f) => existsSync(f))) {
+	if (!files.every((f) => existsSync(f)) || expiresSoon(certPath)) {
 		const tls = generateDevTls();
 		mkdirSync(DEV_CERT_DIR, { recursive: true });
 		writeFileSync(certPath, tls.certPem);
@@ -51,6 +55,15 @@ export function scenarioTls(): ScenarioTls {
 		keyPem: readFileSync(keyPath, "utf8"),
 		caPem: readFileSync(caPath, "utf8"),
 	};
+}
+
+function expiresSoon(certPath: string): boolean {
+	try {
+		const { validTo } = new X509Certificate(readFileSync(certPath));
+		return Date.parse(validTo) - Date.now() < RENEW_WITHIN_MS;
+	} catch {
+		return true;
+	}
 }
 
 export function generateDevTls(): ScenarioTls {
