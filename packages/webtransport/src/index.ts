@@ -299,6 +299,17 @@ function extractMessageErrorCode(msg: string): ErrorCode | undefined {
 	return startCode ?? causal ?? tokens[0];
 }
 
+/** Message for a connect whose session closed before JavaScript took it. */
+function connectRaceMessage(close: CloseInfo | undefined): string {
+	const detail = close
+		? `session closed during connect (code ${close.code ?? "none"}, reason ${JSON.stringify(close.reason ?? "")})`
+		: "session closed during connect";
+	const reasonCode = close?.reason
+		? extractMessageErrorCode(close.reason)
+		: undefined;
+	return `${reasonCode ?? E_SESSION_CLOSED}: ${detail}`;
+}
+
 function toWebTransportError(
 	err: unknown,
 	strictW3CErrors?: boolean,
@@ -3297,6 +3308,9 @@ function connectWithNative(
 ): Promise<ClientSession> {
 	return new Promise<ClientSession>((resolve, reject) => {
 		const closedResolvers = new Map<string, (info: CloseInfo) => void>();
+		// Closes that arrive before the session is handed to JavaScript, so a
+		// connect that loses that race can still report why it closed.
+		const earlyCloses = new Map<string, CloseInfo>();
 		let settled = false;
 		let timeoutHandle: any;
 
@@ -3321,6 +3335,7 @@ function connectWithNative(
 					closedResolvers.delete(evt.id);
 					if (resolveClosed)
 						resolveClosed({ code: evt.code, reason: evt.reason });
+					else earlyCloses.set(evt.id, { code: evt.code, reason: evt.reason });
 				}
 			}
 		};
@@ -3351,12 +3366,24 @@ function connectWithNative(
 					return;
 				}
 				if (handleId == null) {
-					settleReject(new Error("connect succeeded but no handle id"));
+					settleReject(
+						toWebTransportError(
+							new Error("E_INTERNAL: connect succeeded but no handle id"),
+							strictW3CErrors,
+						),
+					);
 					return;
 				}
 				const handle = native.takeClientSession(handleId);
 				if (!handle) {
-					settleReject(new Error("connect: handle not found in registry"));
+					// The session closed before JavaScript could take it, e.g. a
+					// server at maxSessions closing it with E_LIMIT_EXCEEDED.
+					settleReject(
+						toWebTransportError(
+							new Error(connectRaceMessage(earlyCloses.get(handleId))),
+							strictW3CErrors,
+						),
+					);
 					return;
 				}
 				if (settled) {
