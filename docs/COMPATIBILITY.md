@@ -17,7 +17,7 @@ commit-bound passing evidence.
 |---------|-------|----------------|-----------|
 | macOS   | arm64 | darwin-arm64   | candidate; evidence pending |
 | macOS   | x64   | darwin-x64     | candidate; evidence pending |
-| Linux   | x64   | linux-x64      | candidate; evidence pending |
+| Linux   | x64   | linux-x64-gnu  | candidate; evidence pending (glibc; no musl build) |
 | Windows | x64   | win32-x64-msvc | candidate; evidence pending |
 
 ## Node-API

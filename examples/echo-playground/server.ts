@@ -67,10 +67,18 @@ const wtServer = createServer({
 			try {
 				for await (const duplex of session.incomingBidirectionalStreams) {
 					void (async () => {
-						const chunks = await readLimitedChunks(
-							duplex.readable,
-							EXAMPLE_MAX_STREAM_BODY_BYTES,
-						);
+						let chunks: Uint8Array[];
+						try {
+							chunks = await readLimitedChunks(
+								duplex.readable,
+								EXAMPLE_MAX_STREAM_BODY_BYTES,
+							);
+						} catch (err) {
+							// Reset our half too, or a client waiting for the echo
+							// hangs until the session closes.
+							await duplex.writable.abort(err).catch(() => {});
+							throw err;
+						}
 						const writer = duplex.writable.getWriter();
 						if (chunks.length > 0) {
 							await writer.write(toBuffer(chunks));

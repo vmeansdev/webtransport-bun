@@ -181,7 +181,8 @@ export interface PortableServer {
  * import { createServer } from "@webtransport-bun/webtransport/portable";
  * const server = await createServer({
  *   port: 4433,
- *   tls: { allowSelfSigned: true },
+ *   // PEM works on both backends; `allowSelfSigned: true` is wasm-only.
+ *   tls: { certPem, keyPem },
  *   onSession: async (session) => {
  *     for await (const d of session.incomingDatagrams()) {
  *       await session.sendDatagram(d);

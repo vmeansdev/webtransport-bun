@@ -12,8 +12,8 @@ backend (`@webtransport-bun/webtransport/wasm`) over the Direct Sockets
 > 151's replacement `local-network` and `loopback-network` policies. The
 > scheduled/dispatch `iwa.yml` job proves the same signed bundle with both the
 > pinned Playwright Chromium and the current Chrome Beta channel.
-> packages and installs this exact app; a normal page load is not accepted as
-> release evidence.
+> `tools/interop/run-iwa.mjs` packages and installs this exact app; a normal
+> page load is not accepted as release evidence.
 
 ## What it shows
 
@@ -48,6 +48,9 @@ backend (`@webtransport-bun/webtransport/wasm`) over the Direct Sockets
    Chromium's `wbn` + `wbn-sign` npm tooling:
 
    ```bash
+   # Run from this example's directory (step 2 left you in packages/webtransport).
+   cd ../../examples/webtransport-wasm-iwa
+
    # Generate the Ed25519 signing key OUTSIDE the app directory. It defines
    # the app's identity/origin and must never be included in the web bundle.
    mkdir -p ../../.release-evidence/iwa

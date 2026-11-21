@@ -141,7 +141,14 @@ export type LimitsOptions = {
   backpressureTimeoutMs: number;
   handshakeTimeoutMs: number;
   idleTimeoutMs: number;
+  /** Keep-alive ping interval, clamped below idleTimeoutMs. Client default:
+   * idleTimeoutMs / 3; server: off unless set. 0 disables. */
+  keepAliveIntervalMs?: number;
 };
+// Server-only fields: maxSessions, maxHandshakesInFlight and maxStreamsGlobal
+// govern the server's admission; a client accepts them but has nothing to
+// apply them to. Both sides enforce the per-session stream caps, the queued-
+// byte budgets, maxDatagramSize and the timeouts.
 
 export type ServerOptions = {
   host?: string;          // IP literal only; "::" binds dual-stack; default: 0.0.0.0
@@ -150,11 +157,32 @@ export type ServerOptions = {
   limits?: Partial<LimitsOptions>;
   rateLimits?: Partial<RateLimitOptions>;
 
+  // Cubic ("default"), BBR ("throughput") or NewReno ("low-latency"), for all connections.
+  congestionControl?: "default" | "throughput" | "low-latency";
+  // Native 0-RTT. Off by default; see SECURITY.md "Native 0-RTT / early data".
+  enable0Rtt?: boolean;
+  // Deliver 0-RTT sessions to onSession before the handshake is confirmed
+  // (replayable). Off by default; no effect without enable0Rtt.
+  allowEarlySession?: boolean;
+  // SETTINGS_QPACK_MAX_TABLE_CAPACITY, 0..65536 bytes; default 0 (static table only).
+  qpackMaxTableCapacity?: number;
+  // Preset for a 4096-byte dynamic table; qpackMaxTableCapacity wins if both are set.
+  enableDynamicQpack?: boolean;
+  // Experimental (see "Experimental surfaces"): multi-process binds and CID routing.
+  reusePort?: boolean;
+  quicLb?: QuicLbOptions;
+  reusePortSteering?: { sockArrayPinPath: string; key: number; attachProgPinPath?: string };
+  // Experimental: native egress pacing for the paced mirror.
+  egressPacer?: EgressPacerOptions;
+
   // Called on each accepted session (must not block; long work should be async)
   onSession: (session: ServerSession) => void | Promise<void>;
 
   // Optional logging hook
   log?: (event: LogEvent) => void;
+  // Turns native log redaction off: full messages plus sessionId, peerIp and
+  // peerPort. Trusted environments only.
+  debug?: boolean;
 };
 
 export type LogEvent = {
@@ -168,6 +196,8 @@ export type LogEvent = {
 
 export interface WebTransportServer {
   readonly address: { host: string; port: number };
+  /** Effective congestion-control mode applied to all server connections. */
+  readonly congestionControl: "default" | "throughput" | "low-latency";
   /**
    * Hot-swap TLS leaf cert/key material in place.
    * Existing sessions stay open; only new handshakes observe the new certificate.
@@ -259,9 +289,34 @@ export type ClientOptions = {
   };
   limits?: Partial<LimitsOptions>;
   log?: (event: LogEvent) => void;
+  /** Pin the server leaf by SHA-256 (W3C semantics; cert validity <= 14 days). */
+  serverCertificateHashes?: Array<{ algorithm: "sha-256"; value: BufferSource }>;
+  congestionControl?: "default" | "throughput" | "low-latency";
+  /** Reuse one QUIC connection for compatible connects (see "Pooling Semantics"). */
+  allowPooling?: boolean;
+  /** Requires datagram support; participates in pool compatibility. */
+  requireUnreliable?: boolean;
+  /** Browser-style DOMException names instead of E_* codes (see "Error Model"). */
+  strictW3CErrors?: boolean;
+  /** Offer 0-RTT to servers this process has seen; incompatible with allowPooling. */
+  enable0Rtt?: boolean;
+  qpackMaxTableCapacity?: number;
+  enableDynamicQpack?: boolean;
 };
 
 export function connect(url: string, opts?: ClientOptions): Promise<ClientSession>;
+
+/** Move this process's in-memory 0-RTT tickets between client identities.
+ * Tokens are not durable across restarts. */
+export function exportTicketVault(opts?: ClientOptions, serverName?: string): string | null;
+export function importTicketVault(token: string, opts?: ClientOptions): boolean;
+
+/** Wrap a connect() session in the W3C-shaped facade. */
+export function toWebTransport(session: ClientSession): WebTransport;
+/** Pool counters (hits, misses, evictIdle, evictBroken) for allowPooling. */
+export function clientPoolMetricsSnapshot(): {
+  hits: number; misses: number; evictIdle: number; evictBroken: number;
+};
 ```
 
 ### Sessions (server + client)
@@ -282,10 +337,21 @@ export interface CommonSession {
   readonly id: string;
   readonly peer: { ip: string; port: number };
 
+  /** 0-RTT state. Without 0-RTT: has0Rtt and accepted0Rtt are false,
+   * handshakeConfirmed is true. */
+  readonly has0Rtt: boolean;
+  readonly accepted0Rtt: boolean;
+  readonly handshakeConfirmed: boolean;
+
   readonly ready: Promise<void>;
   readonly closed: Promise<CloseInfo>;
+  /** Resolves when the peer signals the session is going away
+   * (WT_DRAIN_SESSION or GOAWAY). The session stays usable. */
+  readonly draining: Promise<void>;
 
   close(info?: CloseInfo): void;
+  /** Send WT_DRAIN_SESSION: tell the peer this session ends soon, without ending it. */
+  drain(): void;
 
   // Datagrams
   sendDatagram(data: Uint8Array): Promise<void>;
@@ -303,6 +369,9 @@ export interface ServerSession extends CommonSession {
 
   createUnidirectionalStream(options?: { waitUntilAvailable?: boolean }): Promise<Writable>;
   readonly incomingUnidirectionalStreams: ReadableStream<WebTransportReceiveStream>;
+
+  /** Send GOAWAY on this session's connection; the peer sees `draining`. */
+  goAway(): void;
 
   // Metrics (per session)
   metricsSnapshot(): SessionMetricsSnapshot;
@@ -347,6 +416,13 @@ For browser-shaped facade streams, the control mapping is:
 - Symbol controls remain available for Node-first compatibility.
 
 ### Metrics
+
+The block below lists the core fields. `docs/METRICS.md` is the full
+reference (paced-mirror, native send-path, sink and close-cause counters
+included), and `metricsToPrometheus(snapshot, opts?)` renders a snapshot in
+Prometheus text format with the `METRICS_PREFIX` name prefix
+(`webtransport_`, overridable via `WEBTRANSPORT_METRICS_PREFIX`).
+`DEFAULT_LIMITS` and `DEFAULT_RATE_LIMITS` export the defaults.
 
 ```ts
 export type MetricsSnapshot = {
@@ -888,7 +964,7 @@ behavior under gates that have not passed.
   `E_SINK_FRAME_FAULT`, `E_SINK_INTERNAL`, `E_SINK_LIMIT`, `E_SINK_OVERSIZED`,
   `E_SINK_READ_ACTIVE`, `E_SINK_STALLED`). Those are **experimental** with the
   sink and may change in a 1.x minor.
-- **Metrics fields**: ServerMetricsSnapshot and SessionMetricsSnapshot field names are stable; new fields may be added in minor releases.
+- **Metrics fields**: `MetricsSnapshot` and `SessionMetricsSnapshot` field names are stable; new fields may be added in minor releases.
 - **`__TESTING__` is explicitly unstable**: the root module's `__TESTING__`
   export is a bag of internal test seams (addon loading, session/stream
   construction hooks). It is not part of this spec, is excluded from the frozen
