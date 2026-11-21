@@ -341,6 +341,14 @@ unstable `__TESTING__.serverInternals(server)` accessor (`docs/SPEC.md`,
   `E_*` prefix and `.code` are unchanged). A native sink's `reset` record also
   carried the on-wire HTTP/3 value (clamped to `4294967295`) instead of the
   peer's code; it now carries the code.
+- The wasm manager's `metricsSnapshot()` reported 0 for `rateLimitedCount`,
+  `limitExceededCount`, `sniCertSelections`, `defaultCertSelections` and
+  `unknownSniRejectedCount`: it read keys the governor snapshot does not have,
+  and the wasm governor counted no cap refusals at all. `rateLimitedCount` is
+  now the sum of the handshake, stream-open and datagram-ingress rate-limit
+  counters, `limitExceededCount` counts refusals at `maxHandshakesInFlight`,
+  `maxSessions` and the stream caps (also exposed as the governor snapshot's
+  `limitExceededCount`), and the SNI counters come from the TLS resolver.
 - Bidirectional streams no longer stall when both directions are busy. One
   byte budget served both directions, so writes queued faster than the peer
   drained them filled it, the receive side could not reserve, and both peers

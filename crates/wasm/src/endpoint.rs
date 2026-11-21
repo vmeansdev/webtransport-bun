@@ -1664,6 +1664,7 @@ impl WtEndpoint {
             "rateLimitedStreamOpenCount": rate_limit_snapshot.rate_limited_stream_open_count,
             "rateLimitedDatagramIngressCount": rate_limit_snapshot.rate_limited_datagram_ingress_count,
             "rateLimitedByPrefixCount": rate_limit_snapshot.rate_limited_by_prefix_count,
+            "limitExceededCount": snapshot.limit_exceeded_count,
             "handshakeTimeoutMs": self.handshake_timeout_ms,
             "idleTimeoutMs": self.idle_timeout_ms,
             "wtSessionsActive": wt_sessions_active,

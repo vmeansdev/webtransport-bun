@@ -99,6 +99,13 @@ In addition to the shared governor fields (`sessionsActive`, queued bytes, rate-
 |-------|------|-------------|
 | wtSessionsActive | number | Live primary/extra WT sessions + client pending CONNECTs (excludes server unlatched admitted CONNECTs that still count toward admission occupied) |
 | sessionClosedCount | number | Cumulative `SessionClosed` events (extra-session / timed-out CONNECT) |
+| limitExceededCount | number | Admissions refused at `maxHandshakesInFlight`, `maxSessions`, `maxStreamsGlobal` or a per-session stream cap |
+
+The manager's `metricsSnapshot()` maps these onto the shared fields:
+`rateLimitedCount` is `rateLimitedHandshakeCount + rateLimitedStreamOpenCount +
+rateLimitedDatagramIngressCount` (`rateLimitedByPrefixCount` is a subset of
+those, not added again), `limitExceededCount` is the field above, and the SNI
+counters come from the endpoint's TLS snapshot.
 
 Per-connection `has0Rtt` / `accepted0Rtt` remain on connection getters (not rolled into this snapshot).
 

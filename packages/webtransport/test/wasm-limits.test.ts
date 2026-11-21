@@ -1948,4 +1948,104 @@ describe("wasm resource governor (Task 6 RED)", () => {
 		},
 		10_000,
 	);
+
+	// metricsSnapshot() read `rateLimitedCount`, `limitExceededCount` and the
+	// SNI counters from the governor snapshot, which has none of those keys,
+	// so every one of them read 0 whatever the endpoint refused or served.
+	test.skipIf(!wasmAvailable)(
+		"metricsSnapshot carries the governor's refusal counters and the TLS counters",
+		async () => {
+			const relay = new InMemoryRelay();
+			const server = WasmTransportManager.create(
+				wasm,
+				relay.endpoint({ address: "127.0.0.1", port: 4433 }),
+				true,
+				"127.0.0.1:4433",
+				"127.0.0.1:5544",
+				() => {},
+				normalizeWasmEndpointOptions({
+					limits: { maxSessions: 1 },
+					rateLimits: {
+						handshakesPerSec: 1,
+						handshakesBurst: 1,
+						streamOpensPerSec: 1,
+						streamOpensBurst: 1,
+					},
+				}),
+			);
+			const client = (address: string, port: number) =>
+				WasmTransportManager.create(
+					wasm,
+					relay.endpoint({ address, port }),
+					false,
+					`${address}:${port}`,
+					"127.0.0.1:4433",
+					null,
+					normalizeWasmEndpointOptions({}),
+				);
+			const within = <T>(promise: Promise<T>, label: string) =>
+				Promise.race([
+					promise,
+					Bun.sleep(3_000).then(() => {
+						throw new Error(`timeout: ${label}`);
+					}),
+				]);
+			const admitted = client("127.0.0.1", 5544);
+			// Same IP as `admitted`: refused by the per-IP handshake bucket.
+			const sameIp = client("127.0.0.1", 5545);
+			// Its own bucket, so it reaches admission and is refused at maxSessions.
+			const overCap = client("127.0.0.2", 5544);
+			try {
+				const session = admitted.connectClient("localhost");
+				await within(session.ready, "admitted session ready");
+
+				// Burst 1: the second stream open is rate limited.
+				session.createBidirectionalStream().write(Uint8Array.of(1));
+				session.createBidirectionalStream().write(Uint8Array.of(2));
+
+				const refusedByRate = sameIp.connectClient("localhost");
+				const refusedByCap = overCap.connectClient("localhost");
+				await within(
+					Promise.allSettled([refusedByRate.ready, refusedByCap.ready]),
+					"refused clients settle",
+				);
+
+				const deadline = Date.now() + 3_000;
+				let metrics = server.metricsSnapshot();
+				while (
+					(metrics.rateLimitedCount < 2 || metrics.limitExceededCount < 1) &&
+					Date.now() < deadline
+				) {
+					await Bun.sleep(10);
+					metrics = server.metricsSnapshot();
+				}
+				const governor = JSON.parse(server.endpoint.governorSnapshot()) as {
+					rateLimitedHandshakeCount: number;
+					rateLimitedStreamOpenCount: number;
+				};
+				expect(governor.rateLimitedHandshakeCount).toBe(1);
+				expect(governor.rateLimitedStreamOpenCount).toBe(1);
+				expect(metrics.rateLimitedCount).toBe(2);
+				expect(metrics.limitExceededCount).toBe(1);
+
+				const tls = JSON.parse(server.endpoint.tlsSnapshot()) as {
+					sniCertSelections: number;
+					defaultCertSelections: number;
+					unknownSniRejectedCount: number;
+				};
+				expect(tls.defaultCertSelections).toBeGreaterThan(0);
+				expect(metrics.defaultCertSelections).toBe(tls.defaultCertSelections);
+				expect(metrics.sniCertSelections).toBe(tls.sniCertSelections);
+				expect(metrics.unknownSniRejectedCount).toBe(
+					tls.unknownSniRejectedCount,
+				);
+			} finally {
+				admitted.close();
+				sameIp.close();
+				overCap.close();
+				server.close();
+			}
+		},
+		15_000,
+	);
 });

@@ -1191,6 +1191,17 @@ function sessionKey(conn: number, sessionId: bigint): string {
 /** Placeholder session id for a client connect before SessionEstablished. */
 const PENDING_SESSION_ID = -1n;
 
+/** A wasm JSON counter snapshot; a malformed or missing one reads as empty. */
+function parseCounterSnapshot(
+	read: () => string,
+): Record<string, number | undefined> {
+	try {
+		return JSON.parse(read()) as Record<string, number | undefined>;
+	} catch {
+		return {};
+	}
+}
+
 export class WasmTransportManager {
 	readonly endpoint: WasmEndpoint;
 	private sessions = new Map<string, WasmSession>();
@@ -1818,17 +1829,10 @@ export class WasmTransportManager {
 		return true;
 	}
 
-	/** Native-shaped metrics snapshot (governor + JS counters). TLS counters are 0 until Phase 6. */
+	/** Native-shaped metrics snapshot: governor, TLS resolver and JS counters. */
 	metricsSnapshot(): MetricsSnapshot {
-		let rust: Record<string, number> = {};
-		try {
-			rust = JSON.parse(this.endpoint.governorSnapshot()) as Record<
-				string,
-				number
-			>;
-		} catch {
-			rust = {};
-		}
+		const rust = parseCounterSnapshot(() => this.endpoint.governorSnapshot());
+		const tls = parseCounterSnapshot(() => this.endpoint.tlsSnapshot());
 		return {
 			nowMs: Date.now(),
 			sessionsActive: this.sessions.size,
@@ -1842,11 +1846,16 @@ export class WasmTransportManager {
 			queuedBytesGlobal: this.hostQueuedBytesGlobal,
 			backpressureWaitCount: this.backpressureWaitCount,
 			backpressureTimeoutCount: this.backpressureTimeoutCount,
-			rateLimitedCount: rust.rateLimitedCount ?? 0,
+			// Every rate-limit refusal lands in exactly one dimension counter
+			// (the by-prefix count is a subset of them, not a fourth kind).
+			rateLimitedCount:
+				(rust.rateLimitedHandshakeCount ?? 0) +
+				(rust.rateLimitedStreamOpenCount ?? 0) +
+				(rust.rateLimitedDatagramIngressCount ?? 0),
 			limitExceededCount: rust.limitExceededCount ?? 0,
-			sniCertSelections: rust.sniCertSelections ?? 0,
-			defaultCertSelections: rust.defaultCertSelections ?? 0,
-			unknownSniRejectedCount: rust.unknownSniRejectedCount ?? 0,
+			sniCertSelections: tls.sniCertSelections ?? 0,
+			defaultCertSelections: tls.defaultCertSelections ?? 0,
+			unknownSniRejectedCount: tls.unknownSniRejectedCount ?? 0,
 		};
 	}
 
