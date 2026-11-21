@@ -85,3 +85,6 @@ docs/superpowers/
 
 # Dev-machine-local cargo overrides (shared target dir, signing runner) — never commit
 .cargo/
+
+# Per-worktree cargo target dir (CARGO_TARGET_DIR=$PWD/target-local)
+/target-local/
