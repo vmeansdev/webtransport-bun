@@ -165,9 +165,10 @@ recorded here rather than changed. Native remains the authority for the code:
 `docs/SPEC.md` documents the pair, and the wasm value is pinned by the parity
 test above so it cannot drift silently either.
 
-**The native backend consumes the fork at rev `ac515b1`** (branch
-`feat/qpack-dynamic`, which stacks on `feat/track1-conformance`, itself a
-superset of `feat/0rtt`), which is where `close_session`, the drain/GOAWAY
+**The native backend builds a vendored copy of the fork**
+(`vendor/wtransport-fork/`: rev `c1888a89` on branch
+`fix/cancellation-safe-frame-reads`, which stacks on `feat/qpack-dynamic`,
+`feat/track1-conformance` and `feat/0rtt`, plus local commits), which is where `close_session`, the drain/GOAWAY
 methods, the §4.4 remap, and the dynamic QPACK decode + encoder machinery live.
 See `docs/FORK_MAINTENANCE.md`.
 
@@ -231,8 +232,8 @@ control (`ServerOptions.congestionControl`) and keep-alive
 implemented on native and no longer upstream-gated.
 
 **0-RTT and dynamic QPACK are no longer upstream-gated.** The native backend now
-depends on a fork of wtransport (`vmeansdev/wtransport`, branch
-`feat/qpack-dynamic`, pinned by rev `ac515b1`) that adds `enable_0rtt`,
+depends on a fork of wtransport (`vmeansdev/wtransport` at rev `c1888a89`,
+built from the vendored copy in `vendor/wtransport-fork/`) that adds `enable_0rtt`,
 `connect_0rtt`, `SessionRequest::is_0rtt`/`handshake_confirmed`, and
 0-RTT-rejection recovery — the exact APIs 0.7.1 lacked — plus the
 `qpack_max_table_capacity` config method and the dynamic QPACK decode + encoder
