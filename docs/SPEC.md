@@ -144,7 +144,7 @@ export type LimitsOptions = {
 };
 
 export type ServerOptions = {
-  host?: string;          // default: 0.0.0.0
+  host?: string;          // IP literal only; "::" binds dual-stack; default: 0.0.0.0
   port: number;
   tls: TlsOptions;
   limits?: Partial<LimitsOptions>;
