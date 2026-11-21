@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, setDefaultTimeout } from "bun:test";
 import { spawnSync } from "node:child_process";
 import {
+	existsSync,
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
@@ -369,6 +370,15 @@ describe("GitHub Actions release policy", () => {
 		expect(NATIVE_BUILD_SCRIPT).not.toContain(
 			'bun",\n\t\t"x",\n\t\t"@napi-rs/cli"',
 		);
+	});
+
+	it("pins rust-toolchain.toml to the release Rust toolchain", () => {
+		const toolchainFile = join(PROJECT_ROOT, "rust-toolchain.toml");
+		expect(existsSync(toolchainFile)).toBe(true);
+		const channel = readFileSync(toolchainFile, "utf8").match(
+			/^channel\s*=\s*"([^"]+)"/m,
+		)?.[1];
+		expect(channel).toBe(RELEASE_TOOLCHAIN.rust[0]);
 	});
 
 	it("fails closed for direct root release:npm publishing", () => {
