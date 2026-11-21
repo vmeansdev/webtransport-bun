@@ -13,7 +13,7 @@ figure, is in [CAPACITY.md](../CAPACITY.md).
 ## Workload this guide is proven for
 
 The G9 shape, which is also what the
-[example](../../examples/scenarios/churn/) implements:
+[example](https://github.com/vmeansdev/webtransport-bun/tree/main/examples/scenarios/churn) implements:
 
 | Population | Rate | Payload | API |
 |---|---|---|---|
@@ -159,7 +159,8 @@ On the same machine that gave `"connectRetries": 28`,
 `"connectFailures": {"E_INTERNAL (CONNECTION_REFUSED)": 28}` and still
 `churnGaveUp: 0`, `baseConnected: 200`: every refused dial came back through
 the backoff and got in. The server's `limitExceededCount` was also 28. That
-run predates PR #25; the same refusals now report as `"E_LIMIT_EXCEEDED"`.
+run reported the refusals as `E_INTERNAL`, as 1.0.0-rc.5 and earlier do; they
+now report as `"E_LIMIT_EXCEEDED"`.
 
 ## Retry refused connects
 
@@ -197,7 +198,7 @@ What each refusal looks like to a client, checked against this version:
 | Server condition | On the wire | `connect()` rejects with | Server counter |
 |---|---|---|---|
 | Per-IP or per-prefix handshake limit | HTTP 429 on the CONNECT | `E_RATE_LIMITED` | `rateLimitedCount` |
-| `maxHandshakesInFlight` reached | QUIC `CONNECTION_REFUSED` | `E_LIMIT_EXCEEDED` (since PR #25) | `limitExceededCount` |
+| `maxHandshakesInFlight` reached | QUIC `CONNECTION_REFUSED` | `E_LIMIT_EXCEEDED` | `limitExceededCount` |
 | `maxSessions` reached | handshake completes, then close code `3992` / reason `E_LIMIT_EXCEEDED` | `E_LIMIT_EXCEEDED` (rarely: the session opens and closes with 3992 right away; see "Pitfalls") | `limitExceededCount` |
 
 Treat all three as retryable. Only repeated exhaustion of the retry budget is
@@ -212,8 +213,8 @@ import { createServer } from "@webtransport-bun/webtransport";
 
 const server = createServer({
   port: 4433,
-  host: "0.0.0.0",              // "::" takes IPv6, plus IPv4 on Linux
-                                // and macOS (on Windows since PR #22)
+  host: "0.0.0.0",              // "::" binds dual-stack (IPv4 + IPv6)
+                                // on every OS
   tls: { certPem, keyPem },
   limits: {
     maxSessions: 2_000,         // default; base population + churners in flight + headroom
@@ -342,16 +343,17 @@ From `server.metricsSnapshot()` (Prometheus names in
 
 ## Pitfalls
 
-- **Both caps refuse with the same code.** Since PR #25 a dial refused at
+- **Both caps refuse with the same code.** A dial refused at
   `maxHandshakesInFlight` rejects with `E_LIMIT_EXCEEDED`, like a
-  `maxSessions` refusal (it used to be a code-less `E_INTERNAL`). The code
+  `maxSessions` refusal (in 1.0.0-rc.5 and earlier, a code-less
+  `E_INTERNAL`). The code
   does not say which cap refused, and `limitExceededCount` counts both.
   Retry either with jittered backoff.
 - **A `maxSessions` refusal can race the hand-off.** The server completes the
   handshake and then closes with 3992. When the close lands between the native
   connect and the JavaScript side taking the session, `connect()` rejects with
-  the close's code (`E_LIMIT_EXCEEDED`) or `E_SESSION_CLOSED`; before PR #25
-  it was a code-less `Error("connect: handle not found in registry")`. If the
+  the close's code (`E_LIMIT_EXCEEDED`) or `E_SESSION_CLOSED`; in 1.0.0-rc.5
+  and earlier it was a code-less `Error("connect: handle not found in registry")`. If the
   close lands after the hand-off, the session opens and closes right away; the
   example treats that as a refused dial and retries it.
 - **Close sessions explicitly.** A client that leaves (page unload, app
@@ -372,7 +374,7 @@ From `server.metricsSnapshot()` (Prometheus names in
 - **0-RTT is replayable.** `enable0Rtt` on both sides lets a returning client
   send its CONNECT as TLS early data, which can cut reconnect latency, but an
   attacker who captured that early data can replay it. Read
-  [SECURITY.md, "Native 0-RTT / early data"](../../SECURITY.md#native-0-rtt--early-data-anti-replay)
+  [SECURITY.md, "Native 0-RTT / early data"](https://github.com/vmeansdev/webtransport-bun/blob/main/SECURITY.md#native-0-rtt--early-data-anti-replay)
   before turning it on. Tickets live in process memory, so a reconnect to a
   different instance falls back to a full handshake. No campaign has measured
   0-RTT under churn.
@@ -397,9 +399,9 @@ stay flat. The G9 bar is a useful template: achieved rate within 1% of the
 target, base RTT p99 under 40 ms, zero leaked sessions and handles.
 
 In-repo tools that cover parts of this:
-[`tools/bench/handshake-latency.ts`](../../tools/bench/handshake-latency.ts)
+[`tools/bench/handshake-latency.ts`](https://github.com/vmeansdev/webtransport-bun/blob/main/tools/bench/handshake-latency.ts)
 (`bun run bench:handshake`) measures connect p50/p95/p99 for a single sequence
 of handshakes, and
-[`tools/load/soak-addon.ts`](../../tools/load/soak-addon.ts) has a
+[`tools/load/soak-addon.ts`](https://github.com/vmeansdev/webtransport-bun/blob/main/tools/load/soak-addon.ts) has a
 `reconnect-churn` phase in its long-running soak. The G9 and G6 campaign
 drivers are not in this repository.

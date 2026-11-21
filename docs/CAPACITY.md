@@ -25,7 +25,7 @@ original shape has no verdict and is superseded by the paced-broadcast gate.
   shapes. Where a gate was narrowed, the narrowing is part of the result.
 - **The harnesses are not in this repository.** The campaign's conductors,
   registrations and raw evidence were moved to the maintainer's archive on
-  2026-10-29. The [scenario examples](../examples/scenarios/) reproduce each
+  2026-10-29. The [scenario examples](https://github.com/vmeansdev/webtransport-bun/tree/main/examples/scenarios) reproduce each
   workload's shape at a scale you can run, and the guides name the in-repo
   drivers that still exist.
 
@@ -76,7 +76,8 @@ original shape has no verdict and is superseded by the paced-broadcast gate.
 
 **Distribution: yes.** Fan-out to many long-lived subscribers (dashboards,
 browser and mobile clients, game state, market data to end users) at the
-envelopes above: sub-millisecond median broadcast latency at 5,000 sessions,
+envelopes above: sub-millisecond median RTT (the campaign instrument's round
+trip, not the age of a tick) at 5,000 sessions,
 1.25 Gbps of stream egress, 10,000 sessions per process at the G1 telemetry
 shape.
 

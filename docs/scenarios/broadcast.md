@@ -16,7 +16,7 @@ microsecond-scale claim in either direction.
 ## Workload this guide is proven for
 
 The paced broadcast gate's shape, which is also what the
-[example](../../examples/scenarios/broadcast/) implements:
+[example](https://github.com/vmeansdev/webtransport-bun/tree/main/examples/scenarios/broadcast) implements:
 
 | Direction | Rate | Payload | API |
 |---|---|---|---|
@@ -202,7 +202,7 @@ const server = createServer({
 });
 ```
 
-The tick, as the example's [server](../../examples/scenarios/broadcast/server.ts)
+The tick, as the example's [server](https://github.com/vmeansdev/webtransport-bun/blob/main/examples/scenarios/broadcast/server.ts)
 does it:
 
 ```ts
@@ -369,6 +369,9 @@ fields.
 
 The harness that produced the gate figures is not in this repository. For the
 cost of the native crossing alone (no transport),
-[`tools/bench/mirror-send/fanout-bench.ts`](../../tools/bench/mirror-send/fanout-bench.ts)
-compares per-target sends with mirror shapes at 10 to 10,000 targets; it needs
-its own small addon built first (instructions at the top of the file).
+[`tools/bench/mirror-send/fanout-bench.ts`](https://github.com/vmeansdev/webtransport-bun/blob/main/tools/bench/mirror-send/fanout-bench.ts)
+compares per-target sends with mirror shapes at 10 to 10,000 targets. It loads
+its own small addon from `tools/bench/mirror-send/fanout-bench.node`: run
+`cargo build --release` in `tools/bench/mirror-send/fanout`, then copy
+`target/release/libfanout_bench.dylib` (`.so` on Linux) from there to that
+path.

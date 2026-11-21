@@ -27,8 +27,9 @@ connection ID, where it travels with the connection.
 project exercises a client address change; "rebind" in this repository's history
 means a *release-evidence* rebind, an unrelated thing. The argument is standard
 and it is load-bearing, but nobody here has watched a 4-tuple balancer drop a
-session, and this document will not imply otherwise. See the capacity document's
-Deployment §3 and disclosure (d).
+session, and this document will not imply otherwise. See
+[`scenarios/deployment.md`](scenarios/deployment.md), "What not to do: hash the
+4-tuple" and "Not verified by this project".
 
 ## One box: `reusePort` + `quicLb` + the eBPF example
 
@@ -160,14 +161,15 @@ paid on the destination-CID field of **every short-header packet in both
 directions**, for the life of the connection.
 
 Against this rig's measured egress that is small but not free: G7's stream cell
-moved **1.2498 Gbps** (`g7.md` C2; the run's 79.1% host-CPU maximum belongs to
-cell B-1k, not to this one — `g7.md` C1), and at the ~1,400-byte datagrams that
-path carries, three extra header octets is roughly **0.2%** of the wire bytes;
-G3's egress cell ran with GSO and GRO active at 64 segments, so the extra bytes
-ride the same syscalls rather than costing new ones. **It has not been
-measured** — no gate has run with `quicLb` enabled. If your fleet is small and
-the bytes matter, a minimal `nonceLen` (4) and a short `serverId` shrink it, at
-the cost of the unlinkability budget §5.4 asks you to keep.
+moved **1.2498 Gbps** (the G7 row in [`CAPACITY.md`](CAPACITY.md); the run's
+79.1% host-CPU maximum belongs to the 1 KiB-write cell, not to this one), and at
+the ~1,400-byte datagrams that path carries, three extra header octets is
+roughly **0.2%** of the wire bytes; G3's egress cell ran with GSO and GRO active
+at 64 segments, so the extra bytes ride the same syscalls rather than costing
+new ones. **The overhead has not been isolated in a measurement**; the G6
+sharded cells ran with `quicLb` on. If your fleet is small and the bytes matter,
+a minimal `nonceLen` (4) and a short `serverId` shrink it, at the cost of the
+unlinkability budget §5.4 asks you to keep.
 
 ## What is deferred
 
@@ -184,8 +186,10 @@ different scheme. It is not implemented.
 
 **Shared fleet-wide reset keys.** Reset keys are random **per process**, which
 decides what a mis-steered flow actually does, and the intuitive guess is wrong
-in the expensive direction. Traced through quinn-proto 0.11.16 (capacity
-document, Deployment §3): the wrong backend may try a stateless reset, but the
+in the expensive direction. Traced through quinn-proto 0.11.16 (the full trace
+lives in the archived campaign record;
+[`scenarios/deployment.md`](scenarios/deployment.md), "What not to do: hash the
+4-tuple", summarises it): the wrong backend may try a stateless reset, but the
 token is HMAC'd with *its* key while the client only recognises a token derived
 from the original backend's — so the client discards it, and most stranded flows
 are rate-limited into getting no reset at all. **A mis-steered connection does

@@ -127,7 +127,7 @@ Replace `0.8 * maxQueuedBytesGlobal` with your configured value (e.g. `419430400
 
 At `maxHandshakesInFlight`, the server answers a new dial with QUIC
 `CONNECTION_REFUSED`; the client's `connect()` rejects with
-`E_LIMIT_EXCEEDED` (since PR #25; before it, a code-less `E_INTERNAL`).
+`E_LIMIT_EXCEEDED` (in 1.0.0-rc.5 and earlier, a code-less `E_INTERNAL`).
 At `maxSessions`, the server completes the handshake and then closes the
 session with code 3992 / reason `E_LIMIT_EXCEEDED`; `connect()` rejects with
 `E_LIMIT_EXCEEDED`. Both increment `limitExceededCount`. Both are a

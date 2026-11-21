@@ -21,7 +21,7 @@ The summary this guide was written from does not say which stream type
 stream count and write size. Check [CAPACITY.md](../CAPACITY.md) before you
 assume they match the example.
 
-The [example](../../examples/scenarios/bulk/) reproduces the G7 egress shape (16 streams, 64 KiB writes):
+The [example](https://github.com/vmeansdev/webtransport-bun/tree/main/examples/scenarios/bulk) reproduces the G7 egress shape (16 streams, 64 KiB writes):
 one session asks for N transfers, and the server sends each one on its own
 unidirectional stream in 64 KiB writes.
 
@@ -363,16 +363,16 @@ yourself, by error code, where you write. The example server does this: its
   A bare `once(stream, "drain")` then waits forever. The example's `drained()`
   rejects on `'error'`, on `'close'`, and immediately on an already-destroyed
   stream.
-- **One-way bulk has half the session and global caps.** Since PR #25
-  stream sends and receives draw on separate halves of
-  `maxQueuedBytesPerSession` and `maxQueuedBytesGlobal`, and each direction of
-  a stream gets the whole `maxQueuedBytesPerStream`. That fixed a bidi echo
-  that stalled with `E_BACKPRESSURE_TIMEOUT` at ~55 KB (1 MiB in 16 KiB
-  writes). A download now queues at most 1 MiB per session on the server at
+- **One-way bulk has half the session and global caps.** Stream sends and
+  receives draw on separate halves of `maxQueuedBytesPerSession` and
+  `maxQueuedBytesGlobal`, and each direction of a stream gets the whole
+  `maxQueuedBytesPerStream`. In 1.0.0-rc.5 and earlier, with one shared
+  budget, a bidi echo stalled with `E_BACKPRESSURE_TIMEOUT` at ~55 KB (1 MiB
+  in 16 KiB writes). A download now queues at most 1 MiB per session on the server at
   the 2 MiB default; size `maxQueuedBytesPerSession` with that in mind.
 - **Keep each write within `maxQueuedBytesPerStream`.** Writes larger than the
   per-stream budget used to fail with `E_BACKPRESSURE_TIMEOUT`. This is fixed
-  after rc.5 (PR #22) by splitting them into budget-sized pieces. The example
+  after 1.0.0-rc.5 by splitting them into budget-sized pieces. The example
   server refuses a `chunkBytes` above its per-stream budget, so it behaves the
   same on either side of that fix.
 - **Do not close straight after EOF.** On the sending side, `end()` (the
@@ -381,8 +381,8 @@ yourself, by error code, where you write. The example server does this: its
   can beat that acknowledgement. The sender then sees `E_STREAM_RESET` for a
   stream that was fully delivered. Have the sender say "done" in-band, as the
   example's summary does, and close after that.
-- **`close()` then exit.** Since PR #25 a process exit waits up to 250 ms
-  for pending closes to be sent. Before it, a client that called `close()`
+- **`close()` then exit.** A process exit waits up to 250 ms for pending
+  closes to be sent. In 1.0.0-rc.5 and earlier, a client that called `close()`
   and exited at once left its session on the server until `idleTimeoutMs`
   (60 s by default): 247 sessions lingered about a minute in this example's
   runs. Awaiting `session.closed` before exiting is still good practice; it
@@ -397,9 +397,8 @@ yourself, by error code, where you write. The example server does this: its
   processes, cap streams per session, or make the client resume (request the
   missing byte range on a new stream) rather than raising the timeout.
 - **Per-session stream caps apply on both sides.** Both sides enforce
-  `maxStreamsPerSessionUni` (200 by default; the client side since PR #22),
-  which limits how many transfers can be open at once. Opening
-  beyond it rejects with `E_LIMIT_EXCEEDED`, or waits with
+  `maxStreamsPerSessionUni` (200 by default), which limits how many
+  transfers can be open at once. Opening beyond it rejects with `E_LIMIT_EXCEEDED`, or waits with
   `createUnidirectionalStream({ waitUntilAvailable: true })`, which times out
   after `backpressureTimeoutMs`.
 

@@ -95,8 +95,8 @@ addresses. [quic-lb.md](../quic-lb.md) explains the wire format and its costs.
 
 Requirements: Linux 5.2 or newer, clang/LLVM with the BPF target, `bpftool`,
 libbpf headers, and root (or `CAP_BPF` + `CAP_NET_ADMIN`). Work from
-[`examples/quic-lb/`](../../examples/quic-lb/), whose
-[`attach.sh.example`](../../examples/quic-lb/attach.sh.example) holds the
+[`examples/quic-lb/`](https://github.com/vmeansdev/webtransport-bun/tree/main/examples/quic-lb), whose
+[`attach.sh.example`](https://github.com/vmeansdev/webtransport-bun/blob/main/examples/quic-lb/attach.sh.example) holds the
 steps the campaign ran:
 
 ```bash

@@ -11,7 +11,7 @@ realm). The full measurement table, with hardware for every figure, is in
 ## Workload this guide is proven for
 
 The G6 realm shape, per player, which is also what the
-[example](../../examples/scenarios/game/) implements:
+[example](https://github.com/vmeansdev/webtransport-bun/tree/main/examples/scenarios/game) implements:
 
 | Direction | Rate | Payload | API |
 |---|---|---|---|
@@ -166,8 +166,8 @@ import { createServer } from "@webtransport-bun/webtransport";
 
 const server = createServer({
   port: 4433,
-  host: "0.0.0.0",              // "::" takes IPv6, plus IPv4 on Linux
-                                // and macOS (on Windows since PR #22)
+  host: "0.0.0.0",              // "::" binds dual-stack (IPv4 + IPv6)
+                                // on every OS
   tls: { certPem, keyPem },
   limits: {
     maxSessions: 5_000,         // default 2,000; size to what one process holds
@@ -281,8 +281,8 @@ From `server.metricsSnapshot()` (Prometheus names in [METRICS.md](../METRICS.md)
   production.
 - **Refused connects are retryable.** At `maxHandshakesInFlight` the server
   refuses the connection; at `maxSessions` it closes the new session. Both
-  reject `connect()` with `E_LIMIT_EXCEEDED` (the handshake-cap refusal since
-  PR #25). Clients should retry both with jittered backoff (see
+  reject `connect()` with `E_LIMIT_EXCEEDED`. Clients should retry both with
+  jittered backoff (see
   OPERATIONS.md,
   [Admission control](../OPERATIONS.md#admission-control-refusal-is-load-shaping-not-rejection),
   and [connection-churn.md](connection-churn.md)).
@@ -308,5 +308,5 @@ rate limits to cover the generator IPs. Grade on the client report
 (`ackRttP99Ms`, `snapshotDelivery`, `connectFailures`) and on the server's
 `datagramsDropped` and the kernel counters above. For plain session scale and
 datagram load against several server processes,
-[`tools/load/distributed-scale.ts`](../../tools/load/distributed-scale.ts) is
+[`tools/load/distributed-scale.ts`](https://github.com/vmeansdev/webtransport-bun/blob/main/tools/load/distributed-scale.ts) is
 the in-repo driver (configured through `LOAD_SCALE_*` environment variables).

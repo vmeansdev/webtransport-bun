@@ -11,7 +11,7 @@ hardware for every figure, is in [CAPACITY.md](../CAPACITY.md).
 ## Workload this guide is proven for
 
 The SFU shape, per publisher, which is also what the
-[example](../../examples/scenarios/rooms/) implements:
+[example](https://github.com/vmeansdev/webtransport-bun/tree/main/examples/scenarios/rooms) implements:
 
 | Direction | Rate | Payload | API |
 |---|---|---|---|
@@ -202,8 +202,8 @@ import { createServer, E_SESSION_CLOSED } from "@webtransport-bun/webtransport";
 
 const server = createServer({
   port: 4433,
-  host: "0.0.0.0",              // "::" takes IPv6, plus IPv4 on Linux
-                                // and macOS (on Windows since PR #22)
+  host: "0.0.0.0",              // "::" binds dual-stack (IPv4 + IPv6)
+                                // on every OS
   tls: { certPem, keyPem },     // certificate and key only; clients verify the chain
   limits: {
     maxSessions: 5_000,         // default 2,000; size to what one shard holds
@@ -391,7 +391,10 @@ To find a shard's forward ceiling, hold one room shape and raise `--rooms`
 until `delivery` drops below 1 or `latencyP99Ms` leaves your frame budget
 (33.3 ms at 30 fps). The campaign's G3, G4 and G8 drivers are not in this
 repository (see [CAPACITY.md](../CAPACITY.md)). In-repo,
-[`tools/bench/mirror-send/fanout-bench.ts`](../../tools/bench/mirror-send/fanout-bench.ts)
+[`tools/bench/mirror-send/fanout-bench.ts`](https://github.com/vmeansdev/webtransport-bun/blob/main/tools/bench/mirror-send/fanout-bench.ts)
 measures what a one-payload-to-N fan-out costs per target across the
-JavaScript/native boundary, with no network behind it (build its addon first,
-as the file header says).
+JavaScript/native boundary, with no network behind it. It loads its own small
+addon from `tools/bench/mirror-send/fanout-bench.node`: run
+`cargo build --release` in `tools/bench/mirror-send/fanout`, then copy
+`target/release/libfanout_bench.dylib` (`.so` on Linux) from there to that
+path.

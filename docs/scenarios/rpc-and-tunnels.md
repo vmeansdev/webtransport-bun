@@ -15,7 +15,7 @@ table, with hardware for every figure, is in [CAPACITY.md](../CAPACITY.md).
 | X, exchange | client → server request, then server → client response, on a new bidi stream per call | 60,000 calls over 1,000 sessions | not recorded in the material this guide was written from | client `createBidirectionalStream()`, server `incomingBidirectionalStreams` |
 | T, tunnel | both directions at once, one bidi stream per session | 3 Mbps each way per tunnel, 100 tunnels, 60 s | timestamped frames | same, held open |
 
-The [example](../../examples/scenarios/rpc/) implements both shapes in one
+The [example](https://github.com/vmeansdev/webtransport-bun/tree/main/examples/scenarios/rpc) implements both shapes in one
 server. Its defaults: exchange requests of 256 B and responses of 1,024 B,
 1 call per second per session; tunnel frames of 1,024 B (length prefix
 included) at 3 Mbps each way. Those sizes are the example's choice, not the
@@ -46,9 +46,9 @@ steeply near saturation (see OPERATIONS.md,
 
 - **Tunnels faster than 3 Mbps each way.** No gate graded a higher
   per-tunnel rate. On this example, at default limits, 80 tunnels at 10 Mbps
-  each way pass since PR #25; before it they failed under load (see Pitfalls,
-  "Bidirectional streams used to stall"). Do not extrapolate the T result
-  upward.
+  each way pass; in 1.0.0-rc.5 and earlier they failed under load (see
+  Pitfalls, "Bidirectional streams used to stall"). Do not extrapolate the T
+  result upward.
 - **More than 100 tunnels per process** as a graded figure. The home rig
   saturated at 200; plan around ~70 tunnels of this shape per JavaScript
   process on reference hardware (OPERATIONS.md) and shard beyond.
@@ -202,8 +202,8 @@ import { createServer } from "@webtransport-bun/webtransport";
 
 const server = createServer({
   port: 4433,
-  host: "0.0.0.0",                  // "::" takes IPv6, plus IPv4 on Linux
-                                    // and macOS (on Windows since PR #22)
+  host: "0.0.0.0",                  // "::" binds dual-stack (IPv4 + IPv6)
+                                    // on every OS
   tls: { certPem, keyPem },         // no caPem on a server: it fails with E_TLS
   limits: {
     maxStreamsPerSessionBidi: 200,  // default; concurrent calls per session (a tunnel counts as one)
@@ -238,34 +238,26 @@ What matters in this workload:
   200/s plus the 400 burst, and the server's `rateLimitedCount` was 1,386,
   exactly the failed calls.
 - **Streams per session.** `maxStreamsPerSessionBidi` (default 200; both
-  sides enforce it, the client side since PR #22) caps concurrent streams per
-  session, not streams over the session's lifetime: a closed stream frees its
-  slot. Concurrent calls per session are roughly call rate × call duration.
-  The server refuses an incoming stream over its cap by resetting it (counted
+  sides enforce it) caps concurrent streams per session, not streams over
+  the session's lifetime: a closed stream frees its slot. Concurrent calls
+  per session are roughly call rate × call duration. The server refuses an incoming stream over its cap by resetting it (counted
   in `limitExceededCount`).
 - **`waitUntilAvailable`.** `createBidirectionalStream()` at the cap rejects
   with `E_LIMIT_EXCEEDED`. `createBidirectionalStream({ waitUntilAvailable:
   true })` instead waits for a slot to free, retrying on `E_LIMIT_EXCEEDED`,
   `E_QUEUE_FULL` and `E_BACKPRESSURE_TIMEOUT`, for at most
   `backpressureTimeoutMs`, then rejects with `E_BACKPRESSURE_TIMEOUT`. It
-  does not wait out a rate limit. The example client uses it. Before PR #22 the
-  client accepted its own `maxStreamsPerSessionBidi` but did not enforce it,
-  so there was nothing to wait for: in a probe on a pre-#22 build, one
-  session opened 215 of 230 concurrent streams locally, the server
-  accepted 200 and reset 15 (`limitExceededCount` 15), and the last 15
-  opens waited on QUIC stream credit for as long as the probe watched (3 s).
-  After PR #22 the client rejects (or with `waitUntilAvailable`, waits) at
-  its cap.
+  does not wait out a rate limit. The example client uses it (1.0.0-rc.5 and
+  earlier did not enforce the client cap, so there was nothing to wait for).
 - **Keep-alive for quiet tunnels.** A tunnel with no traffic for
   `idleTimeoutMs` is closed. The client pings at `idleTimeoutMs / 3` by
   default (`keepAliveIntervalMs`); the server does not ping unless you set
   `keepAliveIntervalMs` on it.
-- **Each direction has its own budget.** Since PR #25 stream sends and
-  receives draw on separate halves of `maxQueuedBytesGlobal` and
-  `maxQueuedBytesPerSession`, and each direction of a stream gets the whole
-  `maxQueuedBytesPerStream`. A one-way tunnel therefore has half of the
-  session and global caps in its direction: 1 MiB of a session's 2 MiB
-  default.
+- **Each direction has its own budget.** Stream sends and receives draw on
+  separate halves of `maxQueuedBytesGlobal` and `maxQueuedBytesPerSession`,
+  and each direction of a stream gets the whole `maxQueuedBytesPerStream`.
+  A one-way tunnel therefore has half of the session and global caps in its
+  direction: 1 MiB of a session's 2 MiB default.
 
 ## Host tuning
 
@@ -342,7 +334,7 @@ From `server.metricsSnapshot()` (Prometheus names in [METRICS.md](../METRICS.md)
 ## Pitfalls
 
 - **Bidirectional streams used to stall when both directions were busy.**
-  Fixed since PR #25. One per-stream budget served both directions, so with
+  Fixed after 1.0.0-rc.5. One per-stream budget served both directions, so with
   both sides writing unpaced `queuedBytesGlobal` sat at exactly 262,144 until
   both failed with `E_BACKPRESSURE_TIMEOUT`, and paced tunnels of 10 Mbps or
   more each way failed under load (23–29 of 80 at 10 Mbps) while one-way
@@ -350,7 +342,7 @@ From `server.metricsSnapshot()` (Prometheus names in [METRICS.md](../METRICS.md)
   80 × 10 Mbps each-way run passes. Pacing writers below what the stream
   drains is still how to keep the tail low.
 - **Writes larger than `maxQueuedBytesPerStream` used to fail** with
-  `E_BACKPRESSURE_TIMEOUT`. This is fixed after rc.5 (PR #22), which splits
+  `E_BACKPRESSURE_TIMEOUT`. This is fixed after 1.0.0-rc.5, which splits
   them into budget-sized pieces. The example never writes more than 64 KiB at
   once, so it behaves the same on either side of that fix.
 - **Read the whole request; frame the tunnel.** Chunk boundaries are not
@@ -358,11 +350,11 @@ From `server.metricsSnapshot()` (Prometheus names in [METRICS.md](../METRICS.md)
   needs its own framing. The example uses a 4-byte length prefix and
   reassembles frames that span reads.
 - **Stream error codes.** Session-level and open failures are
-  `WebTransportError`s with a `code`. Since PR #25 so are errors emitted by a
-  client's Node `Duplex` (`'error'` events, write callbacks), as on the
-  server; before, they were plain `Error`s without `code`. The message still
-  starts with the code (for example `E_BACKPRESSURE_TIMEOUT: ...`), so the
-  example's `errorCode()`, which handles both, keeps working.
+  `WebTransportError`s with a `code`. So are errors emitted by a client's
+  Node `Duplex` (`'error'` events, write callbacks), as on the server; in
+  1.0.0-rc.5 and earlier they were plain `Error`s without `code`. The message
+  still starts with the code (for example `E_BACKPRESSURE_TIMEOUT: ...`), so
+  the example's `errorCode()`, which handles both, keeps working.
 - **Do not close the session right after the last byte.** On the sending side
   a stream's close completes only when the peer has acknowledged the FIN. A
   client that reads its response and closes its session at once can make the
@@ -392,7 +384,7 @@ approaches ~80% of a core and record where the tail starts climbing.
 To A/B the server's read path, run the server once more with
 `WEBTRANSPORT_STREAM_READ_GROUP=0` (it is read at startup). To compare the
 facade read path with the native sink under a saturated loop,
-[`tools/load/bench-sink.ts`](../../tools/load/bench-sink.ts) is the in-repo
+[`tools/load/bench-sink.ts`](https://github.com/vmeansdev/webtransport-bun/blob/main/tools/load/bench-sink.ts) is the in-repo
 driver:
 
 ```bash

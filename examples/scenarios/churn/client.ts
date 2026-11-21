@@ -55,7 +55,7 @@ export function backoffMs(n: number, policy: RetryPolicy): number {
  *   per-IP / per-prefix rate limit   E_RATE_LIMITED (HTTP 429 on the CONNECT)
  *   maxSessions                      E_LIMIT_EXCEEDED (closed with 3992)
  *   maxHandshakesInFlight            E_LIMIT_EXCEEDED (QUIC CONNECTION_REFUSED;
- *                                    E_INTERNAL before PR #25)
+ *                                    E_INTERNAL in 1.0.0-rc.5 and earlier)
  */
 export function failureCode(err: unknown): string {
 	const { code } = (err ?? {}) as { code?: unknown };

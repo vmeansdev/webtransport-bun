@@ -4,7 +4,7 @@ Each guide takes one family of workloads from nothing to a running setup: the
 workload shape that was measured, the result and the hardware it belongs to, a
 runnable example, the server configuration, host tuning, how to scale out,
 what to monitor, and the traps. Every example lives in
-[`examples/scenarios/`](../../examples/scenarios/) and is exercised by the test
+[`examples/scenarios/`](https://github.com/vmeansdev/webtransport-bun/tree/main/examples/scenarios) and is exercised by the test
 suite at a small scale, so the code in the guides runs.
 
 | If you are building… | Read | Gates |
