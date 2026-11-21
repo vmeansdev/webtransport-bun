@@ -14,6 +14,7 @@ import type {
 	WritableOptions,
 } from "node:stream";
 import { Duplex, Readable, Writable } from "node:stream";
+import { WebTransportError } from "./errors.js";
 import type { NativeReadableOwner } from "./native-readable.js";
 import {
 	openReadSinkOnNativeHandle,
@@ -21,6 +22,7 @@ import {
 	type StreamSinkOptions,
 } from "./sink.js";
 import { readStreamChunk } from "./stream-chunk-batch.js";
+import type { ErrorCode } from "./types.js";
 
 /**
  * Symbol to call stream reset (abort receiving). Use on BidiStream, SendStream, RecvStream.
@@ -80,6 +82,23 @@ const SUPPRESS_UNHANDLED_STREAM_ERROR_LOGS =
 
 function normalizeError(err: unknown): Error {
 	return err instanceof Error ? err : new Error(String(err));
+}
+
+const STREAM_ERROR_CODE_RE = /\bE_[A-Z0-9_]+/;
+
+/**
+ * A stream failure that carries its stable E_* code on `.code`, as the
+ * server's web streams and the open/connect paths already do. Native
+ * stream calls report failures as `E_CODE[: detail]` strings.
+ */
+function streamError(reason: unknown): Error {
+	if (reason instanceof WebTransportError) return reason;
+	const message = reason instanceof Error ? reason.message : String(reason);
+	const code = STREAM_ERROR_CODE_RE.exec(message)?.[0];
+	if (!code) return normalizeError(reason);
+	return new WebTransportError(code as ErrorCode, message, {
+		cause: reason instanceof Error ? reason : undefined,
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -217,13 +236,13 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
 				// Never-reject sentinel: a string result IS an error code
 				// (see unwrapNativeValue) — never deliverable as payload.
 				if (typeof buf === "string") {
-					this.destroy(new Error(buf));
+					this.destroy(streamError(buf));
 					return;
 				}
 				if (buf && !this.#destroyed) this.push(buf);
 				else this.push(null);
 			})
-			.catch((err: any) => this.destroy(err));
+			.catch((err: unknown) => this.destroy(streamError(err)));
 	}
 
 	override _write(
@@ -233,14 +252,14 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
 	): void {
 		const h = this.#nativeHandle;
 		if (!h || this.#destroyed) {
-			callback(new Error("E_STREAM_RESET"));
+			callback(streamError("E_STREAM_RESET"));
 			return;
 		}
 		h.write(chunk)
 			.then((code: string | null | undefined) =>
-				typeof code === "string" ? callback(new Error(code)) : callback(),
+				typeof code === "string" ? callback(streamError(code)) : callback(),
 			)
-			.catch(callback);
+			.catch((err: unknown) => callback(streamError(err)));
 	}
 
 	override _final(callback: (error?: Error | null) => void): void {
@@ -259,14 +278,14 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
 			if (ret && typeof ret.then === "function") {
 				ret.then(
 					(code: string | null | undefined) =>
-						typeof code === "string" ? callback(new Error(code)) : callback(),
-					(err: Error) => callback(err),
+						typeof code === "string" ? callback(streamError(code)) : callback(),
+					(err: unknown) => callback(streamError(err)),
 				);
 				return;
 			}
 			callback();
 		} catch (err) {
-			callback(err as Error);
+			callback(streamError(err));
 		}
 	}
 
@@ -337,13 +356,13 @@ export class BidiStream extends Duplex implements Resettable, StopSendable {
 	 */
 	openReadSink(opts?: StreamSinkOptions): StreamSinkHandle {
 		const h = this.#nativeHandle;
-		if (!h || this.#destroyed) throw new Error("E_STREAM_RESET");
+		if (!h || this.#destroyed) throw streamError("E_STREAM_RESET");
 		if (
 			this.readableDidRead ||
 			this.readableFlowing !== null ||
 			this.#directReadStarted
 		) {
-			throw new Error("E_SINK_READ_ACTIVE");
+			throw streamError("E_SINK_READ_ACTIVE");
 		}
 		return openReadSinkOnNativeHandle(h, opts);
 	}
@@ -397,14 +416,14 @@ export class SendStream extends Writable implements Resettable {
 	): void {
 		const h = this.#nativeHandle;
 		if (!h || this.#destroyed) {
-			callback(new Error("E_STREAM_RESET"));
+			callback(streamError("E_STREAM_RESET"));
 			return;
 		}
 		h.write(chunk)
 			.then((code: string | null | undefined) =>
-				typeof code === "string" ? callback(new Error(code)) : callback(),
+				typeof code === "string" ? callback(streamError(code)) : callback(),
 			)
-			.catch(callback);
+			.catch((err: unknown) => callback(streamError(err)));
 	}
 
 	override _final(callback: (error?: Error | null) => void): void {
@@ -423,14 +442,14 @@ export class SendStream extends Writable implements Resettable {
 			if (ret && typeof ret.then === "function") {
 				ret.then(
 					(code: string | null | undefined) =>
-						typeof code === "string" ? callback(new Error(code)) : callback(),
-					(err: Error) => callback(err),
+						typeof code === "string" ? callback(streamError(code)) : callback(),
+					(err: unknown) => callback(streamError(err)),
 				);
 				return;
 			}
 			callback();
 		} catch (err) {
-			callback(err as Error);
+			callback(streamError(err));
 		}
 	}
 
@@ -564,13 +583,13 @@ export class RecvStream extends Readable implements StopSendable {
 				// Never-reject sentinel: a string result IS an error code
 				// (see unwrapNativeValue) — never deliverable as payload.
 				if (typeof buf === "string") {
-					this.destroy(new Error(buf));
+					this.destroy(streamError(buf));
 					return;
 				}
 				if (buf && !this.#destroyed) this.push(buf);
 				else this.push(null);
 			})
-			.catch((err: any) => this.destroy(err));
+			.catch((err: unknown) => this.destroy(streamError(err)));
 	}
 
 	override _destroy(
@@ -615,13 +634,13 @@ export class RecvStream extends Readable implements StopSendable {
 	 */
 	openReadSink(opts?: StreamSinkOptions): StreamSinkHandle {
 		const h = this.#nativeHandle;
-		if (!h || this.#destroyed) throw new Error("E_STREAM_RESET");
+		if (!h || this.#destroyed) throw streamError("E_STREAM_RESET");
 		if (
 			this.readableDidRead ||
 			this.readableFlowing !== null ||
 			this.#directReadStarted
 		) {
-			throw new Error("E_SINK_READ_ACTIVE");
+			throw streamError("E_SINK_READ_ACTIVE");
 		}
 		return openReadSinkOnNativeHandle(h, opts);
 	}

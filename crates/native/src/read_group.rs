@@ -855,6 +855,7 @@ mod tests {
             max_session: 1 << 18,
             max_stream: 1 << 16,
             capacity_notify: crate::client_stream::StreamBudget::new_notify(),
+            direction: crate::client_stream::BudgetDirection::Receive,
             backpressure_timeout_ms: 1000,
         }
     }

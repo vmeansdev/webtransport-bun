@@ -70,6 +70,15 @@ hatch exists. Checked against the rc.1 candidate (875dfbfe).
   concurrency the client grants its peer follows the caps (cap + 16 for HTTP/3
   control streams), as on the server. Raise the caps to restore rc.1's
   unbounded opens.
+- **Handshake-cap refusals reject with `E_LIMIT_EXCEEDED`.** A dial refused at
+  `maxHandshakesInFlight` (QUIC `CONNECTION_REFUSED`) used to reject
+  `connect()` with a codeless `E_INTERNAL`. It now carries `E_LIMIT_EXCEEDED`,
+  the same code as a `maxSessions` refusal; both are transient and retryable.
+- **Client stream errors are `WebTransportError`s.** Client Node streams
+  (`createBidirectionalStream`, `createUnidirectionalStream`, incoming
+  streams) failed with plain `Error`s whose message began with the code. They
+  now emit a `WebTransportError` with the same message and `.code` set, like
+  the server's streams; code reading `err.message` is unaffected.
 - **Not breaking, listed for completeness.** The surfaces under "Removed and
   internalized" below were never in rc.1, so no rc.1 caller can depend on
   them: the reflector, the campaign getters, `__sendPathDiagnostics`, the
@@ -321,6 +330,25 @@ unstable `__TESTING__.serverInternals(server)` accessor (`docs/SPEC.md`,
 
 ### Fixed
 
+- Bidirectional streams no longer stall when both directions are busy. One
+  byte budget served both directions, so writes queued faster than the peer
+  drained them filled it, the receive side could not reserve, and both peers
+  failed with `E_BACKPRESSURE_TIMEOUT` (a 1 MiB echo in 16 KiB writes stalled
+  at about 55 KB at default limits; with 16 busy streams the shared session
+  budget deadlocked the same way). Stream sends and receives now draw on
+  separate halves of the global and per-session caps, and each direction of a
+  stream gets the whole per-stream cap. Datagrams keep the full caps. In
+  same-host measurements this fixed every stall case and cost no throughput
+  (16 uni streams × 64 MiB: 1.27 vs 1.22 Gbps).
+- `connect()` could reject with a plain `Error` ("handle not found in
+  registry") when the session closed, for example a server at `maxSessions`
+  closing it, between the native connect and the JavaScript hand-off. It now
+  rejects with the close's own code (`E_LIMIT_EXCEEDED` for that case) or
+  `E_SESSION_CLOSED`.
+- A client that called `session.close()` and then `process.exit()` killed the
+  addon's client thread before the close was sent, leaving its sessions open
+  on the server until the idle timeout (60 s by default). The process now
+  waits, at most 250 ms, for those closes to go out.
 - A single stream write larger than `maxQueuedBytesPerStream` (or the session
   or global budget) waited on a reservation that could never succeed and failed
   with `E_BACKPRESSURE_TIMEOUT`. It is now queued in budget-sized pieces, each

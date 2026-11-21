@@ -118,7 +118,8 @@ pub(crate) fn session_metrics_snapshot_from(
             datagrams_in: sm.datagrams_in.load(Ordering::Relaxed) as f64,
             datagrams_out: sm.datagrams_out.load(Ordering::Relaxed) as f64,
             streams_active: sm.streams_active() as u32,
-            queued_bytes: sm.queued_bytes.load(Ordering::Relaxed) as f64,
+            queued_bytes: (sm.queued_bytes.load(Ordering::Relaxed)
+                + sm.queued_bytes_send.load(Ordering::Relaxed)) as f64,
         }
     } else {
         crate::metrics::SessionMetricsSnapshot {

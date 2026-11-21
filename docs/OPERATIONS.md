@@ -278,7 +278,12 @@ Two different things bound memory, and they used to be one knob:
 
 - **Byte governors** (`maxQueuedBytesGlobal` / `PerSession` / `PerStream`) —
   application-level accounting of bytes queued across the JS boundary. They
-  drive backpressure, `E_QUEUE_FULL`, and the native datagram channel.
+  drive backpressure, `E_QUEUE_FULL`, and the native datagram channel. Stream
+  bytes are accounted per direction: queued sends and queued receives each get
+  half of the global and per-session caps, and each direction of a stream the
+  whole per-stream cap, so a write backlog cannot starve reading. Datagrams
+  use the full caps. Worst case at defaults is unchanged for streams (512 MiB
+  global); with datagrams and stream sends both saturated it is 768 MiB.
 - **QUIC flow-control windows** (`streamReceiveWindow`, `receiveWindow`,
   `sendWindow`) — what the transport advertises to the peer. They decide how
   much data can be in flight, and therefore throughput on a path with any

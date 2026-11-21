@@ -126,6 +126,11 @@ export type LimitsOptions = {
   maxStreamsGlobal: number;
 
   maxDatagramSize: number; // hard cap in bytes (also must respect negotiated max)
+  // Byte governors for queued data. Stream bytes are accounted per direction:
+  // queued sends and queued receives each get half of maxQueuedBytesGlobal and
+  // of maxQueuedBytesPerSession, and each direction of a stream gets the whole
+  // maxQueuedBytesPerStream, so a backlog of writes can never block reading
+  // (and the reverse). Datagrams use the full session and global caps.
   maxQueuedBytesGlobal: number;
   maxQueuedBytesPerSession: number;
   maxQueuedBytesPerStream: number;

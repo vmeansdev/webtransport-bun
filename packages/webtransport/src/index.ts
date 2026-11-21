@@ -299,6 +299,17 @@ function extractMessageErrorCode(msg: string): ErrorCode | undefined {
 	return startCode ?? causal ?? tokens[0];
 }
 
+/** Message for a connect whose session closed before JavaScript took it. */
+function connectRaceMessage(close: CloseInfo | undefined): string {
+	const detail = close
+		? `session closed during connect (code ${close.code ?? "none"}, reason ${JSON.stringify(close.reason ?? "")})`
+		: "session closed during connect";
+	const reasonCode = close?.reason
+		? extractMessageErrorCode(close.reason)
+		: undefined;
+	return `${reasonCode ?? E_SESSION_CLOSED}: ${detail}`;
+}
+
 function toWebTransportError(
 	err: unknown,
 	strictW3CErrors?: boolean,
@@ -1753,6 +1764,8 @@ interface NativeAddon {
 		cb: (err: unknown, handleId?: string) => void,
 	): void;
 	takeClientSession(handleId: string): NativeSessionHandle | undefined;
+	/** Blocks until locally closed client sessions finish closing; returns how many did not. */
+	flushClientCloses?: (timeoutMs: number) => number;
 	clientPoolMetricsSnapshot(): {
 		hits: number;
 		misses: number;
@@ -2998,6 +3011,23 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 // Client session implementation
 // ---------------------------------------------------------------------------
 
+/**
+ * Upper bound on how long a process exit waits for client closes to be sent.
+ * The close goes out on the addon's client thread; `process.exit()` right
+ * after `session.close()` would otherwise kill that thread first and leave the
+ * session open on the server until its idle timeout.
+ */
+const CLIENT_CLOSE_FLUSH_ON_EXIT_MS = 250;
+let clientCloseFlushOnExitInstalled = false;
+
+function flushClientClosesOnExit(): void {
+	if (clientCloseFlushOnExitInstalled) return;
+	clientCloseFlushOnExitInstalled = true;
+	process.on("exit", () => {
+		native?.flushClientCloses?.(CLIENT_CLOSE_FLUSH_ON_EXIT_MS);
+	});
+}
+
 class NativeClientSession implements ClientSession {
 	#nativeHandle: NativeSessionHandle;
 	#readyPromise: Promise<void>;
@@ -3079,6 +3109,7 @@ class NativeClientSession implements ClientSession {
 		if (!this.#closed) {
 			this.#closed = true;
 			this.#requestedCloseInfo = normalizeCloseInfo(info);
+			flushClientClosesOnExit();
 			this.#nativeHandle.close(info?.code ?? null, info?.reason ?? null);
 		}
 	}
@@ -3301,6 +3332,9 @@ function connectWithNative(
 ): Promise<ClientSession> {
 	return new Promise<ClientSession>((resolve, reject) => {
 		const closedResolvers = new Map<string, (info: CloseInfo) => void>();
+		// Closes that arrive before the session is handed to JavaScript, so a
+		// connect that loses that race can still report why it closed.
+		const earlyCloses = new Map<string, CloseInfo>();
 		let settled = false;
 		let timeoutHandle: any;
 
@@ -3325,6 +3359,7 @@ function connectWithNative(
 					closedResolvers.delete(evt.id);
 					if (resolveClosed)
 						resolveClosed({ code: evt.code, reason: evt.reason });
+					else earlyCloses.set(evt.id, { code: evt.code, reason: evt.reason });
 				}
 			}
 		};
@@ -3355,12 +3390,24 @@ function connectWithNative(
 					return;
 				}
 				if (handleId == null) {
-					settleReject(new Error("connect succeeded but no handle id"));
+					settleReject(
+						toWebTransportError(
+							new Error("E_INTERNAL: connect succeeded but no handle id"),
+							strictW3CErrors,
+						),
+					);
 					return;
 				}
 				const handle = native.takeClientSession(handleId);
 				if (!handle) {
-					settleReject(new Error("connect: handle not found in registry"));
+					// The session closed before JavaScript could take it, e.g. a
+					// server at maxSessions closing it with E_LIMIT_EXCEEDED.
+					settleReject(
+						toWebTransportError(
+							new Error(connectRaceMessage(earlyCloses.get(handleId))),
+							strictW3CErrors,
+						),
+					);
 					return;
 				}
 				if (settled) {

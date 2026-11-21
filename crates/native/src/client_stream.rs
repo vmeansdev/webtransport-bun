@@ -161,6 +161,14 @@ impl Drop for StreamGuard {
 /// Byte-accounted budget for stream data in transit through channels.
 /// Three-level reservation: global → session → stream.
 /// Reserve before enqueue, release after dequeue.
+///
+/// Sending and receiving draw on separate halves of the session and global
+/// caps (`direction`), and a bidi stream's two directions have separate
+/// per-stream counters. With one shared budget, writes queued faster than the
+/// peer drained them filled it, the receive side could no longer reserve,
+/// nothing was read, and both peers stalled until E_BACKPRESSURE_TIMEOUT. Each
+/// direction gets the whole per-stream cap; the halved session and global caps
+/// keep the worst case at the configured totals.
 #[derive(Clone)]
 pub struct StreamBudget {
     pub server_metrics: Arc<crate::server_metrics::ServerMetrics>,
@@ -176,6 +184,17 @@ pub struct StreamBudget {
     /// Max time a send may park waiting for budget headroom before yielding
     /// E_BACKPRESSURE_TIMEOUT (reliable-stream backpressure bound).
     pub backpressure_timeout_ms: u64,
+    /// Which half of the session and global caps this budget draws on.
+    pub direction: BudgetDirection,
+}
+
+/// The direction a stream budget accounts for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BudgetDirection {
+    /// Bytes received from the peer and queued for JavaScript.
+    Receive,
+    /// Bytes written by JavaScript and queued for the transport.
+    Send,
 }
 
 /// Configuration retained by an accepted stream before JS consumes it.
@@ -222,6 +241,7 @@ impl DeferredStreamBudgetConfig {
             max_session: self.max_session,
             max_stream: self.max_stream,
             capacity_notify: StreamBudget::new_notify(),
+            direction: BudgetDirection::Receive,
             backpressure_timeout_ms: self.backpressure_timeout_ms,
         }
     }
@@ -377,40 +397,64 @@ async fn reserve_for_recv(
 impl StreamBudget {
     /// The largest single reservation this budget can ever grant.
     pub fn max_reservation(&self) -> u64 {
-        self.max_stream.min(self.max_session).min(self.max_global)
+        self.max_stream
+            .min(Self::half(self.max_session))
+            .min(Self::half(self.max_global))
+    }
+
+    /// Each direction's share of a session or global cap.
+    fn half(cap: u64) -> u64 {
+        (cap / 2).max(1)
+    }
+
+    fn global_counter(&self) -> &AtomicU64 {
+        match self.direction {
+            BudgetDirection::Receive => &self.server_metrics.queued_bytes_global,
+            BudgetDirection::Send => &self.server_metrics.queued_bytes_global_send,
+        }
+    }
+
+    fn session_counter(&self) -> &AtomicU64 {
+        match self.direction {
+            BudgetDirection::Receive => &self.session_metrics.queued_bytes,
+            BudgetDirection::Send => &self.session_metrics.queued_bytes_send,
+        }
+    }
+
+    /// The budget the send direction of the same stream reserves against: the
+    /// same limits, its own per-stream counter and notifier, and the send
+    /// halves of the session and global caps.
+    pub fn for_send(&self) -> StreamBudget {
+        StreamBudget {
+            stream_queued: Arc::new(AtomicU64::new(0)),
+            capacity_notify: StreamBudget::new_notify(),
+            direction: BudgetDirection::Send,
+            ..self.clone()
+        }
+    }
+
+    fn try_counter(counter: &AtomicU64, n: u64, max: u64) -> bool {
+        counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                c.checked_add(n)
+                    .and_then(|next| (next <= max).then_some(next))
+            })
+            .is_ok()
     }
 
     pub fn try_reserve(&self, n: u64) -> bool {
-        if !self
-            .server_metrics
-            .try_reserve_queued_bytes(n, self.max_global)
-        {
+        let global = self.global_counter();
+        let session = self.session_counter();
+        if !Self::try_counter(global, n, Self::half(self.max_global)) {
             return false;
         }
-        let session_ok = self
-            .session_metrics
-            .queued_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
-                c.checked_add(n)
-                    .and_then(|next| (next <= self.max_session).then_some(next))
-            })
-            .is_ok();
-        if !session_ok {
-            self.server_metrics.release_queued_bytes(n);
+        if !Self::try_counter(session, n, Self::half(self.max_session)) {
+            global.fetch_sub(n, Ordering::Relaxed);
             return false;
         }
-        let stream_ok = self
-            .stream_queued
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
-                c.checked_add(n)
-                    .and_then(|next| (next <= self.max_stream).then_some(next))
-            })
-            .is_ok();
-        if !stream_ok {
-            self.session_metrics
-                .queued_bytes
-                .fetch_sub(n, Ordering::Relaxed);
-            self.server_metrics.release_queued_bytes(n);
+        if !Self::try_counter(&self.stream_queued, n, self.max_stream) {
+            session.fetch_sub(n, Ordering::Relaxed);
+            global.fetch_sub(n, Ordering::Relaxed);
             return false;
         }
         true
@@ -418,10 +462,8 @@ impl StreamBudget {
 
     pub fn release(&self, n: u64) {
         self.stream_queued.fetch_sub(n, Ordering::Relaxed);
-        self.session_metrics
-            .queued_bytes
-            .fetch_sub(n, Ordering::Relaxed);
-        self.server_metrics.release_queued_bytes(n);
+        self.session_counter().fetch_sub(n, Ordering::Relaxed);
+        self.global_counter().fetch_sub(n, Ordering::Relaxed);
         // Wake any recv loop parked waiting for budget headroom.
         self.capacity_notify.notify_waiters();
     }
@@ -1326,6 +1368,8 @@ pub struct ClientBidiStreamHandle {
     deferred_terminal: TerminalLatch,
     stop_tx: std::sync::Mutex<Option<oneshot::Sender<u32>>>,
     budget: Mutex<Option<StreamBudget>>,
+    /// Send-direction budget, derived from `budget` on the first write.
+    send_budget: Mutex<Option<StreamBudget>>,
     deferred_budget: Mutex<Option<DeferredStreamBudgetConfig>>,
     write_error_slot: Mutex<Option<WriteErrorSlot>>,
     read_error_slot: Option<ReadErrorSlot>,
@@ -1365,6 +1409,7 @@ impl ClientBidiStreamHandle {
             deferred_terminal: TerminalLatch::default(),
             stop_tx: std::sync::Mutex::new(Some(stop_tx)),
             budget: Mutex::new(None),
+            send_budget: Mutex::new(None),
             deferred_budget: Mutex::new(None),
             write_error_slot: Mutex::new(None),
             read_error_slot: None,
@@ -1406,6 +1451,7 @@ impl ClientBidiStreamHandle {
             deferred_terminal: TerminalLatch::default(),
             stop_tx: std::sync::Mutex::new(Some(stop_tx)),
             budget: Mutex::new(budget),
+            send_budget: Mutex::new(None),
             deferred_budget: Mutex::new(None),
             write_error_slot: Mutex::new(write_error_slot),
             read_error_slot,
@@ -1440,6 +1486,7 @@ impl ClientBidiStreamHandle {
             deferred_terminal: TerminalLatch::default(),
             stop_tx: std::sync::Mutex::new(None),
             budget: Mutex::new(None),
+            send_budget: Mutex::new(None),
             deferred_budget: Mutex::new(budget),
             write_error_slot: Mutex::new(None),
             read_error_slot: None,
@@ -1476,6 +1523,7 @@ impl ClientBidiStreamHandle {
             deferred_terminal: TerminalLatch::default(),
             stop_tx: std::sync::Mutex::new(None),
             budget: Mutex::new(Some(budget)),
+            send_budget: Mutex::new(None),
             deferred_budget: Mutex::new(None),
             write_error_slot: Mutex::new(None),
             read_error_slot: None,
@@ -1764,6 +1812,9 @@ impl ClientBidiStreamHandle {
         if let Ok(mut budget) = self.budget.lock() {
             budget.take();
         }
+        if let Ok(mut budget) = self.send_budget.lock() {
+            budget.take();
+        }
         if let Ok(mut read) = self.read_rx.lock() {
             read.take();
         }
@@ -1988,7 +2039,17 @@ impl ClientBidiStreamHandle {
         // An accepted stream that is only ever written keeps its budget deferred
         // until here: materialize it on this side too, otherwise a push-style
         // server bypasses the queue limits entirely.
-        let budget = installed_budget(&self.budget, &self.deferred_budget)?;
+        let budget = {
+            let recv = installed_budget(&self.budget, &self.deferred_budget)?;
+            let mut guard = self
+                .send_budget
+                .lock()
+                .map_err(|_| napi::Error::from_reason("E_INTERNAL: send budget lock poisoned"))?;
+            if guard.is_none() {
+                *guard = recv.as_ref().map(StreamBudget::for_send);
+            }
+            guard.clone()
+        };
         for bytes in write_pieces(bytes, budget.as_ref()) {
             let sz = bytes.len() as u64;
             if let Some(ref b) = budget {
@@ -2214,6 +2275,7 @@ impl ClientUniSendHandle {
         write_error_slot: Option<WriteErrorSlot>,
     ) -> Self {
         LIVE_UNI_SEND_HANDLES.fetch_add(1, Ordering::Relaxed);
+        let budget = budget.map(|b| b.for_send());
         Self {
             write_tx: Mutex::new(Some(write_tx)),
             budget,
@@ -3352,6 +3414,7 @@ mod tests {
             max_session: 1 << 18,
             max_stream: 1 << 16,
             capacity_notify: StreamBudget::new_notify(),
+            direction: BudgetDirection::Receive,
             backpressure_timeout_ms: 1000,
         }
     }
@@ -3636,20 +3699,42 @@ mod tests {
             handle.deferred_budget.lock().unwrap().is_none(),
             "deferred config must be consumed exactly once"
         );
-        assert_eq!(installed.stream_queued.load(Ordering::Relaxed), 128);
+        // Writes are accounted on the send side of the materialized budget;
+        // the receive side stays empty for the peer's data.
+        let send = handle
+            .send_budget
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("write path must derive the send budget");
+        assert_eq!(send.direction, BudgetDirection::Send);
+        assert_eq!(send.stream_queued.load(Ordering::Relaxed), 128);
+        assert_eq!(
+            send.server_metrics
+                .queued_bytes_global_send
+                .load(Ordering::Relaxed),
+            128
+        );
+        assert_eq!(
+            send.session_metrics
+                .queued_bytes_send
+                .load(Ordering::Relaxed),
+            128
+        );
+        assert_eq!(installed.stream_queued.load(Ordering::Relaxed), 0);
         assert_eq!(
             installed
                 .server_metrics
                 .queued_bytes_global
                 .load(Ordering::Relaxed),
-            128
+            0
         );
         assert_eq!(
             installed
                 .session_metrics
                 .queued_bytes
                 .load(Ordering::Relaxed),
-            128
+            0
         );
     }
 
@@ -3670,8 +3755,63 @@ mod tests {
                 .expect("write must succeed");
         }
 
-        let installed = handle.budget.lock().unwrap().clone().expect("budget");
-        assert_eq!(installed.stream_queued.load(Ordering::Relaxed), 192);
+        let send = handle.send_budget.lock().unwrap().clone().expect("budget");
+        assert_eq!(send.stream_queued.load(Ordering::Relaxed), 192);
+    }
+
+    /// The bidi stall: with one shared budget, queued writes filled it and the
+    /// receive side could no longer reserve. Each side must have its own room.
+    #[test]
+    fn a_full_receive_side_leaves_the_send_side_its_own_room() {
+        let stream_queued = Arc::new(AtomicU64::new(0));
+        let recv = budget(&stream_queued);
+        let send = recv.for_send();
+        let full = recv.max_reservation();
+        assert!(recv.try_reserve(full), "receive side fills its share");
+        assert!(!recv.try_reserve(1), "receive side is full");
+        assert!(send.try_reserve(full), "send side still has its own share");
+        assert!(!send.try_reserve(1), "send side is full");
+        recv.release(full);
+        assert!(
+            recv.try_reserve(1),
+            "a receive release frees only receive room"
+        );
+        assert!(!send.try_reserve(1));
+        send.release(full);
+        recv.release(1);
+        assert_eq!(
+            recv.server_metrics
+                .queued_bytes_global
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            recv.server_metrics
+                .queued_bytes_global_send
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    /// Each direction may use half of the session and global caps and the
+    /// whole per-stream cap, so the total stays the configured cap.
+    #[test]
+    fn each_direction_gets_half_the_session_and_global_caps() {
+        let stream_queued = Arc::new(AtomicU64::new(0));
+        let mut b = budget(&stream_queued);
+        b.max_stream = 1 << 30;
+        assert_eq!(
+            b.max_reservation(),
+            (b.max_session / 2).min(b.max_global / 2)
+        );
+        b.max_session = 1 << 30;
+        b.max_global = 1 << 30;
+        b.max_stream = 1000;
+        assert_eq!(
+            b.max_reservation(),
+            1000,
+            "the per-stream cap is not halved"
+        );
     }
 
     #[test]

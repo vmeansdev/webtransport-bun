@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch, Mutex as TokioMutex, Notify};
 
 /// Per-client-session atomic metrics.
@@ -190,6 +191,15 @@ fn map_connecting_error(
             std::io::Error::other("E_RATE_LIMITED: server rejected WebTransport session request")
                 .into()
         }
+        // A server at maxHandshakesInFlight answers CONNECTION_REFUSED. It is
+        // the same transient admission signal as a maxSessions close, so it
+        // gets the same code, which callers already retry with backoff.
+        wtransport::error::ConnectingError::ConnectionError(
+            wtransport::error::ConnectionError::ConnectionClosed(close),
+        ) if close.is_connection_refused() => std::io::Error::other(
+            "E_LIMIT_EXCEEDED: server refused the connection (admission limit; retry with backoff)",
+        )
+        .into(),
         other => other.into(),
     }
 }
@@ -516,6 +526,80 @@ impl ClientDatagramReadState {
             .queued_bytes
             .fetch_sub(bytes.len() as u64, Ordering::Relaxed);
     }
+}
+
+/// Connections of client sessions this process closed, kept until their
+/// CONNECTION_CLOSE has been sent. The close goes out on the client runtime's
+/// thread, so a process that exits straight after `close()` would kill it with
+/// the close still queued and leave the session open on the server until its
+/// idle timeout. [`flush_client_closes`] lets the JavaScript layer wait for it.
+/// Entries are recorded synchronously inside `close()`, so a flush that runs
+/// right after it always sees them.
+static CLOSING_CONNECTIONS: Lazy<Mutex<Vec<(std::time::Instant, wtransport::Connection)>>> =
+    Lazy::new(|| Mutex::new(Vec::new()));
+
+/// How long a closing connection is waited for at most. A pooled session's
+/// close leaves its shared connection open, so its entry simply ages out.
+const CLOSE_IN_FLIGHT_LIMIT: Duration = Duration::from_millis(3_500);
+
+/// Whether a closing connection has told the peer: it sent CONNECTION_CLOSE,
+/// or the connection already ended for another reason (peer close, timeout),
+/// so there is nothing left to send.
+fn close_reached_peer(conn: &wtransport::Connection) -> bool {
+    let quic = conn.quic_connection();
+    if quic.stats().frame_tx.connection_close > 0 {
+        return true;
+    }
+    matches!(
+        quic.close_reason(),
+        Some(reason) if !matches!(reason, wtransport::quinn::ConnectionError::LocallyClosed)
+    )
+}
+
+fn pending_closes(
+    entries: &mut Vec<(std::time::Instant, wtransport::Connection)>,
+    done: impl Fn(&wtransport::Connection) -> bool,
+) -> usize {
+    entries.retain(|(since, conn)| since.elapsed() < CLOSE_IN_FLIGHT_LIMIT && !done(conn));
+    entries.len()
+}
+
+fn note_closing_connection(conn: &wtransport::Connection) {
+    let mut entries = CLOSING_CONNECTIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    pending_closes(&mut entries, close_reached_peer);
+    entries.push((std::time::Instant::now(), conn.clone()));
+}
+
+/// Polls `pending` until it reports zero or `timeout` passes; returns the
+/// last count.
+fn wait_until_drained(pending: impl Fn() -> usize, timeout: Duration) -> usize {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let n = pending();
+        if n == 0 || std::time::Instant::now() >= deadline {
+            return n;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Blocks the calling thread until every client session this process closed
+/// has sent its CONNECTION_CLOSE, or `timeout_ms` passes. Returns how many had
+/// not. Called from a process `exit` handler, where nothing can await.
+#[napi]
+pub fn flush_client_closes(timeout_ms: u32) -> u32 {
+    let left = wait_until_drained(
+        || {
+            let mut entries = CLOSING_CONNECTIONS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            pending_closes(&mut entries, close_reached_peer)
+        },
+        Duration::from_millis(u64::from(timeout_ms)),
+    );
+    u32::try_from(left).unwrap_or(u32::MAX)
 }
 
 /// Signals that the receive forwarder's body has finished.
@@ -1330,6 +1414,7 @@ impl ClientSessionHandle {
             }
         }
         if let Some(ref conn) = self.conn {
+            note_closing_connection(conn);
             conn.close_session(code, &reason);
         }
     }
@@ -1404,6 +1489,7 @@ impl ClientSessionHandle {
                 max_session,
                 max_stream,
                 capacity_notify: StreamBudget::new_notify(),
+                direction: crate::client_stream::BudgetDirection::Receive,
                 backpressure_timeout_ms,
             }
         };
@@ -2536,6 +2622,33 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn wait_until_drained_returns_as_soon_as_nothing_is_pending() {
+        use std::sync::atomic::AtomicUsize;
+        let pending = Arc::new(AtomicUsize::new(2));
+        let drainer = Arc::clone(&pending);
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            drainer.store(0, Ordering::Release);
+        });
+        let started = std::time::Instant::now();
+        let left = super::wait_until_drained(
+            || pending.load(Ordering::Acquire),
+            std::time::Duration::from_secs(5),
+        );
+        assert_eq!(left, 0);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn wait_until_drained_gives_up_at_the_timeout_and_reports_what_is_left() {
+        let started = std::time::Instant::now();
+        let left = super::wait_until_drained(|| 3, std::time::Duration::from_millis(30));
+        assert_eq!(left, 3);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(30));
+    }
     use std::sync::{Arc, Mutex};
     use tokio::sync::{mpsc, watch, Mutex as TokioMutex, Notify};
     use tokio::time::{timeout, Duration};

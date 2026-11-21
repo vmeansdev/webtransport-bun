@@ -22,6 +22,9 @@ pub struct SessionMetrics {
     pub streams_bidi_active: AtomicU64,
     pub streams_uni_active: AtomicU64,
     pub queued_bytes: AtomicU64,
+    /// Stream bytes this session has queued for sending; see
+    /// `ServerMetrics::queued_bytes_global_send`.
+    pub queued_bytes_send: AtomicU64,
 }
 
 impl SessionMetrics {

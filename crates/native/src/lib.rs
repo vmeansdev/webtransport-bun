@@ -1646,6 +1646,7 @@ pub(crate) fn spawn_wtransport_server(
                                                                     max_session: lim_create_bi.max_queued_bytes_per_session,
                                                                     max_stream: lim_create_bi.max_queued_bytes_per_stream,
                                                                     capacity_notify: crate::client_stream::StreamBudget::new_notify(),
+                                                                    direction: crate::client_stream::BudgetDirection::Receive,
                                                                     backpressure_timeout_ms: lim_create_bi.backpressure_timeout_ms,
                                                                 };
                                                                 // Deferred like accepted streams: no bridge task, channel,
@@ -1718,6 +1719,7 @@ pub(crate) fn spawn_wtransport_server(
                                                                         max_session: lim_create_uni.max_queued_bytes_per_session,
                                                                         max_stream: lim_create_uni.max_queued_bytes_per_stream,
                                                                         capacity_notify: crate::client_stream::StreamBudget::new_notify(),
+                                                                        direction: crate::client_stream::BudgetDirection::Receive,
                                                                         backpressure_timeout_ms: lim_create_uni.backpressure_timeout_ms,
                                                                     };
                                                                     let (write_tx, write_err_slot) = crate::client_stream::spawn_uni_send_bridge(send, Some(guard), Some(budget.clone()));
