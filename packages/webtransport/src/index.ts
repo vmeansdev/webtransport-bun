@@ -240,6 +240,8 @@ import type {
 import {
 	createW3CMappedError as createMappedError,
 	normalizeW3CBrowserName as normalizeToBrowserName,
+	validateW3CClientOptions,
+	type W3CClientOptionSurface,
 } from "./w3c-client-options.js";
 
 /** Web IDL BufferSource (ArrayBuffer | ArrayBufferView) for spec alignment */
@@ -3573,6 +3575,7 @@ export async function connect(
 	warnIfLeakyBunRuntime();
 	const native = getNativeOrThrow();
 	validateConnectUrl(url, opts?.strictW3CErrors);
+	validateClientOptions(opts, opts?.strictW3CErrors);
 	const serverCertificateHashes = mapServerCertificateHashes(
 		opts?.serverCertificateHashes,
 	);
@@ -3589,12 +3592,6 @@ export async function connect(
 		});
 	}
 
-	if (opts?.serverCertificateHashes !== undefined) {
-		validateServerCertificateHashes(
-			opts.serverCertificateHashes,
-			opts?.strictW3CErrors,
-		);
-	}
 	if (opts !== undefined) {
 		validateQpackOptions(opts, opts.strictW3CErrors);
 	}
@@ -3659,24 +3656,14 @@ export function releaseNativeMemory(): boolean {
 // Browser-style WebTransport facade (Phase P1)
 // ---------------------------------------------------------------------------
 
-function validateServerCertificateHashes(
-	arr: unknown,
+/**
+ * The entries of a `serverCertificateHashes` array the shared W3C validator has
+ * already accepted as a non-empty array: only the native pin path reads them.
+ */
+function validateServerCertificateHashEntries(
+	arr: ReadonlyArray<{ algorithm: string; value: unknown }>,
 	strictW3CErrors?: boolean,
 ): void {
-	if (!Array.isArray(arr)) {
-		throw createMappedError(
-			E_INVALID_ARGUMENT as ErrorCode,
-			"E_INVALID_ARGUMENT: serverCertificateHashes must be an array",
-			strictW3CErrors,
-		);
-	}
-	if (arr.length === 0) {
-		throw createMappedError(
-			E_INVALID_ARGUMENT as ErrorCode,
-			"E_INVALID_ARGUMENT: serverCertificateHashes must be a non-empty array",
-			strictW3CErrors,
-		);
-	}
 	for (const entry of arr) {
 		if (entry.algorithm !== "sha-256") {
 			throw createMappedError(
@@ -3743,7 +3730,6 @@ function validateUnknownSniPolicy(policy: unknown, required = false): void {
 const VALID_CONGESTION = new Set(["default", "throughput", "low-latency"]);
 /** Hard cap on advertised QPACK dynamic-table capacity (mirrors the native `MAX_QPACK_TABLE_CAPACITY`, 64 KiB). */
 const MAX_QPACK_TABLE_CAPACITY = 65536;
-const VALID_DATAGRAMS_READABLE_TYPE = new Set(["bytes", "default"]);
 
 /**
  * Both QPACK options, validated the same way on the server and the client.
@@ -3858,81 +3844,36 @@ function validateQpackOptions(
 	}
 }
 
+/**
+ * The one client-option validator behind both `connect()` and
+ * `new WebTransport()`: the W3C surface shared with the wasm facade, then the
+ * options only the native client reads.
+ */
 function validateClientOptions(
-	opts?: WebTransportClientOptions,
+	opts: (W3CClientOptionSurface & { enable0Rtt?: unknown }) | undefined,
 	strictW3CErrors?: boolean,
 ): void {
 	if (!opts) return;
-	if (
-		opts.allowPooling !== undefined &&
-		typeof opts.allowPooling !== "boolean"
-	) {
-		throw createMappedError(
-			E_INVALID_ARGUMENT as ErrorCode,
-			"E_INVALID_ARGUMENT: allowPooling must be a boolean",
-			strictW3CErrors,
-		);
-	}
-	if (
-		opts.requireUnreliable !== undefined &&
-		typeof opts.requireUnreliable !== "boolean"
-	) {
-		throw createMappedError(
-			E_INVALID_ARGUMENT as ErrorCode,
-			"E_INVALID_ARGUMENT: requireUnreliable must be a boolean",
-			strictW3CErrors,
-		);
-	}
-	if (
-		opts.congestionControl !== undefined &&
-		!VALID_CONGESTION.has(opts.congestionControl)
-	) {
-		throw createMappedError(
-			E_INVALID_ARGUMENT as ErrorCode,
-			`E_INVALID_ARGUMENT: congestionControl must be "default", "throughput", or "low-latency", got "${opts.congestionControl}"`,
-			strictW3CErrors,
-		);
-	}
-	if (
-		opts.datagramsReadableType !== undefined &&
-		!VALID_DATAGRAMS_READABLE_TYPE.has(opts.datagramsReadableType)
-	) {
-		throw createMappedError(
-			E_INVALID_ARGUMENT as ErrorCode,
-			`E_INVALID_ARGUMENT: datagramsReadableType must be "bytes" or "default", got "${opts.datagramsReadableType}"`,
-			strictW3CErrors,
-		);
-	}
+	validateW3CClientOptions(opts, strictW3CErrors);
 	if (opts.serverCertificateHashes !== undefined) {
-		if (!Array.isArray(opts.serverCertificateHashes)) {
-			throw createMappedError(
-				E_INVALID_ARGUMENT as ErrorCode,
-				"E_INVALID_ARGUMENT: serverCertificateHashes must be an array",
-				strictW3CErrors,
-			);
-		}
-		// An empty array is a silent pinning downgrade: the consumer asked for
-		// cert pinning but supplied no hashes. Reject rather than fall back to
-		// accept-any.
-		if (opts.serverCertificateHashes.length === 0) {
-			throw createMappedError(
-				E_INVALID_ARGUMENT as ErrorCode,
-				"E_INVALID_ARGUMENT: serverCertificateHashes must be a non-empty array",
-				strictW3CErrors,
-			);
-		}
-		if (opts.allowPooling === true) {
-			// W3C mandates NotSupportedError for this combination regardless of
-			// the strict flag (asserted by parity-compat) — intentionally not
-			// gated on strictW3CErrors.
-			throw createMappedError(
-				E_UNSUPPORTED_ARGUMENT as ErrorCode,
-				"E_UNSUPPORTED_ARGUMENT: serverCertificateHashes cannot be used with allowPooling=true",
-				true,
-			);
-		}
-		validateServerCertificateHashes(
+		validateServerCertificateHashEntries(
 			opts.serverCertificateHashes,
+			strictW3CErrors,
+		);
+	}
+	if (opts.enable0Rtt !== undefined && typeof opts.enable0Rtt !== "boolean") {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			"E_INVALID_ARGUMENT: enable0Rtt must be a boolean",
+			strictW3CErrors,
+		);
+	}
+	if (opts.enable0Rtt === true && opts.allowPooling === true) {
+		// Pooling reuses live connections, while 0-RTT and its
+		// has0Rtt/accepted0Rtt reporting are per handshake.
+		throw createMappedError(
+			E_UNSUPPORTED_ARGUMENT as ErrorCode,
+			"E_UNSUPPORTED_ARGUMENT: enable0Rtt cannot be used with allowPooling=true",
 			strictW3CErrors,
 		);
 	}

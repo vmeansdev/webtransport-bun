@@ -64,9 +64,10 @@ On supported targets (Bun/Node/Deno on macOS/Linux/Windows), the transport backe
 ## Error Model and Browser-Style Names
 
 - **Stable `E_*` codes:** All errors carry `code` (e.g. `E_TLS`, `E_HANDSHAKE_TIMEOUT`) for programmatic handling. This is preserved for backward compatibility.
-- **Deterministic browser name for validation:** `allowPooling + serverCertificateHashes` throws with `name: "NotSupportedError"` and `code: E_INTERNAL`.
+- **One option validator for both client APIs:** `connect()` and `new WebTransport()` run the same validation before anything is dialed. A malformed option (wrong type, unknown `congestionControl`, an empty `serverCertificateHashes`) is `E_INVALID_ARGUMENT`; a combination the client cannot honor is `E_UNSUPPORTED_ARGUMENT`: `allowPooling` with `serverCertificateHashes`, and (on `connect()`, the only API that takes it) `enable0Rtt` with `allowPooling`.
+- **Deterministic browser name for validation:** `allowPooling + serverCertificateHashes` throws with `name: "NotSupportedError"` and `code: E_UNSUPPORTED_ARGUMENT`, whether or not `strictW3CErrors` is set (W3C mandates `NotSupportedError` here).
 - **strictW3CErrors option:** When `strictW3CErrors: true` is passed to `connect()` or `new WebTransport()`, connect-path, session, and Web Streams facade errors use browser-style DOMException names while retaining `code: E_*`. Default is `false` for backward compatibility. Strict mode affects error surface only, not transport internals.
-- **Mapping rules (when strictW3CErrors):** E_TLS → NetworkError; E_HANDSHAKE_TIMEOUT/E_BACKPRESSURE_TIMEOUT → TimeoutError; E_SESSION_CLOSED/E_SESSION_IDLE_TIMEOUT → InvalidStateError; E_STREAM_RESET/E_STOP_SENDING → AbortError; E_LIMIT_EXCEEDED/E_QUEUE_FULL/E_RATE_LIMITED → QuotaExceededError; invalid option types → TypeError; allowPooling+serverCertificateHashes → NotSupportedError; other E_INTERNAL cases → OperationError.
+- **Mapping rules (when strictW3CErrors):** E_TLS → NetworkError; E_HANDSHAKE_TIMEOUT/E_BACKPRESSURE_TIMEOUT → TimeoutError; E_SESSION_CLOSED/E_SESSION_IDLE_TIMEOUT → InvalidStateError; E_STREAM_RESET/E_STOP_SENDING → AbortError; E_LIMIT_EXCEEDED/E_QUEUE_FULL/E_RATE_LIMITED → QuotaExceededError; E_INVALID_ARGUMENT → TypeError; E_UNSUPPORTED_ARGUMENT → NotSupportedError; E_INTERNAL → OperationError.
 - **Unknown errors:** No broad catch-all; unmapped cases keep `name: "WebTransportError"`.
 - **Close-reason-only codes:** `E_SERVER_CLOSING` is in the `ErrorCode` union and exported like its peers, but it is only ever produced as a `CloseInfo.reason` (with close code `3993`), never as a thrown `WebTransportError.code` — so it has no `strictW3CErrors` mapping. See "Server shutdown close semantics".
 
@@ -306,11 +307,11 @@ export type ClientOptions = {
   /** Pin the server leaf by SHA-256 (W3C semantics; cert validity <= 14 days). */
   serverCertificateHashes?: Array<{ algorithm: "sha-256"; value: BufferSource }>;
   congestionControl?: "default" | "throughput" | "low-latency";
-  /** Reuse one QUIC connection for compatible connects (see "Pooling Semantics"). */
+  /** Reuse a pooled endpoint for compatible connects; each connect still makes its own connection (see "Pooling Semantics"). */
   allowPooling?: boolean;
   /** Requires datagram support; participates in pool compatibility. */
   requireUnreliable?: boolean;
-  /** Browser-style DOMException names instead of E_* codes (see "Error Model"). */
+  /** Browser-style DOMException names; `code` keeps the E_* (see "Error Model"). */
   strictW3CErrors?: boolean;
   /** Offer 0-RTT to servers this process has seen; incompatible with allowPooling. */
   enable0Rtt?: boolean;

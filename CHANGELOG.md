@@ -27,6 +27,15 @@ hatch exists. Checked against the rc.1 candidate (875dfbfe).
   - a numeric field set to `null` or to a non-finite value (`NaN`,
     `Infinity`, a string).
   An absent field still means "default".
+- **`connect()` validates its options like `new WebTransport()`.** Both now
+  run one validator before dialing, so `connect()` reports `E_INVALID_ARGUMENT`
+  for an unknown `congestionControl`, a non-boolean `allowPooling`,
+  `requireUnreliable` or `enable0Rtt`, and a malformed
+  `serverCertificateHashes`, where rc.1 reached the addon and failed with
+  `E_INTERNAL` (or silently ignored the non-boolean). `allowPooling` combined
+  with `serverCertificateHashes` or with `enable0Rtt` is
+  `E_UNSUPPORTED_ARGUMENT` (`NotSupportedError` under `strictW3CErrors`, and
+  always for the hashes case) on `connect()` too; rc.1 gave `E_INTERNAL`.
 - **Server shutdown close code.** Sessions ended by `server.close()` now close
   with code `3993` and reason `E_SERVER_CLOSING`, on the wire and in the local
   `closed` fallback. rc.1 used application code `0` with reason

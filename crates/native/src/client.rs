@@ -2318,6 +2318,31 @@ pub type RunConnectResult = (
     Option<crate::zero_rtt::ZeroRttHandleState>,
 );
 
+/// Option combinations pooling cannot honor. The TypeScript layer refuses
+/// them first with the same codes; this keeps the addon from accepting them
+/// when called directly.
+fn check_pooling_compatibility(
+    allow_pooling: bool,
+    has_pinned_hashes: bool,
+    enable_0rtt: bool,
+) -> std::result::Result<(), &'static str> {
+    if !allow_pooling {
+        return Ok(());
+    }
+    if has_pinned_hashes {
+        return Err(
+            "E_UNSUPPORTED_ARGUMENT: serverCertificateHashes cannot be used with allowPooling=true",
+        );
+    }
+    // Pooling reuses live connections; 0-RTT is about new-connection latency
+    // and its has0Rtt/accepted0Rtt reporting is per-handshake. Combining the
+    // two would silently report nothing, so reject loudly instead.
+    if enable_0rtt {
+        return Err("E_UNSUPPORTED_ARGUMENT: enable0Rtt cannot be used with allowPooling=true");
+    }
+    Ok(())
+}
+
 async fn run_connect(
     url: &str,
     opts_json: String,
@@ -2348,22 +2373,12 @@ async fn run_connect(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    if allow_pooling && !pinned_hashes.is_empty() {
-        return Err(
-            "E_INTERNAL: serverCertificateHashes cannot be used with allowPooling=true".into(),
-        );
-    }
-
     let enable_0rtt = opts
         .get("enable0Rtt")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    // Pooling reuses live connections; 0-RTT is about new-connection latency
-    // and its has0Rtt/accepted0Rtt reporting is per-handshake. Combining the
-    // two would silently report nothing, so reject loudly instead.
-    if enable_0rtt && allow_pooling {
-        return Err("E_INTERNAL: enable0Rtt cannot be used with allowPooling=true".into());
-    }
+    check_pooling_compatibility(allow_pooling, !pinned_hashes.is_empty(), enable_0rtt)
+        .map_err(std::io::Error::other)?;
 
     // QPACK dynamic-table capacity to advertise (0 = static-only, the default).
     let qpack_max_table_capacity =
@@ -2660,6 +2675,17 @@ mod tests {
             })
             .into(),
         )
+    }
+
+    #[test]
+    fn pooling_refuses_pinning_and_0rtt_as_unsupported() {
+        use super::check_pooling_compatibility;
+        assert_eq!(check_pooling_compatibility(false, true, true), Ok(()));
+        assert_eq!(check_pooling_compatibility(true, false, false), Ok(()));
+        let pinned = check_pooling_compatibility(true, true, false).unwrap_err();
+        assert!(pinned.starts_with("E_UNSUPPORTED_ARGUMENT: serverCertificateHashes"));
+        let early = check_pooling_compatibility(true, false, true).unwrap_err();
+        assert!(early.starts_with("E_UNSUPPORTED_ARGUMENT: enable0Rtt"));
     }
 
     #[test]
