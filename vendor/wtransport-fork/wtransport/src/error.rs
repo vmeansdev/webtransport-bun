@@ -276,6 +276,14 @@ impl ApplicationClose {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionClose(quinn::ConnectionClose);
 
+impl ConnectionClose {
+    /// Whether the peer closed with the transport error `CONNECTION_REFUSED`:
+    /// a server declining new connections, typically at an admission limit.
+    pub fn is_connection_refused(&self) -> bool {
+        self.0.error_code == quinn::TransportErrorCode::CONNECTION_REFUSED
+    }
+}
+
 impl Display for ConnectionClose {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
@@ -351,3 +359,23 @@ impl Display for QuicProtoError {
 #[derive(Debug, thiserror::Error, Clone, Eq, PartialEq)]
 #[error("cannot derive keying material as requested output length is too large")]
 pub struct ExportKeyingMaterialError;
+
+#[cfg(test)]
+mod connection_close_tests {
+    use super::ConnectionClose;
+
+    fn close(code: quinn::TransportErrorCode) -> ConnectionClose {
+        ConnectionClose(quinn::ConnectionClose {
+            error_code: code,
+            frame_type: None,
+            reason: Default::default(),
+        })
+    }
+
+    #[test]
+    fn only_connection_refused_reads_as_refused() {
+        assert!(close(quinn::TransportErrorCode::CONNECTION_REFUSED).is_connection_refused());
+        assert!(!close(quinn::TransportErrorCode::PROTOCOL_VIOLATION).is_connection_refused());
+        assert!(!close(quinn::TransportErrorCode::NO_ERROR).is_connection_refused());
+    }
+}

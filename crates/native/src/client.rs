@@ -190,6 +190,15 @@ fn map_connecting_error(
             std::io::Error::other("E_RATE_LIMITED: server rejected WebTransport session request")
                 .into()
         }
+        // A server at maxHandshakesInFlight answers CONNECTION_REFUSED. It is
+        // the same transient admission signal as a maxSessions close, so it
+        // gets the same code, which callers already retry with backoff.
+        wtransport::error::ConnectingError::ConnectionError(
+            wtransport::error::ConnectionError::ConnectionClosed(close),
+        ) if close.is_connection_refused() => std::io::Error::other(
+            "E_LIMIT_EXCEEDED: server refused the connection (admission limit; retry with backoff)",
+        )
+        .into(),
         other => other.into(),
     }
 }
