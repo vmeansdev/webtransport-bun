@@ -79,6 +79,13 @@ hatch exists. Checked against the rc.1 candidate (875dfbfe).
   streams) failed with plain `Error`s whose message began with the code. They
   now emit a `WebTransportError` with the same message and `.code` set, like
   the server's streams; code reading `err.message` is unaffected.
+- **A wasm server drops over-rate datagrams instead of closing the
+  connection.** A datagram over the per-IP ingress rate
+  (`rateLimits.datagramsIngressPerSec` / `datagramsIngressBurst`) used to
+  close the sender's whole connection on the wasm engine, while native drops
+  the datagram and keeps the session. wasm now matches native: the datagram
+  is dropped, counted in `rateLimitedCount` and `datagramsDropped`, and the
+  session stays open. There is no option to restore the close.
 - **Not breaking, listed for completeness.** The surfaces under "Removed and
   internalized" below were never in rc.1, so no rc.1 caller can depend on
   them: the reflector, the campaign getters, `__sendPathDiagnostics`, the

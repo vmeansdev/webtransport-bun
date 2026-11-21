@@ -1842,7 +1842,10 @@ export class WasmTransportManager {
 			streamsActive: this.streams.size,
 			datagramsIn: this.datagramsIn,
 			datagramsOut: this.datagramsOut,
-			datagramsDropped: this.datagramsDropped,
+			// The endpoint drops over-rate datagrams before they reach the
+			// host, so they are counted there, not in this.datagramsDropped.
+			datagramsDropped:
+				this.datagramsDropped + (rust.rateLimitedDatagramIngressCount ?? 0),
 			queuedBytesGlobal: this.hostQueuedBytesGlobal,
 			backpressureWaitCount: this.backpressureWaitCount,
 			backpressureTimeoutCount: this.backpressureTimeoutCount,

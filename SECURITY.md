@@ -38,6 +38,7 @@ Canonical release truth: `docs/release-status.json`. This document defines the s
 - maxDatagramSize cap
 3. Rate limits per peer IP and per prefix
 - RateLimitOptions: per-IP handshakesBurst, per-prefix handshakesBurstPerPrefix (/24 IPv4, /64 IPv6)
+- Over-rate traffic is refused, not punished: a handshake is refused, a stream open is reset, and a datagram over the ingress rate is dropped and counted in `rateLimitedCount` and `datagramsDropped`. The session survives, on both the native and wasm engines.
 4. Connection churn protection
 - maxHandshakesInFlight caps concurrent TLS handshakes (default 200)
 - Per-IP and per-prefix limits prevent single-source exhaustion

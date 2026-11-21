@@ -3638,13 +3638,21 @@ impl WtEndpoint {
             else {
                 continue;
             };
+            // Over the per-IP ingress rate: drop this datagram and keep the
+            // connection, as native does. The limiter already counted it
+            // (`rateLimitedDatagramIngressCount`). Any other limiter error
+            // (missing ownership) still fails the connection closed.
             if self.is_server {
                 if let Err(err) =
                     self.rate_limiter
                         .check_connection(now, id, RateLimitDimension::DatagramIngress)
                 {
+                    let rate_limited = err.starts_with("E_RATE_LIMITED");
                     self.set_last_error(err);
-                    self.close_conn(id, 0, b"rate limited", now);
+                    if rate_limited {
+                        continue;
+                    }
+                    self.close_conn(id, 0, b"rate limiter unavailable", now);
                     break;
                 }
             }

@@ -107,6 +107,10 @@ rateLimitedDatagramIngressCount` (`rateLimitedByPrefixCount` is a subset of
 those, not added again), `limitExceededCount` is the field above, and the SNI
 counters come from the endpoint's TLS snapshot.
 
+`datagramsDropped` adds `rateLimitedDatagramIngressCount`: the endpoint drops a
+datagram over the per-IP ingress rate before the host sees it and keeps the
+session, as native does.
+
 Per-connection `has0Rtt` / `accepted0Rtt` remain on connection getters (not rolled into this snapshot).
 
 ## Latency histograms (P3.1)
