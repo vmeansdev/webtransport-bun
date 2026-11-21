@@ -345,6 +345,10 @@ unstable `__TESTING__.serverInternals(server)` accessor (`docs/SPEC.md`,
   what `docs/METRICS.md` says: from the connection's first Initial to its
   CONNECT request being accepted. Expect values of a few round trips;
   dashboards and the p99 alert built on the old numbers read differently.
+- `bun run bench:handshake` made 50 handshakes from one address against the
+  default per-IP burst of 40, logged the `E_RATE_LIMITED` failures and still
+  printed PASS. Its server now opens the handshake rate limits, and any failed
+  sample fails the run.
 - Bidirectional streams no longer stall when both directions are busy. One
   byte budget served both directions, so writes queued faster than the peer
   drained them filled it, the receive side could not reserve, and both peers
