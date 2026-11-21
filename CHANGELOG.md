@@ -330,6 +330,17 @@ unstable `__TESTING__.serverInternals(server)` accessor (`docs/SPEC.md`,
 
 ### Fixed
 
+- Native streams now report the peer's application error code. A peer
+  `RESET_STREAM` or `STOP_SENDING` failed the receiving side with
+  `streamErrorCode: null`, because the code was dropped where the transport
+  error became an `E_*` string; wasm already reported it. Client Node streams,
+  the `WebTransport` facade's streams and the server's streams now carry it on
+  `WebTransportError.streamErrorCode`, and the message reads
+  `E_STREAM_RESET: stream reset by peer (code N)` /
+  `E_STOP_SENDING: stream stopped by peer (code N)` on both backends (the
+  `E_*` prefix and `.code` are unchanged). A native sink's `reset` record also
+  carried the on-wire HTTP/3 value (clamped to `4294967295`) instead of the
+  peer's code; it now carries the code.
 - Bidirectional streams no longer stall when both directions are busy. One
   byte budget served both directions, so writes queued faster than the peer
   drained them filled it, the receive side could not reserve, and both peers
