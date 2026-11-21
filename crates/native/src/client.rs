@@ -1717,51 +1717,70 @@ fn take_client_session_inner(handle_id: String) -> Result<Option<ClientSessionHa
 
 const DEFAULT_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
 
-/// Resolver that returns a fixed SocketAddr, used when serverName overrides an IP host
-/// so we connect to the original IP while using serverName for TLS SNI.
+/// Resolver used when `serverName` overrides the URL host: the connect URL then
+/// carries the SNI name, and this resolver keeps the dial aimed at the URL's own
+/// host. Without it wtransport would resolve the SNI name, which usually does not
+/// exist in DNS (`serverName: "wt.test"` against `https://localhost:4433`).
 #[derive(Clone, Debug)]
-struct StaticSocketResolver(std::net::SocketAddr);
+enum StaticSocketResolver {
+    /// The URL host was an IP literal.
+    Fixed(std::net::SocketAddr),
+    /// The URL host was a name, resolved like wtransport's default resolver
+    /// would (first address from the OS).
+    Host(String),
+}
 
-impl wtransport::config::DnsResolver for StaticSocketResolver {
-    fn resolve(&self, _host: &str) -> std::pin::Pin<Box<dyn wtransport::config::DnsLookupFuture>> {
-        let addr = self.0;
-        Box::pin(async move { Ok(Some(addr)) })
+impl StaticSocketResolver {
+    fn fixed_ip(&self) -> Option<std::net::IpAddr> {
+        match self {
+            Self::Fixed(addr) => Some(addr.ip()),
+            Self::Host(_) => None,
+        }
     }
 }
 
-/// Build (connect_url, optional custom resolver). When serverName is provided and the
-/// original URL host is an IP, we use a custom resolver so we connect to that IP
-/// while using serverName for TLS SNI (avoids DNS resolution of serverName which can
-/// return ::1 and cause connection failures).
+impl wtransport::config::DnsResolver for StaticSocketResolver {
+    fn resolve(&self, _host: &str) -> std::pin::Pin<Box<dyn wtransport::config::DnsLookupFuture>> {
+        let this = self.clone();
+        Box::pin(async move {
+            match this {
+                Self::Fixed(addr) => Ok(Some(addr)),
+                Self::Host(host_port) => Ok(tokio::net::lookup_host(host_port).await?.next()),
+            }
+        })
+    }
+}
+
+/// The URL host as an IP, brackets already stripped by the parser (`host_str()`
+/// keeps them for IPv6, so parsing it as an `IpAddr` fails on `[::1]`).
+fn url_host_ip(url: &url::Url) -> Option<std::net::IpAddr> {
+    match url.host()? {
+        url::Host::Ipv4(ip) => Some(ip.into()),
+        url::Host::Ipv6(ip) => Some(ip.into()),
+        url::Host::Domain(_) => None,
+    }
+}
+
+/// Build (connect_url, optional custom resolver). When serverName is provided, the
+/// connect URL carries it for TLS SNI and the resolver keeps the dial on the
+/// original URL host (an IP, or a name resolved by the OS).
 fn connect_url_and_resolver(
     url: &str,
     server_name: Option<&str>,
 ) -> std::result::Result<(String, Option<StaticSocketResolver>), String> {
     let parsed = url::Url::parse(url).map_err(|e| format!("E_TLS: invalid URL: {}", e))?;
     let port = parsed.port().unwrap_or(443);
-    let path = parsed.path();
-    let path_query = if path.is_empty() {
-        "/".to_string()
-    } else {
-        format!(
-            "{}{}",
-            path,
-            parsed.query().map(|q| format!("?{q}")).unwrap_or_default()
-        )
-    };
 
     let (connect_url, resolver) = match (parsed.host_str(), server_name) {
         (Some(host), Some(sni)) if !sni.is_empty() => {
-            if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-                let addr = SocketAddr::new(ip, port);
-                let connect_url = format!("https://{sni}:{port}{path_query}");
-                (connect_url, Some(StaticSocketResolver(addr)))
-            } else {
-                let mut p = parsed.clone();
-                p.set_host(Some(sni))
-                    .map_err(|_| format!("E_TLS: invalid serverName for SNI: {}", sni))?;
-                (p.to_string(), None)
-            }
+            let resolver = match url_host_ip(&parsed) {
+                Some(ip) => StaticSocketResolver::Fixed(SocketAddr::new(ip, port)),
+                None => StaticSocketResolver::Host(format!("{host}:{port}")),
+            };
+            let mut p = parsed.clone();
+            p.set_host(Some(sni))
+                .map_err(|_| format!("E_TLS: invalid serverName for SNI: {}", sni))?;
+            (p.to_string(), Some(resolver))
         }
         _ => (url.to_string(), None),
     };
@@ -1798,12 +1817,13 @@ fn connect_destination_ip(
     connect_url: &str,
     custom_resolver: Option<&StaticSocketResolver>,
 ) -> Option<std::net::IpAddr> {
-    custom_resolver.map(|r| r.0.ip()).or_else(|| {
-        url::Url::parse(connect_url)
+    match custom_resolver {
+        Some(resolver) => resolver.fixed_ip(),
+        None => url::Url::parse(connect_url)
             .ok()
-            .and_then(|u| u.host_str().map(str::to_string))
-            .and_then(|h| h.parse::<std::net::IpAddr>().ok())
-    })
+            .as_ref()
+            .and_then(url_host_ip),
+    }
 }
 
 /// The platform trust store, read once per process.
@@ -2657,6 +2677,52 @@ mod tests {
             connect_destination_ip(&named_url, named_resolver.as_ref()),
             None
         );
+    }
+
+    #[test]
+    fn a_server_name_override_keeps_dialing_the_url_host() {
+        // Bracketed IPv6: `host_str()` is "[::1]", which is not an IpAddr.
+        let (url, resolver) =
+            super::connect_url_and_resolver("https://[::1]:4433/wt?x=1", Some("wt.test"))
+                .expect("v6 form");
+        assert_eq!(url, "https://wt.test:4433/wt?x=1");
+        assert_eq!(
+            connect_destination_ip(&url, resolver.as_ref()),
+            Some("::1".parse::<std::net::IpAddr>().expect("v6"))
+        );
+        // A hostname: dial the URL host, never the SNI name.
+        let (url, resolver) =
+            super::connect_url_and_resolver("https://localhost:4433/", Some("wt.test"))
+                .expect("named form");
+        assert_eq!(url, "https://wt.test:4433/");
+        assert!(matches!(
+            resolver,
+            Some(super::StaticSocketResolver::Host(ref h)) if h == "localhost:4433"
+        ));
+        assert_eq!(connect_destination_ip(&url, resolver.as_ref()), None);
+    }
+
+    #[test]
+    fn a_bracketed_ipv6_url_host_is_nameable_without_an_override() {
+        let (url, resolver) =
+            super::connect_url_and_resolver("https://[::1]:4433/", None).expect("v6 form");
+        assert_eq!(
+            connect_destination_ip(&url, resolver.as_ref()),
+            Some("::1".parse::<std::net::IpAddr>().expect("v6"))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_host_resolver_resolves_the_url_host_not_the_name_it_is_asked_for() {
+        use wtransport::config::DnsResolver;
+        let resolver = super::StaticSocketResolver::Host("localhost:4433".to_string());
+        let addr = resolver
+            .resolve("wt.invalid:4433")
+            .await
+            .expect("lookup")
+            .expect("an address");
+        assert!(addr.ip().is_loopback(), "{addr}");
+        assert_eq!(addr.port(), 4433);
     }
 
     #[test]
