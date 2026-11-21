@@ -330,6 +330,16 @@ unstable `__TESTING__.serverInternals(server)` accessor (`docs/SPEC.md`,
 
 ### Fixed
 
+- Bidirectional streams no longer stall when both directions are busy. One
+  byte budget served both directions, so writes queued faster than the peer
+  drained them filled it, the receive side could not reserve, and both peers
+  failed with `E_BACKPRESSURE_TIMEOUT` (a 1 MiB echo in 16 KiB writes stalled
+  at about 55 KB at default limits; with 16 busy streams the shared session
+  budget deadlocked the same way). Stream sends and receives now draw on
+  separate halves of the global and per-session caps, and each direction of a
+  stream gets the whole per-stream cap. Datagrams keep the full caps. In
+  same-host measurements this fixed every stall case and cost no throughput
+  (16 uni streams × 64 MiB: 1.27 vs 1.22 Gbps).
 - `connect()` could reject with a plain `Error` ("handle not found in
   registry") when the session closed, for example a server at `maxSessions`
   closing it, between the native connect and the JavaScript hand-off. It now

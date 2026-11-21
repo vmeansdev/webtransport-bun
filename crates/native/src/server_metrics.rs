@@ -65,6 +65,10 @@ pub struct ServerMetrics {
     pub datagrams_dropped_queue_session: AtomicU64,
     pub datagrams_skipped_queue_full: AtomicU64,
     pub queued_bytes_global: AtomicU64,
+    /// Stream bytes queued for sending, across sessions. Kept apart from
+    /// `queued_bytes_global` so queued sends cannot starve receives; the
+    /// snapshot reports the sum.
+    pub queued_bytes_global_send: AtomicU64,
     pub backpressure_wait_count: AtomicU64,
     pub backpressure_timeout_count: AtomicU64,
     /// Datagram sends that could not be served synchronously and had to take
@@ -327,7 +331,9 @@ impl ServerMetrics {
             datagrams_skipped_queue_full: Some(
                 self.datagrams_skipped_queue_full.load(Ordering::Relaxed) as f64,
             ),
-            queued_bytes_global: self.queued_bytes_global.load(Ordering::Relaxed) as f64,
+            queued_bytes_global: (self.queued_bytes_global.load(Ordering::Relaxed)
+                + self.queued_bytes_global_send.load(Ordering::Relaxed))
+                as f64,
             backpressure_wait_count: self.backpressure_wait_count.load(Ordering::Relaxed) as f64,
             backpressure_timeout_count: self.backpressure_timeout_count.load(Ordering::Relaxed)
                 as f64,

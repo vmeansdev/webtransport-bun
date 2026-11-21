@@ -1489,6 +1489,7 @@ impl ClientSessionHandle {
                 max_session,
                 max_stream,
                 capacity_notify: StreamBudget::new_notify(),
+                direction: crate::client_stream::BudgetDirection::Receive,
                 backpressure_timeout_ms,
             }
         };
