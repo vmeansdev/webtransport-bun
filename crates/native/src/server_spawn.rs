@@ -32,12 +32,38 @@ pub(crate) struct BindOptions {
     pub udp_send_buffer_bytes: Option<usize>,
 }
 
+/// Parses the server `host` into the address to bind. Only IP literals are
+/// accepted (IPv6 brackets optional); anything else is an error rather than a
+/// silent fallback, which used to bind `0.0.0.0` for any unparsable host.
+pub(crate) fn parse_bind_addr(host: &str, port: u16) -> Result<std::net::SocketAddr, String> {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    bare.parse::<std::net::IpAddr>()
+        .map(|ip| std::net::SocketAddr::new(ip, port))
+        .map_err(|_| {
+            format!(
+                "E_INVALID_ARGUMENT: host must be an IPv4 or IPv6 address, got \"{}\"",
+                host
+            )
+        })
+}
+
+/// True for the IPv6 wildcard `::`, which this server binds dual-stack
+/// (`IPV6_V6ONLY` off) on every platform, so IPv4 clients reach it too.
+/// Windows defaults `IPV6_V6ONLY` on, so leaving it at the OS default would
+/// make `::` mean IPv6-only there and dual-stack elsewhere.
+pub(crate) fn binds_dual_stack(addr: &std::net::SocketAddr) -> bool {
+    matches!(addr, std::net::SocketAddr::V6(v6) if v6.ip().is_unspecified())
+}
+
 /// Builds the server's UDP socket with `SO_REUSEPORT` set before `bind()`.
 ///
-/// This mirrors what the fork's `BindAddressConfig::bind_socket` does for a
-/// plain address bind (`Ipv6DualStackConfig::OsDefault`: `IPV6_V6ONLY` is left
-/// at the OS default, never forced either way), because `with_bind_socket`
-/// hands the socket straight through and skips that path entirely.
+/// This mirrors what the plain `with_bind_address` path does: the IPv6
+/// wildcard is bound dual-stack (see [`binds_dual_stack`]) and every other
+/// address leaves `IPV6_V6ONLY` at the OS default, because `with_bind_socket`
+/// hands the socket straight through and skips the fork's own socket setup.
 ///
 /// Nonblocking mode and GSO/GRO are deliberately not touched here: quinn-udp's
 /// `UdpSocketState::new` configures both when the endpoint wraps the socket.
@@ -53,6 +79,9 @@ pub(crate) fn bind_socket_with_options(
         std::net::SocketAddr::V6(_) => Domain::IPV6,
     };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    if binds_dual_stack(&addr) {
+        socket.set_only_v6(false)?;
+    }
     #[cfg(unix)]
     if reuse_port {
         socket.set_reuse_port(true)?;
@@ -444,33 +473,74 @@ mod tests {
 
     /// `with_bind_socket` skips the fork's own socket construction, so the
     /// reusePort path has to land on the same dual-stack setting the plain
-    /// `with_bind_address` path produces: IPV6_V6ONLY never touched by us.
+    /// path produces: the OS default for a specific v6 address, and
+    /// dual-stack for the wildcard.
     ///
     /// The reference is bound, not merely constructed, because IPV6_V6ONLY is
     /// not a constant of the socket — Linux raises it at bind() time for a
     /// *specific* v6 address (a socket bound to [::1] cannot carry v4 traffic)
     /// while leaving it alone for the wildcard, and macOS does neither.
-    /// Comparing a bound socket against an unbound one measures that kernel
-    /// behavior rather than anything this code does. Both address shapes are
-    /// covered so the wildcard case, the one where the OS default actually
-    /// survives the bind, is exercised too.
     #[cfg(unix)]
     #[test]
-    fn reuse_port_v6_bind_matches_the_os_default_dual_stack_setting() {
+    fn reuse_port_v6_specific_bind_matches_the_os_default_dual_stack_setting() {
         use socket2::Socket;
 
-        for addr in ["[::1]:0", "[::]:0"] {
-            let addr: std::net::SocketAddr = addr.parse().expect("addr");
-            let expected = os_default_dual_stack_reference(addr);
+        let addr: std::net::SocketAddr = "[::1]:0".parse().expect("addr");
+        let expected = os_default_dual_stack_reference(addr);
+        let bound = super::bind_reuse_port_socket(addr).expect("v6 reusePort bind");
+        assert!(bound.local_addr().expect("bound addr").is_ipv6());
+        assert_eq!(
+            Socket::from(bound).only_v6().expect("only_v6"),
+            expected,
+            "reusePort must leave IPV6_V6ONLY at the OS default for {addr}"
+        );
+    }
 
-            let bound = super::bind_reuse_port_socket(addr).expect("v6 reusePort bind");
-            assert!(bound.local_addr().expect("bound addr").is_ipv6());
-            assert_eq!(
-                Socket::from(bound).only_v6().expect("only_v6"),
-                expected,
-                "reusePort must not change IPV6_V6ONLY away from what the \
-                 fork's own OsDefault bind produces for {addr}"
+    #[test]
+    fn v6_wildcard_bind_is_dual_stack() {
+        use socket2::Socket;
+
+        let addr: std::net::SocketAddr = "[::]:0".parse().expect("addr");
+        for reuse_port in [false, cfg!(unix)] {
+            let bound =
+                super::bind_socket_with_options(addr, reuse_port, None).expect("v6 wildcard bind");
+            assert!(
+                !Socket::from(bound).only_v6().expect("only_v6"),
+                "[::] must bind dual-stack (reuse_port={reuse_port})"
             );
+        }
+    }
+
+    #[test]
+    fn parse_bind_addr_accepts_ip_literals_only() {
+        let ok = |host: &str| super::parse_bind_addr(host, 4433).expect(host);
+        assert_eq!(ok("0.0.0.0"), "0.0.0.0:4433".parse().unwrap());
+        assert_eq!(ok("127.0.0.1"), "127.0.0.1:4433".parse().unwrap());
+        assert_eq!(ok("::"), "[::]:4433".parse().unwrap());
+        assert_eq!(ok("[::1]"), "[::1]:4433".parse().unwrap());
+        for bad in [
+            "localhost",
+            "example.com",
+            "",
+            "[::1",
+            "127.0.0.1:80",
+            "[127.0.0.1]x",
+        ] {
+            let err = super::parse_bind_addr(bad, 4433).expect_err(bad);
+            assert!(err.starts_with("E_INVALID_ARGUMENT: "), "{err}");
+        }
+    }
+
+    #[test]
+    fn only_the_v6_wildcard_binds_dual_stack() {
+        for (addr, dual) in [
+            ("[::]:1", true),
+            ("[::1]:1", false),
+            ("0.0.0.0:1", false),
+            ("127.0.0.1:1", false),
+        ] {
+            let addr: std::net::SocketAddr = addr.parse().unwrap();
+            assert_eq!(super::binds_dual_stack(&addr), dual, "{addr}");
         }
     }
 

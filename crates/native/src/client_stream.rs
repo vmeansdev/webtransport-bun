@@ -82,6 +82,7 @@ pub enum StreamCmd {
 enum StreamGuardAction {
     Client {
         metrics: Arc<crate::client::ClientMetrics>,
+        bidi: bool,
     },
     Server {
         metrics: Arc<crate::server_metrics::ServerMetrics>,
@@ -97,9 +98,10 @@ pub struct StreamGuard {
 }
 
 impl StreamGuard {
-    pub fn client(metrics: Arc<crate::client::ClientMetrics>) -> Self {
+    /// Releases a slot taken by `ClientMetrics::try_admit_stream`.
+    pub fn client(metrics: Arc<crate::client::ClientMetrics>, bidi: bool) -> Self {
         Self {
-            action: Some(StreamGuardAction::Client { metrics }),
+            action: Some(StreamGuardAction::Client { metrics, bidi }),
         }
     }
 
@@ -126,8 +128,14 @@ impl Drop for StreamGuard {
             return;
         };
         match action {
-            StreamGuardAction::Client { metrics } => {
+            StreamGuardAction::Client { metrics, bidi } => {
                 metrics.streams_active.fetch_sub(1, Ordering::Relaxed);
+                let counter = if bidi {
+                    &metrics.streams_bidi_active
+                } else {
+                    &metrics.streams_uni_active
+                };
+                counter.fetch_sub(1, Ordering::AcqRel);
             }
             StreamGuardAction::Server {
                 metrics,
@@ -367,6 +375,11 @@ async fn reserve_for_recv(
 }
 
 impl StreamBudget {
+    /// The largest single reservation this budget can ever grant.
+    pub fn max_reservation(&self) -> u64 {
+        self.max_stream.min(self.max_session).min(self.max_global)
+    }
+
     pub fn try_reserve(&self, n: u64) -> bool {
         if !self
             .server_metrics
@@ -1184,6 +1197,18 @@ fn read_error_code(err: &StreamReadError) -> &'static str {
     }
 }
 
+/// Splits a write into pieces the budget can actually reserve. A write larger
+/// than `maxQueuedBytesPerStream` used to park on a reservation that could
+/// never succeed and fail with E_BACKPRESSURE_TIMEOUT; queued piece by piece,
+/// each piece waits for headroom like any other write.
+fn write_pieces(bytes: Vec<u8>, budget: Option<&StreamBudget>) -> Vec<Vec<u8>> {
+    let max = budget.map_or(0, StreamBudget::max_reservation);
+    match usize::try_from(max) {
+        Ok(max) if max > 0 && bytes.len() > max => bytes.chunks(max).map(<[u8]>::to_vec).collect(),
+        _ => vec![bytes],
+    }
+}
+
 fn should_reset_on_oversized_chunk(sz: u64, budget: &Option<StreamBudget>) -> bool {
     budget.as_ref().is_some_and(|b| sz > b.max_stream)
 }
@@ -1960,42 +1985,44 @@ impl ClientBidiStreamHandle {
             return Ok(());
         }
         let tx = self.ensure_write_tx()?;
-        let sz = bytes.len() as u64;
         // An accepted stream that is only ever written keeps its budget deferred
         // until here: materialize it on this side too, otherwise a push-style
         // server bypasses the queue limits entirely.
         let budget = installed_budget(&self.budget, &self.deferred_budget)?;
-        if let Some(ref b) = budget {
-            // Reliable-stream backpressure: park until budget frees (lossless)
-            // instead of erroring, bounded by the backpressure timeout.
-            if !b.reserve_or_wait(sz).await {
-                return Err(wt_from_reason("E_BACKPRESSURE_TIMEOUT"));
+        for bytes in write_pieces(bytes, budget.as_ref()) {
+            let sz = bytes.len() as u64;
+            if let Some(ref b) = budget {
+                // Reliable-stream backpressure: park until budget frees (lossless)
+                // instead of erroring, bounded by the backpressure timeout.
+                if !b.reserve_or_wait(sz).await {
+                    return Err(wt_from_reason("E_BACKPRESSURE_TIMEOUT"));
+                }
             }
-        }
-        // Build the chunk NOW, immediately after reserving, so it owns the
-        // reservation: every early return below (the finish re-check, a send
-        // failure) drops it and releases the global/session/stream bytes.
-        // Building it *after* the re-check would strand the bytes reserved by
-        // reserve_or_wait when the re-check returns early — a budget leak.
-        let chunk = StreamChunk::new(bytes, budget, sz);
-        // Re-check after the (awaited) reservation: finish/reset issued during
-        // the park must still win — `chunk` is dropped here (releasing its
-        // bytes) instead of being written after the FIN.
-        //
-        // Deterministic under the single-runtime execution model: finish()/reset()
-        // set `finished` synchronously *before* enqueuing their control command,
-        // so a write issued after them is rejected above, and a write concurrent
-        // with them (its future parked here) is rejected by this re-check. If the
-        // send below parks on a full channel, tokio wakes waiters FIFO, so this
-        // Data (registered first) is enqueued ahead of a later FIN — no reorder.
-        // (WHATWG serializes write/close through the facade; this covers the raw
-        // handle.)
-        if self.finished.load(Ordering::Acquire) {
-            return Err(wt_from_reason("E_STREAM_RESET"));
-        }
-        // On send failure the chunk drops here, releasing its reservation.
-        if tx.send(StreamCmd::Data(chunk)).await.is_err() {
-            return Err(wt_from_reason("E_STREAM_RESET"));
+            // Build the chunk NOW, immediately after reserving, so it owns the
+            // reservation: every early return below (the finish re-check, a send
+            // failure) drops it and releases the global/session/stream bytes.
+            // Building it *after* the re-check would strand the bytes reserved by
+            // reserve_or_wait when the re-check returns early — a budget leak.
+            let chunk = StreamChunk::new(bytes, budget.clone(), sz);
+            // Re-check after the (awaited) reservation: finish/reset issued during
+            // the park must still win — `chunk` is dropped here (releasing its
+            // bytes) instead of being written after the FIN.
+            //
+            // Deterministic under the single-runtime execution model: finish()/reset()
+            // set `finished` synchronously *before* enqueuing their control command,
+            // so a write issued after them is rejected above, and a write concurrent
+            // with them (its future parked here) is rejected by this re-check. If the
+            // send below parks on a full channel, tokio wakes waiters FIFO, so this
+            // Data (registered first) is enqueued ahead of a later FIN — no reorder.
+            // (WHATWG serializes write/close through the facade; this covers the raw
+            // handle.)
+            if self.finished.load(Ordering::Acquire) {
+                return Err(wt_from_reason("E_STREAM_RESET"));
+            }
+            // On send failure the chunk drops here, releasing its reservation.
+            if tx.send(StreamCmd::Data(chunk)).await.is_err() {
+                return Err(wt_from_reason("E_STREAM_RESET"));
+            }
         }
         Ok(())
     }
@@ -2250,24 +2277,26 @@ impl ClientUniSendHandle {
         if bytes.is_empty() {
             return Ok(());
         }
-        let sz = bytes.len() as u64;
-        if let Some(ref b) = self.budget {
-            // Reliable-stream backpressure: park until budget frees (lossless)
-            // instead of erroring, bounded by the backpressure timeout.
-            if !b.reserve_or_wait(sz).await {
-                return Err(napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT"));
+        for bytes in write_pieces(bytes, self.budget.as_ref()) {
+            let sz = bytes.len() as u64;
+            if let Some(ref b) = self.budget {
+                // Reliable-stream backpressure: park until budget frees (lossless)
+                // instead of erroring, bounded by the backpressure timeout.
+                if !b.reserve_or_wait(sz).await {
+                    return Err(napi::Error::from_reason("E_BACKPRESSURE_TIMEOUT"));
+                }
             }
-        }
-        // Build the chunk immediately after reserving so it owns the reservation:
-        // the finish re-check (and a send failure) below then drop it and release
-        // the bytes. Building it after the re-check would leak the reservation.
-        let chunk = StreamChunk::new(bytes, self.budget.clone(), sz);
-        if self.finished.load(Ordering::Acquire) {
-            return Err(napi::Error::from_reason("E_STREAM_RESET"));
-        }
-        // On send failure the chunk drops here, releasing its reservation.
-        if tx.send(StreamCmd::Data(chunk)).await.is_err() {
-            return Err(napi::Error::from_reason("E_STREAM_RESET"));
+            // Build the chunk immediately after reserving so it owns the reservation:
+            // the finish re-check (and a send failure) below then drop it and release
+            // the bytes. Building it after the re-check would leak the reservation.
+            let chunk = StreamChunk::new(bytes, self.budget.clone(), sz);
+            if self.finished.load(Ordering::Acquire) {
+                return Err(napi::Error::from_reason("E_STREAM_RESET"));
+            }
+            // On send failure the chunk drops here, releasing its reservation.
+            if tx.send(StreamCmd::Data(chunk)).await.is_err() {
+                return Err(napi::Error::from_reason("E_STREAM_RESET"));
+            }
         }
         Ok(())
     }
@@ -3529,6 +3558,60 @@ mod tests {
             1 << 16,
             1000,
         )
+    }
+
+    #[test]
+    fn write_pieces_splits_only_what_the_budget_cannot_reserve() {
+        let budget = deferred_config().materialize();
+        assert_eq!(budget.max_reservation(), 1 << 16);
+        let pieces = write_pieces((0..200_000u32).map(|i| i as u8).collect(), Some(&budget));
+        assert_eq!(
+            pieces.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![65_536, 65_536, 65_536, 3_392]
+        );
+        assert_eq!(
+            pieces.concat(),
+            (0..200_000u32).map(|i| i as u8).collect::<Vec<_>>()
+        );
+        assert_eq!(write_pieces(vec![1; 65_536], Some(&budget)).len(), 1);
+        assert_eq!(
+            write_pieces(vec![1; 1 << 20], None).len(),
+            1,
+            "no budget, no split"
+        );
+    }
+
+    /// A write larger than maxQueuedBytesPerStream used to park on a
+    /// reservation that could never succeed until E_BACKPRESSURE_TIMEOUT.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_write_larger_than_the_stream_budget_is_queued_in_order() {
+        let (write_tx, mut write_rx) = mpsc::channel::<StreamCmd>(STREAM_CHANNEL_CAPACITY);
+        let (_read_tx, read_rx) = mpsc::channel::<StreamChunk>(STREAM_CHANNEL_CAPACITY);
+        let (stop_tx, _stop_rx) = oneshot::channel::<u32>();
+        let handle = ClientBidiStreamHandle::new(read_rx, write_tx, stop_tx);
+        *handle.deferred_budget.lock().unwrap() = Some(deferred_config());
+        let payload: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+
+        let drain = tokio::spawn(async move {
+            let mut got = Vec::new();
+            while got.len() < 300_000 {
+                match write_rx.recv().await {
+                    Some(StreamCmd::Data(chunk)) => {
+                        let bytes = chunk.take();
+                        assert!(bytes.len() <= 1 << 16);
+                        got.extend_from_slice(&bytes);
+                    }
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+            got
+        });
+        handle
+            .write_bytes(payload.clone())
+            .await
+            .expect("an oversized write must be queued, not timed out");
+        assert_eq!(drain.await.expect("drain"), payload);
     }
 
     /// An accepted stream that is only ever written to (push-style server) must
