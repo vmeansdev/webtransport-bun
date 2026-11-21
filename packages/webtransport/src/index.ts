@@ -1760,6 +1760,8 @@ interface NativeAddon {
 		cb: (err: unknown, handleId?: string) => void,
 	): void;
 	takeClientSession(handleId: string): NativeSessionHandle | undefined;
+	/** Blocks until locally closed client sessions finish closing; returns how many did not. */
+	flushClientCloses?: (timeoutMs: number) => number;
 	clientPoolMetricsSnapshot(): {
 		hits: number;
 		misses: number;
@@ -3005,6 +3007,23 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 // Client session implementation
 // ---------------------------------------------------------------------------
 
+/**
+ * Upper bound on how long a process exit waits for client closes to be sent.
+ * The close goes out on the addon's client thread; `process.exit()` right
+ * after `session.close()` would otherwise kill that thread first and leave the
+ * session open on the server until its idle timeout.
+ */
+const CLIENT_CLOSE_FLUSH_ON_EXIT_MS = 250;
+let clientCloseFlushOnExitInstalled = false;
+
+function flushClientClosesOnExit(): void {
+	if (clientCloseFlushOnExitInstalled) return;
+	clientCloseFlushOnExitInstalled = true;
+	process.on("exit", () => {
+		native?.flushClientCloses?.(CLIENT_CLOSE_FLUSH_ON_EXIT_MS);
+	});
+}
+
 class NativeClientSession implements ClientSession {
 	#nativeHandle: NativeSessionHandle;
 	#readyPromise: Promise<void>;
@@ -3086,6 +3105,7 @@ class NativeClientSession implements ClientSession {
 		if (!this.#closed) {
 			this.#closed = true;
 			this.#requestedCloseInfo = normalizeCloseInfo(info);
+			flushClientClosesOnExit();
 			this.#nativeHandle.close(info?.code ?? null, info?.reason ?? null);
 		}
 	}
