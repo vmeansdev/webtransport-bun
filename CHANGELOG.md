@@ -361,6 +361,11 @@ unstable `__TESTING__.serverInternals(server)` accessor (`docs/SPEC.md`,
 
 ### Fixed
 
+- `/portable` `createServer({ wasmOptions })` is honored. The option was typed
+  and documented as forwarded to the wasm W3C facade but never read, so
+  `strictW3CErrors` and the other facade options silently did nothing. Each
+  wasm server session is now built with them, and invalid values fail
+  `createServer` with `E_INVALID_ARGUMENT`. Native still ignores them.
 - `createServer()` failures and the server TLS methods (`updateCert`,
   `updateTls`, `replaceSniCerts`, `upsertSniCert`, `removeSniCert`,
   `setUnknownSniPolicy`, `tlsSnapshot`) now throw or reject a

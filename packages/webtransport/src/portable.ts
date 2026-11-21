@@ -7,7 +7,7 @@
 // statically import `node:*`. The native branch — and only the native branch —
 // pulls in `./portable-native.js` through a dynamic import.
 
-import { selectBackend, type BackendKind } from "./backend.js";
+import { type BackendKind, selectBackend } from "./backend.js";
 import type { WasmModule } from "./backend-wasm.js";
 import type { UdpTransport } from "./wasm-relay.js";
 import type {
@@ -137,7 +137,11 @@ export type PortableCreateServerOptions = {
 	onSession: (session: PortableServerSession) => void | Promise<void>;
 	log?: (event: { type: string; [key: string]: unknown }) => void;
 	debug?: boolean;
-	/** Wasm-only knobs forwarded to the W3C facade. */
+	/**
+	 * Wasm-only: options for the W3C facade each wasm server session is built
+	 * on (`strictW3CErrors`, `datagramsReadableType`, `congestionControl`).
+	 * Validated when the server starts; ignored on the native backend.
+	 */
 	wasmOptions?: WasmWebTransportOptions;
 	/**
 	 * Wasm-only: pre-initialized wasm module. Defaults to loading
@@ -206,9 +210,18 @@ export async function createServer(
 async function createWasmPortableServer(
 	opts: PortableCreateServerOptions,
 ): Promise<PortableServer> {
-	const { createServer: createWasmServer } = await import(
-		"./wasm-create-server.js"
-	);
+	const [
+		{ createServer: createWasmServer },
+		{ validateW3CClientOptions },
+		{ toWasmServerSession },
+	] = await Promise.all([
+		import("./wasm-create-server.js"),
+		import("./w3c-client-options.js"),
+		import("./wasm-server-session.js"),
+	]);
+	const { wasmOptions } = opts;
+	// Fail at startup, not on the first stream a session opens.
+	validateW3CClientOptions(wasmOptions);
 	const host = opts.host ?? "127.0.0.1";
 	const server = await createWasmServer({
 		host,
@@ -223,8 +236,15 @@ async function createWasmPortableServer(
 		debug: opts.debug,
 		...(opts.wasmModule ? { wasm: opts.wasmModule } : {}),
 		...(opts.wasmBind ? { bind: opts.wasmBind } : {}),
-		// WasmServerSession already implements the portable surface.
-		onSession: (session) => opts.onSession(session),
+		// WasmServerSession already implements the portable surface. Its W3C
+		// view is built lazily, so re-wrapping the session with the caller's
+		// facade options leaves nothing behind on the discarded wrapper.
+		onSession: (session) =>
+			opts.onSession(
+				wasmOptions
+					? toWasmServerSession(session.unwrap(), wasmOptions)
+					: session,
+			),
 	});
 
 	return {

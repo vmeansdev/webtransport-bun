@@ -184,6 +184,82 @@ describe("portable createServer", () => {
 		},
 	);
 
+	test.skipIf(!wasmAvailable)(
+		"wasmOptions reach the wasm server sessions",
+		async () => {
+			const relay = new InMemoryRelay();
+			const serverAddr = { address: "127.0.0.1", port: 4721 };
+			const clientAddr = { address: "127.0.0.1", port: 5721 };
+			const seen = Promise.withResolvers<unknown>();
+
+			const server = await createServer({
+				backend: "wasm",
+				host: serverAddr.address,
+				port: serverAddr.port,
+				tls: { allowSelfSigned: true },
+				wasmModule: wasm,
+				wasmBind: async () => relay.endpoint(serverAddr),
+				wasmOptions: { strictW3CErrors: true },
+				onSession: async (session) => {
+					// An invalid stream option fails validation before any
+					// stream opens; strict mode names it like a browser would.
+					seen.resolve(
+						await session
+							.createBidirectionalStream({
+								waitUntilAvailable: "yes" as unknown as boolean,
+							})
+							.catch((e: unknown) => e),
+					);
+				},
+			});
+
+			try {
+				const { session, manager } = await connectWasm(
+					wasm,
+					relay.endpoint(clientAddr),
+					"localhost",
+					`${clientAddr.address}:${clientAddr.port}`,
+					`${serverAddr.address}:${serverAddr.port}`,
+					{ certHashBase64: server.certHashBase64 },
+				);
+				await session.ready;
+				const err = await withTimeout(
+					seen.promise,
+					5000,
+					"wasm portable session error",
+				);
+				expect(err).toBeInstanceOf(WebTransportError);
+				expect(err).toMatchObject({
+					code: "E_INVALID_ARGUMENT",
+					name: "TypeError",
+				});
+				manager.close();
+			} finally {
+				await server.close();
+			}
+		},
+	);
+
+	test.skipIf(!wasmAvailable)(
+		"invalid wasmOptions fail createServer on the wasm backend",
+		async () => {
+			const relay = new InMemoryRelay();
+			const err = await createServer({
+				backend: "wasm",
+				host: "127.0.0.1",
+				port: 4731,
+				tls: { allowSelfSigned: true },
+				wasmModule: wasm,
+				wasmBind: async () =>
+					relay.endpoint({ address: "127.0.0.1", port: 4731 }),
+				wasmOptions: { congestionControl: "bogus" as "default" },
+				onSession: () => {},
+			}).catch((e: unknown) => e);
+			expect(err).toBeInstanceOf(WebTransportError);
+			expect(err).toMatchObject({ code: "E_INVALID_ARGUMENT" });
+		},
+	);
+
 	test("rejects wasm-only allowSelfSigned on the native backend", async () => {
 		const err = await createServer({
 			backend: "native",
