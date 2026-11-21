@@ -776,7 +776,7 @@ fn parse_client_limits(opts_json: &str) -> std::result::Result<crate::limits::Li
     if let Some(limits) = parsed.get("limits") {
         let s = serde_json::to_string(limits)
             .map_err(|e| format!("E_INTERNAL: invalid limits payload: {}", e))?;
-        Ok(crate::limits::Limits::from_json(&s))
+        crate::limits::Limits::from_json(&s)
     } else {
         Ok(crate::limits::Limits::default())
     }

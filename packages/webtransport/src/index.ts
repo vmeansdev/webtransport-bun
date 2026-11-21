@@ -515,6 +515,12 @@ export type { RateLimitOptions } from "./types.js";
 
 /**
  * Resource limits. Merge with {@link DEFAULT_LIMITS} for defaults.
+ *
+ * Every field is an integer. A value that is negative, fractional or below its
+ * floor throws `E_INVALID_ARGUMENT` instead of being clamped: `maxSessions`,
+ * `maxHandshakesInFlight` and `maxDatagramSize` >= 1, `backpressureTimeoutMs`
+ * and `handshakeTimeoutMs` >= 100, `idleTimeoutMs` >= 1000, the QUIC windows
+ * (when set) >= 1, everything else >= 0.
  * @see DEFAULT_LIMITS Default values (e.g. handshakeTimeoutMs: 10000, maxDatagramSize: 1200).
  */
 export type LimitsOptions = {
@@ -3741,11 +3747,30 @@ const MAX_QPACK_TABLE_CAPACITY = 65536;
  * advertising something other than what was asked for would be a worse answer
  * than saying no.
  */
+/**
+ * The smallest accepted value of every integer `limits` field (the QUIC
+ * windows are checked separately). Anything lower, negative or fractional is
+ * rejected rather than clamped, so the value in force is the value asked for.
+ * Mirrored by the native parser (`crates/native/src/limits.rs`).
+ */
+const LIMIT_FLOORS: Readonly<Record<string, number>> = Object.freeze({
+	maxSessions: 1,
+	maxHandshakesInFlight: 1,
+	maxStreamsPerSessionBidi: 0,
+	maxStreamsPerSessionUni: 0,
+	maxStreamsGlobal: 0,
+	maxDatagramSize: 1,
+	maxQueuedBytesGlobal: 0,
+	maxQueuedBytesPerSession: 0,
+	maxQueuedBytesPerStream: 0,
+	backpressureTimeoutMs: 100,
+	handshakeTimeoutMs: 100,
+	idleTimeoutMs: 1000,
+	keepAliveIntervalMs: 0,
+});
+
 /** Every numeric `limits` field native reads (the windows are checked below). */
-const NUMERIC_LIMIT_KEYS = [
-	...Object.keys(DEFAULT_LIMITS),
-	"keepAliveIntervalMs",
-] as const;
+const NUMERIC_LIMIT_KEYS = Object.keys(LIMIT_FLOORS);
 
 /**
  * Reject a malformed `limits` object instead of letting native silently fall
@@ -3772,20 +3797,29 @@ function validateLimitsShape(
 		field === "limits" ? NUMERIC_LIMIT_KEYS : NUMERIC_RATE_LIMIT_KEYS;
 	for (const key of numericKeys) {
 		const value = record[key];
-		if (
-			value !== undefined &&
-			(typeof value !== "number" || !Number.isFinite(value))
-		)
+		if (value === undefined) continue;
+		if (typeof value !== "number" || !Number.isFinite(value))
 			fail(`${field}.${key} must be a finite number, got ${String(value)}`);
+		const n = value as number;
+		if (field === "limits") {
+			const floor = LIMIT_FLOORS[key] ?? 0;
+			if (!Number.isSafeInteger(n) || n < floor)
+				fail(`${field}.${key} must be an integer >= ${floor}, got ${n}`);
+		} else if (key.endsWith("PerSec")) {
+			if (n < 0) fail(`${field}.${key} must be >= 0, got ${n}`);
+		} else if (!Number.isSafeInteger(n) || n < 0) {
+			fail(`${field}.${key} must be an integer >= 0, got ${n}`);
+		}
 	}
 	if (field === "limits") validateQuicWindows(record, strictW3CErrors);
 }
 
-/** Every numeric `rateLimits` field native reads. */
-const NUMERIC_RATE_LIMIT_KEYS = [
-	...Object.keys(DEFAULT_RATE_LIMITS),
-	"handshakesBurstPerPrefix",
-] as const;
+/**
+ * Every numeric `rateLimits` field native reads: `*PerSec` rates are
+ * non-negative numbers (fractional rates are fine), bursts are non-negative
+ * token counts.
+ */
+const NUMERIC_RATE_LIMIT_KEYS = Object.keys(DEFAULT_RATE_LIMITS);
 
 /**
  * Reject a malformed explicit QUIC window instead of letting native silently

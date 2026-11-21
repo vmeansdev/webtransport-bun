@@ -258,6 +258,27 @@ export interface WebTransportServer {
 export function createServer(opts: ServerOptions): WebTransportServer;
 ```
 
+**Accepted limit ranges** (`createServer`, `connect` and `new WebTransport` on the native
+backend). Every `limits` field is an integer; a value that is negative,
+fractional, not a number, or below its floor throws `E_INVALID_ARGUMENT`
+rather than being clamped or replaced by the default. An absent field means
+the default.
+
+| Field | Floor |
+|---|---|
+| `maxSessions`, `maxHandshakesInFlight`, `maxDatagramSize` | 1 |
+| `maxStreamsPerSessionBidi`, `maxStreamsPerSessionUni`, `maxStreamsGlobal` | 0 |
+| `maxQueuedBytesGlobal`, `maxQueuedBytesPerSession`, `maxQueuedBytesPerStream` | 0 |
+| `streamReceiveWindow`, `receiveWindow`, `sendWindow` (when set) | 1 |
+| `backpressureTimeoutMs`, `handshakeTimeoutMs` | 100 |
+| `idleTimeoutMs` | 1000 |
+| `keepAliveIntervalMs` (0 disables) | 0 |
+
+`rateLimits` rates (`handshakesPerSec`, `streamsPerSec`, `datagramsPerSec`)
+are finite numbers `>= 0` and may be fractional; bursts (`handshakesBurst`,
+`handshakesBurstPerPrefix`, `streamsBurst`, `datagramsBurst`) are integers
+`>= 0`. The wasm backend validates its own limits (`backend.ts`).
+
 ### Server TLS / SNI semantics
 
 - `tls.certPem` / `tls.keyPem` are the default server certificate and key.

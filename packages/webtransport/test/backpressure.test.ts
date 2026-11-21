@@ -439,7 +439,7 @@ describe("backpressure observability (P1.2)", () => {
 		const server = createServer({
 			port,
 			tls: { certPem: "", keyPem: "" },
-			limits: { backpressureTimeoutMs: 1 },
+			limits: { backpressureTimeoutMs: 100 },
 			onSession: async (s) => {
 				await forEachWithTimeout(
 					s.incomingDatagrams(),

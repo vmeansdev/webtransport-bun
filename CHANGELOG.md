@@ -25,8 +25,18 @@ hatch exists. Checked against the rc.1 candidate (875dfbfe).
   - a `limits` / `rateLimits` value that is `null` or not a plain object
     (for example an array or a `Map`);
   - a numeric field set to `null` or to a non-finite value (`NaN`,
-    `Infinity`, a string).
-  An absent field still means "default".
+    `Infinity`, a string);
+  - a `limits` field that is negative, fractional or below its documented
+    floor (`maxSessions`, `maxHandshakesInFlight` and `maxDatagramSize` >= 1,
+    `backpressureTimeoutMs` and `handshakeTimeoutMs` >= 100, `idleTimeoutMs`
+    >= 1000, everything else >= 0). rc.1 kept the default for a negative or
+    fractional value and silently raised `0` to `1` and short timeouts to
+    their floor (while the client's own handshake timer and stream-open
+    waits used the unraised value);
+  - a negative `rateLimits` rate, or a burst that is negative or fractional.
+  An absent field still means "default", and every value at or above its
+  floor behaves exactly as before. The native addon refuses the same values
+  when called directly. See `docs/SPEC.md` ("Accepted limit ranges").
 - **`connect()` validates its options like `new WebTransport()`.** Both now
   run one validator before dialing, so `connect()` reports `E_INVALID_ARGUMENT`
   for an unknown `congestionControl`, a non-boolean `allowPooling`,

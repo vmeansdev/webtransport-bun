@@ -56,7 +56,7 @@ describe("P0.2 stable error codes", () => {
 				createServer({
 					port,
 					tls: { certPem: "", keyPem: "" },
-					limits: { idleTimeoutMs: 500 },
+					limits: { idleTimeoutMs: 1000 },
 					onSession: (s) => {
 						serverSession = s;
 					},
