@@ -1,4 +1,5 @@
-FROM rust:1.85-bookworm
+# Matches .github/release-toolchain.json; build:native runs `rustup run <that version>`.
+FROM rust:1.95.0-bookworm
 
 ARG BUN_VERSION=1.3.14
 ENV BUN_INSTALL=/root/.bun

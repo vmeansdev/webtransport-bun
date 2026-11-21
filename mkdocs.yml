@@ -26,6 +26,8 @@ nav:
   - API Spec: SPEC.md
   - Architecture: ARCHITECTURE.md
   - Operations: OPERATIONS.md
+  - Routing by connection ID: quic-lb.md
+  - Native stream sink (RFC): RFC_STREAM_SINK.md
   - Metrics: METRICS.md
   - Test Plan: TESTPLAN.md
   - CI / Release: CI.md

@@ -473,7 +473,11 @@ export type TlsOptions = {
 	 * (`BEGIN RSA PRIVATE KEY`) are accepted; encrypted keys are not.
 	 */
 	keyPem: string | Uint8Array;
-	/** Optional CA PEM for client verification. */
+	/**
+	 * Client only: extra CA certificates (PEM) to trust when verifying the
+	 * server. `createServer` rejects it with `E_TLS` (no client-certificate
+	 * verification on the server).
+	 */
 	caPem?: string | Uint8Array;
 	/** SNI for client mode; for server, used in logs/metrics. */
 	serverName?: string;

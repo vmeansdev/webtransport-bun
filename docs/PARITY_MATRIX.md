@@ -62,6 +62,24 @@ surface:
 | Static capabilities and option mapping | `supportsReliableOnly`, `congestionControl`, `datagramsReadableType`, `allowPooling`, `requireUnreliable`, `strictW3CErrors` | `packages/webtransport/src/index.ts`; `packages/webtransport/src/backend.ts` | `packages/webtransport/test/parity-options.test.ts`; `packages/webtransport/test/parity-pooling.test.ts`; `packages/webtransport/test/parity-compat.test.ts` | `docs/release-status.json` still `pending` |
 | 0-RTT session resumption / early data | `enable0Rtt` (server + client), `allowEarlySession`, session-object `has0Rtt`/`accepted0Rtt`/`handshakeConfirmed`, `exportTicketVault`/`importTicketVault` | `crates/native/src/{zero_rtt.rs,client.rs,lib.rs,server_napi.rs,session_napi.rs,session_registry.rs}`; `packages/webtransport/src/index.ts` | `packages/webtransport/test/native-0rtt.test.ts` (7 pass); `crates/native` `zero_rtt` unit + loopback resumption tests (`shared_config_resumes_with_early_data`, `fresh_config_per_connect_never_resumes`) | `docs/release-status.json` still `pending` |
 
+### Not implemented (W3C members absent from both facades)
+
+These members of the snapshot's `WebTransport` interface are `missing` on the
+native and wasm facades. The corresponding constructor options are not
+declared in `WebTransportOptions`, so TypeScript rejects them in an options
+literal; plain JavaScript callers should know they are ignored like any other
+unknown key.
+
+| W3C member | Kind | Status | Notes |
+|---|---|---|---|
+| `reliability` | attribute (`"pending"` / `"reliable-only"` / `"supports-unreliable"`) | `missing` | `requireUnreliable` covers the connect-time guarantee; the attribute is not exposed |
+| `protocol` / `protocols` | attribute / constructor option (subprotocol negotiation, `WT-Available-Protocols`) | `missing` | No subprotocol header is sent or parsed |
+| `exportKeyingMaterial()` | method (TLS exporter) | `missing` | |
+| `anticipatedConcurrentIncomingUnidirectionalStreams`, `anticipatedConcurrentIncomingBidirectionalStreams` | attributes / constructor options | `missing` | Incoming stream concurrency is governed by `limits` instead |
+
+`createSendGroup()` / `WebTransportSendGroup` and `sendOrder` are implemented
+(Datagrams and Streams rows above).
+
 ---
 
 ## 2. Portable server/session parity
