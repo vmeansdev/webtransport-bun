@@ -127,7 +127,7 @@ Detailed migration playbook:
 
 ### OS / Arch
 - macOS arm64 (`darwin-arm64`), macOS x64 (`darwin-x64`)
-- Linux x64 (`linux-x64`)
+- Linux x64, glibc (`linux-x64-gnu`)
 - Windows x64 (`win32-x64-msvc`)
 
 See `docs/COMPATIBILITY.md` for policy details.
@@ -142,20 +142,38 @@ pnpm add @webtransport-bun/webtransport
 yarn add @webtransport-bun/webtransport
 ```
 
-The candidate 1.0 npm artifact is configured to contain:
-- `dist/` compiled JS + TypeScript declarations (`index`, `errors`, `streams`)
+The npm package contains:
+- `dist/` compiled JS + TypeScript declarations for the four entrypoints:
+  `@webtransport-bun/webtransport` (native), `/wasm`, `/portable` and
+  `/sink-reader`
 - `prebuilds/` native addon binaries (`.node`) for the configured target matrix
+- `wasm-dist/` the prebuilt wasm engine used by `/wasm`
 - `README.md` and `LICENSE`
 
 Note: GitHub source zip/tar downloads are source snapshots and may not include generated `dist/`. Use npm install (or the release `.tgz` package asset) for a ready-to-run package.
 
 ### From local workspace (development)
+
+The package's entrypoints point at compiled `dist/`, and the addon is looked
+up in `prebuilds/` next to it, so build both before installing from a
+checkout:
+
 ```bash
-bun add file:./packages/webtransport
-npm i file:./packages/webtransport
-pnpm add file:./packages/webtransport
-yarn add file:./packages/webtransport
+bun install
+bun run build:native                       # addon -> crates/native/*.node
+bun run --cwd packages/webtransport build  # TypeScript -> packages/webtransport/dist
+mkdir -p packages/webtransport/prebuilds
+cp crates/native/webtransport-native.*.node packages/webtransport/prebuilds/
 ```
+
+Then, from your project:
+
+```bash
+bun add file:/path/to/webtransport-bun/packages/webtransport
+```
+
+Set `WEBTRANSPORT_NATIVE_ADDON_PATH=/path/to/webtransport-native.<platform>.node`
+to load an addon from anywhere else.
 
 ## Examples
 
@@ -209,7 +227,7 @@ The current release status is pending in `docs/release-status.json`; treat the
 - **Backend-agnostic contract**: `WebTransportLike` (exported from both the
   root and `/wasm` subpaths) lets application code run unchanged against the
   native or wasm backend.
-- **One server, either backend**: `webtransport-bun/portable` exports an async
+- **One server, either backend**: `@webtransport-bun/webtransport/portable` exports an async
   `createServer` that dispatches on the runtime, handing your `onSession` the
   same session shape on both. See below.
 - **Certs**: `generateCert` produces browser-pinnable ECDSA P-256 certs
@@ -233,7 +251,12 @@ import { createServer } from "@webtransport-bun/webtransport/portable";
 
 const server = await createServer({
   port: 4433,
-  tls: { allowSelfSigned: true }, // wasm-only; pass certPem/keyPem on native
+  // A PEM pair works on both backends. On wasm only, `{ allowSelfSigned: true }`
+  // generates a short-lived browser-pinnable cert instead; native rejects it.
+  tls: {
+    certPem: await Bun.file("cert.pem").text(),
+    keyPem: await Bun.file("key.pem").text(),
+  },
   onSession: async (session) => {
     for await (const d of session.incomingDatagrams()) {
       await session.sendDatagram(d);
@@ -256,7 +279,7 @@ await server.close();
   The wasm server session mirrors the native `ServerSession` shape —
   `incomingDatagrams()`, the incoming stream `ReadableStream`s, and `id`/`peer`
   — so one server codebase runs on either backend through
-  `webtransport-bun/portable`, which is the subset actually contract-tested on
+  `@webtransport-bun/webtransport/portable`, which is the subset actually contract-tested on
   both. What remains divergent is the original callback-style API
   (`onDatagram`/`onIncomingStream`), kept for back-compat but deprecated; it
   cannot be combined with the W3C surface on the same session.
@@ -312,7 +335,8 @@ yarn add @webtransport-bun/webtransport
 import { createServer } from "@webtransport-bun/webtransport";
 import { readFileSync } from "node:fs";
 
-// Dev: use tools/interop/certs/ after `cd tools/interop && bun run prepare:interop`
+// Dev cert: see docs/GETTING_STARTED.md ("Minimal server example") for a
+// one-line openssl command that writes cert.pem / key.pem.
 const certPem = readFileSync("./cert.pem", "utf-8");
 const keyPem = readFileSync("./key.pem", "utf-8");
 
@@ -380,12 +404,16 @@ W3C-facade option semantics in this runtime:
 
 ## From Source (Local Development)
 
-When running directly from this monorepo:
+When running directly from this monorepo (imports from
+`packages/webtransport/src` resolve the addon in `crates/native/`):
 
 ```bash
 bun install
 bun run build:native
 ```
+
+To consume the checkout from another project, see "From local workspace"
+above.
 
 ## Stream Controls
 

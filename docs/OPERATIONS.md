@@ -1,10 +1,8 @@
 # OPERATIONS.md
 
 ## Running an in-process server (example)
-Example usage (JS/TS):
-
-- create server with TLS cert/key
-- handle session: datagrams and streams
+A complete echo server (datagrams and bidi streams) with a dev-certificate
+command is in [`GETTING_STARTED.md`](GETTING_STARTED.md#minimal-server-example).
 
 Operational requirements:
 - UDP port must be reachable from the internet (firewall rules).
