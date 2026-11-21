@@ -879,9 +879,14 @@ pub(crate) fn spawn_wtransport_server(
                         return;
                     }
                 };
-            let bind_addr: std::net::SocketAddr = format!("{}:{}", host, port)
-                .parse()
-                .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], port)));
+            let bind_addr = match server_spawn::parse_bind_addr(&host, port) {
+                Ok(addr) => addr,
+                Err(msg) => {
+                    emit_log(&log_tx, !debug_logs, "error", format_args!("{}", msg), None, None, None);
+                    report_startup(Err(msg));
+                    return;
+                }
+            };
             // Align QUIC transport flow control with the configured app limits so a
             // peer cannot open QUIC-default concurrency (accept/reset churn) or
             // buffer more than the advertised byte budgets. Headroom of 16 streams
@@ -961,7 +966,15 @@ pub(crate) fn spawn_wtransport_server(
                             }
                         }
                     }
-                    None => ServerConfig::builder().with_bind_address(bind_addr),
+                    None => match bind_addr {
+                        std::net::SocketAddr::V6(v6) if server_spawn::binds_dual_stack(&bind_addr) => {
+                            ServerConfig::builder().with_bind_address_v6(
+                                v6,
+                                wtransport::config::Ipv6DualStackConfig::Allow,
+                            )
+                        }
+                        _ => ServerConfig::builder().with_bind_address(bind_addr),
+                    },
                 }
             };
             let config_builder =

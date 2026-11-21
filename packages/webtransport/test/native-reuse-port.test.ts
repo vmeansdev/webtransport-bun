@@ -8,9 +8,10 @@
  * BSD/macOS delivers to the last binder — so nothing here asserts anything
  * about distribution, and the traffic check below runs on Linux only.
  *
- * The socket-level behavior (SO_REUSEPORT set before bind, IPV6_V6ONLY left at
- * the OS default so the injected socket matches the fork's own bind path) is
- * covered by the Rust unit tests in crates/native/src/server_spawn.rs.
+ * The socket-level behavior (SO_REUSEPORT set before bind, IPV6_V6ONLY set the
+ * same way as the plain bind path: dual-stack for `::`, the OS default for a
+ * specific v6 address) is covered by the Rust unit tests in
+ * crates/native/src/server_spawn.rs.
  */
 
 import { describe, expect, it } from "bun:test";

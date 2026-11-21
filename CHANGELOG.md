@@ -55,6 +55,21 @@ hatch exists. Checked against the rc.1 candidate (875dfbfe).
   connection (rc.1: 64 KiB), and runs one extra datagram pump task per
   connection. There is no public knob for these (`docs/OPERATIONS.md`,
   "Transport defaults that changed for 1.0").
+- **Server `host` must be an IP address.** `createServer` throws
+  `E_INVALID_ARGUMENT` for a hostname (`"localhost"` included) or a malformed
+  literal, where rc.1 silently bound `0.0.0.0` (every IPv4 interface) for any
+  string it could not parse, `"::"` among them. `"::"` (brackets optional) now
+  binds every interface dual-stack on all platforms. To keep rc.1's behavior
+  for a hostname, pass `"0.0.0.0"` explicitly.
+- **Client stream caps are enforced.** `limits.maxStreamsPerSessionBidi` and
+  `maxStreamsPerSessionUni` (default 200 each) were accepted by `connect` and
+  `new WebTransport` but ignored. The client now counts open streams per
+  direction like the server: a local open over the cap rejects with
+  `E_LIMIT_EXCEEDED` (`waitUntilAvailable: true` waits for a slot instead), and
+  a peer stream over the cap is refused rather than surfaced. The QUIC stream
+  concurrency the client grants its peer follows the caps (cap + 16 for HTTP/3
+  control streams), as on the server. Raise the caps to restore rc.1's
+  unbounded opens.
 - **Not breaking, listed for completeness.** The surfaces under "Removed and
   internalized" below were never in rc.1, so no rc.1 caller can depend on
   them: the reflector, the campaign getters, `__sendPathDiagnostics`, the
@@ -306,6 +321,15 @@ unstable `__TESTING__.serverInternals(server)` accessor (`docs/SPEC.md`,
 
 ### Fixed
 
+- A single stream write larger than `maxQueuedBytesPerStream` (or the session
+  or global budget) waited on a reservation that could never succeed and failed
+  with `E_BACKPRESSURE_TIMEOUT`. It is now queued in budget-sized pieces, each
+  waiting for headroom like any other write.
+- A client given `serverName` dialed the `serverName` instead of the URL host
+  whenever that host was a name or a bracketed IPv6 literal, so
+  `connect("https://localhost:4433", { tls: { serverName } })` and
+  `https://[::1]:4433` failed DNS lookup. The dial now always targets the URL
+  host and `serverName` only sets TLS SNI.
 - Clients bind their endpoint in the destination's address family, so an
   ephemeral port draw can no longer take a port a local IPv4 socket already
   owns.
