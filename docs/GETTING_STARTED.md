@@ -2,19 +2,38 @@
 
 ## Minimal server example
 
+Generate a development certificate first (any PEM pair works; this one is
+valid for `localhost`, `127.0.0.1` and `::1` for 14 days):
+
+```bash
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 14 \
+  -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:::1" \
+  -keyout key.pem -out cert.pem
+```
+
+An echo server for datagrams and bidirectional streams, which the client
+examples below talk to:
+
 ```ts
 import { createServer } from "@webtransport-bun/webtransport";
 import * as fs from "node:fs";
 
-// Dev certs: cd tools/interop && bun run prepare:interop, then use tools/interop/certs/cert.pem
 const certPem = fs.readFileSync("cert.pem", "utf-8");
 const keyPem = fs.readFileSync("key.pem", "utf-8");
 
 const server = createServer({
-  port: 4433,
+  port: 4433, // binds 0.0.0.0; pass host: "::" to accept IPv6 clients too
   tls: { certPem, keyPem },
-  onSession: (session) => {
+  onSession: async (session) => {
     console.log("Session connected:", session.id, session.peer);
+    void (async () => {
+      for await (const { readable, writable } of session.incomingBidirectionalStreams) {
+        void readable.pipeTo(writable).catch(() => {}); // echo each bidi stream back
+      }
+    })();
+    for await (const d of session.incomingDatagrams()) {
+      await session.sendDatagram(d);
+    }
   },
 });
 
@@ -81,20 +100,23 @@ Use `replaceSniCerts()` when you want to swap the full hostname map while preser
 
 ```ts
 import { connect } from "@webtransport-bun/webtransport";
+import { once } from "node:events";
 
-const session = await connect("https://localhost:4433", {
+// Dial 127.0.0.1 rather than localhost: localhost may resolve to ::1 first,
+// which a server bound to the default 0.0.0.0 does not listen on.
+const session = await connect("https://127.0.0.1:4433", {
   tls: { insecureSkipVerify: true }, // dev only — use valid certs in production
 });
 
 // Send a datagram
 await session.sendDatagram(new Uint8Array([1, 2, 3]));
 
-// Open a bidi stream
+// Open a bidi stream and wait for the echo before closing
 const stream = await session.createBidirectionalStream();
 stream.write(Buffer.from("hello"));
-stream.on("data", (chunk: Buffer) => console.log("received:", chunk));
+const [chunk] = await once(stream, "data");
+console.log("received:", chunk.toString());
 
-// Clean up
 session.close();
 ```
 
@@ -115,7 +137,7 @@ import {
 const wasm = await loadWasmModule(); // prebuilt wasm shipped in the package
 
 // DirectSocketsUdpTransport.bind works inside a Chromium IWA;
-// pass a Bun UDP or InMemoryRelay bind factory elsewhere.
+// elsewhere pass your own bind factory (Bun example below).
 const { manager, certHashBase64 } = await serveOverUdp(
   wasm,
   DirectSocketsUdpTransport.bind,
@@ -129,6 +151,34 @@ const { manager, certHashBase64 } = await serveOverUdp(
 // new WebTransport("https://host:4433", { serverCertificateHashes: [
 //   { algorithm: "sha-256", value: base64ToArrayBuffer(certHashBase64) },
 // ]})
+```
+
+Outside an IWA, give `serveOverUdp` a factory that returns a `UdpTransport`.
+Under Bun:
+
+```ts
+import type { UdpTransport } from "@webtransport-bun/webtransport/wasm";
+
+async function bunUdpBind(localAddress: string, localPort: number): Promise<UdpTransport> {
+  let onPacket: ((data: Uint8Array, src: { address: string; port: number }) => void) | undefined;
+  const socket = await Bun.udpSocket({
+    hostname: localAddress || "0.0.0.0",
+    port: localPort,
+    socket: {
+      data(_s, buf, port, address) {
+        onPacket?.(new Uint8Array(buf), { address, port });
+      },
+    },
+  });
+  return {
+    localPort: socket.port,
+    send: (data, dest) => void socket.send(data, dest.port, dest.address),
+    onPacket: (fn) => { onPacket = fn; },
+    close: () => socket.close(),
+  };
+}
+
+// serveOverUdp(wasm, bunUdpBind, { localAddress: "127.0.0.1", localPort: 4433, onSession })
 ```
 
 What you must handle yourself:
@@ -147,7 +197,7 @@ What you must handle yourself:
 ```ts
 import { WebTransport } from "@webtransport-bun/webtransport";
 
-const wt = new WebTransport("https://localhost:4433", {
+const wt = new WebTransport("https://127.0.0.1:4433", {
   tls: { insecureSkipVerify: true }, // dev only — use valid certs in production
 });
 

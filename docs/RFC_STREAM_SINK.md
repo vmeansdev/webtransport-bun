@@ -12,7 +12,7 @@ latency is a queueing function of that loop's utilization: 2.5 ms p99 with headr
 ~82 %, 11.5 ms at ~95 %, and 348 ms (~140× inflation) on a host that held the loop at 93–95 % of a
 slower core — while wire-level delivery stayed flat throughout (C6-app root cause, 2026-08-25;
 bare-metal capacity chapter, kept outside this repository; OPERATIONS.md §Sizing). A harness-only native
-sink (`crates/native/src/frame_sink.rs` @33b304df, probe/g11-bidi-06) that drained off the event
+sink (`frame_sink.rs` on the unmerged probe branch probe/g11-bidi-06 @33b304df, not in this tree) that drained off the event
 loop held a flat 3–4 ms app-level overhead at every utilization the JS path degraded under, with
 zero JS data crossings (`t100-native.json`: `dataCrossings: 0` vs 1.6 M harness reads).
 
