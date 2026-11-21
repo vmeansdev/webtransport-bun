@@ -1108,9 +1108,9 @@ pub(crate) fn spawn_wtransport_server(
                                 break;
                             }
                             incoming_session = incoming => {
-                                // Started on arrival so handshakeTimeoutMs covers the
-                                // QUIC and TLS handshake, not only the CONNECT
-                                // exchange after it.
+                                // Started on arrival so handshakeTimeoutMs and the
+                                // handshake latency histogram cover the QUIC and TLS
+                                // handshake, not only the CONNECT exchange after it.
                                 let handshake = crate::server::HandshakeDeadline::start(limits.handshake_timeout_ms);
                                 let metrics = Arc::clone(&metrics);
                                 let limits = limits.clone();
@@ -1237,7 +1237,6 @@ pub(crate) fn spawn_wtransport_server(
                                     }
                                     return;
                                 }
-                                let accept_start = std::time::Instant::now();
                                 let accept_result = match handshake.bound(session_request.accept()).await {
                                     Ok(r) => r,
                                     Err(crate::server::HandshakeTimedOut) => {
@@ -1250,7 +1249,7 @@ pub(crate) fn spawn_wtransport_server(
                                 };
                                 match accept_result {
                                     Ok(connection) => {
-                                        metrics.handshake_histogram.observe(accept_start.elapsed());
+                                        metrics.handshake_histogram.observe(handshake.elapsed());
                                         emit_log(&ltx, !debug_logs, "info", format_args!("session accepted peer={}:{} authority={:?}", peer_ip, peer_port, authority), None, Some(&peer_ip), Some(peer_port));
                                         drop(_handshake_admission);
 

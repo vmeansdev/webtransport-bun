@@ -340,6 +340,11 @@ unstable `__TESTING__.serverInternals(server)` accessor (`docs/SPEC.md`,
   `limitExceededCount` and is logged at debug level. The per-IP handshake
   bucket is still charged after the handshake, against the validated address
   (`SECURITY.md`).
+- The `handshakeLatency` histogram (`webtransport_handshake_latency_seconds`)
+  timed only the CONNECT response write, a few microseconds. It now measures
+  what `docs/METRICS.md` says: from the connection's first Initial to its
+  CONNECT request being accepted. Expect values of a few round trips;
+  dashboards and the p99 alert built on the old numbers read differently.
 - Bidirectional streams no longer stall when both directions are busy. One
   byte budget served both directions, so writes queued faster than the peer
   drained them filled it, the receive side could not reserve, and both peers

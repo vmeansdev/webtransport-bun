@@ -102,3 +102,42 @@ describe("handshakeTimeoutMs bounds the whole server-side handshake", () => {
 		}
 	}, 30_000);
 });
+
+describe("handshakeLatency", () => {
+	// The histogram used to time only the CONNECT response write (~10 µs).
+	// It now spans Initial arrival to CONNECT accepted, which sits inside the
+	// client's own connect() span and includes at least a TLS handshake.
+	it("measures the handshake, not just the CONNECT response", async () => {
+		const cert = generateCertForNames(["localhost", "127.0.0.1"]);
+		if (!cert) return;
+		const server = createServer({
+			port: 0,
+			host: "127.0.0.1",
+			tls: { certPem: cert.certPem, keyPem: cert.keyPem },
+			rateLimits: OPEN_RATE_LIMITS,
+			onSession: () => {},
+		});
+		try {
+			const started = performance.now();
+			const session = await Promise.race([
+				connect(`https://127.0.0.1:${server.address.port}/`, {
+					tls: { insecureSkipVerify: true },
+				}),
+				Bun.sleep(5000).then(() => {
+					throw new Error("connect hung");
+				}),
+			]);
+			const clientMs = performance.now() - started;
+			session.close();
+
+			const h = server.metricsSnapshot().handshakeLatency;
+			expect(h?.count).toBe(1);
+			const serverMs = (h?.sumSecs ?? 0) * 1000;
+			expect(serverMs).toBeGreaterThan(0.1);
+			expect(serverMs).toBeLessThanOrEqual(clientMs);
+		} finally {
+			await server.close();
+			cert.cleanup();
+		}
+	}, 15_000);
+});

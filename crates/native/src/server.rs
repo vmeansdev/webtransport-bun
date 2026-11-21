@@ -262,6 +262,7 @@ pub(crate) fn tls_snapshot_from_state(
 /// left, and a peer that stalls anywhere gives its `maxHandshakesInFlight`
 /// slot back when the budget runs out rather than at the idle timeout.
 pub(crate) struct HandshakeDeadline {
+    started: tokio::time::Instant,
     deadline: tokio::time::Instant,
 }
 
@@ -276,7 +277,7 @@ impl HandshakeDeadline {
         let deadline = started
             .checked_add(Duration::from_millis(timeout_ms))
             .unwrap_or_else(|| started + Duration::from_secs(365 * 24 * 60 * 60));
-        Self { deadline }
+        Self { started, deadline }
     }
 
     /// Runs one handshake step under the shared deadline. On expiry the step is
@@ -288,6 +289,12 @@ impl HandshakeDeadline {
         tokio::time::timeout_at(self.deadline, step)
             .await
             .map_err(|_| HandshakeTimedOut)
+    }
+
+    /// Time since the connection attempt arrived: the handshake latency once
+    /// the CONNECT request has been accepted.
+    pub(crate) fn elapsed(&self) -> Duration {
+        self.started.elapsed()
     }
 }
 
@@ -827,7 +834,6 @@ mod tests {
         let metrics = Arc::new(ServerMetrics::default());
         assert!(metrics.try_acquire_handshake(1));
         let guard = SlotGuard(Arc::clone(&metrics));
-        let started = tokio::time::Instant::now();
         let deadline = HandshakeDeadline::start(500);
 
         let result = deadline
@@ -838,7 +844,7 @@ mod tests {
             .await;
 
         assert_eq!(result, Err(HandshakeTimedOut));
-        assert_eq!(started.elapsed(), Duration::from_millis(500));
+        assert_eq!(deadline.elapsed(), Duration::from_millis(500));
         assert_eq!(metrics.handshakes_in_flight.load(Ordering::Acquire), 0);
         assert!(metrics.try_acquire_handshake(1));
     }
@@ -847,7 +853,6 @@ mod tests {
     // so the whole handshake ends at the deadline, not at twice it.
     #[tokio::test(start_paused = true)]
     async fn handshake_deadline_is_shared_across_steps() {
-        let started = tokio::time::Instant::now();
         let deadline = HandshakeDeadline::start(1_000);
 
         let first = deadline.bound(tokio::time::sleep(Duration::from_millis(700))).await;
@@ -857,7 +862,19 @@ mod tests {
             .await;
 
         assert_eq!(second, Err(HandshakeTimedOut));
-        assert_eq!(started.elapsed(), Duration::from_millis(1_000));
+        assert_eq!(deadline.elapsed(), Duration::from_millis(1_000));
+    }
+
+    // Latency is read from the connection's arrival, so it includes the time
+    // before the last step started, not just the last step.
+    #[tokio::test(start_paused = true)]
+    async fn handshake_elapsed_spans_every_step() {
+        let deadline = HandshakeDeadline::start(10_000);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let value = deadline.bound(async { 7 }).await;
+        assert_eq!(value, Ok(7));
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        assert_eq!(deadline.elapsed(), Duration::from_millis(42));
     }
 
     #[tokio::test(start_paused = true)]

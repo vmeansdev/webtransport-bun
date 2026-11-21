@@ -1305,7 +1305,7 @@ export type MetricsSnapshot = {
 	sessionsClosedByReap?: number;
 	/** Native only. Every other way a session ended (peer close, transport error). */
 	sessionsClosedOther?: number;
-	/** Handshake latency (accept start to completion). P99 target &lt;300ms. */
+	/** Handshake latency, first Initial to CONNECT accepted (native). P99 target &lt;300ms. */
 	handshakeLatency?: HistogramSnapshot | null;
 	/** Datagram send enqueue latency. P99 target &lt;10ms. */
 	datagramEnqueueLatency?: HistogramSnapshot | null;

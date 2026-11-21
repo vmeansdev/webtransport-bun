@@ -159,7 +159,8 @@ Server handshake, in order:
    without a QUIC Retry the Initial's source address is spoofable.
 4. `maxSessions` is checked; over it, the session is accepted and closed with
    code 3992 (`E_LIMIT_EXCEEDED`).
-5. The CONNECT request is accepted and the slot from step 1 is released.
+5. The CONNECT request is accepted; the slot from step 1 is released and the
+   handshake latency histogram records the time since step 1.
 
 Steps 2–5 share the one `handshakeTimeoutMs` budget. Running out at any point
 drops the connection, releases the slot and counts in `limitExceededCount`
