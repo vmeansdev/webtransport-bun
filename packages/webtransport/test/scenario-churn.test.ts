@@ -104,9 +104,7 @@ describe("scenario example: connection churn", () => {
 			// Every failed dial was retried (none gave up), and each one the
 			// client saw was a refusal the server counted.
 			expect(report.connectRetries).toBe(failures);
-			expect(churn.server.metricsSnapshot().limitExceededCount).toBe(
-				failures,
-			);
+			expect(churn.server.metricsSnapshot().limitExceededCount).toBe(failures);
 		} finally {
 			await churn.close();
 		}
