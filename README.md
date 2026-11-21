@@ -226,7 +226,9 @@ The current release status is pending in `docs/release-status.json`; treat the
   `connectWasm(...)` / `createUnifiedClient(...)` connect as a client.
 - **Backend-agnostic contract**: `WebTransportLike` (exported from both the
   root and `/wasm` subpaths) lets application code run unchanged against the
-  native or wasm backend.
+  native or wasm backend. On native, get one with
+  `nativeToWebTransportLike(new WebTransport(url, opts))`, or from an existing
+  `connect()` session with `nativeToWebTransportLike(toWebTransport(session))`.
 - **One server, either backend**: `@webtransport-bun/webtransport/portable` exports an async
   `createServer` that dispatches on the runtime, handing your `onSession` the
   same session shape on both. See below.

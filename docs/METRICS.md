@@ -6,6 +6,33 @@ All metrics are exposed via `server.metricsSnapshot()` and `session.metricsSnaps
 
 Use `metricsToPrometheus(snapshot, labels?)` to produce Prometheus exposition format. See `docs/OPERATIONS.md` for scrape setup.
 
+It emits exactly these series (prefix `webtransport_`, overridable with
+`WEBTRANSPORT_METRICS_PREFIX`; `labels` such as `{ serverId }` are added to
+every series). Snapshot fields not listed here are available from
+`metricsSnapshot()` only.
+
+| Series | Type | Meaning |
+|---|---|---|
+| `webtransport_sessions_active` | gauge | Current open sessions |
+| `webtransport_handshakes_in_flight` | gauge | Handshakes in progress |
+| `webtransport_streams_active` | gauge | Active streams |
+| `webtransport_session_tasks_active` | gauge | Internal session tasks |
+| `webtransport_stream_tasks_active` | gauge | Internal stream tasks |
+| `webtransport_queued_bytes_global` | gauge | Bytes queued globally |
+| `webtransport_datagrams_in` | counter | Datagrams received |
+| `webtransport_datagrams_out` | counter | Datagrams sent |
+| `webtransport_datagrams_dropped` | counter | Datagrams dropped (sum of the drop causes below) |
+| `webtransport_backpressure_wait_total` | counter | Times senders waited on backpressure |
+| `webtransport_backpressure_timeout_total` | counter | Times the backpressure timeout fired |
+| `webtransport_rate_limited_total` | counter | Sessions rejected by rate limit |
+| `webtransport_limit_exceeded_total` | counter | Sessions rejected by limits |
+| `webtransport_tls_sni_cert_selections_total` | counter | Handshakes served by a hostname-specific SNI cert |
+| `webtransport_tls_default_cert_selections_total` | counter | Handshakes served by the default certificate |
+| `webtransport_tls_unknown_sni_rejected_total` | counter | Handshakes rejected because SNI matched no configured hostname |
+| `webtransport_handshake_latency_seconds` | histogram | Handshake latency |
+| `webtransport_datagram_enqueue_latency_seconds` | histogram | Datagram enqueue latency |
+| `webtransport_stream_open_latency_seconds` | histogram | Stream open latency |
+
 ## Server metrics
 
 | Field | Type | Description |
