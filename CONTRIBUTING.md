@@ -12,6 +12,7 @@
 
 ## Local build
 - Build native addon: `bun run build:native` (uses napi-rs CLI; produces `webtransport-native.${platform}-${arch}.node`)
+- Build the WASM engine: `bun run build:wasm:dist` (needs `wasm-bindgen-cli` at the version in `.github/release-toolchain.json` and an LLVM `clang` + `llvm-ar` that target wasm32; on macOS `brew install llvm` or any `llvm@NN` is found automatically, elsewhere set `CC_wasm32_unknown_unknown` / `AR_wasm32_unknown_unknown`). The build fails if ring's C code did not link.
 - Run Bun tests:
   - `bun run test`
 - Run Chromium interop tests (requires Playwright browsers):
