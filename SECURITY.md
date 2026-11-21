@@ -15,6 +15,15 @@ Canonical release truth: `docs/release-status.json`. This document defines the s
 1. Safe defaults
 - TLS verification enabled by default for client.
 - `insecureSkipVerify` requires explicit `tls.insecureSkipVerify: true`; emits warning log when used. Dev only — never use in production.
+- The root `createServer()` refuses to invent a certificate in production. With an
+  empty `tls.certPem` or `tls.keyPem` it serves a freshly generated self-signed
+  certificate (SANs `localhost`, `127.0.0.1`, `::1`, valid 14 days, a new key every
+  start) so local development works without a PEM pair; when `NODE_ENV=production`
+  it throws `E_TLS` instead, unless `tls.allowSelfSigned: true` opts back in. Clients
+  will not trust that certificate without `insecureSkipVerify` or a pinned
+  `serverCertificateHashes` entry, and it cannot carry SNI entries. `/portable`
+  never takes this path: it rejects an empty PEM pair on both backends unless the wasm
+  backend's own `allowSelfSigned` is set.
 - Native diagnostics are redacted by default (log payload/message/session metadata and panic details).
   `createServer({ debug: true, ... })` turns redaction off: log events then carry the full
   message plus `sessionId`, `peerIp` and `peerPort`. Use it only in trusted dev/debug
@@ -76,6 +85,9 @@ Canonical release truth: `docs/release-status.json`. This document defines the s
   - expiration/revisit date.
 - Suppressions should be minimal and temporary; broad/global ignores are not allowed.
 - When a finding is accepted temporarily, track it in an issue with owner + target fix release.
+
+## Environment variables affecting security posture
+- `NODE_ENV=production`: the root `createServer()` rejects an empty `tls.certPem`/`tls.keyPem` with `E_TLS` instead of serving a generated self-signed certificate (see "Safe defaults"); `tls.allowSelfSigned: true` overrides it. This is the only place the library reads `NODE_ENV`.
 
 ## Environment variables affecting security diagnostics
 - `WEBTRANSPORT_LOG_EXPECTED_CHANNEL_CLOSES=1`: enables logging of expected (non-error) channel close events. Useful for debugging teardown ordering, but may produce noisy logs in production. Does not affect security enforcement.

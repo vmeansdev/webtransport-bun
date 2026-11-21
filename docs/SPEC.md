@@ -93,7 +93,8 @@ export type TlsOptions = {
    * Default is "reject". No-SNI clients still receive the default cert.
    */
   unknownSniPolicy?: "reject" | "default";
-  /** Production guard override for empty cert/key fallback. */
+  /** Serve the generated development certificate for an empty cert/key even
+   * when NODE_ENV=production (see "Development certificate fallback"). */
   allowSelfSigned?: boolean;
 };
 
@@ -281,6 +282,7 @@ are finite numbers `>= 0` and may be fractional; bursts (`handshakesBurst`,
 
 ### Server TLS / SNI semantics
 
+- **Development certificate fallback (root `createServer` only).** An empty `tls.certPem` or `tls.keyPem` makes the server generate a self-signed certificate at startup (SANs `localhost`, `127.0.0.1`, `::1`; valid 14 days; a new key on every start), so local development needs no PEM pair. With `NODE_ENV=production` that input throws `E_TLS` instead, unless `tls.allowSelfSigned: true` is set. Clients only accept that certificate with `insecureSkipVerify` or a matching `serverCertificateHashes` pin. `/portable` never takes this path: it requires a PEM pair on native and on wasm (unless the wasm backend's `allowSelfSigned` is set). See `SECURITY.md`.
 - `tls.certPem` / `tls.keyPem` are the default server certificate and key.
 - `tls.keyPem` accepts unencrypted PKCS#8 (`BEGIN PRIVATE KEY`), SEC1 ECDSA (`BEGIN EC PRIVATE KEY`), and PKCS#1 RSA (`BEGIN RSA PRIVATE KEY`) PEM. Encrypted keys are not supported. A key that does not match the leaf certificate's public key fails server construction.
 - `tls.sni` adds hostname-specific certificates chosen from the client SNI value.

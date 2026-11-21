@@ -446,6 +446,12 @@ from, never what it enforces. Each is read once per process.
 | `WEBTRANSPORT_SUPPRESS_RUNTIME_VERSION_WARN=1` | off | Silence the startup warning for Bun versions with the known `WritableStream` leak |
 | `WEBTRANSPORT_SUPPRESS_LOG_CALLBACK_WARN=1`, `WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN=1`, `WEBTRANSPORT_LOG_EXPECTED_CHANNEL_CLOSES=1` | off | See `SECURITY.md`, "Environment variables affecting security diagnostics" |
 
+One standard variable changes what the library enforces:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `NODE_ENV=production` | unset | The root `createServer()` throws `E_TLS` for an empty `tls.certPem`/`tls.keyPem` instead of serving a generated self-signed development certificate; `tls.allowSelfSigned: true` overrides it. See `SECURITY.md`, "Safe defaults" |
+
 ## Unsupported tuning knobs
 
 The variables below exist for measurement campaigns. They are **not** part
