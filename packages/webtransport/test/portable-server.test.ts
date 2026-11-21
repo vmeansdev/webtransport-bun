@@ -260,6 +260,89 @@ describe("portable createServer", () => {
 		},
 	);
 
+	// The portable log contract: one event shape on both backends.
+	const expectPortableLogShape = (event: Record<string, unknown>) => {
+		expect(typeof event.type).toBe("string");
+		expect(["debug", "info", "warn", "error"]).toContain(String(event.level));
+		expect(typeof event.msg).toBe("string");
+	};
+
+	test("log events carry type, level and msg on native", async () => {
+		const events: Record<string, unknown>[] = [];
+		const server = await createServer({
+			backend: "native",
+			host: "127.0.0.1",
+			port: 0,
+			tls: nativeTls,
+			log: (event) => events.push(event),
+			onSession: () => {},
+		});
+		try {
+			const wt = await openWTWithRetry(
+				`https://127.0.0.1:${server.address.port}`,
+				{ tls: { insecureSkipVerify: true } },
+			);
+			const deadline = Date.now() + 5000;
+			while (events.length === 0 && Date.now() < deadline) {
+				await Bun.sleep(25);
+			}
+			wt.close();
+			expect(events.length).toBeGreaterThan(0);
+			for (const event of events) {
+				expectPortableLogShape(event);
+				expect(event.type).toBe("log");
+			}
+		} finally {
+			await server.close();
+		}
+	});
+
+	test.skipIf(!wasmAvailable)(
+		"log events carry type, level and msg on wasm",
+		async () => {
+			const relay = new InMemoryRelay();
+			const serverAddr = { address: "127.0.0.1", port: 4741 };
+			const clientAddr = { address: "127.0.0.1", port: 5741 };
+			const events: Record<string, unknown>[] = [];
+			const server = await createServer({
+				backend: "wasm",
+				host: serverAddr.address,
+				port: serverAddr.port,
+				tls: { allowSelfSigned: true },
+				wasmModule: wasm,
+				wasmBind: async () => relay.endpoint(serverAddr),
+				log: (event) => events.push(event),
+				onSession: () => {},
+			});
+			try {
+				const { session, manager } = await connectWasm(
+					wasm,
+					relay.endpoint(clientAddr),
+					"localhost",
+					`${clientAddr.address}:${clientAddr.port}`,
+					`${serverAddr.address}:${serverAddr.port}`,
+					{ certHashBase64: server.certHashBase64 },
+				);
+				await session.ready;
+				const deadline = Date.now() + 5000;
+				while (
+					!events.some((e) => e.type === "session_established") &&
+					Date.now() < deadline
+				) {
+					await Bun.sleep(25);
+				}
+				manager.close();
+				const established = events.find(
+					(e) => e.type === "session_established",
+				);
+				expect(established).toMatchObject({ level: "info" });
+				for (const event of events) expectPortableLogShape(event);
+			} finally {
+				await server.close();
+			}
+		},
+	);
+
 	test("rejects wasm-only allowSelfSigned on the native backend", async () => {
 		const err = await createServer({
 			backend: "native",

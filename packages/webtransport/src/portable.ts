@@ -120,6 +120,47 @@ export type PortableTlsOptions = {
 	allowSelfSigned?: boolean;
 };
 
+/**
+ * One structured log event, the same shape on both backends.
+ *
+ * - `type`: the event kind. The wasm backend names its events
+ *   (`session_established`, `handshake_failed`, `limit_exceeded`, ...); the
+ *   native addon logs free-text messages, so its events are all `"log"`.
+ * - `level` and `msg`: the native fields. Wasm events get `level` from their
+ *   kind (failures and refusals are `"warn"`, lifecycle events `"info"`) and
+ *   `msg` from the kind plus its `detail`, when there is one.
+ * - Anything else is backend-specific context: `sessionId`/`peerIp`/`peerPort`
+ *   on native (redacted unless `debug`), the event's own fields on wasm.
+ */
+export type PortableLogEvent = {
+	type: string;
+	level: "debug" | "info" | "warn" | "error";
+	msg: string;
+	[key: string]: unknown;
+};
+
+const WASM_WARN_EVENTS = new Set([
+	"handshake_failed",
+	"limit_exceeded",
+	"rate_limited",
+	"ticket_persist_failed",
+	"tls_update_failed",
+]);
+
+/** Give a wasm `{ type, ...fields }` event the portable `level` and `msg`. */
+function wasmLogEventToPortable(event: {
+	type: string;
+	[key: string]: unknown;
+}): PortableLogEvent {
+	const detail = typeof event.detail === "string" ? event.detail : undefined;
+	return {
+		...event,
+		type: event.type,
+		level: WASM_WARN_EVENTS.has(event.type) ? "warn" : "info",
+		msg: detail ? `${event.type}: ${detail}` : event.type,
+	};
+}
+
 export type PortableLimits = {
 	maxStreamsPerSessionBidi?: number;
 	maxStreamsGlobal?: number;
@@ -135,7 +176,8 @@ export type PortableCreateServerOptions = {
 	tls: PortableTlsOptions;
 	limits?: PortableLimits;
 	onSession: (session: PortableServerSession) => void | Promise<void>;
-	log?: (event: { type: string; [key: string]: unknown }) => void;
+	/** Structured events, one shape on both backends ({@link PortableLogEvent}). */
+	log?: (event: PortableLogEvent) => void;
 	debug?: boolean;
 	/**
 	 * Wasm-only: options for the W3C facade each wasm server session is built
@@ -232,7 +274,7 @@ async function createWasmPortableServer(
 			allowSelfSigned: opts.tls.allowSelfSigned,
 		},
 		limits: opts.limits,
-		log: opts.log,
+		log: opts.log && ((event) => opts.log?.(wasmLogEventToPortable(event))),
 		debug: opts.debug,
 		...(opts.wasmModule ? { wasm: opts.wasmModule } : {}),
 		...(opts.wasmBind ? { bind: opts.wasmBind } : {}),

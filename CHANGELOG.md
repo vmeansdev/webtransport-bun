@@ -58,6 +58,12 @@ hatch exists. Checked against the rc.1 candidate (875dfbfe).
   `createServer`, which served an auto-generated self-signed certificate. A
   native `tls.allowSelfSigned` rejection is now a `WebTransportError` with
   `E_UNSUPPORTED_ARGUMENT` instead of a plain `Error`.
+- **`/portable` `log` events have one shape on both backends.** They are now
+  `PortableLogEvent` `{ type, level, msg, ... }`. rc.1 typed them `{ type, ... }`
+  but the native backend delivered its raw `{ level, msg, ... }` events with no
+  `type`. Native events now carry `type: "log"`, and wasm events gain `level`
+  (`"warn"` for failures and refusals, `"info"` otherwise) and `msg`. Both
+  changes only add fields.
 - **Server shutdown close code.** Sessions ended by `server.close()` now close
   with code `3993` and reason `E_SERVER_CLOSING`, on the wire and in the local
   `closed` fallback. rc.1 used application code `0` with reason

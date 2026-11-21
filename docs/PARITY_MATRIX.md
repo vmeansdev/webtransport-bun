@@ -124,7 +124,7 @@ the TypeScript signature.
 | `tls.certPem` / `tls.keyPem` | Required: an empty or missing pair rejects with `E_TLS` (the root `createServer`'s development self-signed fallback is not reachable through `/portable`) | Optional when `allowSelfSigned`; otherwise an empty pair rejects with `E_TLS` | Equal where supplied |
 | `tls.allowSelfSigned` | **Rejected** at `createServer` with `E_UNSUPPORTED_ARGUMENT` (a `wasm-only` message) unless a PEM pair is supplied | Generates a short-lived self-signed cert | **Wasm-only, and it fails loudly.** Native refuses rather than silently serving a certificate the caller did not choose |
 | `limits.maxStreamsPerSessionBidi` / `maxStreamsGlobal` / `backpressureTimeoutMs` | Honoured; defaults `200` / `50000` / `5000` | Honoured; identical defaults (`DEFAULT_WASM_LIMITS`) | Equal, defaults included |
-| `log` / `debug` | Structured events, redaction off under `debug` | Same | Equal |
+| `log` / `debug` | `PortableLogEvent` `{ type, level, msg, ... }`: native `{ level, msg, sessionId?, peerIp?, peerPort? }` events gain `type: "log"` (native messages are free text); redaction off under `debug` | `PortableLogEvent`: the wasm `{ type, ...fields }` events gain `level` (failures and refusals `"warn"`, lifecycle `"info"`) and `msg` (the type plus its `detail`); PEM fields stripped unless `debug` | **Equal shape.** Both deliver `type`, `level` and `msg`; the `type` vocabulary and the extra context fields are backend-specific, and neither is promised portably |
 
 ### Session shutdown on the wire
 

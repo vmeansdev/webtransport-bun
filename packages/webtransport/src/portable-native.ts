@@ -97,7 +97,10 @@ export async function createNativePortableServer(
 		port: opts.port,
 		tls: { certPem, keyPem },
 		limits: opts.limits,
-		log: opts.log as Parameters<typeof createNativeServer>[0]["log"],
+		// Native events are { level, msg, ... }; the portable shape adds the
+		// `type` every wasm event has. Native messages are free text, so the
+		// kind is the generic "log".
+		log: opts.log && ((event) => opts.log?.({ type: "log", ...event })),
 		debug: opts.debug,
 		onSession: (session) => opts.onSession(toPortableSession(session)),
 	});
