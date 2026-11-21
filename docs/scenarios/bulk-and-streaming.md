@@ -94,11 +94,9 @@ Why this shape:
 - **A stream request, not a datagram.** The request must arrive, and the
   client needs to hear when the server is done. A datagram request would need
   its own retry logic, and a datagram cannot carry the completion signal
-  reliably. The control stream carries a few hundred bytes, so the shared-budget
-  issue described in [Pitfalls](#pitfalls) does not touch it.
+  reliably.
 - **Unidirectional streams for the bulk.** Each transfer is independent, so a
-  lost packet on one stream does not stall the others. A uni stream also has
-  no reverse half sharing its byte budget (see [Pitfalls](#pitfalls)).
+  lost packet on one stream does not stall the others.
 - **A summary before close.** On the server, a stream's `end()` completes only
   when the client has acknowledged every byte. Holding the session open until
   the summary arrives means no transfer is cut off by the client's close.
@@ -192,7 +190,9 @@ const server = createServer({
   limits: {
     // Byte governors. Bytes queued across the JS boundary count against all
     // three; a full budget makes writes wait (backpressure). Defaults:
-    // 256 KiB per stream, 2 MiB per session, 512 MiB global.
+    // 256 KiB per stream, 2 MiB per session, 512 MiB global. Stream sends
+    // and receives each get half of the session and global caps; each
+    // direction of a stream gets the whole per-stream cap.
     maxQueuedBytesPerStream: 256 * 1024,
     maxQueuedBytesPerSession: 2 * 1024 * 1024,
     maxQueuedBytesGlobal: 512 * 1024 * 1024,
@@ -363,12 +363,13 @@ yourself, by error code, where you write. The example server does this: its
   A bare `once(stream, "drain")` then waits forever. The example's `drained()`
   rejects on `'error'`, on `'close'`, and immediately on an already-destroyed
   stream.
-- **Prefer unidirectional streams for bulk.** There is a known, tracked open
-  issue: one per-stream byte budget (`maxQueuedBytesPerStream`, 256 KiB by
-  default) is shared by both directions of a **bidirectional** stream. An echo
-  in which one side queued ~1 MiB in 16 KiB writes before the echo was drained
-  stalled with `E_BACKPRESSURE_TIMEOUT` at ~55 KB; the same echo in 1 KiB
-  writes passed. A uni stream has no reverse half competing for its budget.
+- **One-way bulk has half the session and global caps.** Since PR #25
+  stream sends and receives draw on separate halves of
+  `maxQueuedBytesPerSession` and `maxQueuedBytesGlobal`, and each direction of
+  a stream gets the whole `maxQueuedBytesPerStream`. That fixed a bidi echo
+  that stalled with `E_BACKPRESSURE_TIMEOUT` at ~55 KB (1 MiB in 16 KiB
+  writes). A download now queues at most 1 MiB per session on the server at
+  the 2 MiB default; size `maxQueuedBytesPerSession` with that in mind.
 - **Keep each write within `maxQueuedBytesPerStream`.** Writes larger than the
   per-stream budget used to fail with `E_BACKPRESSURE_TIMEOUT`. This is fixed
   after rc.5 (PR #22) by splitting them into budget-sized pieces. The example
@@ -380,12 +381,12 @@ yourself, by error code, where you write. The example server does this: its
   can beat that acknowledgement. The sender then sees `E_STREAM_RESET` for a
   stream that was fully delivered. Have the sender say "done" in-band, as the
   example's summary does, and close after that.
-- **Wait for `session.closed` before a process exits.** If a client calls
-  `close()` and exits immediately, the close may never be sent, and the
-  server keeps the session until `idleTimeoutMs` (60 s by default). In this
-  example's own runs, before its client waited on `closed`, 247 sessions
-  lingered on the server for about a minute after the client processes had
-  exited.
+- **`close()` then exit.** Since PR #25 a process exit waits up to 250 ms
+  for pending closes to be sent. Before it, a client that called `close()`
+  and exited at once left its session on the server until `idleTimeoutMs`
+  (60 s by default): 247 sessions lingered about a minute in this example's
+  runs. Awaiting `session.closed` before exiting is still good practice; it
+  also confirms the close.
 - **A slow reader loses its transfer.** If the client stops draining, the
   server's writes wait on the full budget. After `backpressureTimeoutMs`
   (5 s) they fail with `E_BACKPRESSURE_TIMEOUT`, the stream is destroyed, and

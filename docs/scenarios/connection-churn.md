@@ -158,7 +158,8 @@ bun examples/scenarios/churn/server.ts --port=4433 --maxHandshakesInFlight=4
 On the same machine that gave `"connectRetries": 28`,
 `"connectFailures": {"E_INTERNAL (CONNECTION_REFUSED)": 28}` and still
 `churnGaveUp: 0`, `baseConnected: 200`: every refused dial came back through
-the backoff and got in. The server's `limitExceededCount` was also 28.
+the backoff and got in. The server's `limitExceededCount` was also 28. That
+run predates PR #25; the same refusals now report as `"E_LIMIT_EXCEEDED"`.
 
 ## Retry refused connects
 
@@ -196,8 +197,8 @@ What each refusal looks like to a client, checked against this version:
 | Server condition | On the wire | `connect()` rejects with | Server counter |
 |---|---|---|---|
 | Per-IP or per-prefix handshake limit | HTTP 429 on the CONNECT | `E_RATE_LIMITED` | `rateLimitedCount` |
-| `maxHandshakesInFlight` reached | QUIC `CONNECTION_REFUSED` | `E_INTERNAL`, message "the server refused to accept a new connection" | `limitExceededCount` |
-| `maxSessions` reached | handshake completes, then close code `3992` / reason `E_LIMIT_EXCEEDED` | `E_LIMIT_EXCEEDED` (rarely: the session opens and closes with 3992 right away, or a plain `Error` without a code; see "Pitfalls") | `limitExceededCount` |
+| `maxHandshakesInFlight` reached | QUIC `CONNECTION_REFUSED` | `E_LIMIT_EXCEEDED` (since PR #25) | `limitExceededCount` |
+| `maxSessions` reached | handshake completes, then close code `3992` / reason `E_LIMIT_EXCEEDED` | `E_LIMIT_EXCEEDED` (rarely: the session opens and closes with 3992 right away; see "Pitfalls") | `limitExceededCount` |
 
 Treat all three as retryable. Only repeated exhaustion of the retry budget is
 an outage. The example also treats a session that closes before answering its
@@ -341,18 +342,18 @@ From `server.metricsSnapshot()` (Prometheus names in
 
 ## Pitfalls
 
-- **`CONNECTION_REFUSED` arrives as `E_INTERNAL`.** A dial refused at
-  `maxHandshakesInFlight` rejects with code `E_INTERNAL` and the message "the
-  server refused to accept a new connection". There is no stable code for it
-  yet, so a client that retries only named codes skips the case documented as
-  the most common one. Retry `E_INTERNAL` on connect too.
-- **The `maxSessions` refusal can arrive as a plain `Error`.** The server
-  completes the handshake and then closes with 3992. Usually `connect()`
-  rejects with `E_LIMIT_EXCEEDED`. When the close lands between the native
-  connect and the JavaScript side taking the session, it rejects with
-  `Error("connect: handle not found in registry")` and no `code` (5 of about
-  4,800 refusals in a local run against `--maxSessions=201`). The example
-  counts those as `unknown` and retries them.
+- **Both caps refuse with the same code.** Since PR #25 a dial refused at
+  `maxHandshakesInFlight` rejects with `E_LIMIT_EXCEEDED`, like a
+  `maxSessions` refusal (it used to be a code-less `E_INTERNAL`). The code
+  does not say which cap refused, and `limitExceededCount` counts both.
+  Retry either with jittered backoff.
+- **A `maxSessions` refusal can race the hand-off.** The server completes the
+  handshake and then closes with 3992. When the close lands between the native
+  connect and the JavaScript side taking the session, `connect()` rejects with
+  the close's code (`E_LIMIT_EXCEEDED`) or `E_SESSION_CLOSED`; before PR #25
+  it was a code-less `Error("connect: handle not found in registry")`. If the
+  close lands after the hand-off, the session opens and closes right away; the
+  example treats that as a refused dial and retries it.
 - **Close sessions explicitly.** A client that leaves (page unload, app
   backgrounded) without `close()` keeps its server session, its
   `maxSessions` slot and its per-IP slot until the idle timeout, 60 s by

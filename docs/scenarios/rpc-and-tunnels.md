@@ -45,10 +45,10 @@ steeply near saturation (see OPERATIONS.md,
 ### Not proven
 
 - **Tunnels faster than 3 Mbps each way.** No gate graded a higher
-  per-tunnel rate. On this example, at default limits, bidirectional tunnels
-  of 10 Mbps or more each way failed under load where one-directional
-  traffic at the same rate did not (see Pitfalls, "Bidirectional streams can
-  stall"). Do not extrapolate the T result upward.
+  per-tunnel rate. On this example, at default limits, 80 tunnels at 10 Mbps
+  each way pass since PR #25; before it they failed under load (see Pitfalls,
+  "Bidirectional streams used to stall"). Do not extrapolate the T result
+  upward.
 - **More than 100 tunnels per process** as a graded figure. The home rig
   saturated at 200; plan around ~70 tunnels of this shape per JavaScript
   process on reference hardware (OPERATIONS.md) and shard beyond.
@@ -208,7 +208,7 @@ const server = createServer({
   limits: {
     maxStreamsPerSessionBidi: 200,  // default; concurrent calls per session (a tunnel counts as one)
     maxStreamsGlobal: 50_000,       // default; concurrent streams across all sessions
-    maxQueuedBytesPerStream: 262_144, // default 256 KiB; shared by BOTH directions of a bidi stream
+    maxQueuedBytesPerStream: 262_144, // default 256 KiB; each direction of a bidi stream gets all of it
     backpressureTimeoutMs: 5_000,   // default; a stream that cannot make progress this long fails
     idleTimeoutMs: 60_000,          // default; a quiet tunnel is closed after this
   },
@@ -260,9 +260,12 @@ What matters in this workload:
   `idleTimeoutMs` is closed. The client pings at `idleTimeoutMs / 3` by
   default (`keepAliveIntervalMs`); the server does not ping unless you set
   `keepAliveIntervalMs` on it.
-- **Do not raise `maxQueuedBytesPerStream` to fix a stalled tunnel.** Raising
-  it to 1 MiB on the server alone did not remove the bidirectional stall
-  below. Pace the writers instead.
+- **Each direction has its own budget.** Since PR #25 stream sends and
+  receives draw on separate halves of `maxQueuedBytesGlobal` and
+  `maxQueuedBytesPerSession`, and each direction of a stream gets the whole
+  `maxQueuedBytesPerStream`. A one-way tunnel therefore has half of the
+  session and global caps in its direction: 1 MiB of a session's 2 MiB
+  default.
 
 ## Host tuning
 
@@ -329,8 +332,7 @@ From `server.metricsSnapshot()` (Prometheus names in [METRICS.md](../METRICS.md)
 - `streamOpenLatency` (`webtransport_stream_open_latency_seconds`): measures
   streams the server opens, so it is quiet for client-opened calls.
 - `queuedBytesGlobal` (`webtransport_queued_bytes_global`): a value that sits
-  at a multiple of `maxQueuedBytesPerStream` while traffic stops is the
-  bidirectional stall below.
+  flat while traffic stops means a reader is not draining.
 - Your own counters: calls served, call errors by code, tunnel bytes per
   direction. In the example's runs `backpressureTimeoutCount` stayed 0 while
   streams failed with `E_BACKPRESSURE_TIMEOUT`, so do not rely on it to see
@@ -339,38 +341,14 @@ From `server.metricsSnapshot()` (Prometheus names in [METRICS.md](../METRICS.md)
 
 ## Pitfalls
 
-- **Bidirectional streams can stall when both directions are busy.** A known
-  open issue, tracked and not yet fixed: one per-stream byte budget
-  (`maxQueuedBytesPerStream`, 256 KiB by default) is shared by both
-  directions of a bidi stream. The example's runs on the laptop above, at
-  default limits, with both sides reading concurrently:
-  - **Unpaced writers stall reliably.** One stream, each side writing as fast
-    as backpressure allowed while reading the other direction: with 16, 64 or
-    256 KiB writes both directions stopped after under 10 KB; with 1 KiB writes
-    after 2.4 MB in one run and 59 MB in another. Each time
-    `queuedBytesGlobal` sat at exactly 262,144 (one stream's budget) with no
-    progress until both sides failed with `E_BACKPRESSURE_TIMEOUT` after
-    `backpressureTimeoutMs`. The same probe with only one direction busy ran
-    at 443–457 Mbps without an error.
-  - **Paced tunnels at 3 Mbps did not stall**: 100 tunnels (300 Mbps each
-    way) and 200 tunnels (600 Mbps each way, past the loops' comfort: p99
-    84 / 181 ms) both had exact accounting and no errors. Neither did 10
-    tunnels at 40 Mbps each way.
-  - **Paced tunnels at 10–40 Mbps each way failed under load**: 6 of 20
-    tunnels at 40 Mbps, 15 of 40 at 20 Mbps, 23–29 of 80 at 10 Mbps (about
-    500 Mbps each way in total), with `E_BACKPRESSURE_TIMEOUT` on the server
-    and `E_STREAM_RESET` / `E_STOP_SENDING` on the client. The same 80
-    tunnels at 10 Mbps in one direction only ran clean (p99 under 10 ms), and
-    so did 80 × 20 Mbps one-way while overloaded (1,058 of 1,600 Mbps
-    delivered, p99 354 ms). That points at the shared budget rather than at
-    plain loop saturation, but these runs do not prove the mechanism.
-
-  What to do: pace every writer below what the stream drains, keep one write
-  in flight per direction, and keep writes small. For a high-rate tunnel,
-  consider two unidirectional streams, one per direction: a uni stream has no
-  reverse half sharing its budget (not exercised by this example). G11 D,
-  which probed for cross-direction coupling, did not find it; its exact shape
-  is not recorded in the material this guide was written from.
+- **Bidirectional streams used to stall when both directions were busy.**
+  Fixed since PR #25. One per-stream budget served both directions, so with
+  both sides writing unpaced `queuedBytesGlobal` sat at exactly 262,144 until
+  both failed with `E_BACKPRESSURE_TIMEOUT`, and paced tunnels of 10 Mbps or
+  more each way failed under load (23–29 of 80 at 10 Mbps) while one-way
+  traffic at the same rate ran clean. With separate budgets per direction the
+  80 × 10 Mbps each-way run passes. Pacing writers below what the stream
+  drains is still how to keep the tail low.
 - **Writes larger than `maxQueuedBytesPerStream` used to fail** with
   `E_BACKPRESSURE_TIMEOUT`. This is fixed after rc.5 (PR #22), which splits
   them into budget-sized pieces. The example never writes more than 64 KiB at
@@ -380,10 +358,11 @@ From `server.metricsSnapshot()` (Prometheus names in [METRICS.md](../METRICS.md)
   needs its own framing. The example uses a 4-byte length prefix and
   reassembles frames that span reads.
 - **Stream error codes.** Session-level and open failures are
-  `WebTransportError`s with a `code`. Errors emitted by a client's Node
-  `Duplex` (`'error'` events, write callbacks) are plain `Error`s whose
-  message starts with the code (for example `E_BACKPRESSURE_TIMEOUT: ...`)
-  and have no `code` property. The example's `errorCode()` handles both.
+  `WebTransportError`s with a `code`. Since PR #25 so are errors emitted by a
+  client's Node `Duplex` (`'error'` events, write callbacks), as on the
+  server; before, they were plain `Error`s without `code`. The message still
+  starts with the code (for example `E_BACKPRESSURE_TIMEOUT: ...`), so the
+  example's `errorCode()`, which handles both, keeps working.
 - **Do not close the session right after the last byte.** On the sending side
   a stream's close completes only when the peer has acknowledged the FIN. A
   client that reads its response and closes its session at once can make the

@@ -280,8 +280,9 @@ From `server.metricsSnapshot()` (Prometheus names in [METRICS.md](../METRICS.md)
   `E_RATE_LIMITED`. Open the limits for tests; size them for real NATs in
   production.
 - **Refused connects are retryable.** At `maxHandshakesInFlight` the server
-  refuses the connection; at `maxSessions` it closes the new session with
-  `E_LIMIT_EXCEEDED`. Clients should retry both with jittered backoff (see
+  refuses the connection; at `maxSessions` it closes the new session. Both
+  reject `connect()` with `E_LIMIT_EXCEEDED` (the handshake-cap refusal since
+  PR #25). Clients should retry both with jittered backoff (see
   OPERATIONS.md,
   [Admission control](../OPERATIONS.md#admission-control-refusal-is-load-shaping-not-rejection),
   and [connection-churn.md](connection-churn.md)).
