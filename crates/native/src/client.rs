@@ -183,10 +183,20 @@ fn handle_connect_callback_status(success_id: Option<&str>, status: napi::Status
     }
 }
 
-fn map_connecting_error(
+/// Turn a failed WebTransport connect into an error whose message carries the
+/// stable code. Shared by the dedicated and the pooled connect paths.
+pub(crate) fn map_connecting_error(
     err: wtransport::error::ConnectingError,
 ) -> Box<dyn std::error::Error + Send + Sync> {
     match err {
+        // Certificate verification failed on either side (unknown issuer,
+        // name mismatch, a server with no certificate for the requested SNI):
+        // the handshake ended with a QUIC CRYPTO_ERROR.
+        wtransport::error::ConnectingError::ConnectionError(conn_err)
+            if conn_err.is_tls_handshake_failure() =>
+        {
+            std::io::Error::other(format!("E_TLS: TLS handshake failed: {conn_err}")).into()
+        }
         wtransport::error::ConnectingError::SessionRejected => {
             std::io::Error::other("E_RATE_LIMITED: server rejected WebTransport session request")
                 .into()
@@ -2622,6 +2632,70 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn connecting_error_message(err: wtransport::error::ConnectingError) -> String {
+        super::map_connecting_error(err).to_string()
+    }
+
+    fn transport_failure(
+        code: quinn_proto::TransportErrorCode,
+        reason: &str,
+    ) -> wtransport::error::ConnectingError {
+        wtransport::error::ConnectingError::ConnectionError(
+            wtransport::quinn::ConnectionError::TransportError(quinn_proto::TransportError {
+                code,
+                frame: None,
+                reason: reason.to_string(),
+            })
+            .into(),
+        )
+    }
+
+    fn peer_close(code: quinn_proto::TransportErrorCode) -> wtransport::error::ConnectingError {
+        wtransport::error::ConnectingError::ConnectionError(
+            wtransport::quinn::ConnectionError::ConnectionClosed(quinn_proto::ConnectionClose {
+                error_code: code,
+                frame_type: None,
+                reason: bytes::Bytes::new(),
+            })
+            .into(),
+        )
+    }
+
+    #[test]
+    fn certificate_failures_map_to_e_tls() {
+        // Local verification failure: rustls rejects the peer certificate and
+        // quinn closes with CRYPTO_ERROR(bad_certificate / unknown_ca).
+        for alert in [42u8, 48] {
+            let msg = connecting_error_message(transport_failure(
+                quinn_proto::TransportErrorCode::crypto(alert),
+                "invalid peer certificate: UnknownIssuer",
+            ));
+            assert!(msg.starts_with("E_TLS: "), "{msg}");
+            assert!(msg.contains("UnknownIssuer"), "{msg}");
+        }
+        // A TLS alert from the server (no certificate for the requested SNI).
+        let msg = connecting_error_message(peer_close(quinn_proto::TransportErrorCode::crypto(40)));
+        assert!(msg.starts_with("E_TLS: "), "{msg}");
+    }
+
+    #[test]
+    fn non_tls_connect_failures_keep_their_codes() {
+        let refused = connecting_error_message(peer_close(
+            quinn_proto::TransportErrorCode::CONNECTION_REFUSED,
+        ));
+        assert!(refused.starts_with("E_LIMIT_EXCEEDED: "), "{refused}");
+        let rejected =
+            connecting_error_message(wtransport::error::ConnectingError::SessionRejected);
+        assert!(rejected.starts_with("E_RATE_LIMITED: "), "{rejected}");
+        // A protocol violation is not a TLS failure and stays codeless (the
+        // TypeScript layer reports codeless errors as E_INTERNAL).
+        let proto = connecting_error_message(transport_failure(
+            quinn_proto::TransportErrorCode::PROTOCOL_VIOLATION,
+            "bad frame",
+        ));
+        assert!(!proto.starts_with("E_"), "{proto}");
+    }
 
     #[test]
     fn wait_until_drained_returns_as_soon_as_nothing_is_pending() {

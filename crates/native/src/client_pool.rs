@@ -5,21 +5,11 @@
 
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn map_connecting_error(
-    err: wtransport::error::ConnectingError,
-) -> Box<dyn std::error::Error + Send + Sync> {
-    match err {
-        wtransport::error::ConnectingError::SessionRejected => {
-            io::Error::other("E_RATE_LIMITED: server rejected WebTransport session request").into()
-        }
-        other => other.into(),
-    }
-}
+use crate::client::map_connecting_error;
 
 /// Pool compatibility key.
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]

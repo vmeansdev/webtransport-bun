@@ -330,6 +330,12 @@ unstable `__TESTING__.serverInternals(server)` accessor (`docs/SPEC.md`,
 
 ### Fixed
 
+- `connect()` now rejects certificate failures with `E_TLS`, as documented.
+  An untrusted issuer, a certificate not valid for the requested name, and a
+  server with no certificate for the requested server name (its TLS alert)
+  used to surface as `E_INTERNAL`. The native client now recognizes the QUIC
+  `CRYPTO_ERROR` range that every TLS handshake failure ends in, on the
+  dedicated and the pooled connect path alike.
 - Bidirectional streams no longer stall when both directions are busy. One
   byte budget served both directions, so writes queued faster than the peer
   drained them filled it, the receive side could not reserve, and both peers
