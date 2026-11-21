@@ -1108,6 +1108,10 @@ pub(crate) fn spawn_wtransport_server(
                                 break;
                             }
                             incoming_session = incoming => {
+                                // Started on arrival so handshakeTimeoutMs covers the
+                                // QUIC and TLS handshake, not only the CONNECT
+                                // exchange after it.
+                                let handshake = crate::server::HandshakeDeadline::start(limits.handshake_timeout_ms);
                                 let metrics = Arc::clone(&metrics);
                                 let limits = limits.clone();
                                 let rate_limits = rate_limits.clone();
@@ -1134,12 +1138,20 @@ pub(crate) fn spawn_wtransport_server(
                                 let incoming_peer = incoming_session.remote_address();
                                 let incoming_peer_ip = incoming_peer.ip().to_string();
                                 let incoming_peer_port = u32::from(incoming_peer.port());
-                                let session_request = match incoming_session.await {
-                                    Ok(r) => {
+                                let session_request = match handshake.bound(incoming_session).await {
+                                    Ok(Ok(r)) => {
                                         emit_log(&ltx, !debug_logs, "debug", format_args!("CONNECT received authority={:?}", r.authority()), None, None, None);
                                         r
                                     }
-                                    Err(e) => {
+                                    // Dropping the incoming session closes its QUIC
+                                    // connection. Logged at debug: a flood of
+                                    // never-finished Initials must not flood the log.
+                                    Err(crate::server::HandshakeTimedOut) => {
+                                        metrics.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);
+                                        emit_log(&ltx, !debug_logs, "debug", format_args!("handshake timed out before CONNECT (handshakeTimeoutMs={})", limits.handshake_timeout_ms), None, Some(&incoming_peer_ip), Some(incoming_peer_port));
+                                        return;
+                                    }
+                                    Ok(Err(e)) => {
                                         let mut chain = String::new();
                                         let mut src: &dyn std::error::Error = &e;
                                         chain.push_str(&src.to_string());
@@ -1167,7 +1179,7 @@ pub(crate) fn spawn_wtransport_server(
                                 ) {
                                     metrics.rate_limited_count.fetch_add(1, Ordering::Relaxed);
                                     emit_log(&ltx, !debug_logs, "warn", format_args!("rate limited: handshake token bucket"), None, Some(&peer_ip), Some(peer_port));
-                                    session_request.too_many_requests().await;
+                                    let _ = handshake.bound(session_request.too_many_requests()).await;
                                     return;
                                 }
                                 if !rate_limit::try_acquire_per_ip_session_with_prefix(owner_server_id,
@@ -1177,7 +1189,7 @@ pub(crate) fn spawn_wtransport_server(
                                 ) {
                                     metrics.rate_limited_count.fetch_add(1, Ordering::Relaxed);
                                     emit_log(&ltx, !debug_logs, "warn", format_args!("rate limited: per-IP handshake burst"), None, Some(&peer_ip), Some(peer_port));
-                                    session_request.too_many_requests().await;
+                                    let _ = handshake.bound(session_request.too_many_requests()).await;
                                     return;
                                 }
                                 let prev_sessions = metrics.sessions_active.fetch_add(1, Ordering::SeqCst);
@@ -1185,14 +1197,7 @@ pub(crate) fn spawn_wtransport_server(
                                     metrics.sessions_active.fetch_sub(1, Ordering::SeqCst);
                                     metrics.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);
                                     emit_log(&ltx, !debug_logs, "warn", format_args!("limit exceeded: maxSessions"), None, Some(&peer_ip), Some(peer_port));
-                                    let reject_timeout = tokio::time::Duration::from_millis(
-                                        limits.handshake_timeout_ms,
-                                    );
-                                    let reject_result = tokio::time::timeout(
-                                        reject_timeout,
-                                        session_request.accept(),
-                                    )
-                                    .await;
+                                    let reject_result = handshake.bound(session_request.accept()).await;
                                     rate_limit::release_per_ip_session(owner_server_id, peer_ip_addr);
                                     match reject_result {
                                         Ok(Ok(connection)) => {
@@ -1215,7 +1220,7 @@ pub(crate) fn spawn_wtransport_server(
                                                 Some(peer_port),
                                             );
                                         }
-                                        Err(_elapsed) => {
+                                        Err(crate::server::HandshakeTimedOut) => {
                                             emit_log(
                                                 &ltx,
                                                 !debug_logs,
@@ -1232,21 +1237,14 @@ pub(crate) fn spawn_wtransport_server(
                                     }
                                     return;
                                 }
-                                let accept_timeout = tokio::time::Duration::from_millis(
-                                    limits.handshake_timeout_ms,
-                                );
                                 let accept_start = std::time::Instant::now();
-                                let accept_result = tokio::time::timeout(
-                                    accept_timeout,
-                                    session_request.accept(),
-                                )
-                                .await;
-                                let accept_result = match accept_result {
+                                let accept_result = match handshake.bound(session_request.accept()).await {
                                     Ok(r) => r,
-                                    Err(_elapsed) => {
+                                    Err(crate::server::HandshakeTimedOut) => {
                                         metrics.sessions_active.fetch_sub(1, Ordering::SeqCst);
                                         rate_limit::release_per_ip_session(owner_server_id, peer_ip_addr);
-                                        emit_log(&ltx, !debug_logs, "warn", format_args!("handshake timed out authority={:?}", authority), None, Some(&incoming_peer_ip), Some(incoming_peer_port));
+                                        metrics.limit_exceeded_count.fetch_add(1, Ordering::Relaxed);
+                                        emit_log(&ltx, !debug_logs, "debug", format_args!("handshake timed out answering CONNECT authority={:?} (handshakeTimeoutMs={})", authority, limits.handshake_timeout_ms), None, Some(&incoming_peer_ip), Some(incoming_peer_port));
                                         return;
                                     }
                                 };

@@ -144,6 +144,10 @@ export type LimitsOptions = {
   sendWindow?: number;
 
   backpressureTimeoutMs: number;
+  /** Client: bounds connect(). Server (native): one budget per incoming
+   * connection, from its first Initial packet to the answer to its CONNECT
+   * request (QUIC + TLS + CONNECT); a handshake that runs out is dropped,
+   * releases its maxHandshakesInFlight slot and counts in limitExceededCount. */
   handshakeTimeoutMs: number;
   idleTimeoutMs: number;
   /** Keep-alive ping interval, clamped below idleTimeoutMs. Client default:

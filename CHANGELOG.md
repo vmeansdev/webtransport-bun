@@ -330,6 +330,16 @@ unstable `__TESTING__.serverInternals(server)` accessor (`docs/SPEC.md`,
 
 ### Fixed
 
+- `handshakeTimeoutMs` now bounds the whole server-side handshake. It used to
+  start only after the CONNECT request had been read, so a handshake that
+  stalled in QUIC or TLS (one replayed client Initial is enough) held its
+  `maxHandshakesInFlight` slot until the idle timeout; a few hundred such
+  packets could refuse every new client for a minute. One budget now runs from
+  the connection's first Initial to the answer to its CONNECT request; a
+  handshake that runs out is dropped, gives its slot back, is counted in
+  `limitExceededCount` and is logged at debug level. The per-IP handshake
+  bucket is still charged after the handshake, against the validated address
+  (`SECURITY.md`).
 - Bidirectional streams no longer stall when both directions are busy. One
   byte budget served both directions, so writes queued faster than the peer
   drained them filled it, the receive side could not reserve, and both peers

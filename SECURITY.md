@@ -28,7 +28,10 @@ Canonical release truth: `docs/release-status.json`. This document defines the s
 
 ## Required controls (must ship enabled by default)
 1. Timeouts
-- handshakeTimeoutMs (default 10s)
+- handshakeTimeoutMs (default 10s): one budget per incoming connection, from
+  its first Initial packet to the answer to its CONNECT request (QUIC + TLS +
+  CONNECT together). A handshake that runs out is dropped, gives back its
+  `maxHandshakesInFlight` slot and is counted in `limitExceededCount`.
 - idleTimeoutMs (default 60s)
 - backpressureTimeoutMs (default 5s)
 2. Limits
@@ -38,9 +41,22 @@ Canonical release truth: `docs/release-status.json`. This document defines the s
 - maxDatagramSize cap
 3. Rate limits per peer IP and per prefix
 - RateLimitOptions: per-IP handshakesBurst, per-prefix handshakesBurstPerPrefix (/24 IPv4, /64 IPv6)
+- The handshake token bucket and the per-IP / per-prefix session caps are
+  charged once the QUIC and TLS handshake has finished and the CONNECT
+  request has been read, and a refused peer gets HTTP 429 (`E_RATE_LIMITED`).
+  They are not charged earlier on purpose: the server sends no QUIC Retry, so
+  the source address of an Initial is unvalidated and spoofable, and charging
+  it would let anyone drain a victim's budget.
 4. Connection churn protection
-- maxHandshakesInFlight caps concurrent TLS handshakes (default 200)
-- Per-IP and per-prefix limits prevent single-source exhaustion
+- maxHandshakesInFlight (default 200) caps handshakes in progress, counted
+  from the first Initial packet, before any cryptographic work. Overflow is
+  refused with QUIC CONNECTION_REFUSED.
+- handshakeTimeoutMs bounds how long each of those slots can be held. This
+  pair, not the per-IP buckets, is what bounds pre-handshake work: a source
+  that sends Initials and never finishes (one packet each is enough) can keep
+  the cap occupied, but each packet holds a slot for at most
+  handshakeTimeoutMs. Lower handshakeTimeoutMs to shrink that window.
+- Per-IP and per-prefix limits prevent single-source exhaustion of sessions
 5. Panic containment
 - Rust panics must be caught at task boundaries where possible
 - convert to E_INTERNAL and close affected session/server

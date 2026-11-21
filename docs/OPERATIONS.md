@@ -126,7 +126,8 @@ Replace `0.8 * maxQueuedBytesGlobal` with your configured value (e.g. `419430400
 ## Admission control: refusal is load-shaping, not rejection
 
 At `maxSessions` or `maxHandshakesInFlight`, the server answers a new dial
-with QUIC `CONNECTION_REFUSED` and increments `limitExceededCount`. This is a
+with QUIC `CONNECTION_REFUSED` and increments `limitExceededCount`. A handshake
+that runs out of `handshakeTimeoutMs` is also counted there. This is a
 **transient admission signal from a healthy server** — "not right now", never
 "go away". The handshake cap in particular bounds *instantaneous concurrency*
 (how many handshakes are simultaneously incomplete), not arrival rate: a

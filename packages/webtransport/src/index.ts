@@ -562,7 +562,10 @@ export type LimitsOptions = {
 	 */
 	sendWindow?: number;
 	backpressureTimeoutMs: number;
-	/** Connect handshake timeout. Default 10000. */
+	/** Handshake timeout. Default 10000. Client: bounds `connect()`. Server
+	 * (native): one budget per incoming connection, from its first Initial to
+	 * the answer to its CONNECT request; a handshake that runs out is dropped
+	 * and counted in `limitExceededCount`. */
 	handshakeTimeoutMs: number;
 	/**
 	 * Max idle time before a connection is considered dead and closed. Applies

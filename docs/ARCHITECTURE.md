@@ -147,12 +147,31 @@ Streams are exposed as Node streams implemented in JS (recommended):
 No pending Promise may remain unresolved after close.
 
 ## Rate limiting and limits enforcement
-Before expensive work:
-- apply per-IP token buckets for handshake / stream open / datagrams ingress
-- apply global caps (maxSessions, maxHandshakesInFlight, maxStreamsGlobal)
-- apply per-session caps (max streams per session)
+Server handshake, in order:
+1. A new connection attempt (its first Initial packet) reaches the accept
+   loop. Before any cryptographic work it must take a `maxHandshakesInFlight`
+   slot, or it is refused with QUIC `CONNECTION_REFUSED` (client:
+   `E_LIMIT_EXCEEDED`). The `handshakeTimeoutMs` budget starts here.
+2. The QUIC and TLS handshake runs and the CONNECT request is read.
+3. The per-IP handshake token bucket and the per-IP / per-prefix session caps
+   are charged against the now-validated peer address; a refused peer gets
+   HTTP 429 (`E_RATE_LIMITED`). They are deliberately not charged in step 1:
+   without a QUIC Retry the Initial's source address is spoofable.
+4. `maxSessions` is checked; over it, the session is accepted and closed with
+   code 3992 (`E_LIMIT_EXCEEDED`).
+5. The CONNECT request is accepted and the slot from step 1 is released.
+
+Steps 2–5 share the one `handshakeTimeoutMs` budget. Running out at any point
+drops the connection, releases the slot and counts in `limitExceededCount`
+(except while a 429 or `maxSessions` rejection is being sent, which is already
+counted). So what bounds the work done before the peer is validated is
+`maxHandshakesInFlight` × `handshakeTimeoutMs`, not the per-IP buckets.
+
+Streams and datagrams, before they are queued:
+- apply per-IP token buckets for stream open / datagrams ingress
+- apply the global cap (maxStreamsGlobal) and per-session caps (max streams per session)
 If enforcement fails:
-- close with E_RATE_LIMITED or E_LIMIT_EXCEEDED (stable codes)
+- refuse with E_RATE_LIMITED or E_LIMIT_EXCEEDED (stable codes)
 
 ## Observability
 - all drops, limit rejections, backpressure timeouts must increment counters
