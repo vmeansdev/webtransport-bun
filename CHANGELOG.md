@@ -321,6 +321,10 @@ unstable `__TESTING__.serverInternals(server)` accessor (`docs/SPEC.md`,
 
 ### Fixed
 
+- A single stream write larger than `maxQueuedBytesPerStream` (or the session
+  or global budget) waited on a reservation that could never succeed and failed
+  with `E_BACKPRESSURE_TIMEOUT`. It is now queued in budget-sized pieces, each
+  waiting for headroom like any other write.
 - A client given `serverName` dialed the `serverName` instead of the URL host
   whenever that host was a name or a bracketed IPv6 literal, so
   `connect("https://localhost:4433", { tls: { serverName } })` and
