@@ -36,6 +36,12 @@ hatch exists. Checked against the rc.1 candidate (875dfbfe).
   with `serverCertificateHashes` or with `enable0Rtt` is
   `E_UNSUPPORTED_ARGUMENT` (`NotSupportedError` under `strictW3CErrors`, and
   always for the hashes case) on `connect()` too; rc.1 gave `E_INTERNAL`.
+- **`DEFAULT_LIMITS` and `DEFAULT_RATE_LIMITS` are frozen.** rc.1 exported
+  plain objects, and every `createServer`/`connect` merged over them, so a
+  write such as `DEFAULT_LIMITS.maxSessions = 10` silently changed the defaults
+  of every later server and client. Writes now throw in strict mode (and are
+  ignored otherwise); build your own object with
+  `{ ...DEFAULT_LIMITS, maxSessions: 10 }`.
 - **Server shutdown close code.** Sessions ended by `server.close()` now close
   with code `3993` and reason `E_SERVER_CLOSING`, on the wire and in the local
   `closed` fallback. rc.1 used application code `0` with reason

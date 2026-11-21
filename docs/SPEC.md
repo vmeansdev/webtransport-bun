@@ -437,7 +437,8 @@ reference (paced-mirror, native send-path, sink and close-cause counters
 included), and `metricsToPrometheus(snapshot, opts?)` renders a snapshot in
 Prometheus text format with the `METRICS_PREFIX` name prefix
 (`webtransport_`, overridable via `WEBTRANSPORT_METRICS_PREFIX`).
-`DEFAULT_LIMITS` and `DEFAULT_RATE_LIMITS` export the defaults.
+`DEFAULT_LIMITS` and `DEFAULT_RATE_LIMITS` export the defaults as frozen
+objects; spread them into a new object to derive your own.
 
 ```ts
 export type MetricsSnapshot = {

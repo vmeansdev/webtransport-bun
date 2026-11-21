@@ -584,8 +584,12 @@ export type LimitsOptions = {
 	keepAliveIntervalMs?: number;
 };
 
-/** Default limit values from AGENTS.md */
-export const DEFAULT_LIMITS: LimitsOptions = {
+/**
+ * Default limit values from AGENTS.md. Frozen: every createServer/connect
+ * merges the caller's limits over this object, so writing to it would
+ * silently change the defaults of every later server and client.
+ */
+export const DEFAULT_LIMITS: Readonly<LimitsOptions> = Object.freeze({
 	maxSessions: 2000,
 	maxHandshakesInFlight: 200,
 	maxStreamsPerSessionBidi: 200,
@@ -598,10 +602,10 @@ export const DEFAULT_LIMITS: LimitsOptions = {
 	backpressureTimeoutMs: 5000,
 	handshakeTimeoutMs: 10_000,
 	idleTimeoutMs: 60_000,
-};
+});
 
-/** Default rate-limit values from AGENTS.md */
-export const DEFAULT_RATE_LIMITS: RateLimitOptions = {
+/** Default rate-limit values from AGENTS.md. Frozen for the same reason. */
+export const DEFAULT_RATE_LIMITS: Readonly<RateLimitOptions> = Object.freeze({
 	handshakesPerSec: 20,
 	handshakesBurst: 40,
 	handshakesBurstPerPrefix: 100,
@@ -609,7 +613,7 @@ export const DEFAULT_RATE_LIMITS: RateLimitOptions = {
 	streamsBurst: 400,
 	datagramsPerSec: 2000,
 	datagramsBurst: 5000,
-};
+});
 
 // ---------------------------------------------------------------------------
 // Logging
