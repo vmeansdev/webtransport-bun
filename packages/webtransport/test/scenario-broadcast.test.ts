@@ -127,9 +127,10 @@ describe("scenario example: broadcast", () => {
 			expect(report.silentSessions).toBe(0);
 			expect(report.delivery).toBeGreaterThan(0.5);
 
-			// SIGINT makes the CLI print its counters before it exits.
+			// The CLI prints its counters every 5 s. Read the next line rather
+			// than sending SIGINT: Windows has no signals, so a SIGINT handler
+			// never runs there and the child is simply terminated.
 			const seen = lines.length;
-			child.kill("SIGINT");
 			const final = JSON.parse(
 				await waitForLine(lines, (line) => line.startsWith("{"), 10_000, seen),
 			);
