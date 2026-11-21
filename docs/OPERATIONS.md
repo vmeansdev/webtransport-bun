@@ -424,6 +424,23 @@ as a standing configuration.
   a reference on the host event loop, so an echo server under overload can
   again outlive its own `close()`. Any other value keeps the default.
 
+## Diagnostics and warning switches
+
+Supported variables that change what the library prints or where it loads
+from, never what it enforces. Each is read once per process.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `WEBTRANSPORT_NATIVE_ADDON_PATH` | unset | Load the native addon from this exact path instead of `prebuilds/` |
+| `WEBTRANSPORT_METRICS_PREFIX` | `webtransport_` | Name prefix used by `metricsToPrometheus` (`METRICS_PREFIX`) |
+| `WEBTRANSPORT_NATIVE_STDERR_WARNINGS=1` | off | Also write native `warn`/`error` log events straight to stderr, bypassing the bounded log channel (so they survive a connect storm) |
+| `WEBTRANSPORT_VERBOSE_PANICS=1` | off | Print the payload of a contained native task panic, not just the one-line notice |
+| `WEBTRANSPORT_STRICT_STREAM_ERRORS=1` | off | Rethrow a stream error that has no `error` listener (as an uncaught exception) instead of only warning; per-stream `strictStreamErrors` overrides it |
+| `WEBTRANSPORT_SUPPRESS_UNHANDLED_STREAM_ERROR_LOGS=1` | off | Silence the `unhandled ... stream error` warning for streams with no `error` listener |
+| `WEBTRANSPORT_SUPPRESS_READY_REJECTION_WARN=1` | off | Silence the warning when a facade closed during connect later sees `ready` reject |
+| `WEBTRANSPORT_SUPPRESS_RUNTIME_VERSION_WARN=1` | off | Silence the startup warning for Bun versions with the known `WritableStream` leak |
+| `WEBTRANSPORT_SUPPRESS_LOG_CALLBACK_WARN=1`, `WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN=1`, `WEBTRANSPORT_LOG_EXPECTED_CHANNEL_CLOSES=1` | off | See `SECURITY.md`, "Environment variables affecting security diagnostics" |
+
 ## Unsupported tuning knobs
 
 The variables below exist for measurement campaigns. They are **not** part
@@ -448,6 +465,9 @@ falls back to its default. The process is never aborted.
 | `WTRANSPORT_DATAGRAM_PUMP` | pump on | `0` selects the legacy inline datagram read |
 | `WEBTRANSPORT_PACER_NICE`, `WEBTRANSPORT_PACER_SCHED` | unset | thread priority of the (experimental) egress pacer: a nice value, or `rr:<prio>` |
 | `WEBTRANSPORT_DATAGRAM_BATCH_DIAGNOSTICS` | off | `1` arms per-process incoming-datagram batch counters, readable only through `__TESTING__` (JavaScript side, read at module load) |
+| `WEBTRANSPORT_STREAM_BATCH_DIAGNOSTICS` | off | `1` accumulates per-process stream-chunk crossing counters, readable only through `__TESTING__` (JavaScript side) |
+| `WEBTRANSPORT_CLIENT_DATAGRAM_RETAIN` | on | `0` copies every received client datagram instead of retaining large transport buffers |
+| `WEBTRANSPORT_DISABLE_ALLOCATOR_RELIEF` | off | `1` skips the allocator purge after a drained server close (a leak falsifier for RSS campaigns) |
 
 Two cases are refused at `createServer` rather than replaced by a default,
 because the request itself cannot be honoured. Both fail with a recoverable

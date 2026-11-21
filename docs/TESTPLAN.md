@@ -92,9 +92,7 @@ bun test packages/webtransport/test/internal-error-propagation.test.ts
 bun test packages/webtransport/test/internal-actions-policy.test.ts
 bun test tools/load/soak-addon.test.ts
 bun test tools/bench/datagram-delivery-floor.test.ts
-bun test tools/load/compare-h7-bandwidth.test.ts
 bun test tools/load/distributed-scale.test.ts
-bun test tools/load/bench-datagram-napi-growth.test.ts
 bun test tools/interop/tests/security-evidence.test.ts
 bun run typecheck
 ```
@@ -152,7 +150,12 @@ floor stops the bandwidth and growth lanes.
 
 Three interleaved same-SHA control/candidate pairs (control/candidate,
 candidate/control, control/candidate) over the fixed ladder, then the
-comparator, then one echo ladder reported as a send+receive composite only:
+comparator, then one echo ladder reported as a send+receive composite only.
+
+> The comparator (`tools/load/compare-h7-bandwidth.ts`) is not in this
+> repository: it belongs to the H7 campaign tooling kept outside it. The
+> `bench-bandwidth.ts` ladders below run from a checkout; the comparison step
+> and its pass rule are recorded here as the gate's definition.
 
 ```bash
 env -u WEBTRANSPORT_PAYLOAD_DELIVERY -u WEBTRANSPORT_DATAGRAM_BATCH_DIAGNOSTICS WEBTRANSPORT_DATAGRAM_BATCH=0 BENCH_ECHO=0 BENCH_RATES=27,54,109,141,163,217,272,326 BENCH_STEP_SECONDS=180 BENCH_OUT=.release-evidence/h7/bandwidth-control-1.json bun tools/load/bench-bandwidth.ts
@@ -176,6 +179,10 @@ reported as the next bottleneck; the echo ladder cannot rescue a failed receive
 gate.
 
 ### Mechanistic napi-growth and latency A/B
+
+> `tools/load/bench-datagram-napi-growth.ts` is not in this repository (H7
+> campaign tooling, kept outside it). The commands and pass rule below are the
+> gate's definition, not something a checkout can run.
 
 ```bash
 WEBTRANSPORT_PAYLOAD_DELIVERY=buffer-copy WEBTRANSPORT_DATAGRAM_BATCH=0 WEBTRANSPORT_DATAGRAM_BATCH_DIAGNOSTICS=1 H7_GROWTH_OUT=.release-evidence/h7/datagram-napi-growth-control.json bun tools/load/bench-datagram-napi-growth.ts run
