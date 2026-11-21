@@ -20,7 +20,8 @@
 
 ## Code quality
 - TypeScript:
-  - `bunx biome format --write .`
+  - `bunx --bun biome format --write .` (the root `biome.json` limits this to project sources: build output, `node_modules`, scratch/evidence directories and tool-written JSON data are excluded)
+  - `bunx --bun biome check <changed files>`
   - `bun run typecheck`
 - Rust:
   - `cargo fmt`
