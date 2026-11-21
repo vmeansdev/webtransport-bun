@@ -2532,6 +2532,11 @@ function pacerStatsForwards(handle: {
  * @param opts - Server configuration. Requires `port`, `tls` (certPem, keyPem), and `onSession` callback.
  * @returns WebTransportServer with address, live TLS management methods, `close()`, and `metricsSnapshot()`.
  * @throws Error if native addon is not loaded.
+ * @throws WebTransportError with a stable `code` for every other failure:
+ *   `E_INVALID_ARGUMENT` (malformed options, including a missing or
+ *   out-of-range `port`), `E_UNSUPPORTED_ARGUMENT`, `E_TLS` (unusable
+ *   certificate/key) or `E_INTERNAL` (the server could not start, e.g. the
+ *   port is in use). The TLS methods reject the same way.
  *
  * @example
  * ```ts
@@ -2551,6 +2556,19 @@ function pacerStatsForwards(handle: {
 export function createServer(opts: ServerOptions): WebTransportServer {
 	warnIfLeakyBunRuntime();
 	const native = getNativeOrThrow();
+
+	if (
+		typeof opts.port !== "number" ||
+		!Number.isInteger(opts.port) ||
+		opts.port < 0 ||
+		opts.port > 65535
+	) {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			`E_INVALID_ARGUMENT: port must be an integer in 0..65535 (0 selects an ephemeral port), got ${String(opts.port)}`,
+		);
+	}
+	validateUnknownSniPolicy(opts.tls.unknownSniPolicy);
 
 	const decodePem = (value: string | Uint8Array | undefined): string =>
 		typeof value === "string"
@@ -2853,17 +2871,31 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		}
 	};
 
-	const handle = new native.ServerHandle(
-		opts.port,
-		bindHost.host,
-		opts.debug === true,
-		tlsConfigToJson(opts.tls),
-		limitsJson,
-		rateLimitsJson,
-		serverOptsJson,
-		onSessionEvents,
-		logCallback,
-	);
+	let handle: InstanceType<typeof native.ServerHandle>;
+	try {
+		handle = new native.ServerHandle(
+			opts.port,
+			bindHost.host,
+			opts.debug === true,
+			tlsConfigToJson(opts.tls),
+			limitsJson,
+			rateLimitsJson,
+			serverOptsJson,
+			onSessionEvents,
+			logCallback,
+		);
+	} catch (err) {
+		throw toWebTransportError(err);
+	}
+	// Native rejects with a plain Error whose message carries the code; the
+	// public contract is a WebTransportError with `code` set.
+	const mapNative = async <T>(op: () => Promise<T>): Promise<T> => {
+		try {
+			return await op();
+		} catch (err) {
+			throw toWebTransportError(err);
+		}
+	};
 
 	function onSessionCallbackDone() {
 		activeOnSessionCallbacks--;
@@ -2876,39 +2908,49 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 	const server: WebTransportServer = {
 		address: { host: bindHost.host, port: handle.port },
 		congestionControl: opts.congestionControl ?? "default",
-		updateCert: async (tls) => {
-			const nextCertPem = decodePem(tls.certPem);
-			const nextKeyPem = decodePem(tls.keyPem);
-			await handle.updateCert(nextCertPem, nextKeyPem);
-		},
-		updateTls: async (tls) => {
-			await handle.updateTls(tlsConfigToJson(tls));
-		},
-		replaceSniCerts: async (sni) => {
-			await handle.replaceSniCerts(
-				JSON.stringify(
-					sni.map((entry) => ({
-						serverName: entry.serverName,
-						certPem: decodePem(entry.certPem),
-						keyPem: decodePem(entry.keyPem),
-					})),
+		updateCert: (tls) =>
+			mapNative(() =>
+				handle.updateCert(decodePem(tls.certPem), decodePem(tls.keyPem)),
+			),
+		updateTls: (tls) =>
+			mapNative(async () => {
+				validateUnknownSniPolicy(tls.unknownSniPolicy);
+				await handle.updateTls(tlsConfigToJson(tls));
+			}),
+		replaceSniCerts: (sni) =>
+			mapNative(() =>
+				handle.replaceSniCerts(
+					JSON.stringify(
+						sni.map((entry) => ({
+							serverName: entry.serverName,
+							certPem: decodePem(entry.certPem),
+							keyPem: decodePem(entry.keyPem),
+						})),
+					),
 				),
-			);
+			),
+		upsertSniCert: (entry) =>
+			mapNative(() =>
+				handle.upsertSniCert(
+					entry.serverName,
+					decodePem(entry.certPem),
+					decodePem(entry.keyPem),
+				),
+			),
+		removeSniCert: (serverName) =>
+			mapNative(() => handle.removeSniCert(serverName)),
+		setUnknownSniPolicy: (policy) =>
+			mapNative(async () => {
+				validateUnknownSniPolicy(policy, true);
+				await handle.setUnknownSniPolicy(policy);
+			}),
+		tlsSnapshot: () => {
+			try {
+				return handle.tlsSnapshot();
+			} catch (err) {
+				throw toWebTransportError(err);
+			}
 		},
-		upsertSniCert: async (entry) => {
-			await handle.upsertSniCert(
-				entry.serverName,
-				decodePem(entry.certPem),
-				decodePem(entry.keyPem),
-			);
-		},
-		removeSniCert: async (serverName) => {
-			await handle.removeSniCert(serverName);
-		},
-		setUnknownSniPolicy: async (policy) => {
-			await handle.setUnknownSniPolicy(policy);
-		},
-		tlsSnapshot: () => handle.tlsSnapshot(),
 		sendDatagramMirror: (targets, payload) =>
 			sendDatagramMirrorChecked(
 				(ids, bytes) => handle.sendDatagramMirror(ids, bytes),
@@ -3685,6 +3727,17 @@ function mapServerCertificateHashes(
 		algorithm: entry.algorithm,
 		value: Array.from(bufferSourceToUint8(entry.value)),
 	}));
+}
+
+/** `tls.unknownSniPolicy`: absent means default unless the caller requires it. */
+function validateUnknownSniPolicy(policy: unknown, required = false): void {
+	if (policy === undefined && !required) return;
+	if (policy !== "reject" && policy !== "default") {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			`E_INVALID_ARGUMENT: unknownSniPolicy must be "reject" or "default", got ${JSON.stringify(policy) ?? String(policy)}`,
+		);
+	}
 }
 
 const VALID_CONGESTION = new Set(["default", "throughput", "low-latency"]);

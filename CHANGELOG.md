@@ -330,6 +330,15 @@ unstable `__TESTING__.serverInternals(server)` accessor (`docs/SPEC.md`,
 
 ### Fixed
 
+- `createServer()` failures and the server TLS methods (`updateCert`,
+  `updateTls`, `replaceSniCerts`, `upsertSniCert`, `removeSniCert`,
+  `setUnknownSniPolicy`, `tlsSnapshot`) now throw or reject a
+  `WebTransportError` with the stable `code`. They threw the raw Node-API
+  error (`code: "GenericFailure"`, the `E_*` only inside the message). A
+  missing or invalid `port` is now `E_INVALID_ARGUMENT` before the addon is
+  reached (it was a "Failed to convert napi value" error, `-1` was accepted
+  and `70000` was clamped to 65535), and an unknown `unknownSniPolicy` is
+  `E_INVALID_ARGUMENT` rather than `E_INTERNAL`.
 - `connect()` now rejects certificate failures with `E_TLS`, as documented.
   An untrusted issuer, a certificate not valid for the requested name, and a
   server with no certificate for the requested server name (its TLS alert)

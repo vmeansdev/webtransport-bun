@@ -280,6 +280,15 @@ export function createServer(opts: ServerOptions): WebTransportServer;
 - Operators should review configured Unicode hostnames for homograph/confusable risk; IDNA normalization makes names protocol-correct, not human-safe.
 - `tls.sni` and `unknownSniPolicy` require a non-empty default `certPem` / `keyPem`; they do not participate in the dev self-signed fallback path.
 
+Server construction and TLS management errors:
+
+- `createServer()` throws synchronously, and the TLS methods reject, with a `WebTransportError` whose `code` is the stable `E_*` (never a raw Node-API error).
+- `port` must be an integer in `0..65535` (`0` picks an ephemeral port); anything else, including a missing `port`, is `E_INVALID_ARGUMENT`. Other malformed options are `E_INVALID_ARGUMENT` too, and an option this build or platform cannot honor is `E_UNSUPPORTED_ARGUMENT`.
+- Unusable TLS material at construction (no certificate in the PEM, a key that does not match the certificate, server `tls.caPem`) is `E_TLS`.
+- A server that cannot start (for example the port is already in use) is `E_INTERNAL` with a `server startup failed` message.
+- `unknownSniPolicy` other than `"reject"` or `"default"` is `E_INVALID_ARGUMENT`, in `createServer()`, `updateTls()` and `setUnknownSniPolicy()` alike; the policy in force is left unchanged.
+- A rotation the resolver refuses (unparseable PEM, an unknown name passed to `removeSniCert()`, SNI management without a default certificate) rejects with `E_INTERNAL` and a `tls rotation failed` / `certificate rotation failed` message. On a closed server the TLS methods reject with `E_SESSION_CLOSED`.
+
 ### Client
 
 ```ts
