@@ -330,6 +330,11 @@ unstable `__TESTING__.serverInternals(server)` accessor (`docs/SPEC.md`,
 
 ### Fixed
 
+- `loadWasmModule()` from `webtransport-bun/wasm` said "prebuilt wasm module
+  not found" for every load failure, including a present but broken
+  `wasm-dist` artifact (for example glue that still imports `env` because
+  ring's C code was not built for wasm32). The error now includes the
+  underlying load error, so `Cannot find package 'env'` is visible.
 - Bidirectional streams no longer stall when both directions are busy. One
   byte budget served both directions, so writes queued faster than the peer
   drained them filled it, the receive side could not reserve, and both peers
