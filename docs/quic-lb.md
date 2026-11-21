@@ -93,10 +93,12 @@ moves, and the kernel delivers them to the same process.
   `reusePort: true` and `quicLb` (there is nothing to steer by otherwise).
   Loading and pinning the program stay with the operator (`bpftool prog
   loadall … pinmaps …`); the per-process fd work is the addon's. This path is
-  load-proven: a 16-instance group under a registered gate sustained
-  20,000 sessions with per-rung steering deltas at 2.4× the audited floor
-  (gate `g6-sharded/1`, 2026-08-25), and a 24-instance group carried the
-  40,000-session G6 realm ([CAPACITY.md](CAPACITY.md)).
+  load-proven: under registered gates, `g6-sharded/1` was a valid MISS in all
+  three cells on the S3 duty clause alone, and `g6-sharded/2` passed at 5,000
+  and 15,000 sessions, with 20,000 refused (final) on connect errors. A
+  24-instance group later carried the 40,000-session G6 realm in a campaign
+  build with pieces outside the supported library
+  ([CAPACITY.md](CAPACITY.md)).
 - **Sizing first.** Instances-per-box comes from [CAPACITY.md](CAPACITY.md),
   whose per-instance figures are upper bounds of unknown tightness. Read it
   before choosing N; [`scenarios/deployment.md`](scenarios/deployment.md)

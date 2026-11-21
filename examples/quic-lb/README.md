@@ -173,7 +173,8 @@ Restart and re-registration under load have not been measured by this project.
   which needs the BTF-defined map support added in 5.2 — on 4.19 the object
   will not load without rewriting the map definitions in the old
   `struct bpf_map_def` form. **Written against 7.0.0-30-generic** as the
-  reference target and verified against no kernel at all.
+  reference target; it has been loaded only on the campaign's DigitalOcean
+  droplets (see above).
 - clang/LLVM 18+ for the BPF target, `bpftool`, and `libbpf` headers.
 - `CAP_BPF` + `CAP_NET_ADMIN` (or root) to load and attach.
 
