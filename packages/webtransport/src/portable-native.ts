@@ -5,6 +5,7 @@
 // Chromium Isolated Web App bundle.
 
 import { Duplex, Writable } from "node:stream";
+import { E_TLS, E_UNSUPPORTED_ARGUMENT, WebTransportError } from "./errors.js";
 import {
 	createServer as createNativeServer,
 	type ServerSession,
@@ -73,19 +74,28 @@ function duplexToWeb(duplex: Duplex): WebTransportBidirectionalStream {
 export async function createNativePortableServer(
 	opts: PortableCreateServerOptions,
 ): Promise<PortableServer> {
-	if (opts.tls.allowSelfSigned && !opts.tls.certPem) {
-		throw new Error(
-			"portable createServer: tls.allowSelfSigned is wasm-only — supply tls.certPem/keyPem on the native backend",
+	const certPem = decodePem(opts.tls.certPem);
+	const keyPem = decodePem(opts.tls.keyPem);
+	const hasPem = certPem.trim().length > 0 && keyPem.trim().length > 0;
+	if (opts.tls.allowSelfSigned && !hasPem) {
+		throw new WebTransportError(
+			E_UNSUPPORTED_ARGUMENT,
+			"E_UNSUPPORTED_ARGUMENT: portable createServer: tls.allowSelfSigned is wasm-only — supply tls.certPem/keyPem on the native backend",
+		);
+	}
+	// The root createServer serves a generated development certificate for
+	// empty PEM; the portable contract never does, on either backend.
+	if (!hasPem) {
+		throw new WebTransportError(
+			E_TLS,
+			"E_TLS: portable createServer: tls.certPem and tls.keyPem are required on the native backend",
 		);
 	}
 
 	const server = createNativeServer({
 		...(opts.host != null ? { host: opts.host } : {}),
 		port: opts.port,
-		tls: {
-			certPem: decodePem(opts.tls.certPem),
-			keyPem: decodePem(opts.tls.keyPem),
-		},
+		tls: { certPem, keyPem },
 		limits: opts.limits,
 		log: opts.log as Parameters<typeof createNativeServer>[0]["log"],
 		debug: opts.debug,

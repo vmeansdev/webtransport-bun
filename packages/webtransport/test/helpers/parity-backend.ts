@@ -16,8 +16,8 @@ import {
 	type WasmConnectOptions,
 	type WasmSession,
 	WasmTransportManager,
-	wasmClientPoolMetricsSnapshot,
 	WasmWebTransport,
+	wasmClientPoolMetricsSnapshot,
 } from "../../src/backend.js";
 import type { WasmModule } from "../../src/backend-wasm.js";
 import {
@@ -34,6 +34,7 @@ import {
 import type { WebTransportCloseInfo } from "../../src/types.js";
 import { InMemoryRelay } from "../../src/wasm-relay.js";
 import type { WasmWebTransportOptions } from "../../src/wasm-webtransport.js";
+import { type GeneratedCert, generateLocalhostCert } from "./certs.js";
 import { nextPort, openWTWithRetry } from "./network.js";
 import { loadWasmModule, wasmAvailable } from "./wasm-availability.js";
 
@@ -136,6 +137,19 @@ export async function createParityHarness(
 		: createNativeHarness(opts);
 }
 
+/** The portable contract requires a certificate on native too; one per process. */
+let nativeCert: GeneratedCert | null = null;
+function nativeTls(): { certPem: string; keyPem: string } {
+	if (!nativeCert) {
+		nativeCert = generateLocalhostCert();
+		if (!nativeCert)
+			throw new Error("failed to generate the parity certificate");
+		const generated = nativeCert;
+		process.once("exit", () => generated.cleanup());
+	}
+	return { certPem: nativeCert.certPem, keyPem: nativeCert.keyPem };
+}
+
 async function createNativeHarness(
 	opts?: HarnessOptions,
 ): Promise<ParityHarness> {
@@ -144,7 +158,7 @@ async function createNativeHarness(
 		backend: "native",
 		host: "127.0.0.1",
 		port,
-		tls: { certPem: "", keyPem: "" },
+		tls: nativeTls(),
 		limits: opts?.serverLimits,
 		onSession: async (s) => {
 			await opts?.onSession?.(s);

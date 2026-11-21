@@ -1,10 +1,16 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { connectWasm } from "../src/backend.js";
-import { createServer } from "../src/portable.js";
+import {
+	E_TLS,
+	E_UNSUPPORTED_ARGUMENT,
+	WebTransportError,
+} from "../src/index.js";
 import type { PortableServerSession } from "../src/portable.js";
+import { createServer } from "../src/portable.js";
 import { InMemoryRelay } from "../src/wasm-relay.js";
+import { generateLocalhostCert } from "./helpers/certs.js";
 import {
 	forEachWithTimeout,
 	readWithTimeout,
@@ -18,6 +24,11 @@ const wasm = wasmAvailable
 	: (null as unknown as Awaited<ReturnType<typeof loadWasmModule>>);
 
 const srcDir = fileURLToPath(new URL("../src/", import.meta.url));
+
+const cert = generateLocalhostCert();
+if (!cert) throw new Error("failed to generate the native test certificate");
+afterAll(() => cert.cleanup());
+const nativeTls = { certPem: cert.certPem, keyPem: cert.keyPem };
 
 describe("portable createServer", () => {
 	test("the portable module never statically imports node: builtins", () => {
@@ -43,7 +54,7 @@ describe("portable createServer", () => {
 			backend: "native",
 			host: "127.0.0.1",
 			port,
-			tls: { certPem: "", keyPem: "" },
+			tls: nativeTls,
 			onSession: async (session: PortableServerSession) => {
 				await forEachWithTimeout(
 					session.incomingDatagrams(),
@@ -94,7 +105,7 @@ describe("portable createServer", () => {
 			backend: "native",
 			host: "127.0.0.1",
 			port,
-			tls: { certPem: "", keyPem: "" },
+			tls: nativeTls,
 			onSession: async (session: PortableServerSession) => {
 				const stream = await session.createBidirectionalStream();
 				opened?.resolve(stream);
@@ -174,13 +185,33 @@ describe("portable createServer", () => {
 	);
 
 	test("rejects wasm-only allowSelfSigned on the native backend", async () => {
-		await expect(
-			createServer({
+		const err = await createServer({
+			backend: "native",
+			port: 0,
+			tls: { allowSelfSigned: true },
+			onSession: () => {},
+		}).catch((e: unknown) => e);
+		expect(err).toBeInstanceOf(WebTransportError);
+		expect(err).toMatchObject({ code: E_UNSUPPORTED_ARGUMENT });
+		expect((err as Error).message).toMatch(/wasm-only/);
+	});
+
+	test("requires a certificate on the native backend instead of generating one", async () => {
+		for (const tls of [
+			{},
+			{ certPem: "", keyPem: "" },
+			{ certPem: cert.certPem },
+			{ keyPem: cert.keyPem },
+		]) {
+			const err = await createServer({
 				backend: "native",
-				port: nextPort(16600, 200),
-				tls: { allowSelfSigned: true },
+				host: "127.0.0.1",
+				port: 0,
+				tls,
 				onSession: () => {},
-			}),
-		).rejects.toThrow(/wasm-only/);
+			}).catch((e: unknown) => e);
+			expect(err).toBeInstanceOf(WebTransportError);
+			expect(err).toMatchObject({ code: E_TLS });
+		}
 	});
 });

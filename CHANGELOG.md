@@ -52,6 +52,12 @@ hatch exists. Checked against the rc.1 candidate (875dfbfe).
   of every later server and client. Writes now throw in strict mode (and are
   ignored otherwise); build your own object with
   `{ ...DEFAULT_LIMITS, maxSessions: 10 }`.
+- **`/portable` on native requires a certificate.** An empty or missing
+  `tls.certPem`/`tls.keyPem` now rejects with `E_TLS`, as
+  `docs/PARITY_MATRIX.md` always said; rc.1 passed it to the root
+  `createServer`, which served an auto-generated self-signed certificate. A
+  native `tls.allowSelfSigned` rejection is now a `WebTransportError` with
+  `E_UNSUPPORTED_ARGUMENT` instead of a plain `Error`.
 - **Server shutdown close code.** Sessions ended by `server.close()` now close
   with code `3993` and reason `E_SERVER_CLOSING`, on the wire and in the local
   `closed` fallback. rc.1 used application code `0` with reason

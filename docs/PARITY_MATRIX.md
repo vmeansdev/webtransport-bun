@@ -121,8 +121,8 @@ the TypeScript signature.
 | `address: { host, port }` | Bound address; `port: 0` reads back the OS-assigned port | Same | Equal |
 | `certHashBase64?: string` | `undefined` | SHA-256(DER) of the default cert | **Deliberately optional.** Wasm clients pin a hash; native clients chain-validate. The only optional field in the contract, and typed as such |
 | `close(): Promise<void>` | Wraps `WebTransportServer.close()` | Wraps `WasmWebTransportServer.close()`, which awaits `WasmTransportManager.close()` | Equal — resolves to `undefined` on both |
-| `tls.certPem` / `tls.keyPem` | Required | Optional when `allowSelfSigned` | Equal where supplied |
-| `tls.allowSelfSigned` | **Rejected** at `createServer` with a `wasm-only` error | Generates a short-lived self-signed cert | **Wasm-only, and it fails loudly.** Native refuses rather than silently serving a certificate the caller did not choose |
+| `tls.certPem` / `tls.keyPem` | Required: an empty or missing pair rejects with `E_TLS` (the root `createServer`'s development self-signed fallback is not reachable through `/portable`) | Optional when `allowSelfSigned`; otherwise an empty pair rejects with `E_TLS` | Equal where supplied |
+| `tls.allowSelfSigned` | **Rejected** at `createServer` with `E_UNSUPPORTED_ARGUMENT` (a `wasm-only` message) unless a PEM pair is supplied | Generates a short-lived self-signed cert | **Wasm-only, and it fails loudly.** Native refuses rather than silently serving a certificate the caller did not choose |
 | `limits.maxStreamsPerSessionBidi` / `maxStreamsGlobal` / `backpressureTimeoutMs` | Honoured; defaults `200` / `50000` / `5000` | Honoured; identical defaults (`DEFAULT_WASM_LIMITS`) | Equal, defaults included |
 | `log` / `debug` | Structured events, redaction off under `debug` | Same | Equal |
 
@@ -197,7 +197,7 @@ leak onto it.
 | `exportTicketVault()` / `importTicketVault()`, `connect()`, `metricsToPrometheus()` | Native root surface | Node-stream client and Node-API-shaped ticket vault | Frozen in `public-surface-contract.test.ts` |
 | SNI cert map, `updateCert`/`updateTls`, `setUnknownSniPolicy`, keep-alive and congestion-control knobs | Native root surface (`WebTransportServer`) | No wasm equivalent; would silently no-op if promised portably | `packages/webtransport/test/tls.test.ts` |
 | `serveOverUdp`, `UdpTransport` injection, `DirectSocketsUdpTransport`, `InMemoryRelay`, ticket-store hosts, `generateCert`, `certHashBase64` pinning | `/wasm` | IWA / bring-your-own-socket model with no native counterpart | `packages/webtransport/test/wasm-*.test.ts` |
-| `tls.allowSelfSigned` | `/portable` options, wasm-honoured only | Accepted in the options type but **rejected loudly** on native, so callers cannot ship an unintended certificate | `packages/webtransport/test/portable-server.test.ts` ("rejects wasm-only allowSelfSigned on the native backend") |
+| `tls.allowSelfSigned` | `/portable` options, wasm-honoured only | Accepted in the options type but **rejected loudly** on native (`E_UNSUPPORTED_ARGUMENT`), as is an empty PEM pair (`E_TLS`), so callers cannot ship an unintended certificate | `packages/webtransport/test/portable-server.test.ts` ("rejects wasm-only allowSelfSigned on the native backend", "requires a certificate on the native backend instead of generating one") |
 | Callback-style `onDatagram` / `onIncomingStream` | `/wasm` (`WasmServerSession`, deprecated) | Back-compat only; mutually exclusive with the W3C surface on the same session | `packages/webtransport/test/wasm-server-session-parity.test.ts` |
 | Dynamic QPACK blocked-streams posture | Both, configured differently | Native always advertises `SETTINGS_QPACK_BLOCKED_STREAMS = 0`; the wasm `enableDynamicQpack` preset uses 16. Capability parity, deliberate wire divergence | `docs/WASM_PROTOCOL_SCOPE.md`; `packages/webtransport/test/native-qpack.test.ts` |
 
