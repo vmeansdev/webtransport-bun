@@ -18,7 +18,35 @@ pub struct ClientMetrics {
     pub datagrams_in: AtomicU64,
     pub datagrams_out: AtomicU64,
     pub streams_active: AtomicU64,
+    /// Open bidi streams in either direction, checked against
+    /// `limits.max_streams_per_session_bidi`.
+    pub streams_bidi_active: AtomicU64,
+    /// Open uni streams in either direction, checked against
+    /// `limits.max_streams_per_session_uni`.
+    pub streams_uni_active: AtomicU64,
     pub queued_bytes: AtomicU64,
+}
+
+impl ClientMetrics {
+    /// Counts a new stream against the session caps, or refuses it. Opens and
+    /// accepts run on separate tasks, so the check and the increment are one
+    /// compare-and-swap: two racing streams can never both take the last slot.
+    pub(crate) fn try_admit_stream(&self, bidi: bool, cap: u64) -> bool {
+        let counter = if bidi {
+            &self.streams_bidi_active
+        } else {
+            &self.streams_uni_active
+        };
+        let admitted = counter
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < cap).then_some(n + 1)
+            })
+            .is_ok();
+        if admitted {
+            self.streams_active.fetch_add(1, Ordering::Relaxed);
+        }
+        admitted
+    }
 }
 
 use crate::client_pool::{self, PoolKey, PoolReleaseGuard};
@@ -767,6 +795,18 @@ fn build_quic_transport_config(
     let mut config = wtransport::config::QuicTransportConfig::default();
     let memory_policy = crate::transport_memory::TransportMemoryPolicy::from_limits(limits)
         .with_h1b_datagram_buffers(limits);
+    // Same alignment as the server: the peer may open at most the configured
+    // caps, plus 16 streams of headroom for H3 control/QPACK streams.
+    let clamp_varint = |n: u64| {
+        wtransport::quinn::VarInt::from_u64(n.min(wtransport::quinn::VarInt::MAX.into_inner()))
+            .unwrap_or(wtransport::quinn::VarInt::MAX)
+    };
+    config.max_concurrent_bidi_streams(clamp_varint(
+        limits.max_streams_per_session_bidi.saturating_add(16),
+    ));
+    config.max_concurrent_uni_streams(clamp_varint(
+        limits.max_streams_per_session_uni.saturating_add(16),
+    ));
     memory_policy.apply_flow_control(&mut config);
     memory_policy.apply_datagram_buffers(&mut config);
     apply_congestion_controller(&mut config, mode);
@@ -1324,6 +1364,8 @@ impl ClientSessionHandle {
         let max_global = limits.max_queued_bytes_global;
         let max_session = limits.max_queued_bytes_per_session;
         let max_stream = limits.max_queued_bytes_per_stream;
+        let max_streams_bidi = limits.max_streams_per_session_bidi;
+        let max_streams_uni = limits.max_streams_per_session_uni;
         let datagram_budget_bytes = std::cmp::min(max_global, max_session);
 
         let handle = Self {
@@ -1437,13 +1479,19 @@ impl ClientSessionHandle {
                 crate::panic_guard::PanicScope::Conn(conn.clone()),
                 async move {
                     while let Some(resp_tx) = open_bi_rx.recv().await {
+                        if !cm_bi.try_admit_stream(true, max_streams_bidi) {
+                            if resp_tx.send(Err("E_LIMIT_EXCEEDED".to_string())).is_err() {
+                                crate::report_channel_failure("client open_bidi response");
+                            }
+                            continue;
+                        }
+                        // The slot is held from here; a failed open gives it back.
+                        let slot =
+                            crate::client_stream::StreamGuard::client(Arc::clone(&cm_bi), true);
                         let r = match conn_bi.open_bi().await {
                             Ok(opening) => match opening.await {
                                 Ok((send, recv)) => {
-                                    cm_bi.streams_active.fetch_add(1, Ordering::Relaxed);
-                                    let guard = crate::client_stream::StreamGuard::client(
-                                        Arc::clone(&cm_bi),
-                                    );
+                                    let guard = slot;
                                     let budget = make_budget_bi();
                                     // Deferred like accepted server streams: no bridge
                                     // task, channel, or scratch buffer until JS first
@@ -1473,13 +1521,19 @@ impl ClientSessionHandle {
                 crate::panic_guard::PanicScope::Conn(conn.clone()),
                 async move {
                     while let Some(resp_tx) = open_uni_rx.recv().await {
+                        if !cm_uni.try_admit_stream(false, max_streams_uni) {
+                            if resp_tx.send(Err("E_LIMIT_EXCEEDED".to_string())).is_err() {
+                                crate::report_channel_failure("client open_uni response");
+                            }
+                            continue;
+                        }
+                        // The slot is held from here; a failed open gives it back.
+                        let slot =
+                            crate::client_stream::StreamGuard::client(Arc::clone(&cm_uni), false);
                         let r = match conn_uni.open_uni().await {
                             Ok(opening) => match opening.await {
                                 Ok(send) => {
-                                    cm_uni.streams_active.fetch_add(1, Ordering::Relaxed);
-                                    let guard = crate::client_stream::StreamGuard::client(
-                                        Arc::clone(&cm_uni),
-                                    );
+                                    let guard = slot;
                                     let budget = make_budget_uni();
                                     let (write_tx, write_err_slot) = spawn_uni_send_bridge_on(
                                         &CLIENT_RUNTIME,
@@ -1511,12 +1565,23 @@ impl ClientSessionHandle {
                 crate::panic_guard::PanicScope::Conn(conn.clone()),
                 async move {
                     while let Some(resp_tx) = accept_bi_rx.recv().await {
-                        let r = match conn_accept_bi.accept_bi().await {
-                            Ok((send, recv)) => {
-                                cm_accept_bi.streams_active.fetch_add(1, Ordering::Relaxed);
-                                let guard = crate::client_stream::StreamGuard::client(Arc::clone(
-                                    &cm_accept_bi,
-                                ));
+                        let r = match accept_admitted(
+                            || conn_accept_bi.accept_bi(),
+                            |(send, _recv): &mut (
+                                wtransport::SendStream,
+                                wtransport::RecvStream,
+                            )| {
+                                // Refused like the server refuses: reset our half;
+                                // dropping the receive half sends STOP_SENDING.
+                                let _ = send.reset(0u32);
+                            },
+                            &cm_accept_bi,
+                            true,
+                            max_streams_bidi,
+                        )
+                        .await
+                        {
+                            Ok(((send, recv), guard)) => {
                                 let budget = make_budget_accept_bi();
                                 // Deferred: see the open_bi arm above.
                                 Ok(ClientBidiStreamHandle::new_deferred_with_budget(
@@ -1543,12 +1608,17 @@ impl ClientSessionHandle {
                 crate::panic_guard::PanicScope::Conn(conn.clone()),
                 async move {
                     while let Some(resp_tx) = accept_uni_rx_local.recv().await {
-                        let r = match conn_accept_uni.accept_uni().await {
-                            Ok(recv) => {
-                                cm_accept_uni.streams_active.fetch_add(1, Ordering::Relaxed);
-                                let guard = crate::client_stream::StreamGuard::client(Arc::clone(
-                                    &cm_accept_uni,
-                                ));
+                        let r = match accept_admitted(
+                            || conn_accept_uni.accept_uni(),
+                            // Dropping the refused stream sends STOP_SENDING.
+                            |_recv: &mut wtransport::RecvStream| {},
+                            &cm_accept_uni,
+                            false,
+                            max_streams_uni,
+                        )
+                        .await
+                        {
+                            Ok((recv, guard)) => {
                                 let budget = make_budget_accept_uni();
                                 // Deferred: see the open_bi arm above.
                                 Ok(ClientUniRecvHandle::new_deferred_with_budget(
@@ -1716,6 +1786,30 @@ fn take_client_session_inner(handle_id: String) -> Result<Option<ClientSessionHa
 }
 
 const DEFAULT_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
+
+/// Accepts the next peer stream that fits under the session cap, refusing (and
+/// dropping) the ones over it, the way the server's accept loop does. Returns
+/// the stream with the guard that releases its slot.
+async fn accept_admitted<T, E, F, Fut>(
+    mut accept: F,
+    refuse: impl Fn(&mut T),
+    metrics: &Arc<ClientMetrics>,
+    bidi: bool,
+    cap: u64,
+) -> std::result::Result<(T, crate::client_stream::StreamGuard), E>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, E>>,
+{
+    loop {
+        let mut stream = accept().await?;
+        if metrics.try_admit_stream(bidi, cap) {
+            let guard = crate::client_stream::StreamGuard::client(Arc::clone(metrics), bidi);
+            return Ok((stream, guard));
+        }
+        refuse(&mut stream);
+    }
+}
 
 /// Resolver used when `serverName` overrides the URL host: the connect URL then
 /// carries the SNI name, and this resolver keeps the dial aimed at the URL's own
@@ -2677,6 +2771,88 @@ mod tests {
             connect_destination_ip(&named_url, named_resolver.as_ref()),
             None
         );
+    }
+
+    #[test]
+    fn stream_caps_admit_up_to_the_cap_per_direction_and_release_on_drop() {
+        let m = Arc::new(super::ClientMetrics::default());
+        assert!(m.try_admit_stream(true, 2));
+        let held = crate::client_stream::StreamGuard::client(Arc::clone(&m), true);
+        assert!(m.try_admit_stream(true, 2));
+        let _second = crate::client_stream::StreamGuard::client(Arc::clone(&m), true);
+        assert!(!m.try_admit_stream(true, 2), "third bidi must be refused");
+        assert!(m.try_admit_stream(false, 1), "uni has its own cap");
+        let _uni = crate::client_stream::StreamGuard::client(Arc::clone(&m), false);
+        assert!(!m.try_admit_stream(false, 1));
+        assert_eq!(m.streams_active.load(Ordering::Relaxed), 3);
+        drop(held);
+        assert_eq!(m.streams_bidi_active.load(Ordering::Relaxed), 1);
+        assert!(m.try_admit_stream(true, 2), "a released slot is reusable");
+        assert!(!m.try_admit_stream(true, 0), "a zero cap admits nothing");
+    }
+
+    #[test]
+    fn concurrent_admissions_never_exceed_the_cap() {
+        let m = Arc::new(super::ClientMetrics::default());
+        let admitted: usize = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| {
+                    let m = Arc::clone(&m);
+                    scope.spawn(move || (0..100).filter(|_| m.try_admit_stream(true, 50)).count())
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("thread")).sum()
+        });
+        assert_eq!(admitted, 50);
+        assert_eq!(m.streams_bidi_active.load(Ordering::Relaxed), 50);
+    }
+
+    #[tokio::test]
+    async fn accept_admitted_refuses_streams_over_the_cap_and_keeps_accepting() {
+        let m = Arc::new(super::ClientMetrics::default());
+        assert!(m.try_admit_stream(false, 1));
+        // The one slot is taken; it frees after the third refusal, as a
+        // finishing stream would.
+        let held = std::sync::Mutex::new(Some(crate::client_stream::StreamGuard::client(
+            Arc::clone(&m),
+            false,
+        )));
+        let next = std::sync::atomic::AtomicU32::new(0);
+        let refused = std::sync::Mutex::new(Vec::new());
+        let (stream, _guard) = super::accept_admitted(
+            || {
+                let n = next.fetch_add(1, Ordering::Relaxed);
+                async move { Ok::<u32, ()>(n) }
+            },
+            |n: &mut u32| {
+                let mut refused = refused.lock().unwrap();
+                refused.push(*n);
+                if refused.len() == 3 {
+                    held.lock().unwrap().take();
+                }
+            },
+            &m,
+            false,
+            1,
+        )
+        .await
+        .expect("admitted once the slot frees");
+        assert_eq!(*refused.lock().unwrap(), vec![0, 1, 2]);
+        assert_eq!(stream, 3);
+        assert_eq!(m.streams_uni_active.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn client_quic_concurrency_follows_the_stream_caps() {
+        // Smoke: building the transport config with tiny and huge caps must not
+        // panic (the VarInt clamp), matching the server's alignment.
+        let limits = crate::limits::Limits {
+            max_streams_per_session_bidi: 1,
+            max_streams_per_session_uni: u64::MAX,
+            ..Default::default()
+        };
+        let _ =
+            super::build_quic_transport_config(CongestionControlMode::Default, 60_000, 0, &limits);
     }
 
     #[test]

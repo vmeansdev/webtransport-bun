@@ -61,6 +61,15 @@ hatch exists. Checked against the rc.1 candidate (875dfbfe).
   string it could not parse, `"::"` among them. `"::"` (brackets optional) now
   binds every interface dual-stack on all platforms. To keep rc.1's behavior
   for a hostname, pass `"0.0.0.0"` explicitly.
+- **Client stream caps are enforced.** `limits.maxStreamsPerSessionBidi` and
+  `maxStreamsPerSessionUni` (default 200 each) were accepted by `connect` and
+  `new WebTransport` but ignored. The client now counts open streams per
+  direction like the server: a local open over the cap rejects with
+  `E_LIMIT_EXCEEDED` (`waitUntilAvailable: true` waits for a slot instead), and
+  a peer stream over the cap is refused rather than surfaced. The QUIC stream
+  concurrency the client grants its peer follows the caps (cap + 16 for HTTP/3
+  control streams), as on the server. Raise the caps to restore rc.1's
+  unbounded opens.
 - **Not breaking, listed for completeness.** The surfaces under "Removed and
   internalized" below were never in rc.1, so no rc.1 caller can depend on
   them: the reflector, the campaign getters, `__sendPathDiagnostics`, the

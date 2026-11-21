@@ -82,6 +82,7 @@ pub enum StreamCmd {
 enum StreamGuardAction {
     Client {
         metrics: Arc<crate::client::ClientMetrics>,
+        bidi: bool,
     },
     Server {
         metrics: Arc<crate::server_metrics::ServerMetrics>,
@@ -97,9 +98,10 @@ pub struct StreamGuard {
 }
 
 impl StreamGuard {
-    pub fn client(metrics: Arc<crate::client::ClientMetrics>) -> Self {
+    /// Releases a slot taken by `ClientMetrics::try_admit_stream`.
+    pub fn client(metrics: Arc<crate::client::ClientMetrics>, bidi: bool) -> Self {
         Self {
-            action: Some(StreamGuardAction::Client { metrics }),
+            action: Some(StreamGuardAction::Client { metrics, bidi }),
         }
     }
 
@@ -126,8 +128,14 @@ impl Drop for StreamGuard {
             return;
         };
         match action {
-            StreamGuardAction::Client { metrics } => {
+            StreamGuardAction::Client { metrics, bidi } => {
                 metrics.streams_active.fetch_sub(1, Ordering::Relaxed);
+                let counter = if bidi {
+                    &metrics.streams_bidi_active
+                } else {
+                    &metrics.streams_uni_active
+                };
+                counter.fetch_sub(1, Ordering::AcqRel);
             }
             StreamGuardAction::Server {
                 metrics,
