@@ -105,7 +105,7 @@ describe("scenario example: connection churn", () => {
 			// client saw was a refusal the server counted.
 			expect(report.connectRetries).toBe(failures);
 			expect(churn.server.metricsSnapshot().limitExceededCount).toBe(
-				report.connectFailures["E_INTERNAL (CONNECTION_REFUSED)"] ?? 0,
+				failures,
 			);
 		} finally {
 			await churn.close();

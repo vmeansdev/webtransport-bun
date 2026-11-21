@@ -54,24 +54,12 @@ export function backoffMs(n: number, policy: RetryPolicy): number {
  *
  *   per-IP / per-prefix rate limit   E_RATE_LIMITED (HTTP 429 on the CONNECT)
  *   maxSessions                      E_LIMIT_EXCEEDED (closed with 3992)
- *   maxHandshakesInFlight            E_INTERNAL, message "the server refused
- *                                    to accept a new connection" (QUIC
- *                                    CONNECTION_REFUSED has no stable code
- *                                    yet, so it is told apart by message)
+ *   maxHandshakesInFlight            E_LIMIT_EXCEEDED (QUIC CONNECTION_REFUSED;
+ *                                    E_INTERNAL before PR #25)
  */
 export function failureCode(err: unknown): string {
-	const { code, message } = (err ?? {}) as {
-		code?: unknown;
-		message?: unknown;
-	};
-	if (typeof code !== "string") return "unknown";
-	if (
-		code === "E_INTERNAL" &&
-		String(message).includes("refused to accept a new connection")
-	) {
-		return "E_INTERNAL (CONNECTION_REFUSED)";
-	}
-	return code;
+	const { code } = (err ?? {}) as { code?: unknown };
+	return typeof code === "string" ? code : "unknown";
 }
 
 export type ChurnClientOptions = {
