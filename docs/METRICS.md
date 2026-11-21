@@ -18,13 +18,13 @@ every series). Snapshot fields not listed here are available from
 | `webtransport_streams_active` | gauge | Active streams |
 | `webtransport_session_tasks_active` | gauge | Internal session tasks |
 | `webtransport_stream_tasks_active` | gauge | Internal stream tasks |
-| `webtransport_queued_bytes_global` | gauge | Bytes queued globally |
+| `webtransport_queued_bytes_global` | gauge | Queued receive bytes plus queued stream-send bytes, server-wide (see `queuedBytesGlobal`) |
 | `webtransport_datagrams_in` | counter | Datagrams received |
 | `webtransport_datagrams_out` | counter | Datagrams sent |
 | `webtransport_datagrams_dropped` | counter | Datagrams dropped (sum of the drop causes below) |
-| `webtransport_backpressure_wait_total` | counter | Times senders waited on backpressure |
+| `webtransport_backpressure_wait_total` | counter | Datagram sends that found the byte budget full, counted per failed reservation attempt |
 | `webtransport_backpressure_timeout_total` | counter | Times the backpressure timeout fired |
-| `webtransport_rate_limited_total` | counter | Sessions rejected by rate limit |
+| `webtransport_rate_limited_total` | counter | Handshakes, stream opens and incoming datagrams refused by a per-IP rate limit |
 | `webtransport_limit_exceeded_total` | counter | Sessions rejected by limits |
 | `webtransport_tls_sni_cert_selections_total` | counter | Handshakes served by a hostname-specific SNI cert |
 | `webtransport_tls_default_cert_selections_total` | counter | Handshakes served by the default certificate |
@@ -37,6 +37,7 @@ every series). Snapshot fields not listed here are available from
 
 | Field | Type | Description |
 |-------|------|-------------|
+| nowMs | number | Wall-clock time the snapshot was taken, in milliseconds since the Unix epoch. Use it to turn two snapshots' counter deltas into rates. |
 | sessionsActive | number | Current open sessions |
 | handshakesInFlight | number | Handshakes in progress |
 | streamsActive | number | Active streams (bidi + uni) |
@@ -50,8 +51,8 @@ every series). Snapshot fields not listed here are available from
 | datagramsSkippedQueueFull | number? | Native ingest: times the session task parked `receive_datagram` because remaining session slack could not fit `maxDatagramSize`. Park events, not datagrams. Not part of the drop-reason identity. Omitted on WASM. |
 | datagramsDroppedQueueGlobal | number? | Native ingest: global queued-bytes budget. Omitted on WASM. |
 | datagramsDroppedRateLimited | number? | Native ingest: per-IP datagram ingress rate limit. Also counted in `rateLimitedCount`. Omitted on WASM. |
-| queuedBytesGlobal | number | Bytes queued globally |
-| backpressureWaitCount | number | Times server session send waited on backpressure (incremented on timeout) |
+| queuedBytesGlobal | number | Server-wide sum of two separately capped counters: queued receive bytes (datagrams in both directions, up to `maxQueuedBytesGlobal`, plus stream receives, up to half of it) and queued stream-send bytes (up to half of it). It can therefore read at most 1.5 × `maxQueuedBytesGlobal`, and a workload that exhausts only the stream-receive budget reads 50%. See `docs/OPERATIONS.md`, "Alert rules". |
+| backpressureWaitCount | number | Datagram sends that found the session or global byte budget full: incremented on every failed reservation attempt, so one send that waits and retries counts several times, and the attempt that then times out counts here too |
 | backpressureTimeoutCount | number | Times server session send_datagram timed out (E_BACKPRESSURE_TIMEOUT) |
 | datagramMirrorCalls | number? | Native only: `server.sendDatagramMirror()` calls served. Never counted in `datagramSendsAsync` — the mirror hands JavaScript no promise, so it creates none of the host-loop exposure that counter names. Omitted on WASM. |
 | datagramMirrorTargets | number? | Native only: targets those mirror calls **attempted** (an over-cap tail is reported, never attempted, and is not counted here). Delivery is per-session `datagramsOut`, which the mirror increments exactly as every other send path does, so a mirrored datagram is indistinguishable from a looped one there. Omitted on WASM. |
@@ -66,11 +67,27 @@ every series). Snapshot fields not listed here are available from
 | sinksActive | number? | **Experimental.** Native only, process-wide: stream sinks (`openReadSink`) currently running in this process, on client and server streams alike. Returns to 0 once every sink has ended; a sink leak gauge. Omitted on WASM. |
 | sinkDroppedRecords | number? | **Experimental.** Native only, process-wide and cumulative: records dropped by sinks in `overflow: "drop-newest"` mode. Each sink also discloses its drops in-band as `drops` records. Omitted on WASM. |
 | nativeSessionRegistryEntries, nativeTrackedTasks, nativeRateLimitEntries, nativeBidiHandlesLive, nativeUniSendHandlesLive, nativeUniRecvHandlesLive | number? | Native only: live sizes of the addon's registries and handle tables. Use them as leak gauges: after load stops they should return to their idle values. Omitted on WASM. |
-| rateLimitedCount | number | Sessions rejected by per-IP/per-prefix rate limit |
+| rateLimitedCount | number | Refusals by any per-IP rate limit: handshakes (token bucket and per-IP/per-prefix burst), stream opens, and incoming datagrams dropped by the datagram ingress bucket (also in `datagramsDroppedRateLimited`) |
 | limitExceededCount | number | Sessions rejected (maxSessions, maxHandshakesInFlight) |
 | sniCertSelections | number | Handshakes served by hostname-specific SNI certificates |
 | defaultCertSelections | number | Handshakes served by the default certificate |
 | unknownSniRejectedCount | number | Handshakes rejected because SNI did not match a configured hostname |
+
+## Session metrics
+
+`session.metricsSnapshot()` on a server or client session returns a
+`SessionMetricsSnapshot`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| datagramsIn | number | Datagrams this session received |
+| datagramsOut | number | Datagrams this session sent |
+| streamsActive | number | Open streams (bidi + uni) on this session |
+| queuedBytes | number | Server session: this session's queued receive bytes plus queued stream-send bytes, the per-session counterpart of `queuedBytesGlobal` (so it can exceed `maxQueuedBytesPerSession` the same way). Client session: the queued bytes charged to its datagram budget. |
+
+The session counters are cumulative for the session's lifetime and reset with
+it; they are not labelled per session in `metricsToPrometheus()` (that would
+be unbounded cardinality).
 
 ## Internal counters (not public)
 

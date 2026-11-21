@@ -250,6 +250,18 @@ export interface WebTransportServer {
       error: WebTransportError;
     }[];
   };
+  /**
+   * Experimental. Hand one payload and many targets to the native egress
+   * pacer; `admitted` counts scheduled targets, failures arrive later through
+   * readMirrorReports(). Throws E_UNSUPPORTED_ARGUMENT when the pacer is off.
+   * See "The paced mirror (experimental)".
+   */
+  sendDatagramMirrorPaced(
+    targets: readonly string[],
+    payload: Uint8Array,
+  ): DatagramMirrorAdmission;
+  /** Experimental. Drain up to `max` deferred paced-mirror failures, oldest first. */
+  readMirrorReports(max?: number): readonly MirrorReport[];
   close(): Promise<void>;
   metricsSnapshot(): MetricsSnapshot;
 }
@@ -424,7 +436,7 @@ For browser-shaped facade streams, the control mapping is:
 
 The block below lists the core fields. `docs/METRICS.md` is the full
 reference (paced-mirror, native send-path, sink and close-cause counters
-included), and `metricsToPrometheus(snapshot, opts?)` renders a snapshot in
+included), and `metricsToPrometheus(snapshot, labels?)` renders a snapshot in
 Prometheus text format with the `METRICS_PREFIX` name prefix
 (`webtransport_`, overridable via `WEBTRANSPORT_METRICS_PREFIX`).
 `DEFAULT_LIMITS` and `DEFAULT_RATE_LIMITS` export the defaults.
@@ -503,7 +515,7 @@ with a dedicated, wire-visible code and reason:
 
 | Field | Value |
 |---|---|
-| Close code | `3993` (`SERVER_CLOSING_CLOSE_CODE`) |
+| Close code | `3993` |
 | Close reason | `"E_SERVER_CLOSING"` (`E_SERVER_CLOSING`, exported from the root entrypoint) |
 
 **When it is sent.** Every path by which `server.close()` terminates a session
@@ -517,6 +529,13 @@ uses this pair, so the peer sees one answer regardless of which one ran:
   `closed` promise of every still-owned session with the same `{ code, reason }`
   so an app sees identical values whether the event arrived off the wire or from
   the local fallback.
+
+The package exports no close-code constants: compare against the numbers.
+The well-known codes are `3990` (idle timeout: reported locally with reason
+`E_SESSION_IDLE_TIMEOUT` when the QUIC idle timer ends the connection),
+`3992` (the server refused the session over a limit, reason
+`E_LIMIT_EXCEEDED`) and `3993` (server closing, reason `E_SERVER_CLOSING`).
+The reason strings are exported as constants of the same names.
 
 **Why it is distinct.** `3993` sits with the other well-known server-originated
 close codes (`3990` idle timeout, `3992` limit exceeded) and answers a question
@@ -953,6 +972,36 @@ and `undefined` on native.
 `/wasm` has a frozen export list but a `candidate` stability label; see
 `docs/release-status.json`. Freezing names is not the same as promising
 behavior under gates that have not passed.
+
+### Frozen exports this spec does not spell out
+
+The TypeScript API above is the core contract, not the full export list.
+These frozen exports are public too; their contract lives in their TSDoc and
+in the document named:
+
+- **Root, W3C-shaped client:** the `WebTransport` class with
+  `WebTransportClientOptions`, `WebTransportSendGroup`,
+  `WebTransportCloseInfo`, `WebTransportConnectionStats`,
+  `WebTransportDatagramDuplexStream`, `WebTransportBidirectionalStream`,
+  `WebTransportReceiveStream`, `WebTransportErrorOptions` and
+  `WebTransportErrorSource` (`docs/RFC_CLIENT_FACADE.md`,
+  `docs/PARITY_MATRIX.md`).
+- **Root, backend-agnostic client contract:** `nativeToWebTransportLike()`,
+  `WebTransportLike`, `WtBidiStream` and `WtCloseInfo`
+  (`packages/webtransport/src/types.ts`; `/wasm` exports the same types).
+- **Root, server TLS and mirror types:** `ServerTlsSnapshot`,
+  `ServerTlsSniEntry` and `UnknownSniPolicy` ("Server TLS / SNI semantics"),
+  and `DatagramMirrorResult`, `DatagramMirrorFailure`,
+  `DatagramMirrorAdmission`, `MirrorReport` ("One payload to many sessions").
+- **Root, experimental:** the `StreamSink*`, `SinkRecord*` and egress-pacer
+  types listed in "Experimental surfaces".
+- **`./sink-reader`:** `SinkReaderOptions` alongside `SinkReader`
+  (`docs/RFC_STREAM_SINK.md`).
+- **`./portable`:** `PortableCreateServerOptions`, `PortableLimits`,
+  `PortableTlsOptions`, `PortableStreamOpenOptions`, `PortableServerSession`
+  and `BackendKind` (`packages/webtransport/src/portable.ts`).
+- **`./wasm`:** the whole entrypoint (`packages/webtransport/src/wasm.ts`, the
+  README's wasm section, `docs/WASM_PROTOCOL_SCOPE.md`).
 
 ### Semver rules
 

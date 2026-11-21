@@ -53,14 +53,19 @@ Canonical release truth: `docs/release-status.json`. This document defines the s
   - datagramsDropped
   - queuedBytesGlobal
   - backpressureTimeoutCount
-- If queuedBytesGlobal approaches cap:
+- If queuedBytesGlobal climbs and stays high (it sums separately capped
+  receive and send counters; see the queued-bytes alert in docs/OPERATIONS.md):
   - decrease per-session limits
   - decrease stream highWaterMarks
-  - enable datagram drop policy (optional)
+  - shed stale datagrams in the application: there is no drop-policy option.
+    Incoming datagrams are already dropped when the receive budget is full
+    (`E_QUEUE_FULL`, counted in `datagramsDropped`); outgoing sends wait and
+    then fail with `E_BACKPRESSURE_TIMEOUT`, so stop sending what is no longer
+    useful rather than queueing it
   - scale horizontally
 
 ## Dependency policy
-- Pin wtransport + transitive QUIC/H3 dependencies (see Cargo.lock).
+- Pin wtransport (a vendored fork; see docs/FORK_MAINTENANCE.md) and the transitive QUIC/H3 dependencies (see Cargo.lock).
 - Monthly dependency update cadence; security patches applied promptly.
 - Respond to CVEs quickly; publish security advisories if needed.
 

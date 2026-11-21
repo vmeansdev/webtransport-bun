@@ -768,9 +768,11 @@ export type ServerOptions = {
 	 * (`sockArrayPinPath`), and — when `attachProgPinPath` is set — attach the
 	 * pinned `sk_reuseport` steering program to the group (exactly one instance
 	 * per group passes it; the program lives on the group afterwards and covers
-	 * later joiners). By convention `key` equals this instance's numeric QUIC-LB
-	 * server id, matching what the steering program's `slot_by_server_id` map
-	 * resolves. See examples/quic-lb for the program and the load recipe.
+	 * later joiners). `key` is this instance's slot index in the sockarray, not
+	 * its QUIC-LB server id: it must equal the slot that the steering program's
+	 * `slot_by_server_id` map assigns to this instance's `quicLb.serverId`
+	 * (examples/quic-lb/attach.sh.example maps server ids 7, 8 and 9 to slots
+	 * 0, 1 and 2). See examples/quic-lb for the program and the load recipe.
 	 *
 	 * Requires `reusePort: true` (there is no group to steer otherwise) and
 	 * `quicLb` (without QUIC-LB CIDs every packet takes the hash fallback while
@@ -787,7 +789,7 @@ export type ServerOptions = {
 	reusePortSteering?: {
 		/** Absolute bpffs path of the pinned `REUSEPORT_SOCKARRAY`. */
 		sockArrayPinPath: string;
-		/** This instance's slot in the sockarray (its QUIC-LB server id). */
+		/** This instance's slot index in the sockarray (the value `slot_by_server_id` maps its server id to). */
 		key: number;
 		/** Absolute bpffs path of the pinned `sk_reuseport` program to attach. */
 		attachProgPinPath?: string;
@@ -1435,7 +1437,7 @@ export function metricsToPrometheus(
 		`# HELP ${p}stream_tasks_active Internal stream tasks`,
 		`# TYPE ${p}stream_tasks_active gauge`,
 		`${p}stream_tasks_active${metricLabels} ${m.streamTasksActive}`,
-		`# HELP ${p}queued_bytes_global Bytes queued globally`,
+		`# HELP ${p}queued_bytes_global Queued receive bytes plus queued stream-send bytes`,
 		`# TYPE ${p}queued_bytes_global gauge`,
 		`${p}queued_bytes_global${metricLabels} ${m.queuedBytesGlobal}`,
 		`# HELP ${p}datagrams_in Datagrams received`,
@@ -1447,13 +1449,13 @@ export function metricsToPrometheus(
 		`# HELP ${p}datagrams_dropped Datagrams dropped`,
 		`# TYPE ${p}datagrams_dropped counter`,
 		`${p}datagrams_dropped${metricLabels} ${m.datagramsDropped}`,
-		`# HELP ${p}backpressure_wait_total Times senders waited on backpressure`,
+		`# HELP ${p}backpressure_wait_total Failed datagram send budget reservation attempts`,
 		`# TYPE ${p}backpressure_wait_total counter`,
 		`${p}backpressure_wait_total${metricLabels} ${m.backpressureWaitCount}`,
 		`# HELP ${p}backpressure_timeout_total Times backpressure timeout fired`,
 		`# TYPE ${p}backpressure_timeout_total counter`,
 		`${p}backpressure_timeout_total${metricLabels} ${m.backpressureTimeoutCount}`,
-		`# HELP ${p}rate_limited_total Sessions rejected by rate limit`,
+		`# HELP ${p}rate_limited_total Handshakes, stream opens and datagrams refused by a rate limit`,
 		`# TYPE ${p}rate_limited_total counter`,
 		`${p}rate_limited_total${metricLabels} ${m.rateLimitedCount}`,
 		`# HELP ${p}limit_exceeded_total Sessions rejected (limits)`,

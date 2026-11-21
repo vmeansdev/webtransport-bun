@@ -116,12 +116,26 @@ Configure Prometheus alerts. Severity: **page** for Sev-2, **ticket** for Sev-3.
 | WebTransportHandshakeP99High | `histogram_quantile(0.99, rate(webtransport_handshake_latency_seconds_bucket[5m])) > 0.3` | page | Handshake latency |
 | WebTransportDatagramEnqueueP99High | `histogram_quantile(0.99, rate(webtransport_datagram_enqueue_latency_seconds_bucket[5m])) > 0.01` | page | Datagram enqueue |
 | WebTransportStreamOpenP99High | `histogram_quantile(0.99, rate(webtransport_stream_open_latency_seconds_bucket[5m])) > 0.02` | page | Stream open latency |
-| WebTransportQueuedBytesHigh | `webtransport_queued_bytes_global > 0.8 * maxQueuedBytesGlobal` | ticket | Queued bytes climb |
+| WebTransportQueuedBytesHigh | `webtransport_queued_bytes_global > 0.4 * maxQueuedBytesGlobal` for 10m | ticket | Queued bytes climb |
 | WebTransportBackpressureTimeouts | `rate(webtransport_backpressure_timeout_total[5m]) > 1` | ticket | Backpressure timeouts |
 | WebTransportRateLimited | `rate(webtransport_rate_limited_total[5m]) > 10` | ticket | Rate limited |
 | WebTransportLimitExceeded | `rate(webtransport_limit_exceeded_total[5m]) > 5` | ticket | Limit exceeded |
 
-Replace `0.8 * maxQueuedBytesGlobal` with your configured value (e.g. `419430400` for 400 MiB of 512 MiB).
+Replace `0.4 * maxQueuedBytesGlobal` with your configured value (e.g.
+`214748365` for 40% of 512 MiB). `queued_bytes_global` is a sum of two
+separately capped counters, not one budget, so a percentage of the cap does not
+read as "how full":
+
+- the receive counter holds datagrams in both directions (up to the whole
+  `maxQueuedBytesGlobal`) and stream receives (up to half of it);
+- the send counter holds stream sends (up to half of it).
+
+A server whose stream receives have exhausted their budget therefore reads
+only 50%, and one with datagrams and stream sends both saturated reads up to
+150%. An 80% threshold never fires for a stream-only workload. Alert on a
+sustained 40% as the early warning, and treat
+`webtransport_backpressure_timeout_total` (below) as the signal that a budget
+actually ran out.
 
 ## Admission control: refusal is load-shaping, not rejection
 
@@ -166,9 +180,19 @@ When `histogram_quantile(0.99, rate(webtransport_handshake_latency_seconds_bucke
 ## Runbook: datagram enqueue p99 high
 
 When datagram enqueue p99 > 10ms:
-- **Cause**: QUIC send buffer full; backpressure from slow consumers; CPU contention.
-- **Check**: `queuedBytesGlobal`, `backpressureTimeoutCount`, `streamsActive`.
-- **Actions**: Reduce `maxQueuedBytesPerStream`; lower `backpressureTimeoutMs`; scale out.
+- **Cause**: `sendDatagram()` waits when the session's or the server's queued-bytes
+  budget is full, which happens when datagrams are produced faster than QUIC
+  can send them (congestion window, a slow path, CPU contention).
+- **Check**: `backpressureWaitCount` and `backpressureTimeoutCount` (rising
+  together with the p99 confirms budget waits), `datagramSendsAsync` (sends
+  that had to park), `queuedBytesGlobal`, and per-session
+  `session.metricsSnapshot().queuedBytes` to find the sessions holding bytes.
+- **Actions**: Pace the producer (await each `sendDatagram()` promise, or drop
+  stale datagrams at the application layer); lower `backpressureTimeoutMs` so
+  a stuck session fails fast with `E_BACKPRESSURE_TIMEOUT` instead of
+  queueing; scale out. Datagrams use `maxQueuedBytesPerSession` and
+  `maxQueuedBytesGlobal`, never `maxQueuedBytesPerStream`, and raising those
+  budgets lengthens the waits rather than shortening them.
 
 ## Runbook: stream open p99 high
 
@@ -180,7 +204,11 @@ When stream open p99 > 20ms:
 ## Runbook: queued bytes climb
 When `queuedBytesGlobal` rises and stays high:
 - **Cause**: Slow consumers (clients not reading), too many concurrent streams, or bursty senders.
-- **Check**: `streamsActive`, `datagramsIn` vs `datagramsOut` (backlog), `backpressureTimeoutCount`.
+- **Check**: `streamsActive`, `backpressureWaitCount` / `backpressureTimeoutCount`,
+  `datagramsDroppedQueueSession` / `datagramsDroppedQueueGlobal`, and per-session
+  `session.metricsSnapshot().queuedBytes` to find the sessions holding the bytes.
+  (`datagramsIn` and `datagramsOut` count opposite directions; their difference
+  is not a backlog.)
 - **Actions**:
   - Reduce `maxQueuedBytesPerStream` or `maxQueuedBytesPerSession` to shed slow readers sooner.
   - Lower `maxStreamsPerSessionBidi`/`Uni` to limit per-session concurrency.
@@ -302,19 +330,24 @@ Native backend only.
 receiveWindow + sendWindow + datagramChannelCapacity × maxDatagramSize
 ```
 
-where `datagramChannelCapacity = ceil(maxQueuedBytesPerSession / maxDatagramSize)`
-capped at 2048. `maxQueuedBytesGlobal` does **not** bound this — it is a
-different accounting, so a 512 MiB global governor gives no protection at all
-against the window ceiling.
+where `datagramChannelCapacity` is the server's per-session datagram channel:
+a fixed 2048 entries (the client's is a fixed 256). It is not derived from your
+limits. The addon computes `ceil(maxQueuedBytesPerSession / maxDatagramSize)`
+for a diagnostic, but nothing applies that value. The datagram term is in
+practice `min(2048 × maxDatagramSize, maxQueuedBytesPerSession)`, because every
+queued datagram is also charged to the per-session byte budget.
+`maxQueuedBytesGlobal` does **not** bound the windows — it is a different
+accounting, so a 512 MiB global governor gives no protection at all against
+the window ceiling.
 
-| config | per session | × 2000 sessions | sessions that fit 8 GB |
+| config | per session | × 2000 sessions | sessions that fit 8 GiB |
 |---|---|---|---|
-| defaults (256 KiB / 2 MiB) | 6.00 MiB | 12.6 GB | 1365 |
-| windows 8 MiB / 32 MiB, governors default | 66.0 MiB | 138 GB | 124 |
-| governor route to the same windows (`maxQueuedBytesPerSession` 64 MiB) | 130.3 MiB | 273 GB | 62 |
+| defaults (256 KiB / 2 MiB) | 6.00 MiB | 11.7 GiB | 1365 |
+| windows 8 MiB / 32 MiB, governors default | 66.0 MiB | 128.9 GiB | 124 |
+| governor route to the same windows (`maxQueuedBytesPerSession` 64 MiB) | 130.3 MiB | 254.6 GiB | 62 |
 
 Read that table as the reason `maxSessions` and the windows are one decision:
-even the shipped defaults over-commit an 8 GB box at `maxSessions` 2000 by 1.5×.
+even the shipped defaults over-commit an 8 GiB box at `maxSessions` 2000 by 1.5×.
 Nothing is allocated up front — a window is a ceiling a peer must actually
 drive you to, and a session that reads promptly never approaches it — but it is
 the only bound the transport gives you, so pick `maxSessions` against the
@@ -407,12 +440,19 @@ read group").
 
 ## Escape hatches
 
-Two supported variables put back a pre-1.0 delivery path. Both are read once
-per process (at addon load or module load), default to the shipped path, and
+Three supported variables change how datagrams reach JavaScript or leave it.
+All are read once per process (at addon load or module load), default to the
+shipped path, and
 exist so an operator can rule a regression in or out without a rebuild. They
 are supported: they keep their meaning across 1.x. Use them for diagnosis, not
 as a standing configuration.
 
+- **`WEBTRANSPORT_DATAGRAM_BATCH`** (JavaScript side, default `64`). How many
+  incoming datagrams one Node-API crossing hands JavaScript: `0` restores the
+  pre-1.0 one-call-per-datagram path, `1`–`256` sets the batch size, larger
+  values clamp to `256`, invalid values keep `64`. It also changes how much
+  tail a consumer sees when the peer closes cleanly. Full table and semantics:
+  `docs/SPEC.md`, "`WEBTRANSPORT_DATAGRAM_BATCH`".
 - **`WEBTRANSPORT_PAYLOAD_DELIVERY=buffer-copy`** (native addon). By default,
   payloads of 256 KiB or less reach JavaScript as engine-owned `ArrayBuffer`
   copies. Their bytes are reported to the engine, so its garbage collector
@@ -432,7 +472,19 @@ as a standing configuration.
 ## Diagnostics and warning switches
 
 Supported variables that change what the library prints or where it loads
-from, never what it enforces. Each is read once per process.
+from, never what it enforces. Each is read once per process, except
+`WEBTRANSPORT_VERBOSE_PANICS`, `WEBTRANSPORT_LOG_EXPECTED_CHANNEL_CLOSES` and
+`WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN`, which are read again each
+time the event they govern happens, so changing them in a running process
+takes effect.
+
+Independently of these switches, every native `error`-level log event also
+writes a bare `webtransport-native: [error]` line to stderr (no message: the
+redaction policy applies, and the full event goes to your `log` hook). A
+`webtransport-native: log event dropped (queue full or closed)` line means the
+bounded log channel to your hook was full. Neither can be turned off; set
+`WEBTRANSPORT_NATIVE_STDERR_WARNINGS=1` to get the full text on stderr
+instead.
 
 | Variable | Default | Effect |
 |---|---|---|
@@ -452,7 +504,9 @@ The variables below exist for measurement campaigns. They are **not** part
 of the supported surface: they may change meaning or disappear in any
 release, and the getters that report their values back are internal
 (`__TESTING__.serverInternals(server)`; see `docs/SPEC.md`, "Semver rules").
-Leave them unset in production. Each one is read once per process. An invalid
+Leave them unset in production. Each one is read once per process, except
+`WEBTRANSPORT_DISABLE_ALLOCATOR_RELIEF`, which is read at every drained server
+close. An invalid
 value logs one `webtransport-native: warning: ...` line on stderr and the knob
 falls back to its default. The process is never aborted.
 
@@ -743,20 +797,23 @@ Use when a release introduces critical regressions (crashes, data corruption, se
 ### Prerequisites
 
 - GitHub CLI (`gh`) installed (for local drill) or access to run the `rollback` workflow
-- Identify the known-good release tag (e.g. `v0.1.0`) from release history
+- Identify the known-good release tag (e.g. `v0.3.0`) from release history.
+  The target must also exist on npm (`bun pm view @webtransport-bun/webtransport versions`):
+  the `v1.0.0-rc.N` releases are GitHub pre-releases only, so pinning users to
+  one of them fails.
 
 ### Option A: CI workflow (recommended)
 
 1. Open **Actions → rollback** workflow.
 2. Click **Run workflow**.
-3. Enter the rollback target tag (e.g. `v0.1.0`).
+3. Enter the rollback target tag (e.g. `v0.3.0`).
 4. Run the workflow.
 5. On success: the job summary contains the exact pin command. Proceed to **Operator action** below.
 
 ### Option B: Local script
 
 ```bash
-./scripts/rollback-drill.sh v0.1.0
+./scripts/rollback-drill.sh v0.3.0
 ```
 
 Requires `gh` CLI authenticated. Verifies artifact checksums and prints the runbook.
@@ -772,19 +829,25 @@ pnpm add @webtransport-bun/webtransport@<VERSION>
 yarn add @webtransport-bun/webtransport@<VERSION>
 ```
 
-Example: for rollback target `v0.1.0`, users run:
+Example: for rollback target `v0.3.0`, users run:
 
 ```bash
-bun add @webtransport-bun/webtransport@0.1.0
-npm i @webtransport-bun/webtransport@0.1.0
-pnpm add @webtransport-bun/webtransport@0.1.0
-yarn add @webtransport-bun/webtransport@0.1.0
+bun add @webtransport-bun/webtransport@0.3.0
+npm i @webtransport-bun/webtransport@0.3.0
+pnpm add @webtransport-bun/webtransport@0.3.0
+yarn add @webtransport-bun/webtransport@0.3.0
 ```
 
 ### Expected validation signals
 
 - **Checksum verification passes**: `shasum -a 256 -c SHA256SUMS` exits 0
-- **Assets present**: `webtransport-native.*.node` for linux-x64, darwin-arm64, darwin-x64, win32-x64-msvc
+- **Assets present**: `SHA256SUMS`, the package tarball
+  `webtransport-bun-webtransport-<VERSION>.tgz`,
+  `webtransport-native.{darwin-arm64,darwin-x64,linux-x64-gnu,win32-x64-msvc}.node`,
+  and `interop-evidence.json` / `parity-evidence.json`. That full set exists
+  from `v0.3.0` on. Older releases carry less: none before `v0.3.0` has the
+  Windows addon, `v0.2.0` has no tarball, and `v0.1.0` has only
+  `SHA256SUMS` and the darwin and linux addons.
 - **SHA256SUMS exists**: Required; releases before the combined checksum change may not have it (run a new release first if needed)
 
 ### Follow-up
