@@ -1672,6 +1672,8 @@ interface NativeSessionHandle {
 	metricsSnapshot(): SessionMetricsSnapshot;
 	connectionStats?(): QuicConnectionStats | null;
 	pathMaxDatagramSize?: () => number | null;
+	/** min(configured limits.maxDatagramSize, path maximum). Client handles only. */
+	maxDatagramSize?: () => number;
 	/** 0-RTT getters (absent on older prebuilt addons). */
 	has0Rtt?: boolean;
 	accepted0Rtt?: boolean;
@@ -3305,11 +3307,15 @@ class NativeClientSession implements ClientSession {
 			: null;
 	}
 
-	/** Current path MTU-derived max datagram payload size, or null when unknown. */
-	/** @internal */
-	_pathMaxDatagramSize(): number | null {
-		return typeof this.#nativeHandle.pathMaxDatagramSize === "function"
-			? (this.#nativeHandle.pathMaxDatagramSize() ?? null)
+	/**
+	 * Largest datagram this session sends: the configured
+	 * `limits.maxDatagramSize`, lowered to the path maximum once known.
+	 * Null when the addon predates the getter.
+	 * @internal
+	 */
+	_maxDatagramSize(): number | null {
+		return typeof this.#nativeHandle.maxDatagramSize === "function"
+			? this.#nativeHandle.maxDatagramSize()
 			: null;
 	}
 }
@@ -4088,11 +4094,14 @@ export class WebTransport {
 	};
 	readonly #congestionControl: "default" | "throughput" | "low-latency";
 	#strictW3CErrors = false;
+	readonly #configuredMaxDatagramSize: number;
 
 	constructor(
 		urlOrSession: string | ClientSession,
 		options?: WebTransportClientOptions,
 	) {
+		this.#configuredMaxDatagramSize =
+			options?.limits?.maxDatagramSize ?? DEFAULT_LIMITS.maxDatagramSize;
 		if (typeof urlOrSession === "string") {
 			this.#datagramsReadableType = options?.datagramsReadableType ?? "default";
 			const requestedCongestion = options?.congestionControl ?? "default";
@@ -4391,13 +4400,17 @@ export class WebTransport {
 		return this.#sessionPromise;
 	}
 
-	/** Internal: MTU-derived datagram size from the live session, if connected */
-	/** @internal */
-	_getPathMaxDatagramSize(): number | null {
+	/**
+	 * W3C `datagrams.maxDatagramSize`: the live session's cap (configured
+	 * limit, lowered to the path maximum) once connected, the configured limit
+	 * before that.
+	 * @internal
+	 */
+	_getMaxDatagramSize(): number {
 		const s = this.#session as unknown as {
-			_pathMaxDatagramSize?: () => number | null;
+			_maxDatagramSize?: () => number | null;
 		} | null;
-		return s?._pathMaxDatagramSize?.() ?? null;
+		return s?._maxDatagramSize?.() ?? this.#configuredMaxDatagramSize;
 	}
 
 	/** Internal: state for createWritable guard (not part of spec) */
@@ -4465,6 +4478,9 @@ export class WebTransport {
 	): Promise<void> {
 		await this.#sendScheduler.enqueue(policy, async () => {
 			const s = await this.#sessionPromise;
+			// W3C: a datagram larger than maxDatagramSize is discarded and the
+			// write resolves, so the writable stays usable for later writes.
+			if (chunk.byteLength > this._getMaxDatagramSize()) return;
 			await s.sendDatagram(chunk);
 			this.#connStats.bytesSent += chunk.byteLength;
 			this.#connStats.datagramsOut += 1;
@@ -4565,9 +4581,7 @@ function createDatagramStreams(
 			return createDatagramWritable(wt, wt._resolveSendPolicy(options));
 		},
 		get maxDatagramSize(): number {
-			// Path-MTU-derived value from QUIC when connected; configured
-			// default until the handshake completes.
-			return wt._getPathMaxDatagramSize() ?? DEFAULT_LIMITS.maxDatagramSize;
+			return wt._getMaxDatagramSize();
 		},
 	};
 }

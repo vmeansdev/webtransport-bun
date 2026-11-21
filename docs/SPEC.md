@@ -31,7 +31,7 @@ Source of truth: `docs/PARITY_MATRIX.md` (W3C snapshot: `docs/w3c/w3c.github.io-
 
 - Implemented in facade:
   - lifecycle (`ready`, `closed`, `draining`)
-  - datagram duplex shape (`readable`, `writable`, `createWritable`, `maxDatagramSize`)
+  - datagram duplex shape (`readable`, `writable`, `createWritable`, `maxDatagramSize`). `maxDatagramSize` is the configured `limits.maxDatagramSize` (default 1200), lowered to the QUIC path maximum once known. A write larger than it resolves and the datagram is discarded, as the W3C write algorithm specifies, so the writable stays usable; the session-level `sendDatagram()` keeps rejecting oversize payloads
   - datagram send options (`sendOrder`, `sendGroup`) with ownership validation + deterministic scheduling
   - stream creation/incoming stream surfaces
   - stream send options (`sendOrder`, `sendGroup`) with deterministic scheduling

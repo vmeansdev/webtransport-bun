@@ -361,6 +361,14 @@ unstable `__TESTING__.serverInternals(server)` accessor (`docs/SPEC.md`,
 
 ### Fixed
 
+- The W3C facade's `datagrams.maxDatagramSize` reports the configured
+  `limits.maxDatagramSize` (lowered to the QUIC path maximum) instead of the
+  raw path maximum, which read 1413 on loopback against a 1200 default and
+  ignored a configured cap. A write larger than it is now discarded and the
+  write resolves, as the W3C write algorithm specifies; it used to reject and
+  leave `datagrams.writable` errored for every later write (native), or
+  reject with `E_LIMIT_EXCEEDED` (wasm). Session-level `sendDatagram()` still
+  rejects oversize payloads.
 - `/portable` `createServer({ wasmOptions })` is honored. The option was typed
   and documented as forwarded to the wasm W3C facade but never read, so
   `strictW3CErrors` and the other facade options silently did nothing. Each

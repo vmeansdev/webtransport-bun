@@ -1005,6 +1005,13 @@ pub(crate) fn insecure_loopback_client_config(
     )
 }
 
+/// `min(configured, path)`; the configured cap alone while the path maximum is
+/// unknown (or datagrams are unsupported by the peer).
+fn effective_max_datagram_size(configured: usize, path: Option<usize>) -> u32 {
+    let effective = path.map_or(configured, |p| p.min(configured));
+    u32::try_from(effective).unwrap_or(u32::MAX)
+}
+
 #[napi]
 #[derive(Clone)]
 pub struct ClientSessionHandle {
@@ -1087,6 +1094,15 @@ impl ClientSessionHandle {
             return Ok(None);
         }
         Ok(self.conn.as_ref().map(crate::metrics::quic_stats_from_conn))
+    }
+
+    /// The largest datagram payload this session will send: the configured
+    /// `limits.maxDatagramSize`, lowered to the path's current maximum once
+    /// QUIC knows it. What the W3C facade reports as `maxDatagramSize`.
+    #[napi]
+    pub fn max_datagram_size(&self) -> u32 {
+        let path = self.conn.as_ref().and_then(|c| c.max_datagram_size());
+        effective_max_datagram_size(self.max_datagram_size, path)
     }
 
     /// Current max datagram payload size for the path (MTU-derived), if known.
@@ -2675,6 +2691,15 @@ mod tests {
             })
             .into(),
         )
+    }
+
+    #[test]
+    fn effective_max_datagram_size_is_the_smaller_of_config_and_path() {
+        use super::effective_max_datagram_size;
+        assert_eq!(effective_max_datagram_size(1200, None), 1200);
+        assert_eq!(effective_max_datagram_size(1200, Some(1413)), 1200);
+        assert_eq!(effective_max_datagram_size(1200, Some(900)), 900);
+        assert_eq!(effective_max_datagram_size(usize::MAX, None), u32::MAX);
     }
 
     #[test]

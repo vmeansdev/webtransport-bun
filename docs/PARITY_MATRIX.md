@@ -41,7 +41,7 @@ surface:
 - Required members: `ready`, `closed`, `draining`, `datagrams`,
   `incomingBidirectionalStreams`, `incomingUnidirectionalStreams`,
   `createBidirectionalStream`, `createUnidirectionalStream`, `close`
-- Datagrams: `readable`, `writable`, `createWritable()`, `maxDatagramSize`
+- Datagrams: `readable`, `writable`, `createWritable()`, `maxDatagramSize` (the configured `limits.maxDatagramSize`, lowered to the path maximum, on both backends; an oversize write is discarded and resolves, per the W3C write algorithm, on both backends)
   (`WebTransportDatagramDuplexStream`)
 - `getStats()`: returns `WebTransportConnectionStats` backed by real quinn
   transport stats
