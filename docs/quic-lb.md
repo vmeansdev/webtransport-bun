@@ -4,8 +4,8 @@ How the two deployment hooks compose into something a balancer can steer.
 
 This is the operator's note. The option reference lives in
 [`OPERATIONS.md`](OPERATIONS.md) — "Multi-process binds (`reusePort`)" and
-"QUIC-LB connection IDs (`quicLb`)" — the capacity and sizing argument was recorded in the bare-metal capacity
-chapter (a measurement-campaign record kept outside this repository), and the reference eBPF program lives in
+"QUIC-LB connection IDs (`quicLb`)" — the measured sizing figures are in [`CAPACITY.md`](CAPACITY.md),
+the step-by-step sharded setup is in [`scenarios/deployment.md`](scenarios/deployment.md), and the reference eBPF program lives in
 [`examples/quic-lb/`](https://github.com/vmeansdev/webtransport-bun/blob/main/examples/quic-lb/README.md).
 
 Everything here is pinned to **draft-ietf-quic-load-balancers-21**, the same
@@ -56,8 +56,9 @@ Three pieces, and each is inert without the others:
 3. **An `SK_REUSEPORT` eBPF program** attached to the group reads the server-ID
    bytes and selects the matching socket, instead of hashing.
    [`examples/quic-lb/steer_by_cid.bpf.c`](https://github.com/vmeansdev/webtransport-bun/blob/main/examples/quic-lb/steer_by_cid.bpf.c)
-   is a reference for writing one — it compiles, but it has never been loaded,
-   attached, or tested, and it is not shipped.
+   is a reference program, not a shipped component. It is the one the G6
+   sharded campaign loaded and ran (see "Not verified here" for exactly what
+   that covers).
 
 The result is rebind-safe **after the first flight**: once the client adopts a
 server-issued connection ID, its packets carry the server ID wherever the client
@@ -94,10 +95,12 @@ moves, and the kernel delivers them to the same process.
   loadall … pinmaps …`); the per-process fd work is the addon's. This path is
   load-proven: a 16-instance group under a registered gate sustained
   20,000 sessions with per-rung steering deltas at 2.4× the audited floor
-  (gate `g6-sharded/1`, 2026-08-25).
-- **Sizing first.** Instances-per-box comes from the capacity document, whose
-  sizing chapter is an upper bound of unknown tightness — read it before
-  choosing N.
+  (gate `g6-sharded/1`, 2026-08-25), and a 24-instance group carried the
+  40,000-session G6 realm ([CAPACITY.md](CAPACITY.md)).
+- **Sizing first.** Instances-per-box comes from [CAPACITY.md](CAPACITY.md),
+  whose per-instance figures are upper bounds of unknown tightness. Read it
+  before choosing N; [`scenarios/deployment.md`](scenarios/deployment.md)
+  walks through the whole sharded setup.
 
 ## Across machines: `quicLb` + a QUIC-LB-aware L4 balancer
 
@@ -211,10 +214,10 @@ or a backend's counters, not what the application experiences.
 - No NAT-rebind measurement exists in this project; the rebind argument is a
   reading of RFC 9000 and of quinn-proto's source.
 - Reuseport rehash-on-restart has not been measured on any target kernel.
-- The eBPF example compiled clean with `clang -target bpf` against Linux
-  7.0.0-30-generic headers (2026-08-21, the campaign box) — both the original
-  revision and the current post-review text (re-compiled the same day at tip
-  `f7c9058`, zero diagnostics). It has never been loaded, attached,
-  verifier-checked, or run with traffic.
-- No gate has run with `quicLb` enabled, so its byte overhead is arithmetic, not
-  a measurement.
+- The eBPF example compiled clean against Linux 7.0.0-30-generic headers
+  (2026-08-21) and was loaded, verifier-accepted and run with traffic on the
+  G6 campaign's DigitalOcean Linux droplets (2026-08-25 onwards; 4 to 24
+  instances, `quicLb` with a 2-byte server ID and an 8-byte nonce). No other
+  kernel has been tried.
+- `quicLb`'s per-packet byte overhead has not been isolated in a measurement;
+  the figure above is arithmetic. The G6 sharded cells ran with it on.

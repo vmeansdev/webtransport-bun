@@ -5,25 +5,28 @@ built by the repository, tested, loaded, or published. It is not part of the
 npm package and no CI job touches it. It exists so an operator building
 CID-aware steering has a correct starting point instead of a blank file.
 
-Exactly one claim is backed by a run: on 2026-08-21, on the campaign's
-bare-metal box (Linux 7.0.0-30-generic, libbpf-dev installed),
-`clang -target bpf -O2 -g -c steer_by_cid.bpf.c` compiled clean — zero
-diagnostics, a 15,984-byte object. That establishes that it parses and
-type-checks against that kernel's headers, and nothing else.
+What has been run:
 
-**Update, same day: the post-review source compiles too.** The current text
-(tip `f7c9058`, after the review fixes: the short-header fixed-bit test
-removed, Initial/0-RTT routed by DCID, `steer_stats` moved to a per-CPU array)
-was recompiled on the same box with the same command — clean, zero
-diagnostics.
+- **Compiled** clean with `clang -target bpf -O2 -g -c steer_by_cid.bpf.c` on
+  the campaign's bare-metal box (Linux 7.0.0-30-generic), 2026-08-21, at the
+  post-review revision (short-header fixed-bit test removed, Initial/0-RTT
+  routed by DCID, `steer_stats` per-CPU).
+- **Loaded, verifier-accepted and carrying traffic** on the G6 sharded
+  campaign's DigitalOcean Linux droplets from 2026-08-25: built and pinned with
+  the steps in [`attach.sh.example`](attach.sh.example), attached and populated
+  by the servers' `reusePortSteering` option, 4 to 24 instances on one port.
+  `steer_stats` showed short-header packets steered by server ID, and the
+  sharded realm passed at 40,000 sessions on 24 instances
+  ([CAPACITY.md](../../docs/CAPACITY.md)). Two build fixes came out of that
+  and are in the loader: the multiarch include path and unquoted byte tokens
+  for `bpftool`. Build with `-DMAX_INSTANCES=N` when N exceeds the default 8.
 
-**The program has never been submitted to a verifier, never attached to a
-socket, and never carried a packet.** Verifier acceptance and runtime behavior
-are yours to establish on the kernel you target. The loader below has never
-been run at all.
+Not run: any kernel other than those, restart/re-registration under load, and
+a client address change (NAT rebind). Verify the program on the kernel you
+deploy.
 
-- [`steer_by_cid.bpf.c`](steer_by_cid.bpf.c) — the BPF program; compiles, never loaded.
-- [`attach.sh.example`](attach.sh.example) — a loader sketch, never executed.
+- [`steer_by_cid.bpf.c`](steer_by_cid.bpf.c) — the BPF program.
+- [`attach.sh.example`](attach.sh.example) — build, load, populate, observe.
 
 For how this composes with the server options, read
 [`docs/quic-lb.md`](../../docs/quic-lb.md).
@@ -160,7 +163,7 @@ box-wide session event. A CID steer confines the damage to the restarting
 instance's own flows, and only until its slot is repopulated. That is the whole
 argument for doing this, and it holds only if the re-registration is reliable.
 
-None of this has been measured on any kernel by this project.
+Restart and re-registration under load have not been measured by this project.
 
 ## Requirements
 
@@ -182,12 +185,15 @@ build it on (or against the headers of) the kernel that will load it. Porting
 it to CO-RE — `vmlinux.h`, `bpf_core_read.h`, and field reads through
 `BPF_CORE_READ` — is a reasonable upgrade path and has not been done here.
 
-## The gap between this and a working deployment
+## Attaching: the `reusePortSteering` option
 
 Attaching the program (`SO_ATTACH_REUSEPORT_EBPF`) and inserting each socket
-into the sockarray both need the socket's file descriptor, so both must happen
-inside a process that owns the socket. `reusePort: true` builds and owns that
-socket inside the native addon and does not expose its fd to JS. Closing that
-gap needs either a supervisor that creates the sockets and passes them in, or an
-addon that performs the attach itself. Neither exists in this repository, and
-neither is planned here.
+into the sockarray both need the socket's file descriptor, so both happen
+inside the process that owns the socket. The server option
+`reusePortSteering: { sockArrayPinPath, key, attachProgPinPath? }` does this
+at startup: every instance inserts its own socket at slot `key`, and the
+instance that passes `attachProgPinPath` attaches the pinned program to the
+group. It fails `createServer` on a missing pin or missing `CAP_BPF` rather
+than falling back to the kernel hash. See [`docs/quic-lb.md`](../../docs/quic-lb.md)
+and the sharded deployment walkthrough in
+[`docs/scenarios/deployment.md`](../../docs/scenarios/deployment.md).
