@@ -172,6 +172,7 @@ export {
 } from "./errors.js";
 export type { ErrorCode, ExperimentalSinkErrorCode } from "./types.js";
 
+import { normalizeBindHost } from "./bind-host.js";
 import {
 	DATAGRAM_BATCH_MAX,
 	type NativeDatagramBatchResult,
@@ -637,7 +638,14 @@ export type EgressPacerOptions = {
 
 /** Options for {@link createServer}. Limits/rateLimits merge with defaults. */
 export type ServerOptions = {
-	host?: string /** @default "0.0.0.0" */;
+	/**
+	 * IP address to bind: an IPv4 or IPv6 literal (IPv6 brackets optional).
+	 * `"::"` binds every interface for both IPv4 and IPv6, so a client dialing
+	 * `localhost` reaches it whichever family the name resolves to first.
+	 * Hostnames, `"localhost"` included, throw `E_INVALID_ARGUMENT`.
+	 * @default "0.0.0.0"
+	 */
+	host?: string;
 	port: number;
 	tls: TlsOptions;
 	limits?: Partial<LimitsOptions>;
@@ -2576,6 +2584,14 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 
 	validateQpackOptions(opts);
 
+	const bindHost = normalizeBindHost(opts.host ?? "0.0.0.0");
+	if ("error" in bindHost) {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			`E_INVALID_ARGUMENT: ${bindHost.error}`,
+		);
+	}
+
 	if (opts.reusePort !== undefined && typeof opts.reusePort !== "boolean") {
 		throw createMappedError(
 			E_INVALID_ARGUMENT as ErrorCode,
@@ -2826,7 +2842,7 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 
 	const handle = new native.ServerHandle(
 		opts.port,
-		opts.host ?? "0.0.0.0",
+		bindHost.host,
 		opts.debug === true,
 		tlsConfigToJson(opts.tls),
 		limitsJson,
@@ -2845,7 +2861,7 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 	}
 
 	const server: WebTransportServer = {
-		address: { host: opts.host ?? "0.0.0.0", port: handle.port },
+		address: { host: bindHost.host, port: handle.port },
 		congestionControl: opts.congestionControl ?? "default",
 		updateCert: async (tls) => {
 			const nextCertPem = decodePem(tls.certPem);
