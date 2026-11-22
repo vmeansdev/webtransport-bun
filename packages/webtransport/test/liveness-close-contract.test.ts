@@ -23,6 +23,15 @@ import {
 import type { CloseInfo } from "../src/types.js";
 import { generateCertForNames } from "./helpers/certs.js";
 
+function within<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+	return Promise.race([
+		p,
+		Bun.sleep(ms).then(() => {
+			throw new Error(`timeout: ${what}`);
+		}),
+	]);
+}
+
 const ROOT = fileURLToPath(new URL("../../..", import.meta.url));
 const PUBLIC_MODULE = fileURLToPath(
 	new URL("../src/index.ts", import.meta.url),
@@ -176,11 +185,15 @@ describe("server close terminal contract", () => {
 		const cert = generateCertForNames(["localhost", "127.0.0.1"]);
 		expect(cert).not.toBeNull();
 		if (!cert) return;
+		let accepted!: () => void;
+		const serverHasSession = new Promise<void>((resolve) => {
+			accepted = resolve;
+		});
 		const server = createServer({
 			port: 0,
 			host: "127.0.0.1",
 			tls: { certPem: cert.certPem, keyPem: cert.keyPem },
-			onSession: () => {},
+			onSession: () => accepted(),
 		});
 		try {
 			const session = await connect(
@@ -188,6 +201,10 @@ describe("server close terminal contract", () => {
 				{ tls: { insecureSkipVerify: true } },
 			);
 			const closed = session.closed;
+			// The client's connect can settle before the server registers the
+			// session; closing in that gap reaps nothing, though the client
+			// still reads 3993.
+			await within(serverHasSession, 5000, "server session");
 			await server.close();
 			const info = await closed;
 			expect(info.code).toBe(SERVER_CLOSING_CLOSE_CODE);

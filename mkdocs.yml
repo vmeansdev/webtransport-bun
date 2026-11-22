@@ -26,6 +26,16 @@ nav:
   - API Spec: SPEC.md
   - Architecture: ARCHITECTURE.md
   - Operations: OPERATIONS.md
+  - Capacity: CAPACITY.md
+  - Scenario guides:
+      - Overview: scenarios/README.md
+      - Realtime games and telemetry: scenarios/realtime-games.md
+      - Live media and rooms: scenarios/live-media-rooms.md
+      - Bulk transfer and streaming: scenarios/bulk-and-streaming.md
+      - Broadcast: scenarios/broadcast.md
+      - Connection churn: scenarios/connection-churn.md
+      - RPC and tunnels: scenarios/rpc-and-tunnels.md
+      - Deployment and scale-out: scenarios/deployment.md
   - Routing by connection ID: quic-lb.md
   - Native stream sink (RFC): RFC_STREAM_SINK.md
   - Metrics: METRICS.md
