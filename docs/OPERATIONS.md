@@ -125,8 +125,12 @@ Replace `0.8 * maxQueuedBytesGlobal` with your configured value (e.g. `419430400
 
 ## Admission control: refusal is load-shaping, not rejection
 
-At `maxSessions` or `maxHandshakesInFlight`, the server answers a new dial
-with QUIC `CONNECTION_REFUSED` and increments `limitExceededCount`. This is a
+At `maxHandshakesInFlight`, the server answers a new dial with QUIC
+`CONNECTION_REFUSED`; the client's `connect()` rejects with
+`E_LIMIT_EXCEEDED` (in 1.0.0-rc.5 and earlier, a code-less `E_INTERNAL`).
+At `maxSessions`, the server completes the handshake and then closes the
+session with code 3992 / reason `E_LIMIT_EXCEEDED`; `connect()` rejects with
+`E_LIMIT_EXCEEDED`. Both increment `limitExceededCount`. Both are a
 **transient admission signal from a healthy server** — "not right now", never
 "go away". The handshake cap in particular bounds *instantaneous concurrency*
 (how many handshakes are simultaneously incomplete), not arrival rate: a
@@ -134,6 +138,15 @@ server clearing a handshake in ~10 ms sustains hundreds of establishments per
 second under a cap of 200, while a single synchronized wave deeper than the
 cap sees its overflow refused in the first instant, however idle the server
 was a moment earlier.
+
+A third limit looks like a rate but caps concurrency:
+`rateLimits.handshakesBurst` (default 40) is also the most sessions one client
+IP may hold open at once, and `handshakesBurstPerPrefix` (default 100) the
+most per /24 (IPv4) or /64 (IPv6). The slot is held until the session closes.
+Over either, the dial is answered with HTTP 429 and `connect()` rejects with
+`E_RATE_LIMITED`, counted in `rateLimitedCount`. Size both for the most users
+you expect behind one address (carrier-grade NAT, offices, campuses), not for
+one user.
 
 **Clients must treat refusal as retryable**: retry with **jittered** backoff
 (e.g. 100–300 ms base, ±50% jitter, a handful of attempts), and treat only
@@ -154,7 +167,7 @@ what the host's handshake memory actually tolerates.
 - `idleTimeoutMs` (default 60s): connection closed if no activity for this duration.
 - Activity: any data sent or received (handshake, datagrams, stream data). QUIC keepalives may extend the window.
 - When idle timeout fires: session closes with appropriate code; `closed` promise resolves.
-- Slow-reader detection: streams where the peer does not drain within backpressureTimeoutMs are reset (backpressureTimeoutCount incremented).
+- Slow-reader detection: a stream whose queued bytes are not drained within `backpressureTimeoutMs` fails with `E_BACKPRESSURE_TIMEOUT` and is reset. `backpressureTimeoutCount` counts datagram sends only; no public metric counts these stream timeouts, so count them in your error handlers.
 
 ## Runbook: handshake p99 high
 
@@ -500,11 +513,11 @@ utilization — it degrades *nonlinearly* as the loop approaches saturation. The
 mechanism was measured end-to-end (2026-08-25, T-100 shape: 100 bidi streams,
 3 Mbps each direction, ~26.4k frames/s aggregate): with loop headroom the
 app-level p99 is **2.5 ms**; starving the same workload's CPU produced 5.2 ms
-at ~82 % and 11.5 ms at ~95 % utilization; and a host that held the loop at
-93–95 % of a slower core with unthrottled senders measured **348 ms** — a
-~140× tail inflation with near-identical throughput. Wire-level delivery was
-17 ms p99 throughout: the frames arrive; a saturated loop just doesn't run
-your callback.
+at ~82 % and 11.5 ms at ~95 % utilization; and the graded run on a slower
+4-core host, where the benchmark conductor ran inside the server process and
+the host sat at ~87.7 %, measured **348 ms** — a ~140× tail inflation with
+near-identical throughput. Wire-level delivery was 17 ms p99 throughout: the
+frames arrive; a saturated loop just doesn't run your callback.
 
 The rules that follow from the measurements, in order of leverage:
 
@@ -586,9 +599,9 @@ turning it on:
   to a *different* process, which does not recognize it. The connection does not
   close: it **stalls until the idle timeout expires (60 s by default,
   `crates/native/src/limits.rs:47`)**, so what the application sees is a hang
-  followed by a timeout, not a clean drop. The mechanism was verified in §3 of
-  the bare-metal capacity chapter (a campaign record kept outside this
-  repository).
+  followed by a timeout, not a clean drop. The mechanism was traced in
+  quinn-proto's source; [`scenarios/deployment.md`](scenarios/deployment.md)
+  ("What not to do") summarizes it.
   The same argument applies to plain ECMP.
 - **Group membership changes re-hash the whole group.** Adding or removing a
   socket changes the hash distribution for every flow, not just new ones.
@@ -610,12 +623,10 @@ documented reuseport behavior. Distribution across the group is the kernel's,
 not this library's: Linux hashes across members, BSD/macOS delivers to the last
 binder.
 
-The full argument and the measured sizing figures were recorded in the
-bare-metal capacity chapter — sections 3 ("Unsupported: 4-tuple-hash balancers
-in front of long-lived sessions") and 4 ("Four disclosures you must read before
-deploying any steered pattern"). That chapter is a measurement-campaign record
-and is kept outside this repository; the supported deployment pattern is
-summarized here and in [`quic-lb.md`](quic-lb.md).
+The deployment patterns, including the one-port sharded setup with eBPF
+steering, are walked through in [`scenarios/deployment.md`](scenarios/deployment.md);
+the measured sizing figures are in [`CAPACITY.md`](CAPACITY.md) and the wire
+format in [`quic-lb.md`](quic-lb.md).
 
 ## QUIC-LB connection IDs (`quicLb`)
 
@@ -693,12 +704,13 @@ directions, for the life of the connection.
 
 Put against this rig's measured egress, that is small but not free. G7's stream
 cell moved **1.2498 Gbps** with byte-exact ledgers (the run's 79.1% host-CPU
-maximum was measured on a *different* cell, B-1k — recorded in the bare-metal
-capacity chapter, §"Host-level envelopes", kept outside this repository); at the ~1,400-byte datagrams that path carries, three extra header
-octets is roughly **0.2%** of the wire bytes, and G3's egress cell ran with GSO
+maximum was measured on a *different* cell, B-1k; see
+[`CAPACITY.md`](CAPACITY.md)); at the ~1,400-byte datagrams that path carries,
+three extra header octets is roughly **0.2%** of the wire bytes, and G3's egress cell ran with GSO
 and GRO active at 64 segments, so the added bytes ride the same syscalls rather
-than costing new ones. It has **not been measured** — no gate has run with
-`quicLb` on. Size a minimal `nonceLen` (4) and a minimal `serverId` if your
+than costing new ones. The overhead has **not been isolated in a
+measurement**; the G6 sharded cells ran with `quicLb` on, but nothing compared
+them with it off. Size a minimal `nonceLen` (4) and a minimal `serverId` if your
 fleet is small and the bytes matter; note that a short nonce shrinks the
 unlinkability budget §5.4 asks you to keep.
 

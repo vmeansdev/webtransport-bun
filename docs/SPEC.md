@@ -99,8 +99,12 @@ export type TlsOptions = {
 };
 
 export type RateLimitOptions = {
+  // handshakesBurst is two limits: the per-IP handshake token bucket's size,
+  // and the most sessions one IP may hold open at once (default 40). The slot
+  // is held for the session's lifetime, so N users behind one NAT need N.
   handshakesPerSec: number; handshakesBurst: number;
-  handshakesBurstPerPrefix?: number; // per /24 IPv4 or /64 IPv6; default 100
+  // Most sessions open at once per /24 IPv4 or /64 IPv6 prefix; default 100.
+  handshakesBurstPerPrefix?: number;
   // streams/datagrams limits are keyed PER PEER IP, not per session: N
   // sessions from one address (NAT/CGNAT, proxies, load tests from one
   // host) share a single budget. Size the limits for the address, not the
@@ -110,9 +114,11 @@ export type RateLimitOptions = {
 };
 
 export type LimitsOptions = {
-  /** Max concurrent sessions. At limit, the next dial is answered with QUIC
-   * CONNECTION_REFUSED — a transient admission signal; clients retry with
-   * jittered backoff (see OPERATIONS.md "Admission control"). */
+  /** Max concurrent sessions. At limit, the server completes the next
+   * handshake and closes the session with code 3992 / reason
+   * E_LIMIT_EXCEEDED; the client's connect() rejects with E_LIMIT_EXCEEDED.
+   * Transient: clients retry with jittered backoff (see OPERATIONS.md
+   * "Admission control"). */
   maxSessions: number;
   /** Max handshakes in progress (inclusive: limit is allowed). Bounds
    * instantaneous concurrency, not arrival rate: sustained dial rates far

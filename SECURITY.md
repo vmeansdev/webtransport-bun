@@ -46,7 +46,7 @@ Canonical release truth: `docs/release-status.json`. This document defines the s
 - maxQueuedBytes global/per-session/per-stream
 - maxDatagramSize cap
 3. Rate limits per peer IP and per prefix
-- RateLimitOptions: per-IP handshakesBurst, per-prefix handshakesBurstPerPrefix (/24 IPv4, /64 IPv6)
+- RateLimitOptions: per-IP handshakesBurst, per-prefix handshakesBurstPerPrefix (/24 IPv4, /64 IPv6). Both also cap the sessions open at once from that IP or prefix (defaults 40 and 100)
 4. Connection churn protection
 - maxHandshakesInFlight caps concurrent TLS handshakes (default 200)
 - Per-IP and per-prefix limits prevent single-source exhaustion
