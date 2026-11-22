@@ -129,8 +129,9 @@ Detailed migration playbook:
 
 ### Runtime
 - Bun `>= 1.3.14`
-- Node (Node-API compatible runtime)
-- Deno (npm + Node-API addon support)
+- Node `>= 18` (`engines.node`); CI runs the package-consumer smoke on Node
+  18.20.4, 20.19.0 and 22.23.1
+- Deno (npm + Node-API addon support); CI runs the same smoke on Deno 2.9.3
 
 ### OS / Arch
 - macOS arm64 (`darwin-arm64`), macOS x64 (`darwin-x64`)
@@ -470,9 +471,18 @@ The stream helpers are symbol-based to avoid collisions with Node stream APIs:
 - `WT_STOP_SENDING`
 
 ```ts
-import { WT_RESET } from "@webtransport-bun/webtransport";
+import type { Duplex } from "node:stream";
+import {
+  WT_RESET,
+  type Resettable,
+  type StopSendable,
+} from "@webtransport-bun/webtransport";
 
-const bidi = await session.createBidirectionalStream();
+// The session API types streams as plain Node Duplexes; the symbol methods
+// are on the runtime object, so cast to reach them.
+const bidi = (await session.createBidirectionalStream()) as Duplex &
+  Resettable &
+  StopSendable;
 bidi[WT_RESET](42);
 ```
 

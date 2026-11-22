@@ -92,9 +92,11 @@ Use `replaceSniCerts()` when you want to swap the full hostname map while preser
 
 ## Requirements
 
-- Bun >= 1.3.14, or Node, or Deno
+- Bun >= 1.3.14, Node >= 18 (CI tests 18.20.4, 20.19.0 and 22.23.1), or Deno
+  (CI tests 2.9.3)
 - TLS certificate and key (PEM format)
-- UDP port open (default 4433)
+- The UDP port you pass as `port` open in your firewall (there is no default;
+  the examples use 4433)
 
 ## Client
 
@@ -117,6 +119,10 @@ stream.write(Buffer.from("hello"));
 const [chunk] = await once(stream, "data");
 console.log("received:", chunk.toString());
 
+// Finish the stream before closing the session: a stream still open when the
+// session closes errors with E_SESSION_CLOSED ("unhandled bidi stream error").
+stream.end();
+await once(stream, "finish");
 session.close();
 ```
 

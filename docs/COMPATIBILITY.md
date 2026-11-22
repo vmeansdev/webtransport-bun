@@ -8,8 +8,10 @@ commit-bound passing evidence.
 ## Runtime targets
 
 - **Bun**: >= 1.3.14 (primary target in CI; evidence pending)
-- **Node**: Node-API compatible runtime (evidence pending)
-- **Deno**: npm + Node-API addon support target (evidence pending)
+- **Node**: `>= 18` (`engines.node` in the package). The CI package-consumer
+  job runs on Node 18.20.4, 20.19.0 and 22.23.1 (evidence pending)
+- **Deno**: npm + Node-API addon support target. The same job runs on Deno
+  2.9.3 (evidence pending)
 
 ## Platform matrix (shipped prebuilds)
 
