@@ -165,8 +165,10 @@ new head.
 Nikita ruled the bare-metal capacity gates G1–G11 passed for 1.0, each stated
 with its own figure and placement phrase as recorded in the capacity chapter
 (the verdict ledger). That chapter and the campaign records behind it were
-moved out of the repository on 2026-10-29 with the other campaign material;
-they are not part of the shipped documentation. G10 carries a remark: no cloud
+moved out of the repository on 2026-10-29 with the other campaign material.
+The operator-facing summary of the ledger is [`CAPACITY.md`](CAPACITY.md), and
+the [scenario guides](scenarios/README.md) turn each gate into a runnable
+setup. G10 carries a remark: no cloud
 verdict exists (DigitalOcean reruns stopped on provider-side loss between the
 NICs), its scenario is superseded by the paced-broadcast PASS, and a dedicated
 bare-metal rerun is parked. These gates are capacity evidence for the

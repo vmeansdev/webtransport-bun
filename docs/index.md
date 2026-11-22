@@ -13,6 +13,8 @@ Production-focused WebTransport for Bun, Node, and Deno with in-process server/c
 - API contract: [`SPEC.md`](SPEC.md)
 - Architecture: [`ARCHITECTURE.md`](ARCHITECTURE.md)
 - Operations and runbooks: [`OPERATIONS.md`](OPERATIONS.md)
+- Scenario guides (games, media rooms, streaming, broadcast, churn, RPC, scale-out): [`scenarios/README.md`](scenarios/README.md)
+- Measured capacity and latency: [`CAPACITY.md`](CAPACITY.md)
 - Routing by connection ID: [`quic-lb.md`](quic-lb.md)
 - Testing and gates: [`TESTPLAN.md`](TESTPLAN.md)
 - CI/release: [`CI.md`](CI.md)
@@ -23,3 +25,4 @@ Production-focused WebTransport for Bun, Node, and Deno with in-process server/c
 - Echo playground (browser + runtime): `examples/echo-playground`
 - Compose collaboration room: `examples/compose-collab`
 - QUIC-LB CID steering (reference eBPF, not a shipped component): `examples/quic-lb`
+- Scenario examples, one per guide: `examples/scenarios`
