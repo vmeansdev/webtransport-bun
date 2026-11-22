@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
 # ============================================================================
-# EXAMPLE — NOT RUN, NOT TESTED
+# EXAMPLE — ADAPT BEFORE USE
 # ============================================================================
 #
-# A sketch of the loader steps for steer_by_cid.bpf.c, written against Linux
-# 7.0.0-30-generic with bpftool from that kernel's linux-tools package and
-# clang/LLVM 18+ for the BPF target. Nothing here has been executed. The
-# `.example` suffix is deliberate: read it, adapt it, and expect to fix it.
+# The loader steps for steer_by_cid.bpf.c. Steps 1-3 and 5 are the ones the
+# G6 sharded campaign ran on its DigitalOcean Linux droplets (2026-08-25
+# onwards; up to 24 instances on one port, 40,000 sessions), including the two
+# build fixes marked below. Step 4 is done by the servers themselves through
+# the `reusePortSteering` option. The `.example` suffix stays: adapt the
+# server-ID table and paths to your deployment.
 #
-# What this does NOT do, and what makes the pattern hard:
+# What this does NOT do:
 #
-#   * It does not keep the sockarray correct. A socket leaves the array when
-#     its process dies, and only the process that owns a socket can insert it.
-#     Re-registration after a restart is the operator's problem — see the
-#     README. This script only shows the first, easy load.
+#   * It does not keep the sockarray correct across restarts. A socket leaves
+#     the array when its process dies; a restarted instance re-inserts itself
+#     at startup through `reusePortSteering`, but until it is back its flows
+#     take the 4-tuple fallback. See the README.
 #   * It does not populate slot_by_server_id from any authoritative source. The
 #     table below must agree with each instance's `quicLb.serverId` exactly.
 #
@@ -34,8 +36,15 @@ PIN_DIR=${PIN_DIR:-/sys/fs/bpf/quic-lb}
 # and a clang new enough to emit BTF; kernel >= 5.2 to load them.
 
 build() {
+	# -target bpf drops the host's multiarch include path, so asm/types.h (an
+	# x86_64-linux-gnu-only header on Debian/Ubuntu) is not found; add it back.
+	local multiarch
+	multiarch=$(gcc -print-multiarch 2>/dev/null || echo x86_64-linux-gnu)
+	# MAX_INSTANCES sizes the sockarray; the program defaults to 8 slots.
 	clang -O2 -g -target bpf \
 		-D__TARGET_ARCH_x86 \
+		-DMAX_INSTANCES="${MAX_INSTANCES:-8}" \
+		-I"/usr/include/$multiarch" \
 		-c steer_by_cid.bpf.c -o "$BPF_OBJ"
 }
 
@@ -80,46 +89,45 @@ populate() {
 	fi
 	for id in "${!SERVER_ID_SLOTS[@]}"; do
 		slot=${SERVER_ID_SLOTS[$id]}
+		# bpftool wants one argv token per byte, so both substitutions must
+		# word-split: a quoted "07 00 00 00" is one token and bpftool rejects it.
+		# shellcheck disable=SC2086,SC2046
 		bpftool map update pinned "$PIN_DIR/slot_by_server_id" \
 			key hex $id 00 00 00 00 00 00 \
-			value hex "$(printf '%02x %02x %02x %02x' \
+			value hex $(printf '%02x %02x %02x %02x' \
 				$((slot & 0xff)) $((slot >> 8 & 0xff)) \
-				$((slot >> 16 & 0xff)) $((slot >> 24 & 0xff)))"
+				$((slot >> 16 & 0xff)) $((slot >> 24 & 0xff)))
 	done
 	bpftool map dump pinned "$PIN_DIR/slot_by_server_id"
 }
 
 # --- 4. Attach the program to the reuseport group ---------------------------
 #
-# THIS IS THE STEP A SHELL SCRIPT CANNOT DO.
+# Not a shell step. Attaching (SO_ATTACH_REUSEPORT_EBPF) and inserting a socket
+# into the sockarray both need the socket's file descriptor, which lives inside
+# the server process. The `reusePortSteering` server option does both:
 #
-# SK_REUSEPORT programs are attached with
+#   createServer({
+#     port: 4433,
+#     reusePort: true,
+#     quicLb: { serverId: [0x00, 0x07], nonceLen: 8 },  // a row of SERVER_ID_SLOTS
+#     reusePortSteering: {
+#       sockArrayPinPath: "/sys/fs/bpf/quic-lb/socks",
+#       key: 0,                                         // that row's slot
+#       attachProgPinPath: "/sys/fs/bpf/quic-lb/steer_by_cid", // one instance only
+#     },
+#     ...
+#   })
 #
-#     setsockopt(fd, SOL_SOCKET, SO_ATTACH_REUSEPORT_EBPF, &prog_fd, ...)
-#
-# on a socket that is already a member of the reuseport group, and each
-# instance inserts its own socket into the sockarray with
-#
-#     bpf_map_update_elem(sockarray_fd, &slot, &socket_fd, BPF_ANY)
-#
-# Both take a live file descriptor, so both must run inside a process that owns
-# the socket. webtransport-bun's `reusePort: true` builds and owns that socket
-# inside the native addon and does not expose its fd to JS, so today this step
-# needs either a small C/Go/Rust supervisor that creates the sockets and passes
-# them in, or a patched addon that performs the attach itself. Neither exists
-# in this repository. This is the honest gap between the example and a working
-# deployment.
-#
-# Attaching the program to only ONE member of the group is enough — the program
-# is a property of the group, not of the socket — but every member's socket
-# still has to be registered in the sockarray individually.
+# Attaching on one member is enough: the program belongs to the group. Every
+# member still inserts its own socket at its own slot. A missing pin or missing
+# CAP_BPF fails createServer instead of silently running on the kernel hash.
 
 attach_note() {
-	cat <<'EOF'
-attach: not scripted. See the comment above: SO_ATTACH_REUSEPORT_EBPF and the
-sockarray insert both require the socket fd, which lives inside the server
-process. Wire this into whatever supervises your instances.
-EOF
+	cat <<'NOTE'
+attach: done by each server through the reusePortSteering option; see the
+comment above this function.
+NOTE
 }
 
 # --- 5. Observe -------------------------------------------------------------
