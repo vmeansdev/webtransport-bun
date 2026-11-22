@@ -855,7 +855,9 @@ mod tests {
     async fn handshake_deadline_is_shared_across_steps() {
         let deadline = HandshakeDeadline::start(1_000);
 
-        let first = deadline.bound(tokio::time::sleep(Duration::from_millis(700))).await;
+        let first = deadline
+            .bound(tokio::time::sleep(Duration::from_millis(700)))
+            .await;
         assert_eq!(first, Ok(()));
         let second = deadline
             .bound(tokio::time::sleep(Duration::from_millis(700)))
