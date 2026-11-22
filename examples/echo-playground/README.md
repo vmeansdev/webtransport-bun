@@ -27,6 +27,21 @@ Notes:
 WebTransport endpoint used by the page:
 - `https://127.0.0.1:4433`
 
+Environment variables (all optional):
+
+| Variable | Default | Effect |
+|---|---|---|
+| `HTTP_HOST` | `127.0.0.1` | bind address of the HTTP UI (`0.0.0.0` in the Docker image) |
+| `HTTP_PORT` | `3000` | HTTP UI port |
+| `WT_PORT` | `4433` | WebTransport UDP port; the server always binds it on `0.0.0.0` |
+
+The page always dials `https://127.0.0.1:<WT_PORT>`: the server hands it that
+URL from `/config`, and the dev certificate covers only `localhost` and
+`127.0.0.1`. So the playground works only from a browser on the same machine
+(or on a host whose port 4433 is forwarded there, as with the Docker run below).
+Opening the UI from another machine loads the page but its WebTransport
+connect goes to that machine's own loopback and fails.
+
 The example retains at most 256 KiB from any complete bidi or uni stream. An
 over-limit stream is cancelled instead of being buffered until EOF.
 

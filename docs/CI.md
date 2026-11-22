@@ -50,7 +50,7 @@ Runs the seeded user-space UDP fault matrix (`tools/interop/playwright.fault.con
 3. Load-scale-addon — strict RSS gate, right-sized to 20 sessions / 15s for
    shared runners (the full 200-session campaign is generated deliberately as
    release evidence, not per push)
-4. Benchmark — handshake latency (`bun run bench:handshake`); fails if p95 > `BENCH_P95_MAX_MS`
+4. Benchmark — handshake latency (`bun run bench:handshake`); reports percentiles only, with no latency threshold (it fails when fewer than half of its handshakes succeed)
 5. Overload-addon test (`bun run test:overload-addon`)
 6. Load profiles (`bun run test:load-profiles-addon`)
 
@@ -63,6 +63,23 @@ Test log hygiene:
 2. Verifies a reproducible logical package manifest and SHA-256-covered prebuilds.
 3. Installs the tarball with lifecycle scripts disabled.
 4. Runs the same native addon load, datagram, unidirectional-stream, bidirectional-stream, and deterministic-close smoke under exact Bun, Node, and Deno versions.
+
+**wasm** job — `ubuntu-24.04`
+
+1. Builds the native addon (for the cross-backend interop suite), the wasm test
+   package and `wasm-dist`, then runs `bun run test:wasm` (recorded as
+   release evidence) and `bun run test:wasm:interop`.
+2. Records the QPACK, multi-session, 0-RTT and facade suites as one evidence
+   record each (`release-evidence-wasm-gates`).
+3. Hole tests: deletes `crates/wasm/pkg`, then `wasm-dist`, and requires the
+   suites that need them to fail, so a missing build cannot skip-green.
+4. Rebuilds both and runs the Chromium-native-client → wasm-server Playwright
+   suite (`playwright.wasm.config.ts`) with `INTEROP_EVIDENCE=1`
+   (`release-evidence-wasm-interop`).
+
+The `wasm-*.test.ts` files are excluded from the OS matrix above; eight of them
+are not in `test:wasm` either and run only in `coverage.yml` (see
+docs/COMPATIBILITY.md, "CI scope").
 
 **parity** job — `ubuntu-24.04`
 
@@ -141,11 +158,41 @@ The job uses npm Trusted Publishing only: job-scoped `id-token: write`, the prot
 
 Producer for the `supply-chain-provenance` claim. Dispatch it on the rc tag once the version `publish.yml` staged has been approved and is live; until then the job refuses with that reason (`gh workflow run supply-chain.yml --ref v1.0.0-rc.N`); the job refuses any ref that is not a `v*` tag. It resolves the version from the tag with `scripts/stamp-version-from-tag.ts --check`, installs exactly that version from the npm registry into an empty project, and records the install and `npm audit signatures` (registry signatures and provenance attestations) with `scripts/record-command.ts`, uploading `release-evidence-supply-chain`. `contents: read` only; no credentials.
 
+### channels.yml (green `test` runs on development, daily schedule, workflow_dispatch)
+
+Builds the `canary` and `nightly` channel packages and moves the `canary` /
+`nightly` branches and `channel-*` pre-releases; see "Canary and nightly
+channels" below and docs/BRANCHING.md. npm publishing is gated on the
+repository variable `CHANNELS_NPM_PUBLISH`: unless it is `true`, the `npm`
+job is skipped and the `npm-disabled` job warns that the version was built but
+not published (the channel branch and pre-release still move).
+
+### codeql.yml (push and pull requests to main/development, weekly schedule)
+
+CodeQL analysis for `javascript-typescript` and `rust` (`security-events:
+write`). `release.yml` runs its own CodeQL job as a release gate.
+
+### trivy.yml (push and pull requests to main/development, workflow_dispatch)
+
+Trivy filesystem and dependency scans; a CRITICAL or HIGH finding fails the job.
+`release.yml`'s `security` job runs the same scans before a release.
+
+### pages.yml (push to main, workflow_dispatch)
+
+Builds the documentation site with `mkdocs build --strict` from `mkdocs.yml`
+and deploys it to GitHub Pages. It runs from `main` only, so the site shows the
+last release line, not `development`.
+
+### bench-bandwidth.yml (workflow_dispatch)
+
+Bandwidth saturation ladder for an exact `candidate_commit` on the self-hosted
+`heavy` (or `soak`) runner pool. Measurement only, never a release gate.
+
 ### rollback.yml (workflow_dispatch)
 
 **RELEASE-OPS-A**: Rollback drill for known-good release restore.
 
-- **rollback-drill** — workflow_dispatch with input `rollback_target` (e.g. `v0.1.0`)
+- **rollback-drill** — workflow_dispatch with input `rollback_target` (e.g. `v0.3.0`; the target must be a version that is on npm)
   1. Downloads release assets from GitHub
   2. Verifies SHA256 checksums against SHA256SUMS
   3. Outputs operator runbook with pin command
@@ -188,5 +235,5 @@ Producer for the `supply-chain-provenance` claim. Dispatch it on the rc tag once
 4. Verify the registry configuration with a release-candidate workflow run before creating the stable tag. The workflow intentionally has no fallback npm token path.
 
 ## Canary and nightly channels
-- `channels.yml` builds `canary` from every development commit whose push `test` run is green and `nightly` once a day from development's newest green commit, publishing to npm `@canary` / `@nightly` and to the rolling `channel-canary` / `channel-nightly` pre-releases (docs/BRANCHING.md).
-- Release candidates stay tag-driven: `vX.Y.Z-rc.N` on `main`, npm `@next`; run the extended soak on the rc before tagging stable.
+- `channels.yml` builds `canary` from every development commit whose push `test` run is green and `nightly` once a day from development's newest green commit, publishing to the rolling `channel-canary` / `channel-nightly` pre-releases and, when the repository variable `CHANNELS_NPM_PUBLISH` is `true`, to npm `@canary` / `@nightly` (docs/BRANCHING.md).
+- Release candidates stay tag-driven: `vX.Y.Z-rc.N` on `main`, npm `@next` once `publish.yml` stages one and a maintainer approves it. No rc has reached npm so far (`v1.0.0-rc.1`…`rc.5` are GitHub pre-releases only). Run the extended soak on the rc before tagging stable.

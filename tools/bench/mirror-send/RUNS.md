@@ -11,9 +11,12 @@ result.** Only same-pass ratios are used, per T04's rule.
 Build:
 
 ```
-cd tools/bench/mirror-send/fanout && cargo build --release
-cp fanout/target/release/libfanout_bench.dylib tools/bench/mirror-send/fanout-bench.node
+cargo build --release --manifest-path tools/bench/mirror-send/fanout/Cargo.toml
+cp tools/bench/mirror-send/fanout/target/release/libfanout_bench.dylib tools/bench/mirror-send/fanout-bench.node
 ```
+
+(From the repo root. The library is `libfanout_bench.so` on Linux, and sits
+under `$CARGO_TARGET_DIR/release/` when that variable is set.)
 
 Estimator: 6 interleaved passes per cell, **minimum kept** (identical to T04's
 `crossing-bench.ts`). Warmup 0.5 s spread across the N ladder.

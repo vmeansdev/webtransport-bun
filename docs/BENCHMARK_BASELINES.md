@@ -10,16 +10,25 @@ measured-baseline artifact. `bun run bench:regress` now:
 - fails explicitly when no approved measured baseline exists or any required
   sample is missing, non-finite, or outside its semantic domain.
 
+In `release.yml` the `bench-regress` job is **advisory**: the step runs with
+`continue-on-error`, so with no approved baseline it fails every time without
+blocking the release, and only its uploaded artifact is required.
+
 ## Approved baseline artifact
 
 - **Path**: `tools/bench/approved-baselines.json`
 - **Status today**: `blocked`
-- **Reason**: the 2026-07-22 local baseline attempt (`bun run build:native && bun run bench:baseline`) failed because the local native build path resolved to `rustc 1.85.0`, while the current dependency graph requires `rustc 1.88+`.
+- **Reason**: nobody has captured an approved baseline. The `lastAttempt`
+  recorded in the file (2026-07-22) failed on a since-fixed toolchain problem
+  (the local build resolved `rustc 1.85.0`; the release toolchain is now pinned
+  to 1.95.0 in `.github/release-toolchain.json`), and no capture has been
+  attempted since.
 - **Rule**: do not populate thresholds by hand. Only promote this file to
   `status: "approved"` from a successful release-candidate capture on the exact
   machine/runtime you want to gate.
 - **Provenance contract**: an approved file must declare
-  `candidateRelationship: "exact"` and the full candidate Git SHA, machine
+  `candidateRelationship` (`"exact"`, or `"ancestry"` within
+  `maxAncestryDistance` first-parent commits of the candidate) and the full Git SHA, machine
   identity, Bun version, and Rust version. `bench:regress` rejects stale SHAs,
   another machine, or runtime drift before accepting the comparison. Set
   `BENCH_MACHINE_IDENTITY` to a stable runner identity when the host name is not

@@ -16,7 +16,7 @@ no separate job:
   `decode_literal_headers`, `unwrap_datagram`) and
   `parsers_never_panic_on_structured_adversarial_input` (maximal varints,
   all-continuation QPACK integers, truncations).
-- `crates/wasm/src/endpoint.rs`:
+- `crates/wasm/src/endpoint_tests.rs` (the endpoint's test module):
   `decode_frame_header_never_panics_on_random_input` (100k inputs) plus the
   oversized-frame and QPACK-overflow regression tests.
 

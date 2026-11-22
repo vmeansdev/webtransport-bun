@@ -8,8 +8,12 @@
  *
  *   bun tools/bench/mirror-send/fanout-bench.ts [--payload 200] [--seconds 3]
  *
- * Build the addon first:
- *   cd tools/bench/mirror-send/fanout && cargo build --release
+ * Build the scratch addon and copy it next to this file first (from the repo
+ * root; the library is `.so` on Linux, and lives under $CARGO_TARGET_DIR when
+ * that is set):
+ *   cargo build --release --manifest-path tools/bench/mirror-send/fanout/Cargo.toml
+ *   cp tools/bench/mirror-send/fanout/target/release/libfanout_bench.dylib \
+ *     tools/bench/mirror-send/fanout-bench.node
  */
 
 import { createRequire } from "node:module";

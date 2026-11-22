@@ -8,11 +8,14 @@ Verify that the WebTransport server handles sustained load without:
 
 ## Tests
 
-### Short load test (CI)
+### Short load test (`load.ts`, local)
 - Duration: 20 seconds
-- Concurrent sessions: 20 (staggered)
+- Concurrent sessions: 4
 - Datagrams: 50/s, streams: 2/s per session
+- Server: the Rust reference server, not the addon
 - **Pass criteria**: no errors, server RSS within 2× initial (when measurable)
+- Not run by CI. The CI `load` job (docs/CI.md) runs the addon harnesses
+  below instead.
 
 ### Local soak diagnostic (`soak.ts`)
 - Duration: 30 minutes
@@ -89,6 +92,24 @@ bun tools/load/soak-addon.ts verify-h7-hosted \
 
 This lane supplements the release soak policy in `docs/RELEASE_CHECKLIST.md`; it
 does not replace the 24h/72h release soak.
+
+## Other harnesses
+
+The addon harnesses (`createServer` from the package, driven by the Rust
+`load-client`; build it with `cargo build -p reference --bins`):
+
+| Command | Script | In CI (`test.yml` `load` job) |
+|---|---|---|
+| `bun run test:load-addon` | `load-addon.ts`: short load, RSS trend to `rss-trend.json` / `.csv` | yes |
+| `bun run test:load-scale-addon` | `load-scale-addon.ts`: 200-session RSS gate over `distributed-scale.ts` | yes, at 20 sessions / 15 s |
+| `bun run test:overload-addon` | `overload-addon.ts`: shedding at `maxSessions` | yes |
+| `bun run test:load-profiles-addon` | `load-profiles-addon.ts`: handshake, stream-open, datagram and mixed floods, plus the rate-limit contention profile | yes |
+| `bun run test:soak-addon` | `soak-addon.ts`: the soak harness (see above) | 120 s in the `soak` job; long modes via `soak-long` |
+| `bun run test:overload` | `overload-session.ts`: session flood against the reference server | no |
+| `bun run test:bench-sink` / `test:soak-sink` | `bench-sink.ts` / `soak-sink.ts`: native stream sink latency gate and churn soak (`docs/RFC_STREAM_SINK.md`) | no |
+| — | `distributed-scale.ts`: multi-process, multi-port scale campaign (release `distributed-scale` job, advisory) | release only |
+| — | `bench-bandwidth.ts`: bandwidth saturation ladder (`bench-bandwidth.yml`, self-hosted) | dispatch only |
+| — | `datagram-batch-churn.ts`, `rss-cycle-repeat.ts`, `rss-hold.ts`, `rss-isolation-nohandlers.ts`, `isolated-rss-wrapper.ts`: churn and RSS diagnostics; `docs/TESTPLAN.md` names the ones its evidence lanes use | no |
 
 ## Components
 
