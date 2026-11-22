@@ -7,6 +7,9 @@ Use this page as the entry point by role.
 1. Read project positioning in [`README`](https://github.com/vmeansdev/webtransport-bun/blob/main/README.md).
 2. Run examples in `examples/echo-playground` and `examples/compose-collab`.
 3. Check support targets in [`COMPATIBILITY.md`](COMPATIBILITY.md).
+4. See what was measured, on which hardware: [`CAPACITY.md`](CAPACITY.md).
+5. Find the guide for your workload (games, media rooms, streaming, broadcast,
+   churn, RPC): [`scenarios/README.md`](scenarios/README.md).
 
 ## If you are integrating in an app
 
@@ -18,9 +21,10 @@ Use this page as the entry point by role.
 ## If you are operating in production
 
 1. Limits, tuning, and runbooks: [`OPERATIONS.md`](OPERATIONS.md)
-2. Metrics and observability: [`METRICS.md`](METRICS.md)
-3. Test gates and pass criteria: [`TESTPLAN.md`](TESTPLAN.md)
-4. CI/release flow: [`CI.md`](CI.md)
+2. Scaling past one process: [`scenarios/deployment.md`](scenarios/deployment.md)
+3. Metrics and observability: [`METRICS.md`](METRICS.md)
+4. Test gates and pass criteria: [`TESTPLAN.md`](TESTPLAN.md)
+5. CI/release flow: [`CI.md`](CI.md)
 
 ## If you are contributing
 
