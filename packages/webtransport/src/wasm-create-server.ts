@@ -318,8 +318,10 @@ class WasmWebTransportServerImpl implements WasmWebTransportServer {
  * const server = await createServer({
  *   port: 4433,
  *   tls: { allowSelfSigned: true },
- *   onSession: (session) => {
- *     session.onDatagram((d) => void session.sendDatagram(d));
+ *   onSession: async (session) => {
+ *     for await (const d of session.incomingDatagrams()) {
+ *       await session.sendDatagram(d);
+ *     }
  *   },
  * });
  * // pin clients to server.certHashBase64

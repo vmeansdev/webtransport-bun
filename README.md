@@ -238,7 +238,9 @@ The current release status is pending in `docs/release-status.json`; treat the
 - **Bring your own socket**: the core never touches the network. Any transport
   implementing `UdpTransport` (`send(data, dest)` + `onPacket(data, source)`)
   feeds it raw UDP payloads — Direct Sockets `UDPSocket` in a Chromium
-  Isolated Web App, `Bun.udpSocket` in Bun, or an in-memory relay in tests.
+  Isolated Web App (`DirectSocketsUdpTransport`), `Bun.udpSocket` in Bun (a
+  few lines of your own, below), or an in-memory relay in tests
+  (`InMemoryRelay`).
 - **Server + client**: `serveOverUdp(...)` accepts sessions (multi-client,
   routed per source address) and returns the `serverCertificateHashes` value;
   `connectWasm(...)` / `createUnifiedClient(...)` connect as a client.
@@ -254,13 +256,41 @@ The current release status is pending in `docs/release-status.json`; treat the
   (validity clamped to the 14-day `serverCertificateHashes` limit).
 
 ```ts
-import { loadWasmModule, serveOverUdp } from "@webtransport-bun/webtransport/wasm";
+import {
+  loadWasmModule,
+  serveOverUdp,
+  toWasmServerSession,
+  type UdpTransport,
+} from "@webtransport-bun/webtransport/wasm";
+
+// The package ships no Bun UDP adapter; this is the whole of one. Inside a
+// Chromium IWA, pass DirectSocketsUdpTransport.bind instead.
+async function bindUdp(localAddress: string, localPort: number): Promise<UdpTransport> {
+  let onPacket: ((data: Uint8Array, src: { address: string; port: number }) => void) | undefined;
+  const socket = await Bun.udpSocket({
+    hostname: localAddress,
+    port: localPort,
+    socket: { data: (_s, buf, port, address) => onPacket?.(new Uint8Array(buf), { address, port }) },
+  });
+  return {
+    localPort: socket.port,
+    send: (data, dest) => void socket.send(data, dest.port, dest.address),
+    onPacket: (fn) => { onPacket = fn; },
+    close: () => socket.close(),
+  };
+}
 
 const wasm = await loadWasmModule(); // prebuilt artifact shipped in the package
 const { manager, certHashBase64 } = await serveOverUdp(wasm, bindUdp, {
   localPort: 4433,
-  onSession: (session) => session.onDatagram((d) => session.sendDatagram(d)),
+  onSession: async (raw) => {
+    const session = toWasmServerSession(raw);
+    for await (const d of session.incomingDatagrams()) {
+      await session.sendDatagram(d);
+    }
+  },
 });
+// clients pin certHashBase64; manager.close() shuts the server down
 ```
 
 The same echo server, written once and run on whichever backend the runtime
@@ -319,8 +349,9 @@ await server.close();
   clients pin the hash, so a new cert means a new hash.
 - **You bring the I/O — unless you use IWA plug-and-play.** The wasm core is
   sans-IO: it never opens sockets, reads clocks, or schedules timers by itself.
-  Shipped adapters (`DirectSocketsUdpTransport`, Bun UDP, `InMemoryRelay`) pump
-  packets and drive timeouts. Inside a Chromium IWA with Direct Sockets,
+  The shipped adapters (`DirectSocketsUdpTransport`, `InMemoryRelay`) pump
+  packets and drive timeouts; under Bun you wrap `Bun.udpSocket` yourself, as
+  in the snippet above. Inside a Chromium IWA with Direct Sockets,
   `await createServer(...)` from `@webtransport-bun/webtransport/wasm` (alias
   `createIwaServer`) owns bind + pumps for you. That is not the root package's
   native sync `createServer`, and it still cannot run on a normal webpage.

@@ -34,10 +34,16 @@ commit-bound passing evidence.
 The wasm backend (quinn-proto + rustls compiled to `wasm32-unknown-unknown`)
 has its own environment matrix, orthogonal to the prebuild table above.
 
-**CI scope:** the wasm Bun suite (`wasm-*.test.ts`, `webtransport-like.test.ts`)
-is exercised on the ubuntu `wasm` workflow job only. The multi-OS/bun matrix
-excludes those files by design so missing `crates/wasm/pkg` cannot skip-green.
-See `docs/release-status.json` → `support.scopeLimits`.
+**CI scope:** the multi-OS/bun matrix excludes every `wasm-*.test.ts` and
+`webtransport-like.test.ts` by design, so a missing `crates/wasm/pkg` cannot
+skip-green. The ubuntu `wasm` job runs the files `bun run test:wasm` lists
+(14 of them, `webtransport-like.test.ts` included) and
+`wasm-native-interop.test.ts`. The other eight (`wasm-ca-trust`,
+`wasm-create-server`, `wasm-facade-streams`, `wasm-log-events`,
+`wasm-parity-helpers`, `wasm-serve-over-udp-cleanup`,
+`wasm-server-session-parity`, `wasm-session-peer`) run only in the coverage
+workflow's full `bun test packages/`, which builds the wasm package first. See
+`docs/release-status.json` → `support.scopeLimits`.
 
 | Scenario | Environment | Status |
 |----------|-------------|--------|
@@ -56,8 +62,11 @@ Constraints that apply regardless of environment:
   responsibility. You can use the `WasmCertRotator` helper class to automatically 
   generate new certificates ahead of expiry so your server can update its endpoints
   without downtime.
-- **Host glue**: the consumer supplies packet I/O and timer driving; shipped
-  adapters cover Direct Sockets, Bun UDP, and in-memory testing.
+- **Host glue**: the consumer supplies packet I/O; the wasm transport manager
+  drives timers. Shipped adapters cover Direct Sockets
+  (`DirectSocketsUdpTransport`) and in-memory testing (`InMemoryRelay`); there
+  is no exported Bun adapter, so under Bun you wrap `Bun.udpSocket` yourself
+  (see `docs/GETTING_STARTED.md`).
 - **API surface**: connection/stream handles stay `u32` and sizes stay `f64`.
   Session demux uses `u64`/`bigint` (`session_id` on WtEvent and session-scoped
   APIs); consumers must accept BigInt for those fields.

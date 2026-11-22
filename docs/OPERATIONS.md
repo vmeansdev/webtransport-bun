@@ -19,9 +19,12 @@ Canonical release truth: `docs/release-status.json`. This page describes operati
 
 ## WASM footguns (multi-session / 0-RTT / QPACK)
 
-- **Primary CONNECT close tears down the whole QUIC connection** (and every
-  extra WT session on it). Close only non-primary sessions when you want
-  siblings to survive (`SessionClosed`).
+- **Closing a session closes only that session.** Any session, the primary
+  CONNECT included, ends with a `WT_CLOSE_SESSION` capsule and leaves the QUIC
+  connection and its sibling sessions up (`SessionClosed`). Only a session
+  closed before its CONNECT completed takes its connection with it. There is
+  no public per-connection close: close each session, or the transport
+  manager (`manager.close()`), which ends every connection on the endpoint.
 - **Inbound host-queue pressure** can also close the entire QUIC connection
   (budget is keyed by `conn`, not per WT `sessionId`).
 - **`enable0Rtt`**: default false. Ticket stores are **per-endpoint** unless

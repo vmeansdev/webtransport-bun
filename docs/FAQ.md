@@ -51,15 +51,21 @@ new cert always implies a client-side update.
 
 ## Do I need to provide sockets/timers to the wasm backend?
 
-Yes if you write your own transport — the core is sans-IO by design. The
-shipped adapters (`DirectSocketsUdpTransport`, Bun UDP, `InMemoryRelay`)
-handle packet pumping and timeout driving; a custom `UdpTransport` must do
-both, or connections will stall on retransmits and idle timeouts.
+Sockets, yes; timers, no. The core is sans-IO by design, so something has to
+move UDP packets in and out: `DirectSocketsUdpTransport` inside a Chromium IWA,
+`InMemoryRelay` in tests, or a `UdpTransport` you write (the package ships no
+Bun adapter; `docs/GETTING_STARTED.md` has a 20-line `Bun.udpSocket` one).
+Timers are driven for you by the wasm transport manager that `serveOverUdp`,
+`connectWasm` and `/wasm` `createServer` create, so a custom transport only
+has to deliver packets to `onPacket` and send what it is given.
 
 ## Does the wasm API return BigInt?
 
-No. The wasm boundary uses `u32` handles and `f64` numbers only, so there are
-no BigInt interop or JSON-serialization surprises.
+For session ids, yes. Connection and stream handles are `u32` numbers and sizes
+are `f64`, but WebTransport session ids are `u64`, surfaced as `bigint`
+(`WasmSession.sessionId`, the `session_id` of wasm events, and the
+session-scoped manager APIs). `JSON.stringify` throws on a `bigint`, so convert
+it (`String(id)`) before serializing.
 
 ## Is this production-ready?
 

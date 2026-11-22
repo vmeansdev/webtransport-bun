@@ -4,7 +4,7 @@
 Browser-Style Client Facade for `@webtransport-bun/webtransport`
 
 ## Status
-Implemented (see `docs/PARITY_MATRIX.md` and `PARITY_PLAN.md`)
+Implemented (see `docs/PARITY_MATRIX.md`, which also records the remaining divergences; the separate `PARITY_PLAN.md` this line once named is retired and not in the repository)
 
 ## Motivation
 The current package is Node-first and production-friendly for backend usage. For client developers already familiar with browser WebTransport, a browser-shaped API reduces onboarding cost and usage mistakes.
@@ -109,7 +109,7 @@ export function toWebTransport(session: ClientSession): WebTransport;
 ### Lifecycle
 - `ready`: resolves when underlying `connect()` succeeds.
 - `closed`: resolves with close info when session closes cleanly.
-- `draining`: resolves when `close()` initiates graceful closure.
+- `draining`: resolves on whichever comes first: the peer sends `WT_DRAIN_SESSION` (the session stays usable), `close()` starts a local close, or the session closes for any other reason. It never rejects, so a peer that never drains cannot leave it pending.
 
 ### Errors
 - Preserve stable internal `E_*` codes.
