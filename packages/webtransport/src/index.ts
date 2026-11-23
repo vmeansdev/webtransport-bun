@@ -567,7 +567,10 @@ export type LimitsOptions = {
 	 */
 	sendWindow?: number;
 	backpressureTimeoutMs: number;
-	/** Connect handshake timeout. Default 10000. */
+	/** Handshake timeout. Default 10000. Client: bounds `connect()`. Server
+	 * (native): one budget per incoming connection, from its first Initial to
+	 * the answer to its CONNECT request; a handshake that runs out is dropped
+	 * and counted in `limitExceededCount`. */
 	handshakeTimeoutMs: number;
 	/**
 	 * Max idle time before a connection is considered dead and closed. Applies
@@ -1307,7 +1310,7 @@ export type MetricsSnapshot = {
 	sessionsClosedByReap?: number;
 	/** Native only. Every other way a session ended (peer close, transport error). */
 	sessionsClosedOther?: number;
-	/** Handshake latency (accept start to completion). P99 target &lt;300ms. */
+	/** Handshake latency, first Initial to CONNECT accepted (native). P99 target &lt;300ms. */
 	handshakeLatency?: HistogramSnapshot | null;
 	/** Datagram send enqueue latency. P99 target &lt;10ms. */
 	datagramEnqueueLatency?: HistogramSnapshot | null;

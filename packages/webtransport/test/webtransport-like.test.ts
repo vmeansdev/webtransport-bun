@@ -49,8 +49,8 @@ describe("unified WebTransportLike contract (wasm backend)", () => {
 	test.skipIf(!wasmAvailable)(
 		"connect + datagram echo + bidi echo through WebTransportLike only",
 		async () => {
-			const PORT = 47840;
-			const serverUdp = await BunUdpTransport.bind("127.0.0.1", PORT);
+			const serverUdp = await BunUdpTransport.bind("127.0.0.1", 0);
+			const PORT = serverUdp.localPort as number;
 			const server = createWasmServer(
 				wasm,
 				serverUdp,
@@ -112,8 +112,8 @@ describe("unified WebTransportLike contract (wasm backend)", () => {
 	test.skipIf(!wasmAvailable)(
 		"large bidi payload round-trips fully (write loop + flow control)",
 		async () => {
-			const PORT = 47841;
-			const serverUdp = await BunUdpTransport.bind("127.0.0.1", PORT);
+			const serverUdp = await BunUdpTransport.bind("127.0.0.1", 0);
+			const PORT = serverUdp.localPort as number;
 			const server = createWasmServer(
 				wasm,
 				serverUdp,
@@ -199,8 +199,8 @@ describe("unified WebTransportLike contract (wasm backend)", () => {
 	test.skipIf(!wasmAvailable)(
 		"bidi stream readable closes when the echo server FINs",
 		async () => {
-			const PORT = 47843;
-			const serverUdp = await BunUdpTransport.bind("127.0.0.1", PORT);
+			const serverUdp = await BunUdpTransport.bind("127.0.0.1", 0);
+			const PORT = serverUdp.localPort as number;
 			const server = createWasmServer(
 				wasm,
 				serverUdp,
@@ -270,8 +270,8 @@ describe("unified WebTransportLike contract (wasm backend)", () => {
 	test.skipIf(!wasmAvailable)(
 		"cancelling a bidi readable is clean (STOP_SENDING, no throw loop)",
 		async () => {
-			const PORT = 47844;
-			const serverUdp = await BunUdpTransport.bind("127.0.0.1", PORT);
+			const serverUdp = await BunUdpTransport.bind("127.0.0.1", 0);
+			const PORT = serverUdp.localPort as number;
 			let errorSeen = false;
 			const server = createWasmServer(
 				wasm,
@@ -342,8 +342,8 @@ describe("unified WebTransportLike contract (wasm backend)", () => {
 	test.skipIf(!wasmAvailable)(
 		"stream readers settle when the connection closes",
 		async () => {
-			const PORT = 47842;
-			const serverUdp = await BunUdpTransport.bind("127.0.0.1", PORT);
+			const serverUdp = await BunUdpTransport.bind("127.0.0.1", 0);
+			const PORT = serverUdp.localPort as number;
 			let serverSession: { close: () => void } | null = null;
 			const server = createWasmServer(
 				wasm,

@@ -177,6 +177,7 @@ Producer for the `supply-chain-provenance` claim. Dispatch it on the rc tag once
 
 - Every third-party action is pinned to a full 40-character commit SHA with a human-readable release comment.
 - Exact Bun, Rust, Node, Deno, Python, npm, wasm-bindgen, cargo-audit, cargo-llvm-cov, Playwright, and IWA packaging versions are allowlisted in `.github/release-toolchain.json`.
+- `rust-toolchain.toml` pins local `cargo` to the same Rust version (with rustfmt and clippy); `internal-actions-policy.test.ts` fails when it drifts from `.github/release-toolchain.json`. CI jobs install that version with `dtolnay/rust-toolchain`, so the file selects the toolchain they already set as default and only adds rustfmt/clippy where a job did not request them.
 - `bun scripts/check-actions-pinned.ts` rejects mutable action refs, floating or unapproved tool versions, workflow-wide write access, unjustified write scopes, token-based npm publishing, publish jobs without OIDC/provenance, and any publish workflow that does not consume an exact release workflow-run artifact.
 - Release-critical jobs declare explicit permissions, timeouts, concurrency behavior, artifact retention, and checksum validation.
 

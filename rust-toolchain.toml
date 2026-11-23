@@ -1,0 +1,8 @@
+# Keep in sync with "rust" in .github/release-toolchain.json (checked by
+# packages/webtransport/test/internal-actions-policy.test.ts). The wasm32
+# target is not listed: crates/wasm/build-wasm.sh adds it on demand, and
+# listing it would download it in every native CI job.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

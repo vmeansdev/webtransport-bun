@@ -97,8 +97,14 @@ export async function loadWasmModule(): Promise<WasmModule> {
 	try {
 		return (await import(spec)) as unknown as WasmModule;
 	} catch (cause) {
+		// Missing and broken artifacts both land here (a glue file that still
+		// imports "env" fails with a module-not-found error of its own), so the
+		// underlying reason has to be part of the message.
+		// Bun's ResolveMessage carries a message but is not an Error.
+		const message = (cause as { message?: unknown } | null)?.message;
+		const reason = typeof message === "string" ? message : String(cause);
 		throw new Error(
-			"prebuilt wasm module not found: run `bun run build:wasm:dist` in a source checkout, or reinstall the published package",
+			`prebuilt wasm module could not be loaded (${reason}): run \`bun run build:wasm:dist\` in a source checkout, or reinstall the published package`,
 			{ cause },
 		);
 	}

@@ -29,7 +29,7 @@ every series). Snapshot fields not listed here are available from
 | `webtransport_tls_sni_cert_selections_total` | counter | Handshakes served by a hostname-specific SNI cert |
 | `webtransport_tls_default_cert_selections_total` | counter | Handshakes served by the default certificate |
 | `webtransport_tls_unknown_sni_rejected_total` | counter | Handshakes rejected because SNI matched no configured hostname |
-| `webtransport_handshake_latency_seconds` | histogram | Handshake latency |
+| `webtransport_handshake_latency_seconds` | histogram | Handshake latency: first Initial to CONNECT accepted |
 | `webtransport_datagram_enqueue_latency_seconds` | histogram | Datagram enqueue latency |
 | `webtransport_stream_open_latency_seconds` | histogram | Stream open latency |
 
@@ -67,7 +67,7 @@ every series). Snapshot fields not listed here are available from
 | sinkDroppedRecords | number? | **Experimental.** Native only, process-wide and cumulative: records dropped by sinks in `overflow: "drop-newest"` mode. Each sink also discloses its drops in-band as `drops` records. Omitted on WASM. |
 | nativeSessionRegistryEntries, nativeTrackedTasks, nativeRateLimitEntries, nativeBidiHandlesLive, nativeUniSendHandlesLive, nativeUniRecvHandlesLive | number? | Native only: live sizes of the addon's registries and handle tables. Use them as leak gauges: after load stops they should return to their idle values. Omitted on WASM. |
 | rateLimitedCount | number | Sessions rejected by per-IP/per-prefix rate limit |
-| limitExceededCount | number | Sessions rejected (maxSessions, maxHandshakesInFlight) |
+| limitExceededCount | number | Sessions rejected (maxSessions, maxHandshakesInFlight) and handshakes dropped because they ran out of handshakeTimeoutMs |
 | sniCertSelections | number | Handshakes served by hostname-specific SNI certificates |
 | defaultCertSelections | number | Handshakes served by the default certificate |
 | unknownSniRejectedCount | number | Handshakes rejected because SNI did not match a configured hostname |
@@ -119,7 +119,7 @@ Histograms are emitted as Prometheus `histogram` type (`_bucket`, `_count`, `_su
 
 | Field | Description | SLO target (in-region) |
 |-------|-------------|------------------------|
-| handshakeLatency | Accept start to completion | p99 < 300ms |
+| handshakeLatency | Server side, from the connection's first Initial packet reaching the accept loop to its CONNECT request being accepted: QUIC + TLS handshake, the CONNECT exchange and the client's round trips. Only successful handshakes are recorded; refused and timed-out ones are not. | p99 < 300ms |
 | datagramEnqueueLatency | Server send_datagram() duration | p99 < 10ms |
 | streamOpenLatency | createBidiStream / createUniStream duration | p99 < 20ms |
 
