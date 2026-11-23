@@ -49,3 +49,8 @@ libc = "0.2"
 
 [build-dependencies]
 napi-build = "2"
+
+# Paused-clock unit tests for the handshake deadline. Adds no crate to the
+# lock: test-util only enables tokio::time::pause.
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

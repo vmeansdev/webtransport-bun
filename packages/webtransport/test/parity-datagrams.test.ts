@@ -176,6 +176,42 @@ describe.skipIf(skipWasmParityIfUnavailable)("parity datagrams (P2)", () => {
 		wt.close();
 	});
 
+	test("datagrams.maxDatagramSize honours the configured limits.maxDatagramSize", async () => {
+		const configured = await harness.open({ limits: { maxDatagramSize: 500 } });
+		expect(configured.datagrams.maxDatagramSize).toBe(500);
+		configured.close();
+
+		// The default cap (1200) applies too; the QUIC path alone would allow
+		// more on loopback.
+		const defaults = await harness.open();
+		expect(defaults.datagrams.maxDatagramSize).toBeLessThanOrEqual(1200);
+		defaults.close();
+	});
+
+	test("an oversize datagram write is dropped without erroring the writable", async () => {
+		const wt = await harness.open({ limits: { maxDatagramSize: 500 } });
+		const writer = wt.datagrams.writable.getWriter();
+		const reader = wt.datagrams.readable.getReader();
+		try {
+			// W3C: a datagram above maxDatagramSize resolves and is discarded.
+			await writer.write(new Uint8Array(501).fill(7));
+			const small = Uint8Array.of(4, 5, 6);
+			await writer.write(small);
+			// The echo server only ever sees (and returns) the small one.
+			const { value, done } = await readWithTimeout(
+				reader,
+				5000,
+				"echo after an oversize write",
+			);
+			expect(done).toBe(false);
+			expect(new Uint8Array(value ?? [])).toEqual(small);
+		} finally {
+			reader.releaseLock();
+			writer.releaseLock();
+			wt.close();
+		}
+	});
+
 	test("datagrams.createWritable accepts valid sendGroup and validates ownership", async () => {
 		const wt = await harness.open();
 		// Both backends have a nominally-private send-group class, so the union

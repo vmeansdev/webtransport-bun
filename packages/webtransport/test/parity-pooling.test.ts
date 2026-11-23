@@ -168,7 +168,7 @@ describe.skipIf(skipWasmParityIfUnavailable)("parity pooling", () => {
 				const wt = new WebTransport(url, {
 					allowPooling: true,
 					tls: { insecureSkipVerify: true },
-					limits: { handshakeTimeoutMs: 50 },
+					limits: { handshakeTimeoutMs: 100 },
 				});
 				await expect(wt.ready).rejects.toThrow(/E_HANDSHAKE_TIMEOUT/);
 				wt.close();

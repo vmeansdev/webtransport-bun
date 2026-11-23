@@ -25,8 +25,45 @@ hatch exists. Checked against the rc.1 candidate (875dfbfe).
   - a `limits` / `rateLimits` value that is `null` or not a plain object
     (for example an array or a `Map`);
   - a numeric field set to `null` or to a non-finite value (`NaN`,
-    `Infinity`, a string).
-  An absent field still means "default".
+    `Infinity`, a string);
+  - a `limits` field that is negative, fractional or below its documented
+    floor (`maxSessions`, `maxHandshakesInFlight` and `maxDatagramSize` >= 1,
+    `backpressureTimeoutMs` and `handshakeTimeoutMs` >= 100, `idleTimeoutMs`
+    >= 1000, everything else >= 0). rc.1 kept the default for a negative or
+    fractional value and silently raised `0` to `1` and short timeouts to
+    their floor (while the client's own handshake timer and stream-open
+    waits used the unraised value);
+  - a negative `rateLimits` rate, or a burst that is negative or fractional.
+  An absent field still means "default", and every value at or above its
+  floor behaves exactly as before. The native addon refuses the same values
+  when called directly. See `docs/SPEC.md` ("Accepted limit ranges").
+- **`connect()` validates its options like `new WebTransport()`.** Both now
+  run one validator before dialing, so `connect()` reports `E_INVALID_ARGUMENT`
+  for an unknown `congestionControl`, a non-boolean `allowPooling`,
+  `requireUnreliable` or `enable0Rtt`, and a malformed
+  `serverCertificateHashes`, where rc.1 reached the addon and failed with
+  `E_INTERNAL` (or silently ignored the non-boolean). `allowPooling` combined
+  with `serverCertificateHashes` or with `enable0Rtt` is
+  `E_UNSUPPORTED_ARGUMENT` (`NotSupportedError` under `strictW3CErrors`, and
+  always for the hashes case) on `connect()` too; rc.1 gave `E_INTERNAL`.
+- **`DEFAULT_LIMITS` and `DEFAULT_RATE_LIMITS` are frozen.** rc.1 exported
+  plain objects, and every `createServer`/`connect` merged over them, so a
+  write such as `DEFAULT_LIMITS.maxSessions = 10` silently changed the defaults
+  of every later server and client. Writes now throw in strict mode (and are
+  ignored otherwise); build your own object with
+  `{ ...DEFAULT_LIMITS, maxSessions: 10 }`.
+- **`/portable` on native requires a certificate.** An empty or missing
+  `tls.certPem`/`tls.keyPem` now rejects with `E_TLS`, as
+  `docs/PARITY_MATRIX.md` always said; rc.1 passed it to the root
+  `createServer`, which served an auto-generated self-signed certificate. A
+  native `tls.allowSelfSigned` rejection is now a `WebTransportError` with
+  `E_UNSUPPORTED_ARGUMENT` instead of a plain `Error`.
+- **`/portable` `log` events have one shape on both backends.** They are now
+  `PortableLogEvent` `{ type, level, msg, ... }`. rc.1 typed them `{ type, ... }`
+  but the native backend delivered its raw `{ level, msg, ... }` events with no
+  `type`. Native events now carry `type: "log"`, and wasm events gain `level`
+  (`"warn"` for failures and refusals, `"info"` otherwise) and `msg`. Both
+  changes only add fields.
 - **Server shutdown close code.** Sessions ended by `server.close()` now close
   with code `3993` and reason `E_SERVER_CLOSING`, on the wire and in the local
   `closed` fallback. rc.1 used application code `0` with reason
@@ -79,6 +116,13 @@ hatch exists. Checked against the rc.1 candidate (875dfbfe).
   streams) failed with plain `Error`s whose message began with the code. They
   now emit a `WebTransportError` with the same message and `.code` set, like
   the server's streams; code reading `err.message` is unaffected.
+- **A wasm server drops over-rate datagrams instead of closing the
+  connection.** A datagram over the per-IP ingress rate
+  (`rateLimits.datagramsIngressPerSec` / `datagramsIngressBurst`) used to
+  close the sender's whole connection on the wasm engine, while native drops
+  the datagram and keeps the session. wasm now matches native: the datagram
+  is dropped, counted in `rateLimitedCount` and `datagramsDropped`, and the
+  session stays open. There is no option to restore the close.
 - **Not breaking, listed for completeness.** The surfaces under "Removed and
   internalized" below were never in rc.1, so no rc.1 caller can depend on
   them: the reflector, the campaign getters, `__sendPathDiagnostics`, the
@@ -330,6 +374,86 @@ unstable `__TESTING__.serverInternals(server)` accessor (`docs/SPEC.md`,
 
 ### Fixed
 
+- The W3C facade's `datagrams.maxDatagramSize` reports the configured
+  `limits.maxDatagramSize` (lowered to the QUIC path maximum) instead of the
+  raw path maximum, which read 1413 on loopback against a 1200 default and
+  ignored a configured cap. A write larger than it is now discarded and the
+  write resolves, as the W3C write algorithm specifies; it used to reject and
+  leave `datagrams.writable` errored for every later write (native), or
+  reject with `E_LIMIT_EXCEEDED` (wasm). Session-level `sendDatagram()` still
+  rejects oversize payloads.
+- `/portable` `createServer({ wasmOptions })` is honored. The option was typed
+  and documented as forwarded to the wasm W3C facade but never read, so
+  `strictW3CErrors` and the other facade options silently did nothing. Each
+  wasm server session is now built with them, and invalid values fail
+  `createServer` with `E_INVALID_ARGUMENT`. Native still ignores them.
+- `createServer()` failures and the server TLS methods (`updateCert`,
+  `updateTls`, `replaceSniCerts`, `upsertSniCert`, `removeSniCert`,
+  `setUnknownSniPolicy`, `tlsSnapshot`) now throw or reject a
+  `WebTransportError` with the stable `code`. They threw the raw Node-API
+  error (`code: "GenericFailure"`, the `E_*` only inside the message). A
+  missing or invalid `port` is now `E_INVALID_ARGUMENT` before the addon is
+  reached (it was a "Failed to convert napi value" error, `-1` was accepted
+  and `70000` was clamped to 65535), and an unknown `unknownSniPolicy` is
+  `E_INVALID_ARGUMENT` rather than `E_INTERNAL`.
+- `connect()` now rejects certificate failures with `E_TLS`, as documented.
+  An untrusted issuer, a certificate not valid for the requested name, and a
+  server with no certificate for the requested server name (its TLS alert)
+  used to surface as `E_INTERNAL`. The native client now recognizes the QUIC
+  `CRYPTO_ERROR` range that every TLS handshake failure ends in, on the
+  dedicated and the pooled connect path alike.
+- Native streams now report the peer's application error code. A peer
+  `RESET_STREAM` or `STOP_SENDING` failed the receiving side with
+  `streamErrorCode: null`, because the code was dropped where the transport
+  error became an `E_*` string; wasm already reported it. Client Node streams,
+  the `WebTransport` facade's streams and the server's streams now carry it on
+  `WebTransportError.streamErrorCode`, and the message reads
+  `E_STREAM_RESET: stream reset by peer (code N)` /
+  `E_STOP_SENDING: stream stopped by peer (code N)` on both backends (the
+  `E_*` prefix and `.code` are unchanged). A native sink's `reset` record also
+  carried the on-wire HTTP/3 value (clamped to `4294967295`) instead of the
+  peer's code; it now carries the code.
+- The wasm manager's `metricsSnapshot()` reported 0 for `rateLimitedCount`,
+  `limitExceededCount`, `sniCertSelections`, `defaultCertSelections` and
+  `unknownSniRejectedCount`: it read keys the governor snapshot does not have,
+  and the wasm governor counted no cap refusals at all. `rateLimitedCount` is
+  now the sum of the handshake, stream-open and datagram-ingress rate-limit
+  counters, `limitExceededCount` counts refusals at `maxHandshakesInFlight`,
+  `maxSessions` and the stream caps (also exposed as the governor snapshot's
+  `limitExceededCount`), and the SNI counters come from the TLS resolver.
+- `build:wasm:dist` (also run by `prepublishOnly`) exited 0 with a broken
+  artifact when only a versioned Homebrew LLVM (`llvm@NN`) was installed: the
+  system `ar` archived ring's wasm32 objects without a symbol index, so the
+  module imported 44 ring symbols from `env` and failed to load. The script
+  now finds `llvm@NN` (newest first) or a wasm32-capable `clang` on PATH with
+  a matching `llvm-ar`, fails with the unresolved symbol names when the module
+  still imports `env`, and reads the cargo target directory from
+  `cargo metadata`, so `CARGO_TARGET_DIR` and `.cargo/config.toml`
+  `build.target-dir` no longer break it.
+- `loadWasmModule()` from `webtransport-bun/wasm` said "prebuilt wasm module
+  not found" for every load failure, including a present but broken
+  `wasm-dist` artifact (for example glue that still imports `env` because
+  ring's C code was not built for wasm32). The error now includes the
+  underlying load error, so `Cannot find package 'env'` is visible.
+- `handshakeTimeoutMs` now bounds the whole server-side handshake. It used to
+  start only after the CONNECT request had been read, so a handshake that
+  stalled in QUIC or TLS (one replayed client Initial is enough) held its
+  `maxHandshakesInFlight` slot until the idle timeout; a few hundred such
+  packets could refuse every new client for a minute. One budget now runs from
+  the connection's first Initial to the answer to its CONNECT request; a
+  handshake that runs out is dropped, gives its slot back, is counted in
+  `limitExceededCount` and is logged at debug level. The per-IP handshake
+  bucket is still charged after the handshake, against the validated address
+  (`SECURITY.md`).
+- The `handshakeLatency` histogram (`webtransport_handshake_latency_seconds`)
+  timed only the CONNECT response write, a few microseconds. It now measures
+  what `docs/METRICS.md` says: from the connection's first Initial to its
+  CONNECT request being accepted. Expect values of a few round trips;
+  dashboards and the p99 alert built on the old numbers read differently.
+- `bun run bench:handshake` made 50 handshakes from one address against the
+  default per-IP burst of 40, logged the `E_RATE_LIMITED` failures and still
+  printed PASS. Its server now opens the handshake rate limits, and any failed
+  sample fails the run.
 - Bidirectional streams no longer stall when both directions are busy. One
   byte budget served both directions, so writes queued faster than the peer
   drained them filled it, the receive side could not reserve, and both peers

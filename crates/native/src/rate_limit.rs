@@ -60,62 +60,75 @@ impl Default for RateLimits {
     }
 }
 
-/// Accept a rate/burst float only if it is finite and non-negative. NaN,
-/// Infinity, and negatives from malformed config would otherwise silently
-/// hard-block all traffic (NaN comparisons) or disable the limiter (Infinity);
-/// fall back to the caller's current (default) value instead.
-fn sane_rate(v: Option<f64>, current: f64) -> f64 {
-    match v {
-        Some(n) if n.is_finite() && n >= 0.0 => n,
-        _ => current,
+/// A `*PerSec` rate: absent is `None`; present must be a finite, non-negative
+/// number (fractional rates are fine). NaN would hard-block all traffic and
+/// Infinity would disable the limiter, so neither may slip through.
+fn rate_field(v: &serde_json::Value, key: &str) -> std::result::Result<Option<f64>, String> {
+    let Some(raw) = v.get(key) else {
+        return Ok(None);
+    };
+    match raw.as_f64() {
+        Some(n) if n.is_finite() && n >= 0.0 => Ok(Some(n)),
+        _ => Err(format!(
+            "E_INVALID_ARGUMENT: rateLimits.{key} must be >= 0, got {raw}"
+        )),
     }
 }
 
+/// A burst: absent is `None`; present must be a non-negative integer (a
+/// token count).
+fn burst_field(v: &serde_json::Value, key: &str) -> std::result::Result<Option<u64>, String> {
+    let Some(raw) = v.get(key) else {
+        return Ok(None);
+    };
+    raw.as_u64().map(Some).ok_or_else(|| {
+        format!("E_INVALID_ARGUMENT: rateLimits.{key} must be an integer >= 0, got {raw}")
+    })
+}
+
 impl RateLimits {
-    pub fn from_json(json: &str) -> Self {
+    /// Parse a `rateLimits` JSON object. Absent fields keep their defaults; a
+    /// present field outside its range is an `E_INVALID_ARGUMENT` error rather
+    /// than a silently substituted default. The TypeScript layer rejects the
+    /// same inputs first.
+    pub fn from_json(json: &str) -> std::result::Result<Self, String> {
+        let v: serde_json::Value = serde_json::from_str(json)
+            .map_err(|e| format!("E_INVALID_ARGUMENT: rateLimits must be a JSON object: {e}"))?;
+        if !v.is_object() {
+            return Err("E_INVALID_ARGUMENT: rateLimits must be an object".to_string());
+        }
         let mut rl = Self::default();
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(json) {
-            if let Some(n) = v.get("handshakesBurst").and_then(|x| x.as_u64()) {
+        // Public API: handshakesBurst drives both the per-IP burst and the
+        // token bucket. Compat: handshakesBurstTokens is the fallback.
+        let handshakes_burst = match burst_field(&v, "handshakesBurst")? {
+            Some(n) => Some(n),
+            None => burst_field(&v, "handshakesBurstTokens")?,
+        };
+        if let Some(n) = handshakes_burst {
+            rl.handshakes_burst = n as f64;
+            if v.get("handshakesBurst").is_some() {
                 rl.handshakes_burst_per_ip = n;
             }
-            if let Some(n) = v.get("handshakesBurstPerPrefix").and_then(|x| x.as_u64()) {
-                rl.handshakes_burst_per_prefix = n;
-            }
-            rl.streams_per_sec = sane_rate(
-                v.get("streamsPerSec").and_then(|x| x.as_f64()),
-                rl.streams_per_sec,
-            );
-            rl.streams_burst = sane_rate(
-                v.get("streamsBurst").and_then(|x| x.as_f64()),
-                rl.streams_burst,
-            );
-            rl.datagrams_per_sec = sane_rate(
-                v.get("datagramsPerSec").and_then(|x| x.as_f64()),
-                rl.datagrams_per_sec,
-            );
-            rl.datagrams_burst = sane_rate(
-                v.get("datagramsBurst").and_then(|x| x.as_f64()),
-                rl.datagrams_burst,
-            );
-            rl.handshakes_per_sec = sane_rate(
-                v.get("handshakesPerSec").and_then(|x| x.as_f64()),
-                rl.handshakes_per_sec,
-            );
-            // Public API: handshakesBurst drives the token-bucket burst.
-            // Compat: handshakesBurstTokens accepted as fallback.
-            if v.get("handshakesBurst").is_some() {
-                rl.handshakes_burst = sane_rate(
-                    v.get("handshakesBurst").and_then(|x| x.as_f64()),
-                    rl.handshakes_burst,
-                );
-            } else if v.get("handshakesBurstTokens").is_some() {
-                rl.handshakes_burst = sane_rate(
-                    v.get("handshakesBurstTokens").and_then(|x| x.as_f64()),
-                    rl.handshakes_burst,
-                );
-            }
         }
-        rl
+        if let Some(n) = burst_field(&v, "handshakesBurstPerPrefix")? {
+            rl.handshakes_burst_per_prefix = n;
+        }
+        if let Some(n) = rate_field(&v, "handshakesPerSec")? {
+            rl.handshakes_per_sec = n;
+        }
+        if let Some(n) = rate_field(&v, "streamsPerSec")? {
+            rl.streams_per_sec = n;
+        }
+        if let Some(n) = burst_field(&v, "streamsBurst")? {
+            rl.streams_burst = n as f64;
+        }
+        if let Some(n) = rate_field(&v, "datagramsPerSec")? {
+            rl.datagrams_per_sec = n;
+        }
+        if let Some(n) = burst_field(&v, "datagramsBurst")? {
+            rl.datagrams_burst = n as f64;
+        }
+        Ok(rl)
     }
 }
 
@@ -477,19 +490,31 @@ mod tests {
         assert!(try_acquire_stream_open(server_b, ip, rate, burst));
     }
 
-    // Malformed rate/burst floats (NaN/Infinity/negative) must not slip into the
-    // limiter (NaN would hard-block all traffic, Infinity would disable it).
+    // Malformed rates and bursts are refused rather than replaced by defaults:
+    // NaN would hard-block all traffic and Infinity would disable the limiter.
     #[test]
-    fn test_rate_limit_float_sanitization() {
-        let d = RateLimits::default();
-        let nan = RateLimits::from_json(r#"{"streamsPerSec": null, "streamsBurst": -5}"#);
-        assert_eq!(nan.streams_burst, d.streams_burst); // negative rejected
-        let bad =
-            RateLimits::from_json(r#"{"datagramsPerSec": "not-a-number", "handshakesPerSec": -1}"#);
-        assert_eq!(bad.datagrams_per_sec, d.datagrams_per_sec); // non-numeric rejected
-        assert_eq!(bad.handshakes_per_sec, d.handshakes_per_sec); // negative rejected
-        let ok = RateLimits::from_json(r#"{"streamsPerSec": 123.0}"#);
-        assert_eq!(ok.streams_per_sec, 123.0); // finite non-negative accepted
+    fn test_malformed_rate_limits_are_rejected() {
+        for raw in [
+            r#"{"streamsPerSec": null}"#,
+            r#"{"streamsBurst": -5}"#,
+            r#"{"datagramsPerSec": "not-a-number"}"#,
+            r#"{"handshakesPerSec": -1}"#,
+            r#"{"handshakesBurst": 1.5}"#,
+            r#"{"handshakesBurstPerPrefix": -1}"#,
+            r#"{"datagramsBurst": 2.5}"#,
+            r#"{"handshakesBurstTokens": -3}"#,
+            "not-json",
+            "[]",
+        ] {
+            let err = RateLimits::from_json(raw).expect_err(raw);
+            assert!(
+                err.starts_with("E_INVALID_ARGUMENT: rateLimits"),
+                "{raw}: {err}"
+            );
+        }
+        let ok = RateLimits::from_json(r#"{"streamsPerSec": 123.5, "streamsBurst": 0}"#).unwrap();
+        assert_eq!(ok.streams_per_sec, 123.5); // fractional rates accepted
+        assert_eq!(ok.streams_burst, 0.0);
     }
 
     #[test]
@@ -507,7 +532,7 @@ mod tests {
     #[test]
     fn test_rate_limits_from_json() {
         let json = r#"{"handshakesBurst":50,"streamsPerSec":300,"streamsBurst":600,"datagramsPerSec":3000,"datagramsBurst":6000}"#;
-        let rl = RateLimits::from_json(json);
+        let rl = RateLimits::from_json(json).unwrap();
         assert_eq!(rl.handshakes_burst_per_ip, 50);
         assert!((rl.handshakes_burst - 50.0).abs() < f64::EPSILON);
         assert!((rl.streams_per_sec - 300.0).abs() < f64::EPSILON);
@@ -518,7 +543,7 @@ mod tests {
 
     #[test]
     fn test_rate_limits_defaults() {
-        let rl = RateLimits::from_json("{}");
+        let rl = RateLimits::from_json("{}").unwrap();
         assert_eq!(rl.handshakes_burst_per_ip, 40);
         assert!((rl.streams_per_sec - 200.0).abs() < f64::EPSILON);
         assert!((rl.handshakes_per_sec - 20.0).abs() < f64::EPSILON);
@@ -550,7 +575,7 @@ mod tests {
     #[test]
     fn test_handshakes_burst_public_api() {
         let json = r#"{"handshakesPerSec":50,"handshakesBurst":100}"#;
-        let rl = RateLimits::from_json(json);
+        let rl = RateLimits::from_json(json).unwrap();
         assert!((rl.handshakes_per_sec - 50.0).abs() < f64::EPSILON);
         assert!((rl.handshakes_burst - 100.0).abs() < f64::EPSILON);
         assert_eq!(rl.handshakes_burst_per_ip, 100);
@@ -559,14 +584,14 @@ mod tests {
     #[test]
     fn test_handshakes_burst_compat_fallback() {
         let json = r#"{"handshakesPerSec":50,"handshakesBurstTokens":80}"#;
-        let rl = RateLimits::from_json(json);
+        let rl = RateLimits::from_json(json).unwrap();
         assert!((rl.handshakes_burst - 80.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn test_handshakes_burst_public_takes_precedence() {
         let json = r#"{"handshakesBurst":60,"handshakesBurstTokens":999}"#;
-        let rl = RateLimits::from_json(json);
+        let rl = RateLimits::from_json(json).unwrap();
         assert!((rl.handshakes_burst - 60.0).abs() < f64::EPSILON);
     }
 

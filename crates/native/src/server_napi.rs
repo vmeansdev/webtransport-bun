@@ -224,8 +224,10 @@ impl ServerHandle {
                 }
                 None => None,
             };
-            let limits = crate::limits::Limits::from_json(&_limits_json);
-            let rate_limits = crate::rate_limit::RateLimits::from_json(&_rate_limits_json);
+            let limits = crate::limits::Limits::from_json(&_limits_json)
+                .map_err(napi::Error::from_reason)?;
+            let rate_limits = crate::rate_limit::RateLimits::from_json(&_rate_limits_json)
+                .map_err(napi::Error::from_reason)?;
             crate::panic_guard::set_panic_log_verbose(debug);
             let port_u16 = port.min(65535) as u16;
             if reuse_port && port_u16 == 0 {

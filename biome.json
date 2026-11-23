@@ -1,0 +1,33 @@
+{
+	"$schema": "https://biomejs.dev/schemas/2.4.4/schema.json",
+	"vcs": {
+		"enabled": true,
+		"clientKind": "git",
+		"useIgnoreFile": true
+	},
+	"files": {
+		"includes": [
+			"**",
+			"!!**/node_modules",
+			"!!**/target",
+			"!!**/target-*",
+			"!!**/dist",
+			"!!**/pkg",
+			"!!**/wasm-dist",
+			"!!**/prebuilds",
+			"!!**/vendor",
+			"!!**/coverage",
+			"!!**/test-results",
+			"!!**/playwright-report",
+			"!!.scratch",
+			"!!.release-evidence",
+			"!!.bench-evidence",
+			"!!docs/superpowers",
+			"!.github/rulesets",
+			"!crates/native/package.json",
+			"!docs/release-claims.json",
+			"!tools/bench/**/*.json",
+			"!tools/fuzz/corpora"
+		]
+	}
+}

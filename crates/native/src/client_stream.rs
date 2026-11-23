@@ -5,9 +5,7 @@
 //! - Read bridge: sends Vec<u8> to a bounded mpsc channel; selects on a stop_sending oneshot.
 //! - read() awaits directly on the napi runtime (cross-runtime channel waker).
 
-use crate::error::{
-    from_reason as wt_from_reason, from_static_code as wt_from_static_code, WtResult,
-};
+use crate::error::{from_reason as wt_from_reason, WtResult};
 use napi::Result;
 use napi_derive::napi;
 use once_cell::sync::Lazy;
@@ -15,9 +13,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex, Notify, OwnedSemaphorePermit, Semaphore};
-use wtransport::error::{StreamReadError, StreamWriteError};
 
 use crate::read_ownership::{ReadOwnership, ReadOwnershipState};
+use crate::stream_fault::StreamFault;
 use crate::stream_sink::{
     clock_now_ns, resolve_sink_options, run_sink_task, try_acquire_sink_slot, Deframer,
     NativeStreamSinkOptions, SinkClock, SinkCounters, SinkRing, SinkSource, SinkStop,
@@ -70,7 +68,7 @@ pub enum StreamCmd {
     /// buffered write released on teardown cannot leak the budget.
     Data(StreamChunk),
     Finish,
-    FinishWithAck(oneshot::Sender<std::result::Result<(), String>>),
+    FinishWithAck(oneshot::Sender<std::result::Result<(), StreamFault>>),
     Reset(u32),
 }
 
@@ -267,7 +265,7 @@ pub(crate) async fn discard_recv_stream(
         match recv_stream.read(scratch).await {
             Ok(Some(_)) => {}
             Ok(None) => return Ok(()),
-            Err(error) => return Err(read_error_code(&error).to_string()),
+            Err(error) => return Err(StreamFault::from_read(&error).code().to_string()),
         }
     }
 }
@@ -288,7 +286,7 @@ pub(crate) async fn discard_recv_stream_zero_copy(
             Ok(Some(_)) => {}
             Ok(None) => return Ok(()),
             Err(error) => {
-                return Err(quic_read_error_code(&error).to_string());
+                return Err(StreamFault::from_quic_read(&error).code().to_string());
             }
         }
     }
@@ -723,8 +721,8 @@ async fn read_bridge_batch(
             .and_then(|guard| guard.clone());
         if let Some(slot) = ctx.read_error_slot.or(deferred_slot.as_ref()) {
             if let Ok(guard) = slot.lock() {
-                if let Some(code) = *guard {
-                    return Err(wt_from_static_code(code));
+                if let Some(fault) = *guard {
+                    return Err(fault.into_napi());
                 }
             }
         }
@@ -774,18 +772,18 @@ struct DirectReadCtx<'a> {
 /// so every read after the batch that swallowed it reports the same event
 /// rather than a truncation dressed up as a clean end of stream.
 #[derive(Default)]
-struct TerminalLatch(Mutex<Option<&'static str>>);
+struct TerminalLatch(Mutex<Option<StreamFault>>);
 
 impl TerminalLatch {
-    /// Remember `code` unless something terminal is already remembered.
-    fn set(&self, code: &'static str) {
+    /// Remember `fault` unless something terminal is already remembered.
+    fn set(&self, fault: StreamFault) {
         if let Ok(mut slot) = self.0.lock() {
-            slot.get_or_insert(code);
+            slot.get_or_insert(fault);
         }
     }
 
-    /// The remembered terminal code, if a batch consumed one.
-    fn get(&self) -> Option<&'static str> {
+    /// The remembered terminal fault, if a batch consumed one.
+    fn get(&self) -> Option<StreamFault> {
         self.0.lock().ok().and_then(|slot| *slot)
     }
 }
@@ -798,7 +796,7 @@ enum BatchStep {
     Stop,
     /// A terminal event was consumed by this poll. End the batch, hand back the
     /// bytes already collected, and remember the code for the next read.
-    Terminal(&'static str),
+    Terminal(StreamFault),
 }
 
 /// Classify a single `poll_once(read_chunk(..))` result.
@@ -815,7 +813,7 @@ fn classify_batch_poll(
         None => BatchStep::Stop,
         Some(Ok(None)) => BatchStep::Stop,
         Some(Ok(Some(chunk))) => BatchStep::Take(chunk.bytes),
-        Some(Err(error)) => BatchStep::Terminal(quic_read_error_code(&error)),
+        Some(Err(error)) => BatchStep::Terminal(StreamFault::from_quic_read(&error)),
     }
 }
 
@@ -832,8 +830,8 @@ async fn read_deferred_direct_batch(
     // A terminal event an earlier batch consumed is reported here, before the
     // stream is touched: quinn cannot re-report a reset, so this latch is the
     // only remaining record of it.
-    if let Some(code) = ctx.deferred_terminal.get() {
-        return Err(wt_from_static_code(code));
+    if let Some(fault) = ctx.deferred_terminal.get() {
+        return Err(fault.into_napi());
     }
     // The ownership gate replaces "was the deferred slot occupied" as the
     // direct-read admission check: only a `Deferred` readable half may be
@@ -881,7 +879,7 @@ async fn read_deferred_direct_batch(
         Err(error) => {
             drop(guard);
             ctx.ownership.end_direct_read_consumed();
-            return Err(wt_from_static_code(quic_read_error_code(&error)));
+            return Err(StreamFault::from_quic_read(&error).into_napi());
         }
     };
     let Some(chunk_bytes) = read_result.map(|chunk| chunk.bytes) else {
@@ -948,11 +946,11 @@ async fn read_deferred_direct_batch(
                 }
                 break;
             }
-            BatchStep::Terminal(code) => {
+            BatchStep::Terminal(fault) => {
                 if let Some(ref b) = budget {
                     b.release(want as u64);
                 }
-                ctx.deferred_terminal.set(code);
+                ctx.deferred_terminal.set(fault);
                 break;
             }
         };
@@ -1210,34 +1208,15 @@ fn sink_stats_common(slot: &Mutex<Option<Arc<ActiveSink>>>) -> Option<StreamSink
 // Bidi stream handle
 // ---------------------------------------------------------------------------
 
-/// Shared slot for write failure error code (E_STOP_SENDING, E_STREAM_RESET).
-type WriteErrorSlot = Arc<Mutex<Option<&'static str>>>;
-/// Shared slot for read failure error code (E_STREAM_RESET, E_SESSION_CLOSED).
-type ReadErrorSlot = Arc<Mutex<Option<&'static str>>>;
+/// Shared slot for the write half's failure (E_STOP_SENDING, E_STREAM_RESET).
+type WriteErrorSlot = Arc<Mutex<Option<StreamFault>>>;
+/// Shared slot for the read half's failure (E_STREAM_RESET, E_SESSION_CLOSED).
+type ReadErrorSlot = Arc<Mutex<Option<StreamFault>>>;
 type ReadBridgeParts = (
     mpsc::Receiver<StreamChunk>,
     oneshot::Sender<u32>,
     Option<ReadErrorSlot>,
 );
-
-/// The wire code for quinn's chunk-level read errors, matching the mapping the
-/// coalescing `read()` path reports for the same conditions.
-fn quic_read_error_code(err: &wtransport::quinn::ReadError) -> &'static str {
-    match err {
-        wtransport::quinn::ReadError::Reset(_) => "E_STREAM_RESET",
-        wtransport::quinn::ReadError::ConnectionLost(_)
-        | wtransport::quinn::ReadError::ClosedStream
-        | wtransport::quinn::ReadError::IllegalOrderedRead
-        | wtransport::quinn::ReadError::ZeroRttRejected => "E_SESSION_CLOSED",
-    }
-}
-
-fn read_error_code(err: &StreamReadError) -> &'static str {
-    match err {
-        StreamReadError::Reset(_) => "E_STREAM_RESET",
-        StreamReadError::NotConnected | StreamReadError::QuicProto => "E_SESSION_CLOSED",
-    }
-}
 
 /// Splits a write into pieces the budget can actually reserve. A write larger
 /// than `maxQueuedBytesPerStream` used to park on a reservation that could
@@ -1569,8 +1548,8 @@ impl ClientBidiStreamHandle {
     ) -> Result<Option<Option<crate::payload_buffer::PayloadBuffer>>> {
         // A reset a batch already consumed is reported here too: mixing
         // `read()` and `readBatch()` on one stream must not lose it.
-        if let Some(code) = self.deferred_terminal.get() {
-            return Err(wt_from_static_code(code));
+        if let Some(fault) = self.deferred_terminal.get() {
+            return Err(fault.into_napi());
         }
         // Ownership gate: see `read_deferred_direct_batch` — only a
         // `Deferred` readable half may be read directly.
@@ -1614,7 +1593,7 @@ impl ClientBidiStreamHandle {
             Err(error) => {
                 drop(guard);
                 self.read_ownership.end_direct_read_consumed();
-                return Err(wt_from_static_code(quic_read_error_code(&error)));
+                return Err(StreamFault::from_quic_read(&error).into_napi());
             }
         };
         let Some(chunk_bytes) = read_result.map(|chunk| chunk.bytes) else {
@@ -1991,8 +1970,8 @@ impl ClientBidiStreamHandle {
                     .and_then(|guard| guard.clone());
                 if let Some(slot) = self.read_error_slot.as_ref().or(deferred_slot.as_ref()) {
                     if let Ok(guard) = slot.lock() {
-                        if let Some(code) = *guard {
-                            return Err(wt_from_static_code(code));
+                        if let Some(fault) = *guard {
+                            return Err(fault.into_napi());
                         }
                     }
                 }
@@ -2026,8 +2005,8 @@ impl ClientBidiStreamHandle {
         if let Ok(slot) = self.write_error_slot.lock() {
             if let Some(slot) = slot.as_ref() {
                 if let Ok(guard) = slot.lock() {
-                    if let Some(code) = *guard {
-                        return Err(wt_from_static_code(code));
+                    if let Some(fault) = *guard {
+                        return Err(fault.into_napi());
                     }
                 }
             }
@@ -2214,13 +2193,13 @@ impl ClientBidiStreamHandle {
         let _probe_method = await_probe::enter(&await_probe::FINISH_METHOD);
         self.finished.store(true, Ordering::Release);
         let tx = self.ensure_write_tx()?;
-        let (done_tx, done_rx) = oneshot::channel::<std::result::Result<(), String>>();
+        let (done_tx, done_rx) = oneshot::channel::<std::result::Result<(), StreamFault>>();
         tx.send(StreamCmd::FinishWithAck(done_tx))
             .await
             .map_err(|_| napi::Error::from_reason("E_STREAM_RESET"))?;
         match done_rx.await {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(code)) => Err(napi::Error::from_reason(code)),
+            Ok(Err(fault)) => Err(fault.into_napi()),
             Err(_) => Err(napi::Error::from_reason("E_STREAM_RESET")),
         }
     }
@@ -2323,8 +2302,8 @@ impl ClientUniSendHandle {
         }
         if let Some(ref slot) = self.write_error_slot {
             if let Ok(guard) = slot.lock() {
-                if let Some(code) = *guard {
-                    return Err(napi::Error::from_reason(code));
+                if let Some(fault) = *guard {
+                    return Err(fault.into_napi());
                 }
             }
         }
@@ -2407,13 +2386,13 @@ impl ClientUniSendHandle {
             .as_ref()
             .cloned()
             .ok_or_else(|| napi::Error::from_reason("E_STREAM_RESET"))?;
-        let (done_tx, done_rx) = oneshot::channel::<std::result::Result<(), String>>();
+        let (done_tx, done_rx) = oneshot::channel::<std::result::Result<(), StreamFault>>();
         tx.send(StreamCmd::FinishWithAck(done_tx))
             .await
             .map_err(|_| napi::Error::from_reason("E_STREAM_RESET"))?;
         match done_rx.await {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(code)) => Err(napi::Error::from_reason(code)),
+            Ok(Err(fault)) => Err(fault.into_napi()),
             Err(_) => Err(napi::Error::from_reason("E_STREAM_RESET")),
         }
     }
@@ -2592,8 +2571,8 @@ impl ClientUniRecvHandle {
     ) -> Result<Option<Option<crate::payload_buffer::PayloadBuffer>>> {
         // A reset a batch already consumed is reported here too: mixing
         // `read()` and `readBatch()` on one stream must not lose it.
-        if let Some(code) = self.deferred_terminal.get() {
-            return Err(wt_from_static_code(code));
+        if let Some(fault) = self.deferred_terminal.get() {
+            return Err(fault.into_napi());
         }
         // Ownership gate: see `read_deferred_direct_batch` — only a
         // `Deferred` readable half may be read directly.
@@ -2637,7 +2616,7 @@ impl ClientUniRecvHandle {
             Err(error) => {
                 drop(guard);
                 self.read_ownership.end_direct_read_consumed();
-                return Err(wt_from_static_code(quic_read_error_code(&error)));
+                return Err(StreamFault::from_quic_read(&error).into_napi());
             }
         };
         let Some(chunk_bytes) = read_result.map(|chunk| chunk.bytes) else {
@@ -2940,8 +2919,8 @@ impl ClientUniRecvHandle {
                     .and_then(|guard| guard.clone());
                 if let Some(slot) = self.read_error_slot.as_ref().or(deferred_slot.as_ref()) {
                     if let Ok(guard) = slot.lock() {
-                        if let Some(code) = *guard {
-                            return Err(napi::Error::from_reason(code));
+                        if let Some(fault) = *guard {
+                            return Err(fault.into_napi());
                         }
                     }
                 }
@@ -3042,12 +3021,11 @@ impl ClientUniRecvHandle {
 
 async fn finish_send_stream(
     send_stream: &mut wtransport::SendStream,
-) -> std::result::Result<(), &'static str> {
-    match send_stream.finish().await {
-        Ok(()) => Ok(()),
-        Err(StreamWriteError::Stopped(_)) => Err("E_STOP_SENDING"),
-        Err(_) => Err("E_STREAM_RESET"),
-    }
+) -> std::result::Result<(), StreamFault> {
+    send_stream
+        .finish()
+        .await
+        .map_err(|error| StreamFault::from_write(&error))
 }
 
 fn spawn_bidi_write_bridge_on(
@@ -3063,10 +3041,7 @@ fn spawn_bidi_write_bridge_on(
                 StreamCmd::Data(chunk) => match send_stream.write_all(chunk.as_bytes()).await {
                     Ok(()) => {}
                     Err(e) => {
-                        let code = match &e {
-                            StreamWriteError::Stopped(_) => "E_STOP_SENDING",
-                            _ => "E_STREAM_RESET",
-                        };
+                        let code = StreamFault::from_write(&e);
                         if let Ok(mut guard) = write_error_slot_clone.lock() {
                             if guard.is_none() {
                                 *guard = Some(code);
@@ -3086,14 +3061,14 @@ fn spawn_bidi_write_bridge_on(
                     break;
                 }
                 StreamCmd::FinishWithAck(done_tx) => {
-                    let mut ret: std::result::Result<(), String> = Ok(());
+                    let mut ret: std::result::Result<(), StreamFault> = Ok(());
                     if let Err(code) = finish_send_stream(&mut send_stream).await {
                         if let Ok(mut guard) = write_error_slot_clone.lock() {
                             if guard.is_none() {
                                 *guard = Some(code);
                             }
                         }
-                        ret = Err(code.to_string());
+                        ret = Err(code);
                     }
                     let _ = done_tx.send(ret);
                     break;
@@ -3136,7 +3111,7 @@ fn spawn_recv_bridge_on_with_permit(
                                     recv_stream.stop(0);
                                     if let Ok(mut g) = read_error_slot_clone.lock() {
                                         if g.is_none() {
-                                            *g = Some("E_STREAM_RESET");
+                                            *g = Some(StreamFault::Code("E_STREAM_RESET"));
                                         }
                                     }
                                     break;
@@ -3150,9 +3125,9 @@ fn spawn_recv_bridge_on_with_permit(
                                         recv_stream.stop(0);
                                         if let Ok(mut g) = read_error_slot_clone.lock() {
                                             if g.is_none() {
-                                                *g = Some(
+                                                *g = Some(StreamFault::Code(
                                                     "E_BACKPRESSURE_TIMEOUT",
-                                                );
+                                                ));
                                             }
                                         }
                                         break;
@@ -3189,7 +3164,7 @@ fn spawn_recv_bridge_on_with_permit(
                         Err(e) => {
                             if let Ok(mut guard) = read_error_slot_clone.lock() {
                                 if guard.is_none() {
-                                    *guard = Some(read_error_code(&e));
+                                    *guard = Some(StreamFault::from_read(&e));
                                 }
                             }
                             break;
@@ -3240,10 +3215,7 @@ pub fn spawn_uni_send_bridge_on(
                     match send_stream.write_all(chunk.as_bytes()).await {
                         Ok(()) => {}
                         Err(e) => {
-                            let code = match &e {
-                                StreamWriteError::Stopped(_) => "E_STOP_SENDING",
-                                _ => "E_STREAM_RESET",
-                            };
+                            let code = StreamFault::from_write(&e);
                             if let Ok(mut guard) = write_error_slot_clone.lock() {
                                 if guard.is_none() {
                                     *guard = Some(code);
@@ -3264,14 +3236,14 @@ pub fn spawn_uni_send_bridge_on(
                     break;
                 }
                 StreamCmd::FinishWithAck(done_tx) => {
-                    let mut ret: std::result::Result<(), String> = Ok(());
+                    let mut ret: std::result::Result<(), StreamFault> = Ok(());
                     if let Err(code) = finish_send_stream(&mut send_stream).await {
                         if let Ok(mut guard) = write_error_slot_clone.lock() {
                             if guard.is_none() {
                                 *guard = Some(code);
                             }
                         }
-                        ret = Err(code.to_string());
+                        ret = Err(code);
                     }
                     let _ = done_tx.send(ret);
                     break;
@@ -3323,7 +3295,7 @@ fn spawn_uni_recv_bridge_on_with_permit(
                                     recv_stream.stop(0);
                                     if let Ok(mut g) = read_error_slot_clone.lock() {
                                         if g.is_none() {
-                                            *g = Some("E_STREAM_RESET");
+                                            *g = Some(StreamFault::Code("E_STREAM_RESET"));
                                         }
                                     }
                                     break;
@@ -3343,9 +3315,9 @@ fn spawn_uni_recv_bridge_on_with_permit(
                                         recv_stream.stop(0);
                                         if let Ok(mut g) = read_error_slot_clone.lock() {
                                             if g.is_none() {
-                                                *g = Some(
+                                                *g = Some(StreamFault::Code(
                                                     "E_BACKPRESSURE_TIMEOUT",
-                                                );
+                                                ));
                                             }
                                         }
                                         break;
@@ -3381,7 +3353,7 @@ fn spawn_uni_recv_bridge_on_with_permit(
                         Err(e) => {
                             if let Ok(mut guard) = read_error_slot_clone.lock() {
                                 if guard.is_none() {
-                                    *guard = Some(read_error_code(&e));
+                                    *guard = Some(StreamFault::from_read(&e));
                                 }
                             }
                             break;
@@ -3509,11 +3481,11 @@ mod tests {
         let reset = ReadError::Reset(wtransport::quinn::VarInt::from_u32(42));
         assert!(matches!(
             classify_batch_poll(Some(Err(reset))),
-            BatchStep::Terminal("E_STREAM_RESET")
+            BatchStep::Terminal(StreamFault::PeerReset(42))
         ));
         assert!(matches!(
             classify_batch_poll(Some(Err(ReadError::ClosedStream))),
-            BatchStep::Terminal("E_SESSION_CLOSED")
+            BatchStep::Terminal(StreamFault::Code("E_SESSION_CLOSED"))
         ));
     }
 
@@ -3523,12 +3495,12 @@ mod tests {
     fn the_terminal_latch_keeps_the_first_code_forever() {
         let latch = TerminalLatch::default();
         assert_eq!(latch.get(), None);
-        latch.set("E_STREAM_RESET");
-        assert_eq!(latch.get(), Some("E_STREAM_RESET"));
+        latch.set(StreamFault::PeerReset(42));
+        assert_eq!(latch.get(), Some(StreamFault::PeerReset(42)));
         // A later event cannot rewrite what the consumer is owed.
-        latch.set("E_SESSION_CLOSED");
-        assert_eq!(latch.get(), Some("E_STREAM_RESET"));
-        assert_eq!(latch.get(), Some("E_STREAM_RESET"));
+        latch.set(StreamFault::Code("E_SESSION_CLOSED"));
+        assert_eq!(latch.get(), Some(StreamFault::PeerReset(42)));
+        assert_eq!(latch.get(), Some(StreamFault::PeerReset(42)));
     }
 
     // Coalescing must not reorder, pad, or drop bytes, and every chunk's

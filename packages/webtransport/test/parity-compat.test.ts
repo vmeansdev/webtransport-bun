@@ -162,10 +162,10 @@ describe.skipIf(skipWasmParityIfUnavailable)(
 			const wt = new WebTransport("https://127.0.0.1:59997", {
 				allowPooling: true,
 				tls: { insecureSkipVerify: true },
-				limits: { handshakeTimeoutMs: 50 },
+				limits: { handshakeTimeoutMs: 100 },
 			});
 			wt.close();
-			await Bun.sleep(100);
+			await Bun.sleep(200);
 		});
 	},
 );

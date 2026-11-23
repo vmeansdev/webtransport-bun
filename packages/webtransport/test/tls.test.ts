@@ -43,6 +43,107 @@ async function connectWithRetry(
 	throw lastErr ?? new Error("connectWithRetry: timed out");
 }
 
+/** Bounded connect: certificate failures settle fast, so no retry loop. */
+function connectWithin(
+	url: string,
+	opts: Parameters<typeof connect>[1],
+	timeoutMs = 5000,
+): Promise<Awaited<ReturnType<typeof connect>>> {
+	return Promise.race([
+		connect(url, opts),
+		Bun.sleep(timeoutMs).then(() => {
+			throw new Error(`connectWithin: no settle within ${timeoutMs}ms`);
+		}),
+	]);
+}
+
+describe("certificate verification failures reject with E_TLS", () => {
+	it("an issuer the client does not trust", async () => {
+		if (!generatedCert) return;
+		const server = createServer({
+			host: "127.0.0.1",
+			port: 0,
+			tls: { certPem: generatedCert.certPem, keyPem: generatedCert.keyPem },
+			onSession: () => {},
+		});
+		try {
+			await expect(
+				connectWithin(`https://127.0.0.1:${server.address.port}`, {}),
+			).rejects.toMatchObject({ code: "E_TLS" });
+		} finally {
+			await server.close();
+		}
+	}, 15000);
+
+	it("a certificate that is not valid for the requested name", async () => {
+		if (!generatedCert) return;
+		const server = createServer({
+			host: "127.0.0.1",
+			port: 0,
+			tls: { certPem: generatedCert.certPem, keyPem: generatedCert.keyPem },
+			onSession: () => {},
+		});
+		try {
+			await expect(
+				connectWithin(`https://127.0.0.1:${server.address.port}`, {
+					tls: { caPem: generatedCert.certPem, serverName: "wrong.test" },
+				}),
+			).rejects.toMatchObject({ code: "E_TLS" });
+		} finally {
+			await server.close();
+		}
+	}, 15000);
+
+	it("a server with no certificate for the requested server name", async () => {
+		if (!generatedCert) return;
+		const server = createServer({
+			host: "127.0.0.1",
+			port: 0,
+			tls: {
+				certPem: generatedCert.certPem,
+				keyPem: generatedCert.keyPem,
+				unknownSniPolicy: "reject",
+				sni: [
+					{
+						serverName: "known.test",
+						certPem: generatedCert.certPem,
+						keyPem: generatedCert.keyPem,
+					},
+				],
+			},
+			onSession: () => {},
+		});
+		try {
+			await expect(
+				connectWithin(`https://127.0.0.1:${server.address.port}`, {
+					tls: { insecureSkipVerify: true, serverName: "unknown.test" },
+				}),
+			).rejects.toMatchObject({ code: "E_TLS" });
+		} finally {
+			await server.close();
+		}
+	}, 15000);
+
+	it("keeps the browser name under strictW3CErrors", async () => {
+		if (!generatedCert) return;
+		const server = createServer({
+			host: "127.0.0.1",
+			port: 0,
+			tls: { certPem: generatedCert.certPem, keyPem: generatedCert.keyPem },
+			onSession: () => {},
+		});
+		try {
+			await expect(
+				connectWithin(`https://127.0.0.1:${server.address.port}`, {
+					strictW3CErrors: true,
+				}),
+			).rejects.toMatchObject({ code: "E_TLS", name: "NetworkError" });
+		} finally {
+			await server.close();
+		}
+	}, 15000);
+});
+
 describe("TLS contract (P0.3)", () => {
 	it("connect() validates serverCertificateHashes (BufferSource shape) before dialing", async () => {
 		// Empty array = silent pinning downgrade.
@@ -175,7 +276,7 @@ describe("TLS contract (P0.3)", () => {
 					allowPooling: true,
 					tls: { caPem: foreign.certPem, serverName: "localhost" },
 				}),
-			).rejects.toThrow(/invalid peer certificate|E_TLS/);
+			).rejects.toMatchObject({ code: "E_TLS" });
 		} finally {
 			foreign.cleanup();
 			await server.close();
@@ -313,7 +414,7 @@ describe("TLS contract (P0.3)", () => {
 					},
 					1500,
 				),
-			).rejects.toThrow(/(E_TLS|invalid peer certificate|BadSignature)/);
+			).rejects.toMatchObject({ code: "E_TLS" });
 
 			const after = await connectWithRetry(`https://127.0.0.1:${port}`, {
 				tls: { caPem: nextCert.certPem, serverName: "localhost" },

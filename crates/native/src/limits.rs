@@ -50,62 +50,110 @@ impl Default for Limits {
     }
 }
 
-fn positive_u64(value: &serde_json::Value, key: &str) -> Option<u64> {
-    value.get(key).and_then(|x| x.as_u64()).filter(|n| *n > 0)
+/// Smallest accepted value of each integer field. Kept in step with
+/// `LIMIT_FLOORS` in `packages/webtransport/src/index.ts`, which rejects first;
+/// this parser refuses the same inputs so a direct addon call cannot have a
+/// value silently replaced either.
+const FLOORS: &[(&str, u64)] = &[
+    ("maxSessions", 1),
+    ("maxHandshakesInFlight", 1),
+    ("maxStreamsPerSessionBidi", 0),
+    ("maxStreamsPerSessionUni", 0),
+    ("maxStreamsGlobal", 0),
+    ("maxDatagramSize", 1),
+    ("maxQueuedBytesGlobal", 0),
+    ("maxQueuedBytesPerSession", 0),
+    ("maxQueuedBytesPerStream", 0),
+    ("backpressureTimeoutMs", 100),
+    ("handshakeTimeoutMs", 100),
+    ("idleTimeoutMs", 1000),
+    ("keepAliveIntervalMs", 0),
+];
+
+/// An integer field: absent is `None`, present must be an integer at or above
+/// its floor.
+fn integer_field(
+    v: &serde_json::Value,
+    key: &str,
+    floor: u64,
+) -> std::result::Result<Option<u64>, String> {
+    let Some(raw) = v.get(key) else {
+        return Ok(None);
+    };
+    match raw.as_u64() {
+        Some(n) if n >= floor => Ok(Some(n)),
+        _ => Err(format!(
+            "E_INVALID_ARGUMENT: limits.{key} must be an integer >= {floor}, got {raw}"
+        )),
+    }
+}
+
+fn floor_of(key: &str) -> u64 {
+    FLOORS
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, floor)| *floor)
+        .unwrap_or(0)
 }
 
 impl Limits {
-    pub fn from_json(json: &str) -> Self {
-        let mut lim = Self::default();
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(json) {
-            if let Some(n) = v.get("maxSessions").and_then(|x| x.as_u64()) {
-                lim.max_sessions = n.max(1);
-            }
-            if let Some(n) = v.get("maxHandshakesInFlight").and_then(|x| x.as_u64()) {
-                lim.max_handshakes_in_flight = n.max(1);
-            }
-            if let Some(n) = v.get("maxStreamsPerSessionBidi").and_then(|x| x.as_u64()) {
-                lim.max_streams_per_session_bidi = n;
-            }
-            if let Some(n) = v.get("maxStreamsPerSessionUni").and_then(|x| x.as_u64()) {
-                lim.max_streams_per_session_uni = n;
-            }
-            if let Some(n) = v.get("maxStreamsGlobal").and_then(|x| x.as_u64()) {
-                lim.max_streams_global = n;
-            }
-            if let Some(n) = v.get("maxDatagramSize").and_then(|x| x.as_u64()) {
-                lim.max_datagram_size = (n as usize).max(1);
-            }
-            if let Some(n) = v.get("maxQueuedBytesGlobal").and_then(|x| x.as_u64()) {
-                lim.max_queued_bytes_global = n;
-            }
-            if let Some(n) = v.get("maxQueuedBytesPerSession").and_then(|x| x.as_u64()) {
-                lim.max_queued_bytes_per_session = n;
-            }
-            if let Some(n) = v.get("maxQueuedBytesPerStream").and_then(|x| x.as_u64()) {
-                lim.max_queued_bytes_per_stream = n;
-            }
-            // Explicit QUIC windows. Omitted, non-numeric or zero leaves the
-            // window derived from the byte governors, so the shipped config is
-            // byte-identical to before these fields existed.
-            lim.stream_receive_window = positive_u64(&v, "streamReceiveWindow");
-            lim.receive_window = positive_u64(&v, "receiveWindow");
-            lim.send_window = positive_u64(&v, "sendWindow");
-            if let Some(n) = v.get("backpressureTimeoutMs").and_then(|x| x.as_u64()) {
-                lim.backpressure_timeout_ms = n.max(100);
-            }
-            if let Some(n) = v.get("handshakeTimeoutMs").and_then(|x| x.as_u64()) {
-                lim.handshake_timeout_ms = n.max(100);
-            }
-            if let Some(n) = v.get("idleTimeoutMs").and_then(|x| x.as_u64()) {
-                lim.idle_timeout_ms = n.max(1000);
-            }
-            if let Some(n) = v.get("keepAliveIntervalMs").and_then(|x| x.as_u64()) {
-                // 0 means disabled, same as omitting the field.
-                lim.keep_alive_interval_ms = if n > 0 { Some(n) } else { None };
-            }
+    /// Parse a `limits` JSON object. Absent fields keep their defaults; a
+    /// present field that is not an integer at or above its floor is an
+    /// `E_INVALID_ARGUMENT` error rather than a silently substituted value.
+    pub fn from_json(json: &str) -> std::result::Result<Self, String> {
+        let v: serde_json::Value = serde_json::from_str(json)
+            .map_err(|e| format!("E_INVALID_ARGUMENT: limits must be a JSON object: {e}"))?;
+        if !v.is_object() {
+            return Err("E_INVALID_ARGUMENT: limits must be an object".to_string());
         }
-        lim
+        let field = |key: &str| integer_field(&v, key, floor_of(key));
+        let mut lim = Self::default();
+        if let Some(n) = field("maxSessions")? {
+            lim.max_sessions = n;
+        }
+        if let Some(n) = field("maxHandshakesInFlight")? {
+            lim.max_handshakes_in_flight = n;
+        }
+        if let Some(n) = field("maxStreamsPerSessionBidi")? {
+            lim.max_streams_per_session_bidi = n;
+        }
+        if let Some(n) = field("maxStreamsPerSessionUni")? {
+            lim.max_streams_per_session_uni = n;
+        }
+        if let Some(n) = field("maxStreamsGlobal")? {
+            lim.max_streams_global = n;
+        }
+        if let Some(n) = field("maxDatagramSize")? {
+            lim.max_datagram_size = usize::try_from(n).unwrap_or(usize::MAX);
+        }
+        if let Some(n) = field("maxQueuedBytesGlobal")? {
+            lim.max_queued_bytes_global = n;
+        }
+        if let Some(n) = field("maxQueuedBytesPerSession")? {
+            lim.max_queued_bytes_per_session = n;
+        }
+        if let Some(n) = field("maxQueuedBytesPerStream")? {
+            lim.max_queued_bytes_per_stream = n;
+        }
+        // Explicit QUIC windows: omitted leaves the window derived from the
+        // byte governors; set means a positive integer.
+        lim.stream_receive_window = integer_field(&v, "streamReceiveWindow", 1)?;
+        lim.receive_window = integer_field(&v, "receiveWindow", 1)?;
+        lim.send_window = integer_field(&v, "sendWindow", 1)?;
+        if let Some(n) = field("backpressureTimeoutMs")? {
+            lim.backpressure_timeout_ms = n;
+        }
+        if let Some(n) = field("handshakeTimeoutMs")? {
+            lim.handshake_timeout_ms = n;
+        }
+        if let Some(n) = field("idleTimeoutMs")? {
+            lim.idle_timeout_ms = n;
+        }
+        if let Some(n) = field("keepAliveIntervalMs")? {
+            // 0 means disabled, same as omitting the field.
+            lim.keep_alive_interval_ms = (n > 0).then_some(n);
+        }
+        Ok(lim)
     }
 
     /// Effective keep-alive interval: clamped to at most idle_timeout/3 so
@@ -122,34 +170,24 @@ impl Limits {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_zero_max_datagram_size_clamped_to_one() {
-        let lim = Limits::from_json(r#"{"maxDatagramSize": 0}"#);
-        assert_eq!(lim.max_datagram_size, 1);
+    fn parse(json: &str) -> Limits {
+        Limits::from_json(json).expect("valid limits")
     }
 
-    #[test]
-    fn test_zero_max_sessions_clamped_to_one() {
-        let lim = Limits::from_json(r#"{"maxSessions": 0}"#);
-        assert_eq!(lim.max_sessions, 1);
-    }
-
-    #[test]
-    fn test_zero_handshake_timeout_clamped() {
-        let lim = Limits::from_json(r#"{"handshakeTimeoutMs": 0}"#);
-        assert_eq!(lim.handshake_timeout_ms, 100);
+    fn reject(json: &str) -> String {
+        Limits::from_json(json).expect_err("invalid limits")
     }
 
     #[test]
     fn test_normal_values_pass_through() {
-        let lim = Limits::from_json(r#"{"maxSessions": 500, "maxDatagramSize": 1200}"#);
+        let lim = parse(r#"{"maxSessions": 500, "maxDatagramSize": 1200}"#);
         assert_eq!(lim.max_sessions, 500);
         assert_eq!(lim.max_datagram_size, 1200);
     }
 
     #[test]
     fn test_defaults_unchanged() {
-        let lim = Limits::from_json("{}");
+        let lim = parse("{}");
         assert_eq!(lim.max_sessions, 2000);
         assert_eq!(lim.max_datagram_size, 1200);
         assert_eq!(lim.handshake_timeout_ms, 10_000);
@@ -176,72 +214,91 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_json_keeps_defaults() {
-        let lim = Limits::from_json("not-json");
-        assert_eq!(lim.max_sessions, Limits::default().max_sessions);
-        assert_eq!(lim.idle_timeout_ms, Limits::default().idle_timeout_ms);
+    fn invalid_json_or_a_non_object_is_rejected() {
+        assert!(reject("not-json").starts_with("E_INVALID_ARGUMENT: "));
+        assert!(reject("[]").starts_with("E_INVALID_ARGUMENT: "));
     }
 
     #[test]
-    fn test_non_u64_fields_ignored() {
-        let lim = Limits::from_json(
+    fn non_integer_fields_are_rejected_not_ignored() {
+        for (key, raw) in [
+            ("maxSessions", r#""nope""#),
+            ("maxHandshakesInFlight", "null"),
+            ("maxStreamsPerSessionBidi", "true"),
+            ("maxStreamsPerSessionUni", "[]"),
+            ("maxStreamsGlobal", "{}"),
+            ("maxDatagramSize", "-1"),
+            ("maxQueuedBytesGlobal", r#""x""#),
+            ("maxQueuedBytesPerSession", "false"),
+            ("maxQueuedBytesPerStream", "1.5"),
+            ("backpressureTimeoutMs", r#""slow""#),
+            ("handshakeTimeoutMs", "{}"),
+            ("idleTimeoutMs", "[]"),
+            ("keepAliveIntervalMs", "-5"),
+        ] {
+            let err = reject(&format!(r#"{{"{key}": {raw}}}"#));
+            assert!(
+                err.starts_with(&format!("E_INVALID_ARGUMENT: limits.{key} must be")),
+                "{key}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn values_below_a_floor_are_rejected_not_clamped() {
+        for (key, below) in [
+            ("maxSessions", 0),
+            ("maxHandshakesInFlight", 0),
+            ("maxDatagramSize", 0),
+            ("backpressureTimeoutMs", 99),
+            ("handshakeTimeoutMs", 0),
+            ("idleTimeoutMs", 999),
+        ] {
+            let err = reject(&format!(r#"{{"{key}": {below}}}"#));
+            assert!(
+                err.contains(&format!("limits.{key} must be an integer >=")),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn floors_themselves_are_accepted() {
+        let lim = parse(
             r#"{
-                "maxSessions": "nope",
-                "maxHandshakesInFlight": null,
-                "maxStreamsPerSessionBidi": true,
-                "maxStreamsPerSessionUni": [],
-                "maxStreamsGlobal": {},
-                "maxDatagramSize": -1,
-                "maxQueuedBytesGlobal": "x",
-                "maxQueuedBytesPerSession": false,
-                "maxQueuedBytesPerStream": 1.5,
-                "backpressureTimeoutMs": "slow",
-                "handshakeTimeoutMs": {},
-                "idleTimeoutMs": []
+                "maxSessions": 1,
+                "maxHandshakesInFlight": 1,
+                "maxStreamsPerSessionBidi": 0,
+                "maxStreamsPerSessionUni": 0,
+                "maxStreamsGlobal": 0,
+                "maxDatagramSize": 1,
+                "maxQueuedBytesGlobal": 0,
+                "maxQueuedBytesPerSession": 0,
+                "maxQueuedBytesPerStream": 0,
+                "backpressureTimeoutMs": 100,
+                "handshakeTimeoutMs": 100,
+                "idleTimeoutMs": 1000,
+                "keepAliveIntervalMs": 0
             }"#,
         );
-        let defaults = Limits::default();
-        assert_eq!(lim.max_sessions, defaults.max_sessions);
-        assert_eq!(
-            lim.max_handshakes_in_flight,
-            defaults.max_handshakes_in_flight
-        );
-        assert_eq!(
-            lim.max_streams_per_session_bidi,
-            defaults.max_streams_per_session_bidi
-        );
-        assert_eq!(
-            lim.max_streams_per_session_uni,
-            defaults.max_streams_per_session_uni
-        );
-        assert_eq!(lim.max_streams_global, defaults.max_streams_global);
-        assert_eq!(lim.max_datagram_size, defaults.max_datagram_size);
-        assert_eq!(
-            lim.max_queued_bytes_global,
-            defaults.max_queued_bytes_global
-        );
-        assert_eq!(
-            lim.max_queued_bytes_per_session,
-            defaults.max_queued_bytes_per_session
-        );
-        assert_eq!(
-            lim.max_queued_bytes_per_stream,
-            defaults.max_queued_bytes_per_stream
-        );
-        assert_eq!(
-            lim.backpressure_timeout_ms,
-            defaults.backpressure_timeout_ms
-        );
-        assert_eq!(lim.handshake_timeout_ms, defaults.handshake_timeout_ms);
-        assert_eq!(lim.idle_timeout_ms, defaults.idle_timeout_ms);
+        assert_eq!(lim.max_sessions, 1);
+        assert_eq!(lim.max_handshakes_in_flight, 1);
+        assert_eq!(lim.max_streams_per_session_bidi, 0);
+        assert_eq!(lim.max_streams_global, 0);
+        assert_eq!(lim.max_datagram_size, 1);
+        assert_eq!(lim.max_queued_bytes_per_stream, 0);
+        assert_eq!(lim.backpressure_timeout_ms, 100);
+        assert_eq!(lim.handshake_timeout_ms, 100);
+        assert_eq!(lim.idle_timeout_ms, 1000);
+        assert_eq!(lim.keep_alive_interval_ms, None);
     }
 
     #[test]
-    fn test_all_fields_parsed_and_clamped() {
-        let lim = Limits::from_json(
+    fn test_all_fields_parsed() {
+        let lim = parse(
             r#"{
                 "maxSessions": 10,
-                "maxHandshakesInFlight": 0,
+                "maxHandshakesInFlight": 2,
                 "maxStreamsPerSessionBidi": 3,
                 "maxStreamsPerSessionUni": 4,
                 "maxStreamsGlobal": 5,
@@ -249,13 +306,13 @@ mod tests {
                 "maxQueuedBytesGlobal": 1024,
                 "maxQueuedBytesPerSession": 512,
                 "maxQueuedBytesPerStream": 256,
-                "backpressureTimeoutMs": 50,
+                "backpressureTimeoutMs": 150,
                 "handshakeTimeoutMs": 200,
-                "idleTimeoutMs": 500
+                "idleTimeoutMs": 1500
             }"#,
         );
         assert_eq!(lim.max_sessions, 10);
-        assert_eq!(lim.max_handshakes_in_flight, 1);
+        assert_eq!(lim.max_handshakes_in_flight, 2);
         assert_eq!(lim.max_streams_per_session_bidi, 3);
         assert_eq!(lim.max_streams_per_session_uni, 4);
         assert_eq!(lim.max_streams_global, 5);
@@ -263,28 +320,14 @@ mod tests {
         assert_eq!(lim.max_queued_bytes_global, 1024);
         assert_eq!(lim.max_queued_bytes_per_session, 512);
         assert_eq!(lim.max_queued_bytes_per_stream, 256);
-        assert_eq!(lim.backpressure_timeout_ms, 100);
+        assert_eq!(lim.backpressure_timeout_ms, 150);
         assert_eq!(lim.handshake_timeout_ms, 200);
-        assert_eq!(lim.idle_timeout_ms, 1000);
-    }
-
-    #[test]
-    fn test_timeout_floors_apply_only_when_below_minimum() {
-        let lim = Limits::from_json(
-            r#"{
-                "backpressureTimeoutMs": 100,
-                "handshakeTimeoutMs": 100,
-                "idleTimeoutMs": 1000
-            }"#,
-        );
-        assert_eq!(lim.backpressure_timeout_ms, 100);
-        assert_eq!(lim.handshake_timeout_ms, 100);
-        assert_eq!(lim.idle_timeout_ms, 1000);
+        assert_eq!(lim.idle_timeout_ms, 1500);
     }
 
     #[test]
     fn window_fields_default_to_derived() {
-        let lim = Limits::from_json("{}");
+        let lim = parse("{}");
         assert_eq!(lim.stream_receive_window, None);
         assert_eq!(lim.receive_window, None);
         assert_eq!(lim.send_window, None);
@@ -292,7 +335,7 @@ mod tests {
 
     #[test]
     fn window_fields_parse_when_present() {
-        let lim = Limits::from_json(
+        let lim = parse(
             r#"{"streamReceiveWindow": 8388608, "receiveWindow": 33554432, "sendWindow": 4194304}"#,
         );
         assert_eq!(lim.stream_receive_window, Some(8 * 1024 * 1024));
@@ -304,37 +347,37 @@ mod tests {
     }
 
     #[test]
-    fn zero_or_malformed_windows_stay_derived() {
-        let lim = Limits::from_json(
-            r#"{"streamReceiveWindow": 0, "receiveWindow": "big", "sendWindow": -1}"#,
-        );
-        assert_eq!(lim.stream_receive_window, None);
-        assert_eq!(lim.receive_window, None);
-        assert_eq!(lim.send_window, None);
+    fn zero_or_malformed_windows_are_rejected() {
+        for raw in [
+            r#"{"streamReceiveWindow": 0}"#,
+            r#"{"receiveWindow": "big"}"#,
+            r#"{"sendWindow": -1}"#,
+        ] {
+            assert!(
+                reject(raw).starts_with("E_INVALID_ARGUMENT: limits."),
+                "{raw}"
+            );
+        }
     }
 
     #[test]
     fn keep_alive_disabled_by_default_and_on_zero() {
         assert_eq!(Limits::default().effective_keep_alive_interval_ms(), None);
-        let lim = Limits::from_json(r#"{"keepAliveIntervalMs":0}"#);
+        let lim = parse(r#"{"keepAliveIntervalMs":0}"#);
         assert_eq!(lim.effective_keep_alive_interval_ms(), None);
     }
 
     #[test]
     fn keep_alive_clamped_to_third_of_idle_timeout() {
-        let lim = Limits::from_json(r#"{"idleTimeoutMs":3000,"keepAliveIntervalMs":5000}"#);
+        let lim = parse(r#"{"idleTimeoutMs":3000,"keepAliveIntervalMs":5000}"#);
         assert_eq!(lim.effective_keep_alive_interval_ms(), Some(1000));
 
-        let lim = Limits::from_json(r#"{"idleTimeoutMs":3000,"keepAliveIntervalMs":200}"#);
+        let lim = parse(r#"{"idleTimeoutMs":3000,"keepAliveIntervalMs":200}"#);
         assert_eq!(lim.effective_keep_alive_interval_ms(), Some(200));
 
-        // from_json floors idleTimeoutMs at 1000, so a degenerate idle timeout
+        // The parser refuses idle timeouts below 1000 ms, so a degenerate one
         // only reaches the clamp when set directly. It still yields a nonzero
         // interval rather than 0 (which would read as "keep-alive disabled").
-        let lim = Limits::from_json(r#"{"idleTimeoutMs":2,"keepAliveIntervalMs":100}"#);
-        assert_eq!(lim.idle_timeout_ms, 1000, "parse floor applies");
-        assert_eq!(lim.effective_keep_alive_interval_ms(), Some(100));
-
         let lim = Limits {
             idle_timeout_ms: 2,
             keep_alive_interval_ms: Some(100),

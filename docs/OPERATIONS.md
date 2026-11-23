@@ -140,6 +140,9 @@ sustained 40% as the early warning, and treat
 `webtransport_backpressure_timeout_total` (below) as the signal that a budget
 actually ran out.
 
+The 0.3 s handshake threshold includes the clients' round trips (see "Runbook:
+handshake p99 high"); raise it when your clients are far from the server.
+
 ## Admission control: refusal is load-shaping, not rejection
 
 At `maxHandshakesInFlight`, the server answers a new dial with QUIC
@@ -147,7 +150,8 @@ At `maxHandshakesInFlight`, the server answers a new dial with QUIC
 `E_LIMIT_EXCEEDED` (in 1.0.0-rc.5 and earlier, a code-less `E_INTERNAL`).
 At `maxSessions`, the server completes the handshake and then closes the
 session with code 3992 / reason `E_LIMIT_EXCEEDED`; `connect()` rejects with
-`E_LIMIT_EXCEEDED`. Both increment `limitExceededCount`. Both are a
+`E_LIMIT_EXCEEDED`. Both increment `limitExceededCount`, as does a handshake
+that runs out of `handshakeTimeoutMs`. Both are a
 **transient admission signal from a healthy server** — "not right now", never
 "go away". The handshake cap in particular bounds *instantaneous concurrency*
 (how many handshakes are simultaneously incomplete), not arrival rate: a
@@ -189,9 +193,26 @@ what the host's handshake memory actually tolerates.
 ## Runbook: handshake p99 high
 
 When `histogram_quantile(0.99, rate(webtransport_handshake_latency_seconds_bucket[5m])) > 0.3`:
-- **Cause**: TLS/QUIC handshake slow; CPU saturation; network RTT spike; certificate validation.
-- **Check**: `handshakesInFlight`, CPU, network latency to clients.
-- **Actions**: Scale out; reduce `maxHandshakesInFlight` to shed load; verify cert chain not oversized.
+
+The histogram runs from a connection's first Initial packet to its CONNECT
+request being accepted, so it includes the clients' round trips (at least two:
+the QUIC/TLS flight and the CONNECT exchange). A p99 of a few RTTs is normal
+for distant clients; set the threshold from your RTT distribution, not only
+from 300 ms. Successful handshakes only: handshakes that time out are not in
+it.
+- **Cause**: CPU saturation (TLS signing); network RTT or loss toward clients
+  (lost handshake packets wait for a retransmission timeout); an oversized
+  certificate chain (more handshake flights, amplification limit). The
+  histogram stops before `onSession` runs, so application code is not a
+  cause.
+- **Check**: `handshakesInFlight` (near `maxHandshakesInFlight` means queueing
+  or stalled handshakes), CPU, RTT to clients, and the rate of
+  `limitExceededCount`: a rise with `handshakesInFlight` pinned at the cap
+  usually means handshakes that never finish (a flood of Initials), each held
+  for up to `handshakeTimeoutMs`.
+- **Actions**: Scale out; for stalled-handshake floods lower
+  `handshakeTimeoutMs` (each slot frees sooner); reduce `maxHandshakesInFlight`
+  to shed CPU load; verify the cert chain is not oversized.
 
 ## Runbook: datagram enqueue p99 high
 
@@ -513,6 +534,12 @@ instead.
 | `WEBTRANSPORT_SUPPRESS_READY_REJECTION_WARN=1` | off | Silence the warning when a facade closed during connect later sees `ready` reject |
 | `WEBTRANSPORT_SUPPRESS_RUNTIME_VERSION_WARN=1` | off | Silence the startup warning for Bun versions with the known `WritableStream` leak |
 | `WEBTRANSPORT_SUPPRESS_LOG_CALLBACK_WARN=1`, `WEBTRANSPORT_SUPPRESS_INSECURE_SKIP_VERIFY_WARN=1`, `WEBTRANSPORT_LOG_EXPECTED_CHANNEL_CLOSES=1` | off | See `SECURITY.md`, "Environment variables affecting security diagnostics" |
+
+One standard variable changes what the library enforces:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `NODE_ENV=production` | unset | The root `createServer()` throws `E_TLS` for an empty `tls.certPem`/`tls.keyPem` instead of serving a generated self-signed development certificate; `tls.allowSelfSigned: true` overrides it. See `SECURITY.md`, "Safe defaults" |
 
 ## Unsupported tuning knobs
 

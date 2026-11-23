@@ -6,7 +6,12 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { connect, createServer, E_INVALID_ARGUMENT } from "../src/index.js";
+import {
+	connect,
+	createServer,
+	E_INVALID_ARGUMENT,
+	WebTransport,
+} from "../src/index.js";
 import {
 	openReadSinkOnNativeHandle,
 	type SinkCapableNativeHandle,
@@ -98,6 +103,89 @@ describe("openReadSink options", () => {
 		]) {
 			expect(() => validateStreamSinkOptions(opts)).not.toThrow();
 		}
+	});
+});
+
+describe("limits and rateLimits values outside their documented range", () => {
+	// [field, a value below its floor or not an integer, the floor value itself]
+	const LIMITS: [string, unknown[], number][] = [
+		["maxSessions", [0, -1, 1.5], 1],
+		["maxHandshakesInFlight", [0, -3, 2.5], 1],
+		["maxStreamsPerSessionBidi", [-1, 0.5], 0],
+		["maxStreamsPerSessionUni", [-1, 0.5], 0],
+		["maxStreamsGlobal", [-1, 7.25], 0],
+		["maxDatagramSize", [0, -1, 1200.5], 1],
+		["maxQueuedBytesGlobal", [-1, 1.5], 0],
+		["maxQueuedBytesPerSession", [-1, 1.5], 0],
+		["maxQueuedBytesPerStream", [-1, 1.5], 0],
+		["backpressureTimeoutMs", [0, 99, -5, 100.5], 100],
+		["handshakeTimeoutMs", [0, 50, 99, 150.5], 100],
+		["idleTimeoutMs", [0, 500, 999, 1000.5], 1000],
+		["keepAliveIntervalMs", [-1, 2.5], 0],
+	];
+	const RATE_LIMITS: [string, unknown[], number][] = [
+		["handshakesPerSec", [-1], 0],
+		["handshakesBurst", [-1, 1.5], 0],
+		["handshakesBurstPerPrefix", [-1, 1.5], 0],
+		["streamsPerSec", [-0.5], 0],
+		["streamsBurst", [-1, 1.5], 0],
+		["datagramsPerSec", [-1], 0],
+		["datagramsBurst", [-1, 1.5], 0],
+	];
+
+	const server = (extra: Record<string, unknown>) =>
+		createServer({
+			host: "127.0.0.1",
+			port: 0,
+			tls: { certPem: "", keyPem: "" },
+			onSession: () => {},
+			...extra,
+		} as never);
+
+	for (const [key, bads, floor] of LIMITS) {
+		it(`createServer and connect reject limits.${key} below ${floor} or fractional`, async () => {
+			for (const bad of bads) {
+				expect(() => server({ limits: { [key]: bad } })).toThrow(
+					new RegExp(`^${E_INVALID_ARGUMENT}: limits\\.${key} must be`),
+				);
+				await expect(
+					connect("https://127.0.0.1:1", {
+						tls: { insecureSkipVerify: true },
+						limits: { [key]: bad } as never,
+					}),
+				).rejects.toMatchObject({ code: E_INVALID_ARGUMENT });
+			}
+			// The floor itself is valid and behaves exactly as before.
+			const ok = server({ limits: { [key]: floor } });
+			await ok.close();
+		});
+	}
+
+	for (const [key, bads, floor] of RATE_LIMITS) {
+		it(`createServer rejects rateLimits.${key} below ${floor} or fractional`, async () => {
+			for (const bad of bads) {
+				expect(() => server({ rateLimits: { [key]: bad } })).toThrow(
+					new RegExp(`^${E_INVALID_ARGUMENT}: rateLimits\\.${key} must be`),
+				);
+			}
+			const ok = server({ rateLimits: { [key]: floor } });
+			await ok.close();
+		});
+	}
+
+	it("rates may be fractional", async () => {
+		const ok = server({ rateLimits: { handshakesPerSec: 0.5 } });
+		await ok.close();
+	});
+
+	it("new WebTransport rejects a sub-floor limit too", async () => {
+		const wt = new WebTransport("https://127.0.0.1:1", {
+			limits: { idleTimeoutMs: 500 },
+		});
+		await expect(wt.ready).rejects.toMatchObject({
+			code: E_INVALID_ARGUMENT,
+			message: expect.stringMatching(/limits\.idleTimeoutMs must be/),
+		});
 	});
 });
 
