@@ -122,6 +122,8 @@ Configure Prometheus alerts. Severity: **page** for Sev-2, **ticket** for Sev-3.
 | WebTransportLimitExceeded | `rate(webtransport_limit_exceeded_total[5m]) > 5` | ticket | Limit exceeded |
 
 Replace `0.8 * maxQueuedBytesGlobal` with your configured value (e.g. `419430400` for 400 MiB of 512 MiB).
+The 0.3 s handshake threshold includes the clients' round trips (see "Runbook:
+handshake p99 high"); raise it when your clients are far from the server.
 
 ## Admission control: refusal is load-shaping, not rejection
 
@@ -130,7 +132,8 @@ At `maxHandshakesInFlight`, the server answers a new dial with QUIC
 `E_LIMIT_EXCEEDED` (in 1.0.0-rc.5 and earlier, a code-less `E_INTERNAL`).
 At `maxSessions`, the server completes the handshake and then closes the
 session with code 3992 / reason `E_LIMIT_EXCEEDED`; `connect()` rejects with
-`E_LIMIT_EXCEEDED`. Both increment `limitExceededCount`. Both are a
+`E_LIMIT_EXCEEDED`. Both increment `limitExceededCount`, as does a handshake
+that runs out of `handshakeTimeoutMs`. Both are a
 **transient admission signal from a healthy server** — "not right now", never
 "go away". The handshake cap in particular bounds *instantaneous concurrency*
 (how many handshakes are simultaneously incomplete), not arrival rate: a
@@ -172,9 +175,26 @@ what the host's handshake memory actually tolerates.
 ## Runbook: handshake p99 high
 
 When `histogram_quantile(0.99, rate(webtransport_handshake_latency_seconds_bucket[5m])) > 0.3`:
-- **Cause**: TLS/QUIC handshake slow; CPU saturation; network RTT spike; certificate validation.
-- **Check**: `handshakesInFlight`, CPU, network latency to clients.
-- **Actions**: Scale out; reduce `maxHandshakesInFlight` to shed load; verify cert chain not oversized.
+
+The histogram runs from a connection's first Initial packet to its CONNECT
+request being accepted, so it includes the clients' round trips (at least two:
+the QUIC/TLS flight and the CONNECT exchange). A p99 of a few RTTs is normal
+for distant clients; set the threshold from your RTT distribution, not only
+from 300 ms. Successful handshakes only: handshakes that time out are not in
+it.
+- **Cause**: CPU saturation (TLS signing); network RTT or loss toward clients
+  (lost handshake packets wait for a retransmission timeout); an oversized
+  certificate chain (more handshake flights, amplification limit). The
+  histogram stops before `onSession` runs, so application code is not a
+  cause.
+- **Check**: `handshakesInFlight` (near `maxHandshakesInFlight` means queueing
+  or stalled handshakes), CPU, RTT to clients, and the rate of
+  `limitExceededCount`: a rise with `handshakesInFlight` pinned at the cap
+  usually means handshakes that never finish (a flood of Initials), each held
+  for up to `handshakeTimeoutMs`.
+- **Actions**: Scale out; for stalled-handshake floods lower
+  `handshakeTimeoutMs` (each slot frees sooner); reduce `maxHandshakesInFlight`
+  to shed CPU load; verify the cert chain is not oversized.
 
 ## Runbook: datagram enqueue p99 high
 

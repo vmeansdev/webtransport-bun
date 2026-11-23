@@ -14,7 +14,7 @@ import type {
 	WritableOptions,
 } from "node:stream";
 import { Duplex, Readable, Writable } from "node:stream";
-import { WebTransportError } from "./errors.js";
+import { peerStreamErrorCode, WebTransportError } from "./errors.js";
 import type { NativeReadableOwner } from "./native-readable.js";
 import {
 	openReadSinkOnNativeHandle,
@@ -98,6 +98,7 @@ function streamError(reason: unknown): Error {
 	if (!code) return normalizeError(reason);
 	return new WebTransportError(code as ErrorCode, message, {
 		cause: reason instanceof Error ? reason : undefined,
+		streamErrorCode: peerStreamErrorCode(message),
 	});
 }
 

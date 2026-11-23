@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { normalizeWasmEndpointOptions } from "../src/backend.js";
+import {
+	normalizeWasmEndpointOptions,
+	WasmTransportManager,
+} from "../src/backend.js";
 import { WasmEndpoint, type WasmModule } from "../src/backend-wasm.js";
 import { E_RATE_LIMITED } from "../src/errors.js";
 import {
@@ -303,7 +306,7 @@ describe.skipIf(!wasmAvailable)("real wasm abuse controls", () => {
 		}
 	});
 
-	test("datagram ingress rate limits close only the abusive peer and redact addresses", async () => {
+	test("datagram ingress rate limits drop only the abusive peer's excess and redact addresses", async () => {
 		const relay = new InMemoryRelay();
 		const options = normalizeWasmEndpointOptions({
 			rateLimits: {
@@ -400,11 +403,30 @@ describe.skipIf(!wasmAvailable)("real wasm abuse controls", () => {
 					aClosed: clientClosed.a,
 					bClosed: clientClosed.b,
 				}),
-				(state) => state.datagrams === 2 && state.aClosed && !state.bClosed,
+				(state) => state.datagrams === 2 && !state.bClosed,
 				3_000,
 				5,
 				"non-abusive peer stays alive and delivers its datagram",
 			);
+			// The over-rate datagram is dropped and counted; its connection
+			// lives on, as on native.
+			expect(clientClosed.a).toBe(false);
+			expect(serverDatagrams.map((d) => d.payload[0])).toEqual([0x01, 0x03]);
+
+			// Once the 1/s bucket refills, the abusive peer delivers again.
+			await Bun.sleep(1_100);
+			expect(clientA.sendDatagram(connA, sessionId, Uint8Array.of(0x04))).toBe(
+				true,
+			);
+			await waitFor(
+				() => serverDatagrams.length,
+				(count) => count === 3,
+				3_000,
+				5,
+				"rate-limited peer delivers after the bucket refills",
+			);
+			expect(serverDatagrams[2]?.payload[0]).toBe(0x04);
+			expect(clientClosed.a).toBe(false);
 
 			const snapshot = parseSnapshot(server);
 			expect(snapshot).toMatchObject({
@@ -415,6 +437,61 @@ describe.skipIf(!wasmAvailable)("real wasm abuse controls", () => {
 		} finally {
 			clientA.close();
 			clientB.close();
+			server.close();
+		}
+	});
+
+	test("a rate-limited datagram counts as dropped and rate limited in metricsSnapshot", async () => {
+		const relay = new InMemoryRelay();
+		const delivered: number[] = [];
+		const server = WasmTransportManager.create(
+			wasm,
+			relay.endpoint(addr("127.0.0.1", 4433)),
+			true,
+			"127.0.0.1:4433",
+			"127.0.0.1:5544",
+			(session) => session.onDatagram((data) => delivered.push(data[0] ?? -1)),
+			normalizeWasmEndpointOptions({
+				rateLimits: { datagramsIngressPerSec: 1, datagramsIngressBurst: 1 },
+			}),
+		);
+		const client = WasmTransportManager.create(
+			wasm,
+			relay.endpoint(addr("127.0.0.1", 5544)),
+			false,
+			"127.0.0.1:5544",
+			"127.0.0.1:4433",
+			null,
+			normalizeWasmEndpointOptions({}),
+		);
+		try {
+			const session = client.connectClient("localhost");
+			await Promise.race([
+				session.ready,
+				Bun.sleep(3_000).then(() => {
+					throw new Error("timeout: session ready");
+				}),
+			]);
+			let closed = false;
+			void session.closed.then(
+				() => (closed = true),
+				() => (closed = true),
+			);
+			await session.sendDatagram(Uint8Array.of(1));
+			await session.sendDatagram(Uint8Array.of(2));
+			const metrics = await waitFor(
+				() => server.metricsSnapshot(),
+				(m) => m.datagramsDropped === 1,
+				3_000,
+				5,
+				"the over-rate datagram is counted as dropped",
+			);
+			expect(metrics.rateLimitedCount).toBe(1);
+			expect(metrics.sessionsActive).toBe(1);
+			expect(delivered).toEqual([1]);
+			expect(closed).toBe(false);
+		} finally {
+			client.close();
 			server.close();
 		}
 	});

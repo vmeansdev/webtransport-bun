@@ -791,7 +791,7 @@ impl SinkSource {
                 Err(wtransport::quinn::ReadError::Reset(code)) => Err(SinkWireError {
                     kind: RecordType::Reset,
                     code: "E_STREAM_RESET",
-                    aux: u32::try_from(code.into_inner()).unwrap_or(u32::MAX),
+                    aux: crate::stream_fault::peer_app_code(code.into_inner()),
                 }),
                 Err(_) => Err(SinkWireError {
                     kind: RecordType::Error,

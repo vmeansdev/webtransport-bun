@@ -1664,6 +1664,7 @@ impl WtEndpoint {
             "rateLimitedStreamOpenCount": rate_limit_snapshot.rate_limited_stream_open_count,
             "rateLimitedDatagramIngressCount": rate_limit_snapshot.rate_limited_datagram_ingress_count,
             "rateLimitedByPrefixCount": rate_limit_snapshot.rate_limited_by_prefix_count,
+            "limitExceededCount": snapshot.limit_exceeded_count,
             "handshakeTimeoutMs": self.handshake_timeout_ms,
             "idleTimeoutMs": self.idle_timeout_ms,
             "wtSessionsActive": wt_sessions_active,
@@ -3637,13 +3638,21 @@ impl WtEndpoint {
             else {
                 continue;
             };
+            // Over the per-IP ingress rate: drop this datagram and keep the
+            // connection, as native does. The limiter already counted it
+            // (`rateLimitedDatagramIngressCount`). Any other limiter error
+            // (missing ownership) still fails the connection closed.
             if self.is_server {
                 if let Err(err) =
                     self.rate_limiter
                         .check_connection(now, id, RateLimitDimension::DatagramIngress)
                 {
+                    let rate_limited = err.starts_with("E_RATE_LIMITED");
                     self.set_last_error(err);
-                    self.close_conn(id, 0, b"rate limited", now);
+                    if rate_limited {
+                        continue;
+                    }
+                    self.close_conn(id, 0, b"rate limiter unavailable", now);
                     break;
                 }
             }

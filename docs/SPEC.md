@@ -152,6 +152,10 @@ export type LimitsOptions = {
   sendWindow?: number;
 
   backpressureTimeoutMs: number;
+  /** Client: bounds connect(). Server (native): one budget per incoming
+   * connection, from its first Initial packet to the answer to its CONNECT
+   * request (QUIC + TLS + CONNECT); a handshake that runs out is dropped,
+   * releases its maxHandshakesInFlight slot and counts in limitExceededCount. */
   handshakeTimeoutMs: number;
   idleTimeoutMs: number;
   /** Keep-alive ping interval, clamped below idleTimeoutMs. Client default:
@@ -458,6 +462,13 @@ For browser-shaped facade streams, the control mapping is:
 - Writable stream `abort(reason)` -> stream reset (native reset path)
 - Readable stream `cancel(reason)` -> stop-sending (native stop-sending path)
 - Symbol controls remain available for Node-first compatibility.
+
+The receiving side sees the peer's code. A peer reset fails the readable, and a
+peer stop-sending fails the next write, with a `WebTransportError` whose `code`
+is `E_STREAM_RESET` / `E_STOP_SENDING`, `source` is `"stream"`, and
+`streamErrorCode` is the peer's application code. This holds for Node streams,
+facade streams and server streams on both backends. Local resets and session
+loss leave `streamErrorCode` null.
 
 ### Metrics
 

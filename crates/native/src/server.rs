@@ -1,9 +1,10 @@
-//! Server TLS rotation and close-drain helpers (NAPI-free).
+//! Server TLS rotation, handshake deadline and close-drain helpers (NAPI-free).
 //! Bind/retry live in `server_spawn.rs` (outside coverage floors).
 //! NAPI bindings live in `server_napi.rs`. Coverage floors target this module.
 
 use napi::Result;
 use serde::Deserialize;
+use std::future::IntoFuture;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -252,6 +253,51 @@ pub(crate) fn tls_snapshot_from_state(
     })
 }
 
+/// The single `handshakeTimeoutMs` budget of one incoming connection.
+///
+/// Started when the endpoint hands the accept loop a new connection attempt
+/// (its first Initial packet), so one deadline covers the QUIC and TLS
+/// handshake, reading the CONNECT request and answering it. Each step that
+/// runs under [`HandshakeDeadline::bound`] gets only what the earlier steps
+/// left, and a peer that stalls anywhere gives its `maxHandshakesInFlight`
+/// slot back when the budget runs out rather than at the idle timeout.
+pub(crate) struct HandshakeDeadline {
+    started: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct HandshakeTimedOut;
+
+impl HandshakeDeadline {
+    pub(crate) fn start(timeout_ms: u64) -> Self {
+        let started = tokio::time::Instant::now();
+        // tokio's own timeout() saturates the same way: a budget too large for
+        // the clock means "effectively never", not a panic in the accept loop.
+        let deadline = started
+            .checked_add(Duration::from_millis(timeout_ms))
+            .unwrap_or_else(|| started + Duration::from_secs(365 * 24 * 60 * 60));
+        Self { started, deadline }
+    }
+
+    /// Runs one handshake step under the shared deadline. On expiry the step is
+    /// dropped, which for an incoming session drops the connection with it.
+    pub(crate) async fn bound<F: IntoFuture>(
+        &self,
+        step: F,
+    ) -> std::result::Result<F::Output, HandshakeTimedOut> {
+        tokio::time::timeout_at(self.deadline, step)
+            .await
+            .map_err(|_| HandshakeTimedOut)
+    }
+
+    /// Time since the connection attempt arrived: the handshake latency once
+    /// the CONNECT request has been accepted.
+    pub(crate) fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct CloseDrainTiming {
     pub(crate) grace_period: Duration,
@@ -357,7 +403,8 @@ mod tests {
         parse_unknown_sni_policy, remove_sni_cert_state, replace_sni_certs_state,
         rotate_default_cert, rotate_tls_config, server_runtime_is_idle,
         set_unknown_sni_policy_state, tls_snapshot_from_state, upsert_sni_cert_state,
-        wait_for_server_drain, CloseDrainTiming, ServerRuntimeState,
+        wait_for_server_drain, CloseDrainTiming, HandshakeDeadline, HandshakeTimedOut,
+        ServerRuntimeState,
     };
     use crate::server_metrics::ServerMetrics;
     use crate::server_tls::{build_default_dev_resolver, UnknownSniPolicy};
@@ -770,5 +817,74 @@ mod tests {
         assert!(result.contains("streamTasksActive=2"));
         assert!(result.contains("trackedTasksActive=0"));
         assert!(result.contains("abortedTasks=0"));
+    }
+
+    struct SlotGuard(Arc<ServerMetrics>);
+
+    impl Drop for SlotGuard {
+        fn drop(&mut self) {
+            self.0.release_handshake();
+        }
+    }
+
+    // A step that never finishes, holding a handshake slot the way the
+    // incoming-session task does. Expiry must drop it, slot included.
+    #[tokio::test(start_paused = true)]
+    async fn handshake_deadline_drops_a_stalled_step_and_its_slot() {
+        let metrics = Arc::new(ServerMetrics::default());
+        assert!(metrics.try_acquire_handshake(1));
+        let guard = SlotGuard(Arc::clone(&metrics));
+        let deadline = HandshakeDeadline::start(500);
+
+        let result = deadline
+            .bound(async move {
+                let _guard = guard;
+                std::future::pending::<()>().await
+            })
+            .await;
+
+        assert_eq!(result, Err(HandshakeTimedOut));
+        assert_eq!(deadline.elapsed(), Duration::from_millis(500));
+        assert_eq!(metrics.handshakes_in_flight.load(Ordering::Acquire), 0);
+        assert!(metrics.try_acquire_handshake(1));
+    }
+
+    // Steps share one budget: a step after a slow one gets only the remainder,
+    // so the whole handshake ends at the deadline, not at twice it.
+    #[tokio::test(start_paused = true)]
+    async fn handshake_deadline_is_shared_across_steps() {
+        let deadline = HandshakeDeadline::start(1_000);
+
+        let first = deadline
+            .bound(tokio::time::sleep(Duration::from_millis(700)))
+            .await;
+        assert_eq!(first, Ok(()));
+        let second = deadline
+            .bound(tokio::time::sleep(Duration::from_millis(700)))
+            .await;
+
+        assert_eq!(second, Err(HandshakeTimedOut));
+        assert_eq!(deadline.elapsed(), Duration::from_millis(1_000));
+    }
+
+    // Latency is read from the connection's arrival, so it includes the time
+    // before the last step started, not just the last step.
+    #[tokio::test(start_paused = true)]
+    async fn handshake_elapsed_spans_every_step() {
+        let deadline = HandshakeDeadline::start(10_000);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let value = deadline.bound(async { 7 }).await;
+        assert_eq!(value, Ok(7));
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        assert_eq!(deadline.elapsed(), Duration::from_millis(42));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handshake_deadline_saturates_an_unrepresentable_budget() {
+        let deadline = HandshakeDeadline::start(u64::MAX);
+        let result = deadline
+            .bound(tokio::time::sleep(Duration::from_secs(3_600)))
+            .await;
+        assert_eq!(result, Ok(()));
     }
 }

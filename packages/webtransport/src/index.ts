@@ -207,6 +207,7 @@ import {
 	E_TLS,
 	E_UNSUPPORTED_ARGUMENT,
 	extractStreamErrorCode,
+	peerStreamErrorCode,
 	unwrapNativeValue,
 	unwrapNativeVoid,
 	WebTransportError,
@@ -326,13 +327,17 @@ function toWebTransportError(
 			? (explicitCode as ErrorCode)
 			: undefined;
 	const msg = err instanceof Error ? err.message : String(err);
-	if (knownExplicitCode) {
-		return createMappedError(knownExplicitCode, msg, strictW3CErrors);
-	}
+	const streamErrorCode =
+		err instanceof WebTransportError && err.streamErrorCode !== null
+			? err.streamErrorCode
+			: peerStreamErrorCode(msg);
 	return createMappedError(
-		extractMessageErrorCode(msg) ?? (E_INTERNAL as ErrorCode),
+		knownExplicitCode ??
+			extractMessageErrorCode(msg) ??
+			(E_INTERNAL as ErrorCode),
 		msg,
 		strictW3CErrors,
+		{ streamErrorCode },
 	);
 }
 
@@ -570,7 +575,10 @@ export type LimitsOptions = {
 	 */
 	sendWindow?: number;
 	backpressureTimeoutMs: number;
-	/** Connect handshake timeout. Default 10000. */
+	/** Handshake timeout. Default 10000. Client: bounds `connect()`. Server
+	 * (native): one budget per incoming connection, from its first Initial to
+	 * the answer to its CONNECT request; a handshake that runs out is dropped
+	 * and counted in `limitExceededCount`. */
 	handshakeTimeoutMs: number;
 	/**
 	 * Max idle time before a connection is considered dead and closed. Applies
@@ -1314,7 +1322,7 @@ export type MetricsSnapshot = {
 	sessionsClosedByReap?: number;
 	/** Native only. Every other way a session ended (peer close, transport error). */
 	sessionsClosedOther?: number;
-	/** Handshake latency (accept start to completion). P99 target &lt;300ms. */
+	/** Handshake latency, first Initial to CONNECT accepted (native). P99 target &lt;300ms. */
 	handshakeLatency?: HistogramSnapshot | null;
 	/** Datagram send enqueue latency. P99 target &lt;10ms. */
 	datagramEnqueueLatency?: HistogramSnapshot | null;

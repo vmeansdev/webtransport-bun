@@ -116,6 +116,13 @@ hatch exists. Checked against the rc.1 candidate (875dfbfe).
   streams) failed with plain `Error`s whose message began with the code. They
   now emit a `WebTransportError` with the same message and `.code` set, like
   the server's streams; code reading `err.message` is unaffected.
+- **A wasm server drops over-rate datagrams instead of closing the
+  connection.** A datagram over the per-IP ingress rate
+  (`rateLimits.datagramsIngressPerSec` / `datagramsIngressBurst`) used to
+  close the sender's whole connection on the wasm engine, while native drops
+  the datagram and keeps the session. wasm now matches native: the datagram
+  is dropped, counted in `rateLimitedCount` and `datagramsDropped`, and the
+  session stays open. There is no option to restore the close.
 - **Not breaking, listed for completeness.** The surfaces under "Removed and
   internalized" below were never in rc.1, so no rc.1 caller can depend on
   them: the reflector, the campaign getters, `__sendPathDiagnostics`, the
@@ -395,6 +402,58 @@ unstable `__TESTING__.serverInternals(server)` accessor (`docs/SPEC.md`,
   used to surface as `E_INTERNAL`. The native client now recognizes the QUIC
   `CRYPTO_ERROR` range that every TLS handshake failure ends in, on the
   dedicated and the pooled connect path alike.
+- Native streams now report the peer's application error code. A peer
+  `RESET_STREAM` or `STOP_SENDING` failed the receiving side with
+  `streamErrorCode: null`, because the code was dropped where the transport
+  error became an `E_*` string; wasm already reported it. Client Node streams,
+  the `WebTransport` facade's streams and the server's streams now carry it on
+  `WebTransportError.streamErrorCode`, and the message reads
+  `E_STREAM_RESET: stream reset by peer (code N)` /
+  `E_STOP_SENDING: stream stopped by peer (code N)` on both backends (the
+  `E_*` prefix and `.code` are unchanged). A native sink's `reset` record also
+  carried the on-wire HTTP/3 value (clamped to `4294967295`) instead of the
+  peer's code; it now carries the code.
+- The wasm manager's `metricsSnapshot()` reported 0 for `rateLimitedCount`,
+  `limitExceededCount`, `sniCertSelections`, `defaultCertSelections` and
+  `unknownSniRejectedCount`: it read keys the governor snapshot does not have,
+  and the wasm governor counted no cap refusals at all. `rateLimitedCount` is
+  now the sum of the handshake, stream-open and datagram-ingress rate-limit
+  counters, `limitExceededCount` counts refusals at `maxHandshakesInFlight`,
+  `maxSessions` and the stream caps (also exposed as the governor snapshot's
+  `limitExceededCount`), and the SNI counters come from the TLS resolver.
+- `build:wasm:dist` (also run by `prepublishOnly`) exited 0 with a broken
+  artifact when only a versioned Homebrew LLVM (`llvm@NN`) was installed: the
+  system `ar` archived ring's wasm32 objects without a symbol index, so the
+  module imported 44 ring symbols from `env` and failed to load. The script
+  now finds `llvm@NN` (newest first) or a wasm32-capable `clang` on PATH with
+  a matching `llvm-ar`, fails with the unresolved symbol names when the module
+  still imports `env`, and reads the cargo target directory from
+  `cargo metadata`, so `CARGO_TARGET_DIR` and `.cargo/config.toml`
+  `build.target-dir` no longer break it.
+- `loadWasmModule()` from `webtransport-bun/wasm` said "prebuilt wasm module
+  not found" for every load failure, including a present but broken
+  `wasm-dist` artifact (for example glue that still imports `env` because
+  ring's C code was not built for wasm32). The error now includes the
+  underlying load error, so `Cannot find package 'env'` is visible.
+- `handshakeTimeoutMs` now bounds the whole server-side handshake. It used to
+  start only after the CONNECT request had been read, so a handshake that
+  stalled in QUIC or TLS (one replayed client Initial is enough) held its
+  `maxHandshakesInFlight` slot until the idle timeout; a few hundred such
+  packets could refuse every new client for a minute. One budget now runs from
+  the connection's first Initial to the answer to its CONNECT request; a
+  handshake that runs out is dropped, gives its slot back, is counted in
+  `limitExceededCount` and is logged at debug level. The per-IP handshake
+  bucket is still charged after the handshake, against the validated address
+  (`SECURITY.md`).
+- The `handshakeLatency` histogram (`webtransport_handshake_latency_seconds`)
+  timed only the CONNECT response write, a few microseconds. It now measures
+  what `docs/METRICS.md` says: from the connection's first Initial to its
+  CONNECT request being accepted. Expect values of a few round trips;
+  dashboards and the p99 alert built on the old numbers read differently.
+- `bun run bench:handshake` made 50 handshakes from one address against the
+  default per-IP burst of 40, logged the `E_RATE_LIMITED` failures and still
+  printed PASS. Its server now opens the handshake rate limits, and any failed
+  sample fails the run.
 - Bidirectional streams no longer stall when both directions are busy. One
   byte budget served both directions, so writes queued faster than the peer
   drained them filled it, the receive side could not reserve, and both peers

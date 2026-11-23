@@ -662,6 +662,9 @@ pub struct GovernorSnapshot {
     pub queued_bytes_for_session: usize,
     pub queued_bytes_for_stream: usize,
     pub host_tokens_active: usize,
+    /// Admissions refused at a handshake, session or stream cap (native's
+    /// `limitExceededCount`).
+    pub limit_exceeded_count: u64,
 }
 
 #[derive(Clone)]
@@ -710,6 +713,7 @@ struct GovernorInner {
     next_host_token: u32,
     host_token_ceiling: u32,
     host_tokens: HashMap<u32, HostToken>,
+    limit_exceeded_count: u64,
 }
 
 impl Governor {
@@ -729,6 +733,7 @@ impl Governor {
                 next_host_token: 1,
                 host_token_ceiling: u32::MAX,
                 host_tokens: HashMap::new(),
+                limit_exceeded_count: 0,
             })),
         })
     }
@@ -740,6 +745,7 @@ impl Governor {
     pub fn reserve_handshake(&self) -> Result<Reservation, Cow<'static, str>> {
         let mut inner = self.inner.borrow_mut();
         if inner.handshakes_in_flight >= inner.limits.max_handshakes_in_flight {
+            inner.count_limit_exceeded();
             return Err("E_LIMIT_EXCEEDED: maxHandshakesInFlight reached".into());
         }
         inner.handshakes_in_flight += 1;
@@ -752,6 +758,7 @@ impl Governor {
     pub fn reserve_session(&self, conn: u32) -> Result<Reservation, Cow<'static, str>> {
         let mut inner = self.inner.borrow_mut();
         if inner.sessions_active >= inner.limits.max_sessions {
+            inner.count_limit_exceeded();
             return Err("E_LIMIT_EXCEEDED: maxSessions reached".into());
         }
         inner.sessions_active += 1;
@@ -769,6 +776,7 @@ impl Governor {
     ) -> Result<Reservation, Cow<'static, str>> {
         let mut inner = self.inner.borrow_mut();
         if inner.streams_active_global >= inner.limits.max_streams_global {
+            inner.count_limit_exceeded();
             return Err("E_LIMIT_EXCEEDED: maxStreamsGlobal reached".into());
         }
         let per_session_limit = match kind {
@@ -785,6 +793,7 @@ impl Governor {
                 StreamKind::Bidi => "maxStreamsPerSessionBidi",
                 StreamKind::Uni => "maxStreamsPerSessionUni",
             };
+            inner.count_limit_exceeded();
             return Err(format!("E_LIMIT_EXCEEDED: {name} reached").into());
         }
         map.insert(conn, per_session + 1);
@@ -987,11 +996,16 @@ impl Governor {
                 })
                 .unwrap_or(0),
             host_tokens_active: inner.host_tokens.len(),
+            limit_exceeded_count: inner.limit_exceeded_count,
         }
     }
 }
 
 impl GovernorInner {
+    fn count_limit_exceeded(&mut self) {
+        self.limit_exceeded_count = self.limit_exceeded_count.saturating_add(1);
+    }
+
     fn release_kind(&mut self, kind: &ReservationKind) {
         match kind {
             ReservationKind::Handshake => {
@@ -1621,7 +1635,7 @@ mod tests {
         })
         .expect("governor");
 
-        for _ in 0..32 {
+        for round in 1..=32u64 {
             let handshakes = [
                 governor.reserve_handshake().expect("handshake 1"),
                 governor
@@ -1701,9 +1715,14 @@ mod tests {
             drop(uni);
             drop(sessions);
             drop(handshakes);
+            // Every refusal above is counted once (handshake, session, global
+            // stream, per-session bidi, per-session uni); admissions are not.
             assert_eq!(
                 governor.snapshot(1, None),
-                super::GovernorSnapshot::default()
+                super::GovernorSnapshot {
+                    limit_exceeded_count: 5 * round,
+                    ..super::GovernorSnapshot::default()
+                }
             );
         }
     }

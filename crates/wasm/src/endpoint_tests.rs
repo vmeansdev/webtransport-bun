@@ -5273,6 +5273,98 @@ fn server_datagram_ingress_rate_limit_and_event_budget_close() {
     );
 }
 
+// Native drops a datagram over the per-IP ingress rate and counts it; the
+// session lives on. wasm used to close the whole connection instead.
+#[test]
+fn server_datagram_ingress_rate_limit_drops_and_keeps_the_connection() {
+    let caddr: SocketAddr = CADDR.parse().unwrap();
+    let saddr: SocketAddr = SADDR.parse().unwrap();
+    let rate = WasmRateLimits {
+        datagrams_ingress_per_sec: 1,
+        datagrams_ingress_burst: 1,
+        ..WasmRateLimits::default()
+    };
+    let mut server = WtEndpoint::new_with_limits_and_rate_limits(
+        true,
+        saddr,
+        caddr,
+        WasmLimits::default(),
+        rate,
+    )
+    .unwrap();
+    let mut client =
+        WtEndpoint::new_with_limits(false, caddr, saddr, WasmLimits::default()).unwrap();
+    let cid = client.connect("localhost") as u32;
+    let mut established = false;
+    for _ in 0..600 {
+        let moved = relay_client_to_server(&mut client, &mut server)
+            | relay_server_to_client(&mut server, &mut client);
+        while let Some(ev) = client.poll_event() {
+            if matches!(ev, WtEvent::SessionEstablished { .. }) {
+                established = true;
+            }
+        }
+        while server.poll_event().is_some() {}
+        if established {
+            break;
+        }
+        if !moved {
+            let now = Instant::now();
+            server.handle_timeout(now);
+            client.handle_timeout(now);
+        }
+    }
+    assert!(established);
+
+    let pump = |client: &mut WtEndpoint, server: &mut WtEndpoint| {
+        let mut datagrams = Vec::new();
+        let mut client_closed = false;
+        for _ in 0..80 {
+            let _ = relay_client_to_server(client, server);
+            let _ = relay_server_to_client(server, client);
+            while let Some(ev) = server.poll_event() {
+                if let WtEvent::Datagram { data, .. } = ev {
+                    datagrams.push(data);
+                }
+            }
+            while let Some(ev) = client.poll_event() {
+                if matches!(ev, WtEvent::ConnectionClosed { .. }) {
+                    client_closed = true;
+                }
+            }
+        }
+        (datagrams, client_closed)
+    };
+
+    // The burst admits one datagram; the next is over the rate.
+    assert!(client.send_datagram(cid, 0, b"first"));
+    assert!(client.send_datagram(cid, 0, b"over-rate"));
+    let (datagrams, client_closed) = pump(&mut client, &mut server);
+    assert_eq!(datagrams, vec![b"first".to_vec()]);
+    assert!(
+        !client_closed,
+        "a rate-limited datagram must not close the connection"
+    );
+    assert_eq!(server.conns.len(), 1);
+    assert_eq!(
+        server
+            .rate_limiter
+            .snapshot()
+            .rate_limited_datagram_ingress_count,
+        1
+    );
+    assert!(server
+        .take_last_error()
+        .is_some_and(|err| err.contains("E_RATE_LIMITED")));
+
+    // Once the bucket refills the same connection delivers again.
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    assert!(client.send_datagram(cid, 0, b"after-refill"));
+    let (datagrams, client_closed) = pump(&mut client, &mut server);
+    assert_eq!(datagrams, vec![b"after-refill".to_vec()]);
+    assert!(!client_closed);
+}
+
 #[test]
 fn reject_wt_unknown_session_resets_live_connection_stream() {
     use quinn_proto::{Dir, Side};

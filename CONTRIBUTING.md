@@ -2,7 +2,9 @@
 
 ## Development setup
 1) Install Bun >= 1.3.14
-2) Install Rust stable (rustup)
+2) Install Rust 1.95.0 with rustup: `rustup toolchain install 1.95.0 --component rustfmt,clippy`
+  - `rust-toolchain.toml` selects it inside the repository; it follows `rust` in `.github/release-toolchain.json`, the toolchain CI and releases build with. Newer stable releases fail `clippy -D warnings` on deprecations.
+  - An exported `RUSTUP_TOOLCHAIN` (some version managers, such as mise, set it) overrides the file; use `cargo +1.95.0 ...` there.
 3) Install dependencies:
 - `bun install`
 - `cargo fetch`
@@ -12,15 +14,17 @@
 
 ## Local build
 - Build native addon: `bun run build:native` (uses napi-rs CLI; produces `webtransport-native.${platform}-${arch}.node`)
+- Build the WASM engine: `bun run build:wasm:dist` (needs `wasm-bindgen-cli` at the version in `.github/release-toolchain.json` and an LLVM `clang` + `llvm-ar` that target wasm32; on macOS `brew install llvm` or any `llvm@NN` is found automatically, elsewhere set `CC_wasm32_unknown_unknown` / `AR_wasm32_unknown_unknown`). The build fails if ring's C code did not link.
 - Run Bun tests:
   - `bun run test`
-- Run Chromium interop tests (requires Playwright browsers):
-  - `cd tools/interop && bun run install:browsers` (one-time)
-  - `bun run test:interop`
+- Run Chromium interop tests (needs the native addon from `bun run build:native`):
+  - `cd tools/interop && bun install && bun run install:browsers && bun run prepare:interop` (one-time; `prepare:interop` generates the test certificates)
+  - `bun run test:interop` (from the repository root)
 
 ## Code quality
 - TypeScript:
-  - `bunx biome format --write .`
+  - `bunx --bun biome format --write .` (the root `biome.json` limits this to project sources: build output, `node_modules`, scratch/evidence directories and tool-written JSON data are excluded)
+  - `bunx --bun biome check <changed files>`
   - `bun run typecheck`
 - Rust:
   - `cargo fmt`
