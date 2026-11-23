@@ -14,8 +14,8 @@ describe("wasm backend over real Bun UDP (P5)", () => {
 	test.skipIf(!wasmAvailable)(
 		"wasm server <-> wasm client over localhost UDP: datagram + bidi echo",
 		async () => {
-			const PORT = 47833;
-			const serverUdp = await BunUdpTransport.bind("127.0.0.1", PORT);
+			const serverUdp = await BunUdpTransport.bind("127.0.0.1", 0);
+			const PORT = serverUdp.localPort as number;
 			const server = createWasmServer(
 				wasm,
 				serverUdp,
@@ -77,8 +77,8 @@ describe("wasm backend over real Bun UDP (P5)", () => {
 	test.skipIf(!wasmAvailable)(
 		"two clients <-> one server over localhost UDP: datagram isolation",
 		async () => {
-			const PORT = 47834;
-			const serverUdp = await BunUdpTransport.bind("127.0.0.1", PORT);
+			const serverUdp = await BunUdpTransport.bind("127.0.0.1", 0);
+			const PORT = serverUdp.localPort as number;
 			const server = createWasmServer(
 				wasm,
 				serverUdp,
