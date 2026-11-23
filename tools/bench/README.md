@@ -6,7 +6,7 @@ how regressions are judged.
 
 | Command | Script | What it reports |
 |---|---|---|
-| `bun run bench:handshake` | `handshake-latency.ts` | handshake p50/p95/p99 and close-latency p99 (JSON line); fails only if fewer than half the handshakes succeed |
+| `bun run bench:handshake` | `handshake-latency.ts` | handshake p50/p95/p99 and close-latency p99 (JSON line); fails if any handshake fails |
 | `bun run bench:stream` | `stream-throughput.ts` | bidi echo throughput in MB/s (JSON line) |
 | `bun run bench:datagram` | `datagram-throughput.ts` | datagram throughput, loss ratio, event-loop delay, CPU user time, peak RSS |
 | `bun run bench:baseline` | `baseline.ts` | the three above in one machine-readable summary |

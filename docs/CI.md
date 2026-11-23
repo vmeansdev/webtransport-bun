@@ -50,7 +50,7 @@ Runs the seeded user-space UDP fault matrix (`tools/interop/playwright.fault.con
 3. Load-scale-addon — strict RSS gate, right-sized to 20 sessions / 15s for
    shared runners (the full 200-session campaign is generated deliberately as
    release evidence, not per push)
-4. Benchmark — handshake latency (`bun run bench:handshake`); reports percentiles only, with no latency threshold (it fails when fewer than half of its handshakes succeed)
+4. Benchmark — handshake latency (`bun run bench:handshake`); reports percentiles only, with no latency threshold (it fails if any handshake fails)
 5. Overload-addon test (`bun run test:overload-addon`)
 6. Load profiles (`bun run test:load-profiles-addon`)
 

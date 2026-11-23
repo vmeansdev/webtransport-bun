@@ -22,7 +22,7 @@ Canonical release truth: `docs/release-status.json`. The suites below are the ev
 - `bun run test:soak-addon:1h` / `:24h` / `:72h` — P2.2 staged long soak; use `workflow_dispatch` soak-long.yml for 24h/72h
 
 ### Benchmarks
-- `bun run bench:handshake` — p50/p95/p99 handshake latency and close-latency p99 as JSON. It has **no latency threshold** (the old `BENCH_P95_MAX_MS` gate was removed); it fails only when fewer than half of its handshakes succeed. Latency regressions belong to `bench:regress` below
+- `bun run bench:handshake` — p50/p95/p99 handshake latency and close-latency p99 as JSON. It has **no latency threshold** (the old `BENCH_P95_MAX_MS` gate was removed); it fails if any handshake fails. Latency regressions belong to `bench:regress` below
 - `bun run bench:stream` — stream throughput (MB/s); emits JSON: `{"name":"stream-throughput","rounds":N,"bytes":N,"elapsed_s":N,"throughput_mbps":N}`
 - `bun run bench:regress` — Task 14 regression gate: warmup + repeated runs for handshake p50/p95/p99, close-latency p99, stream throughput, and datagram throughput/loss plus event-loop delay, CPU user time, and peak RSS; writes `.release-evidence/bench/bench-regress-artifact.json`; uses Student-t 95% confidence intervals and fails on missing/non-finite/semantically invalid metrics, a baseline whose exact candidate SHA/machine/Bun/Rust identity differs from the current measurement, or a statistically significant regression.
 
