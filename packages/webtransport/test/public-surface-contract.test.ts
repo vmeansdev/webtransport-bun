@@ -26,6 +26,7 @@ import * as sinkReaderSurface from "../src/sink-reader.js";
 import * as wasmSurface from "../src/wasm.js";
 import { InMemoryRelay } from "../src/wasm-relay.js";
 import type { WasmServerSession } from "../src/wasm-server-session.js";
+import { generateLocalhostCert } from "./helpers/certs.js";
 import { withTimeout } from "./helpers/harness.js";
 import { nextPort, openWTWithRetry } from "./helpers/network.js";
 import { loadWasmModule, wasmAvailable } from "./helpers/wasm-availability.js";
@@ -715,11 +716,14 @@ describe("/portable runtime contract", () => {
 	test("the native adapter satisfies the common session contract", async () => {
 		const port = nativePort();
 		const seen = Promise.withResolvers<PortableServerSession>();
+		// /portable requires a PEM pair on native (no development fallback).
+		const cert = generateLocalhostCert();
+		if (!cert) throw new Error("failed to generate the portable certificate");
 		const server = await portableSurface.createServer({
 			backend: "native",
 			host: "127.0.0.1",
 			port,
-			tls: { certPem: "", keyPem: "" },
+			tls: { certPem: cert.certPem, keyPem: cert.keyPem },
 			onSession: (session) => seen.resolve(session),
 		});
 
@@ -752,6 +756,7 @@ describe("/portable runtime contract", () => {
 			const closed = server.close();
 			expect(closed).toBeInstanceOf(Promise);
 			await expect(closed).resolves.toBeUndefined();
+			cert.cleanup();
 		}
 	});
 

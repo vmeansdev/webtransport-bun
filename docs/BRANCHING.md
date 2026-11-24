@@ -14,7 +14,7 @@ feature/*, fix/* ──(PR)──► development ──(each green push)──�
 | `development` | Integration branch and the repository's default branch. All work lands here. | Pull requests only, merged when the required checks are green |
 | `canary` | The newest development commit that passed `test` and was built by `channels.yml`. | `channels.yml` only, fast-forward |
 | `nightly` | Development's newest green commit as of the daily build. | `channels.yml` only, fast-forward |
-| `main` | Stable line. Only release merges from development and hotfixes land here; every release and release candidate is tagged here. | Release and hotfix pull requests only, merged with a merge commit |
+| `main` | Stable line. Only release merges from development and hotfixes land here; every release and release candidate is tagged here. | Release and hotfix pull requests only, merged with a merge commit (by convention; see Releases) |
 | `feature/*`, `fix/*`, `chore/*`, `release/*` | Short-lived work branches off development; deleted after merge. | Anyone |
 | `hotfix/*` | Off `main` (the released tag) for a fix to a shipped version; merged into `main` by pull request, then a `main` → `development` pull request brings it back. | Maintainer |
 
@@ -81,7 +81,12 @@ branches' workflows from using it.
 ## Releases
 
 1. Open a pull request from `development` to `main` and merge it with a merge
-   commit (not squash or rebase) once the required checks are green.
+   commit (not squash or rebase) once the required checks are green. This is
+   a maintainer convention, not an enforced rule:
+   `.github/rulesets/integration-branches.json` allows all three merge methods
+   on both branches, so avoid squash and rebase by hand: `main` has to contain
+   development's own commits for the next release pull request to merge
+   cleanly.
 2. Tag the merge commit `v<base>-rc.N` and push the tag. `release.yml` runs the
    gates, creates the pre-release and attaches the evidence; `publish.yml`
    stages the version on npm under `next` for 2FA approval.

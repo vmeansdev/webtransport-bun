@@ -135,7 +135,7 @@ describe("native 0-RTT", () => {
 						...clientOpts("reject-pool.test", true),
 						allowPooling: true,
 					}),
-				).rejects.toThrow(/E_INTERNAL.*enable0Rtt.*allowPooling/);
+				).rejects.toMatchObject({ code: "E_UNSUPPORTED_ARGUMENT" });
 			} finally {
 				await server.close();
 			}

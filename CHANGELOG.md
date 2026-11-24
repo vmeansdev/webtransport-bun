@@ -25,8 +25,45 @@ hatch exists. Checked against the rc.1 candidate (875dfbfe).
   - a `limits` / `rateLimits` value that is `null` or not a plain object
     (for example an array or a `Map`);
   - a numeric field set to `null` or to a non-finite value (`NaN`,
-    `Infinity`, a string).
-  An absent field still means "default".
+    `Infinity`, a string);
+  - a `limits` field that is negative, fractional or below its documented
+    floor (`maxSessions`, `maxHandshakesInFlight` and `maxDatagramSize` >= 1,
+    `backpressureTimeoutMs` and `handshakeTimeoutMs` >= 100, `idleTimeoutMs`
+    >= 1000, everything else >= 0). rc.1 kept the default for a negative or
+    fractional value and silently raised `0` to `1` and short timeouts to
+    their floor (while the client's own handshake timer and stream-open
+    waits used the unraised value);
+  - a negative `rateLimits` rate, or a burst that is negative or fractional.
+  An absent field still means "default", and every value at or above its
+  floor behaves exactly as before. The native addon refuses the same values
+  when called directly. See `docs/SPEC.md` ("Accepted limit ranges").
+- **`connect()` validates its options like `new WebTransport()`.** Both now
+  run one validator before dialing, so `connect()` reports `E_INVALID_ARGUMENT`
+  for an unknown `congestionControl`, a non-boolean `allowPooling`,
+  `requireUnreliable` or `enable0Rtt`, and a malformed
+  `serverCertificateHashes`, where rc.1 reached the addon and failed with
+  `E_INTERNAL` (or silently ignored the non-boolean). `allowPooling` combined
+  with `serverCertificateHashes` or with `enable0Rtt` is
+  `E_UNSUPPORTED_ARGUMENT` (`NotSupportedError` under `strictW3CErrors`, and
+  always for the hashes case) on `connect()` too; rc.1 gave `E_INTERNAL`.
+- **`DEFAULT_LIMITS` and `DEFAULT_RATE_LIMITS` are frozen.** rc.1 exported
+  plain objects, and every `createServer`/`connect` merged over them, so a
+  write such as `DEFAULT_LIMITS.maxSessions = 10` silently changed the defaults
+  of every later server and client. Writes now throw in strict mode (and are
+  ignored otherwise); build your own object with
+  `{ ...DEFAULT_LIMITS, maxSessions: 10 }`.
+- **`/portable` on native requires a certificate.** An empty or missing
+  `tls.certPem`/`tls.keyPem` now rejects with `E_TLS`, as
+  `docs/PARITY_MATRIX.md` always said; rc.1 passed it to the root
+  `createServer`, which served an auto-generated self-signed certificate. A
+  native `tls.allowSelfSigned` rejection is now a `WebTransportError` with
+  `E_UNSUPPORTED_ARGUMENT` instead of a plain `Error`.
+- **`/portable` `log` events have one shape on both backends.** They are now
+  `PortableLogEvent` `{ type, level, msg, ... }`. rc.1 typed them `{ type, ... }`
+  but the native backend delivered its raw `{ level, msg, ... }` events with no
+  `type`. Native events now carry `type: "log"`, and wasm events gain `level`
+  (`"warn"` for failures and refusals, `"info"` otherwise) and `msg`. Both
+  changes only add fields.
 - **Server shutdown close code.** Sessions ended by `server.close()` now close
   with code `3993` and reason `E_SERVER_CLOSING`, on the wire and in the local
   `closed` fallback. rc.1 used application code `0` with reason
@@ -337,6 +374,34 @@ unstable `__TESTING__.serverInternals(server)` accessor (`docs/SPEC.md`,
 
 ### Fixed
 
+- The W3C facade's `datagrams.maxDatagramSize` reports the configured
+  `limits.maxDatagramSize` (lowered to the QUIC path maximum) instead of the
+  raw path maximum, which read 1413 on loopback against a 1200 default and
+  ignored a configured cap. A write larger than it is now discarded and the
+  write resolves, as the W3C write algorithm specifies; it used to reject and
+  leave `datagrams.writable` errored for every later write (native), or
+  reject with `E_LIMIT_EXCEEDED` (wasm). Session-level `sendDatagram()` still
+  rejects oversize payloads.
+- `/portable` `createServer({ wasmOptions })` is honored. The option was typed
+  and documented as forwarded to the wasm W3C facade but never read, so
+  `strictW3CErrors` and the other facade options silently did nothing. Each
+  wasm server session is now built with them, and invalid values fail
+  `createServer` with `E_INVALID_ARGUMENT`. Native still ignores them.
+- `createServer()` failures and the server TLS methods (`updateCert`,
+  `updateTls`, `replaceSniCerts`, `upsertSniCert`, `removeSniCert`,
+  `setUnknownSniPolicy`, `tlsSnapshot`) now throw or reject a
+  `WebTransportError` with the stable `code`. They threw the raw Node-API
+  error (`code: "GenericFailure"`, the `E_*` only inside the message). A
+  missing or invalid `port` is now `E_INVALID_ARGUMENT` before the addon is
+  reached (it was a "Failed to convert napi value" error, `-1` was accepted
+  and `70000` was clamped to 65535), and an unknown `unknownSniPolicy` is
+  `E_INVALID_ARGUMENT` rather than `E_INTERNAL`.
+- `connect()` now rejects certificate failures with `E_TLS`, as documented.
+  An untrusted issuer, a certificate not valid for the requested name, and a
+  server with no certificate for the requested server name (its TLS alert)
+  used to surface as `E_INTERNAL`. The native client now recognizes the QUIC
+  `CRYPTO_ERROR` range that every TLS handshake failure ends in, on the
+  dedicated and the pooled connect path alike.
 - Native streams now report the peer's application error code. A peer
   `RESET_STREAM` or `STOP_SENDING` failed the receiving side with
   `streamErrorCode: null`, because the code was dropped where the transport

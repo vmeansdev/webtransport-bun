@@ -4,8 +4,11 @@ Canonical release truth: `docs/release-status.json`.
 
 Package version: committed base `1.0.0`; published versions are stamped
 from the release tag (`v1.0.0-rc.N` → `1.0.0-rc.N` on npm `next`, `v1.0.0` →
-`1.0.0` on npm `latest`). The latest published release candidate is
-`1.0.0-rc.1`.
+`1.0.0` on npm `latest`). No release candidate has reached npm so far:
+`v1.0.0-rc.1` … `v1.0.0-rc.5` exist only as git tags and GitHub
+pre-releases, npm `latest` is still the pre-1.0 `0.3.0`, and the 1.0 surface is
+published only under the `canary` and `nightly` dist-tags by
+`.github/workflows/channels.yml`. No 1.0 release date is set.
 
 **Coupled GA model:** `1.0.0` only when every `gaRequired: true` claim is
 `passed` with commit-bound evidence and
@@ -116,7 +119,9 @@ single-source scale scripts it replaced are not release evidence.
 
 ## What is safe to say today
 
-- The latest published package is `1.0.0-rc.1`; readiness remains `pending`.
+- npm `latest` is `0.3.0` (pre-1.0, root entrypoint only); the 1.0 surface is
+  installable only as `@canary` / `@nightly`, and no 1.0 release candidate is
+  on npm. Readiness remains `pending`.
 - No gate is currently `passed` in `docs/release-status.json`; earlier passes
   were bound to a commit that no longer exists and are history, not evidence.
 - Promote refuses until every `gaRequired` claim passes at a new candidate.

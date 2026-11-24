@@ -41,7 +41,7 @@ surface:
 - Required members: `ready`, `closed`, `draining`, `datagrams`,
   `incomingBidirectionalStreams`, `incomingUnidirectionalStreams`,
   `createBidirectionalStream`, `createUnidirectionalStream`, `close`
-- Datagrams: `readable`, `writable`, `createWritable()`, `maxDatagramSize`
+- Datagrams: `readable`, `writable`, `createWritable()`, `maxDatagramSize` (the configured `limits.maxDatagramSize`, lowered to the path maximum, on both backends; an oversize write is discarded and resolves, per the W3C write algorithm, on both backends)
   (`WebTransportDatagramDuplexStream`)
 - `getStats()`: returns `WebTransportConnectionStats` backed by real quinn
   transport stats
@@ -121,10 +121,10 @@ the TypeScript signature.
 | `address: { host, port }` | Bound address; `port: 0` reads back the OS-assigned port | Same | Equal |
 | `certHashBase64?: string` | `undefined` | SHA-256(DER) of the default cert | **Deliberately optional.** Wasm clients pin a hash; native clients chain-validate. The only optional field in the contract, and typed as such |
 | `close(): Promise<void>` | Wraps `WebTransportServer.close()` | Wraps `WasmWebTransportServer.close()`, which awaits `WasmTransportManager.close()` | Equal — resolves to `undefined` on both |
-| `tls.certPem` / `tls.keyPem` | Required | Optional when `allowSelfSigned` | Equal where supplied |
-| `tls.allowSelfSigned` | **Rejected** at `createServer` with a `wasm-only` error | Generates a short-lived self-signed cert | **Wasm-only, and it fails loudly.** Native refuses rather than silently serving a certificate the caller did not choose |
+| `tls.certPem` / `tls.keyPem` | Required: an empty or missing pair rejects with `E_TLS` (the root `createServer`'s development self-signed fallback is not reachable through `/portable`) | Optional when `allowSelfSigned`; otherwise an empty pair rejects with `E_TLS` | Equal where supplied |
+| `tls.allowSelfSigned` | **Rejected** at `createServer` with `E_UNSUPPORTED_ARGUMENT` (a `wasm-only` message) unless a PEM pair is supplied | Generates a short-lived self-signed cert | **Wasm-only, and it fails loudly.** Native refuses rather than silently serving a certificate the caller did not choose |
 | `limits.maxStreamsPerSessionBidi` / `maxStreamsGlobal` / `backpressureTimeoutMs` | Honoured; defaults `200` / `50000` / `5000` | Honoured; identical defaults (`DEFAULT_WASM_LIMITS`) | Equal, defaults included |
-| `log` / `debug` | Structured events, redaction off under `debug` | Same | Equal |
+| `log` / `debug` | `PortableLogEvent` `{ type, level, msg, ... }`: native `{ level, msg, sessionId?, peerIp?, peerPort? }` events gain `type: "log"` (native messages are free text); redaction off under `debug` | `PortableLogEvent`: the wasm `{ type, ...fields }` events gain `level` (failures and refusals `"warn"`, lifecycle `"info"`) and `msg` (the type plus its `detail`); PEM fields stripped unless `debug` | **Equal shape.** Both deliver `type`, `level` and `msg`; the `type` vocabulary and the extra context fields are backend-specific, and neither is promised portably |
 
 ### Session shutdown on the wire
 
@@ -165,9 +165,10 @@ recorded here rather than changed. Native remains the authority for the code:
 `docs/SPEC.md` documents the pair, and the wasm value is pinned by the parity
 test above so it cannot drift silently either.
 
-**The native backend consumes the fork at rev `ac515b1`** (branch
-`feat/qpack-dynamic`, which stacks on `feat/track1-conformance`, itself a
-superset of `feat/0rtt`), which is where `close_session`, the drain/GOAWAY
+**The native backend builds a vendored copy of the fork**
+(`vendor/wtransport-fork/`: rev `c1888a89` on branch
+`fix/cancellation-safe-frame-reads`, which stacks on `feat/qpack-dynamic`,
+`feat/track1-conformance` and `feat/0rtt`, plus local commits), which is where `close_session`, the drain/GOAWAY
 methods, the §4.4 remap, and the dynamic QPACK decode + encoder machinery live.
 See `docs/FORK_MAINTENANCE.md`.
 
@@ -197,7 +198,8 @@ leak onto it.
 | `exportTicketVault()` / `importTicketVault()`, `connect()`, `metricsToPrometheus()` | Native root surface | Node-stream client and Node-API-shaped ticket vault | Frozen in `public-surface-contract.test.ts` |
 | SNI cert map, `updateCert`/`updateTls`, `setUnknownSniPolicy`, keep-alive and congestion-control knobs | Native root surface (`WebTransportServer`) | No wasm equivalent; would silently no-op if promised portably | `packages/webtransport/test/tls.test.ts` |
 | `serveOverUdp`, `UdpTransport` injection, `DirectSocketsUdpTransport`, `InMemoryRelay`, ticket-store hosts, `generateCert`, `certHashBase64` pinning | `/wasm` | IWA / bring-your-own-socket model with no native counterpart | `packages/webtransport/test/wasm-*.test.ts` |
-| `tls.allowSelfSigned` | `/portable` options, wasm-honoured only | Accepted in the options type but **rejected loudly** on native, so callers cannot ship an unintended certificate | `packages/webtransport/test/portable-server.test.ts` ("rejects wasm-only allowSelfSigned on the native backend") |
+| `tls.allowSelfSigned` | `/portable` options, wasm-honoured only | Accepted in the options type but **rejected loudly** on native (`E_UNSUPPORTED_ARGUMENT`), as is an empty PEM pair (`E_TLS`), so callers cannot ship an unintended certificate | `packages/webtransport/test/portable-server.test.ts` ("rejects wasm-only allowSelfSigned on the native backend", "requires a certificate on the native backend instead of generating one") |
+| `wasmOptions` (`strictW3CErrors`, `datagramsReadableType`, `congestionControl`) | `/portable` options, wasm-honoured only | The W3C facade options each wasm server session is built on; validated when the server starts (`E_INVALID_ARGUMENT`), ignored on native, whose sessions have no facade to configure | `packages/webtransport/test/portable-server.test.ts` ("wasmOptions reach the wasm server sessions", "invalid wasmOptions fail createServer on the wasm backend") |
 | Callback-style `onDatagram` / `onIncomingStream` | `/wasm` (`WasmServerSession`, deprecated) | Back-compat only; mutually exclusive with the W3C surface on the same session | `packages/webtransport/test/wasm-server-session-parity.test.ts` |
 | Dynamic QPACK blocked-streams posture | Both, configured differently | Native always advertises `SETTINGS_QPACK_BLOCKED_STREAMS = 0`; the wasm `enableDynamicQpack` preset uses 16. Capability parity, deliberate wire divergence | `docs/WASM_PROTOCOL_SCOPE.md`; `packages/webtransport/test/native-qpack.test.ts` |
 
@@ -231,8 +233,8 @@ control (`ServerOptions.congestionControl`) and keep-alive
 implemented on native and no longer upstream-gated.
 
 **0-RTT and dynamic QPACK are no longer upstream-gated.** The native backend now
-depends on a fork of wtransport (`vmeansdev/wtransport`, branch
-`feat/qpack-dynamic`, pinned by rev `ac515b1`) that adds `enable_0rtt`,
+depends on a fork of wtransport (`vmeansdev/wtransport` at rev `c1888a89`,
+built from the vendored copy in `vendor/wtransport-fork/`) that adds `enable_0rtt`,
 `connect_0rtt`, `SessionRequest::is_0rtt`/`handshake_confirmed`, and
 0-RTT-rejection recovery — the exact APIs 0.7.1 lacked — plus the
 `qpack_max_table_capacity` config method and the dynamic QPACK decode + encoder
@@ -248,7 +250,7 @@ surfaced through the facade; see the implemented rows above and
 | Surface | Implementation source | Implementation evidence | Release verification |
 |---|---|---|---|
 | Native addon path | `crates/native/src/{client.rs,lib.rs,limits.rs,rate_limit.rs,server.rs}` | `packages/webtransport/test/{acceptance,adversarial,backpressure,drain,fairness,hardening*,parity-*,tls}.test.ts` | `docs/release-status.json` still `pending` |
-| WASM candidate path (coupled 1.0 target) | `crates/wasm/src/{bridge.rs,cert.rs,endpoint.rs,event.rs,h3.rs,lib.rs,verify.rs,server_tls.rs,congestion.rs}`; `packages/webtransport/src/{backend.ts,backend-wasm.ts,wasm-webtransport.ts,webtransport-like-wasm.ts,send-scheduler.ts,wasm-endpoint-pool.ts,ticket-store-hosts.ts,wasm-server-session.ts}` | `packages/webtransport/test/{wasm-*.test.ts,parity-*.test.ts}`; `tools/interop/interop-evidence-wasm.json` | `docs/release-status.json` still `pending` (earlier passes of `wasm-dynamic-qpack` / `wasm-multi-session` / `wasm-0rtt` / `wasm-facade-parity` were bound to a pre-rewrite candidate and must be regenerated); all `parity-*.test.ts` run on both backends via `webtransport-bun/portable` |
+| WASM candidate path (coupled 1.0 target) | `crates/wasm/src/{bridge.rs,cert.rs,endpoint.rs,event.rs,h3.rs,lib.rs,verify.rs,server_tls.rs,congestion.rs}`; `packages/webtransport/src/{backend.ts,backend-wasm.ts,wasm-webtransport.ts,webtransport-like-wasm.ts,send-scheduler.ts,wasm-endpoint-pool.ts,ticket-store-hosts.ts,wasm-server-session.ts}` | `packages/webtransport/test/{wasm-*.test.ts,parity-*.test.ts}`; `tools/interop/interop-evidence-wasm.json` | `docs/release-status.json` still `pending` (earlier passes of `wasm-dynamic-qpack` / `wasm-multi-session` / `wasm-0rtt` / `wasm-facade-parity` were bound to a pre-rewrite candidate and must be regenerated); all `parity-*.test.ts` run on both backends via `@webtransport-bun/webtransport/portable` (`WEBTRANSPORT_PARITY_BACKEND=wasm` selects wasm) |
 
 | Scenario | Implementation source | Evidence path | Release verification |
 |---|---|---|---|

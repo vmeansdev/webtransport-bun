@@ -695,6 +695,9 @@ export class WasmWebTransport {
 	): Promise<void> {
 		try {
 			await this.#sendScheduler.enqueue(policy, async () => {
+				// W3C: a datagram larger than maxDatagramSize is discarded and
+				// the write resolves, so the writable stays usable.
+				if (chunk.byteLength > this.session.maxDatagramSize) return;
 				await this.session.sendDatagram(chunk);
 				this._recordSendGroupBytes(policy.groupId, chunk.byteLength);
 			});

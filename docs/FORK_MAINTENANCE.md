@@ -2,55 +2,78 @@
 
 The native backend depends on a **fork** of `wtransport`, not the crates.io
 release, because upstream 0.7.1 has neither 0-RTT support, the WebTransport
-session-lifecycle conformance work, nor dynamic QPACK, and we need all three:
+session-lifecycle conformance work, nor dynamic QPACK, and we need all three.
+The build does not fetch that fork, though: it compiles a vendored copy of it
+from this repository.
 
 - Fork: [`vmeansdev/wtransport`](https://github.com/vmeansdev/wtransport),
-  branch `feat/qpack-dynamic` (which stacks on `feat/track1-conformance`, itself
-  a superset of `feat/0rtt`), branched from `BiagioFesta/wtransport` `master` at
-  `a11e6a8`.
-- Consumed as a **Git dependency pinned by revision** through
-  `[workspace.dependencies]` in the root `Cargo.toml`:
+  branched from `BiagioFesta/wtransport` `master` at `a11e6a8`. The pinned rev
+  is `c1888a89` on branch `fix/cancellation-safe-frame-reads`, which stacks on
+  `probe/server-with-runtime` (`afe6528`), `fix/close-capsule-race`
+  (`7dc1a03`) and `feat/qpack-dynamic` (`ac515b1`), itself on
+  `feat/track1-conformance` and `feat/0rtt`.
+- The root `Cargo.toml` names the fork in `[workspace.dependencies]`:
 
   ```toml
-  wtransport = { git = "https://github.com/vmeansdev/wtransport", rev = "ac515b1559b75ae83059b4c14c9289bf5cf447a5", features = ["dangerous-configuration", "quinn"] }
+  wtransport = { git = "https://github.com/vmeansdev/wtransport", rev = "c1888a890525ad79b58a3f1970afcfdec60d46f7", features = ["dangerous-configuration", "quinn"] }
   ```
 
-  `crates/native` and `crates/reference` both reference it with
-  `wtransport = { workspace = true }`. The committed `Cargo.lock` records the
-  exact rev (`0.7.1-zerortt-qpack.1`).
+  and then redirects that git source to the vendored tree:
 
-This document is the standing obligation list that pinning to a Git fork
-creates. Read it before touching the dependency, cutting a release, or
+  ```toml
+  [patch."https://github.com/vmeansdev/wtransport"]
+  wtransport = { path = "vendor/wtransport-fork/wtransport" }
+  ```
+
+  `crates/native` and `crates/reference` both use
+  `wtransport = { workspace = true }`, so the `[patch]` applies to every
+  build. The committed `Cargo.lock` therefore records `wtransport
+  0.7.1-zerortt-qpack.1` (and `wtransport-proto`) as **path** packages with no
+  `source` line; the git rev is not in the lockfile.
+- `vendor/wtransport-fork/` is a `git archive` of the fork at `c1888a89` plus
+  local commits made in this repository (see
+  `git log -- vendor/wtransport-fork` and
+  `vendor/wtransport-fork/VENDORED.md`). At the time of writing those are the
+  dedicated per-connection datagram pump (`1e5281d4`) and the
+  `ConnectionClose::is_connection_refused` accessor (`1495034f`). Neither
+  exists at the pinned rev on GitHub.
+
+This document is the standing obligation list that the fork and its vendored
+copy create. Read it before touching the dependency, cutting a release, or
 triaging a security advisory.
 
-## The rev must stay permanently reachable
+## What the pinned rev is still for
 
 `release.yml` builds the native addon **from source** (`bun run build:native`
-compiles `crates/native`, which compiles the pinned wtransport rev). There is
-no vendored copy and no prebuilt wtransport artifact. If the pinned rev becomes
-unreachable, **every release build breaks**, and so does any consumer building
-from source.
+compiles `crates/native`), and that compile reads `vendor/wtransport-fork/`,
+not GitHub. A release build does not need the fork repository to be reachable.
+
+The rev still matters:
+
+- It records which fork commit the vendored tree started from, so a bump can
+  diff against it and the local commits can be re-applied (see the checklist).
+- Older release tags of this project predate the vendored copy (added in
+  `1b751014`, 2026-10-01) and build the git rev directly; they break if their
+  rev becomes unreachable.
 
 Therefore, for `vmeansdev/wtransport`:
 
 - The repository must stay **public**.
-- The commit `ac515b1` (and any rev this project has ever pinned, including the
-  earlier `d3ff84d`, `b0b9f5c` and `aa45f37`) must remain reachable: **no
-  force-push that orphans it, no history rewrite, no garbage collection** of that
-  object. Keep a branch or tag pointing at each pinned rev so it is never a
-  dangling commit. `feat/qpack-dynamic` currently serves that role for both
-  `ac515b1` and its ancestor `d3ff84d`, `feat/track1-conformance` for `b0b9f5c`,
-  and `feat/0rtt` for `aa45f37`; if any branch is rebased forward, tag the old
-  tips first (e.g. `pinned/ac515b1`, `pinned/d3ff84d`).
-- Bumping the pin is a deliberate change: update `rev` in the workspace
-  `Cargo.toml`, regenerate `Cargo.lock`, and keep the old rev reachable anyway
-  (older release tags of this project still point at it).
+- Every rev this project has ever pinned must remain reachable: `aa45f37`,
+  `b0b9f5c`, `d3ff84d`, `ac515b1`, `7dc1a03`, `afe6528` and `c1888a89`. **No
+  force-push that orphans one, no history rewrite, no garbage collection.**
+  Keep a branch or tag on each: today `feat/0rtt` holds `aa45f37`,
+  `feat/track1-conformance` holds `b0b9f5c`, `feat/qpack-dynamic` holds
+  `ac515b1` and its ancestor `d3ff84d`, `fix/close-capsule-race` holds
+  `7dc1a03`, `probe/server-with-runtime` holds `afe6528`, and
+  `fix/cancellation-safe-frame-reads` holds `c1888a89`. If a branch is rebased
+  forward, tag the old tip first (e.g. `pinned/c1888a89`).
 
 ## Security scanning no longer covers wtransport
 
 `cargo audit` (run in CI's `security` job and locally) matches crate versions
-against the RustSec advisory database **by crates.io version**. A Git
-dependency is not a crates.io release, so:
+against the RustSec advisory database **by crates.io version**. The vendored
+path package (and the git fork behind it) is not a crates.io release, so:
 
 - **`cargo audit` will not flag advisories against the forked wtransport or any
   dependency it pulls in that differs from the crates.io graph.** A `cargo
@@ -82,10 +105,18 @@ git rebase upstream/master           # rebase feat/qpack-dynamic onto master
 
 Rebasing keeps the feature commits proposable upstream and keeps the branch a
 clean series. Before rebasing away the current tip, tag it so the pinned rev
-stays reachable (see above). After a rebase, run the fork's own test suite
-locally (`cargo test` in the fork, including `wtransport/tests/zero_rtt.rs`,
-`wtransport/tests/session_close.rs`, and `wtransport/tests/qpack_dynamic.rs`) —
-webtransport-bun CI does **not** run the fork's suite.
+stays reachable (see above). After a rebase, run the fork's own test suite.
+Its integration tests are compiled only with the right features, so a plain
+`cargo test` runs the unit tests and **zero** integration tests:
+
+```sh
+cargo test --locked -p wtransport --features dangerous-configuration,self-signed,quinn
+```
+
+That includes `wtransport/tests/zero_rtt.rs`, `session_close.rs`,
+`session_drain.rs`, `qpack_dynamic.rs` and the datagram-pump tests. Run the
+same command in `vendor/wtransport-fork/` after changing the vendored tree:
+webtransport-bun CI runs **neither** the fork's suite nor the vendored copy's.
 
 Cadence: at minimum whenever upstream ships a correctness or security fix that
 touches the transport/H3/TLS paths, and opportunistically otherwise so the
@@ -119,12 +150,21 @@ then, the obligations above hold.
 
 ## Checklist for bumping the pin
 
-1. Rebase `feat/qpack-dynamic` on the fork; tag the old tip so its rev
-   stays reachable.
+1. Rebase the pinned branch on the fork; tag the old tip so its rev stays
+   reachable.
 2. Push the fork (a maintainer action; agents do not push).
 3. Update `rev` in the root `Cargo.toml` `[workspace.dependencies]`.
-4. `RUSTUP_TOOLCHAIN=stable cargo update -p wtransport` (or `cargo build`) to
-   regenerate `Cargo.lock`; commit the lockfile change.
-5. Rebuild the native addon and run the canonical suites.
-6. Manually re-check advisories for wtransport/quinn/rustls, since `cargo audit`
+4. Re-vendor: replace `vendor/wtransport-fork/` with a `git archive` of the new
+   rev (the workspace manifest, licenses, `wtransport/` and
+   `wtransport-proto/`), keeping `VENDORED.md`.
+5. Re-apply every local commit listed by `git log -- vendor/wtransport-fork`
+   since the last vendoring, or upstream them into the fork first and drop
+   them here. Update `VENDORED.md` with the new rev and the remaining local
+   changes.
+6. Run `cargo build` to refresh `Cargo.lock` (the `[patch]` keeps wtransport a
+   path package there); commit the lockfile with the re-vendored tree.
+7. Run the vendored suite (`cargo test --locked -p wtransport --features
+   dangerous-configuration,self-signed,quinn` in `vendor/wtransport-fork/`),
+   rebuild the native addon and run the canonical suites.
+8. Manually re-check advisories for wtransport/quinn/rustls, since `cargo audit`
    will not.

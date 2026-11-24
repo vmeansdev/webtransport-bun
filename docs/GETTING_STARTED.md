@@ -92,9 +92,11 @@ Use `replaceSniCerts()` when you want to swap the full hostname map while preser
 
 ## Requirements
 
-- Bun >= 1.3.14, or Node, or Deno
+- Bun >= 1.3.14, Node >= 18 (CI tests 18.20.4, 20.19.0 and 22.23.1), or Deno
+  (CI tests 2.9.3)
 - TLS certificate and key (PEM format)
-- UDP port open (default 4433)
+- The UDP port you pass as `port` open in your firewall (there is no default;
+  the examples use 4433)
 
 ## Client
 
@@ -117,6 +119,10 @@ stream.write(Buffer.from("hello"));
 const [chunk] = await once(stream, "data");
 console.log("received:", chunk.toString());
 
+// Finish the stream before closing the session: a stream still open when the
+// session closes errors with E_SESSION_CLOSED ("unhandled bidi stream error").
+stream.end();
+await once(stream, "finish");
 session.close();
 ```
 
@@ -131,6 +137,7 @@ live at most 14 days.
 import {
   loadWasmModule,
   serveOverUdp,
+  toWasmServerSession,
   DirectSocketsUdpTransport,
 } from "@webtransport-bun/webtransport/wasm";
 
@@ -143,7 +150,13 @@ const { manager, certHashBase64 } = await serveOverUdp(
   DirectSocketsUdpTransport.bind,
   {
     localPort: 4433,
-    onSession: (session) => session.onDatagram((d) => session.sendDatagram(d)),
+    onSession: async (raw) => {
+      // The ServerSession-shaped view: incomingDatagrams(), streams, getStats().
+      const session = toWasmServerSession(raw);
+      for await (const d of session.incomingDatagrams()) {
+        await session.sendDatagram(d);
+      }
+    },
   },
 );
 
@@ -154,7 +167,7 @@ const { manager, certHashBase64 } = await serveOverUdp(
 ```
 
 Outside an IWA, give `serveOverUdp` a factory that returns a `UdpTransport`.
-Under Bun:
+The package ships no Bun adapter; under Bun, wrap `Bun.udpSocket` yourself:
 
 ```ts
 import type { UdpTransport } from "@webtransport-bun/webtransport/wasm";
@@ -183,9 +196,10 @@ async function bunUdpBind(localAddress: string, localPort: number): Promise<UdpT
 
 What you must handle yourself:
 
-- **Packet pumping and timers** — the core is sans-IO. The shipped adapters
-  (`DirectSocketsUdpTransport`, Bun UDP, `InMemoryRelay`) do this for you; a
-  custom transport must implement `UdpTransport` and honor the timeout hints.
+- **Packet pumping and timers** — the core is sans-IO. `serveOverUdp` and the
+  shipped adapters (`DirectSocketsUdpTransport`, `InMemoryRelay`) do this for
+  you once a `UdpTransport` delivers packets; a transport you write, like
+  `bunUdpBind` above, only has to move packets in and out.
 - **Cert rotation** — regenerate before the ≤ 14-day window closes and get the
   new hash to your clients. Unlike the native server's `updateCert()`,
   re-pinning is a client-side change: plan the distribution channel.

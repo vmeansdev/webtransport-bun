@@ -645,15 +645,17 @@ pub fn native_payload_delivery_mode() -> &'static str {
 /// process state — so a caller can confirm that an explicit `receiveWindow`
 /// (or the governor-derived default) is the value the transport would get.
 #[napi]
-pub fn native_transport_windows(limits_json: String) -> metrics::TransportWindowsSnapshot {
-    let limits = limits::Limits::from_json(&limits_json);
+pub fn native_transport_windows(
+    limits_json: String,
+) -> napi::Result<metrics::TransportWindowsSnapshot> {
+    let limits = limits::Limits::from_json(&limits_json).map_err(napi::Error::from_reason)?;
     let policy = transport_memory::TransportMemoryPolicy::from_limits(&limits);
-    metrics::TransportWindowsSnapshot {
+    Ok(metrics::TransportWindowsSnapshot {
         stream_receive_window: policy.stream_receive_window as f64,
         receive_window: policy.receive_window as f64,
         send_window: policy.send_window as f64,
         datagram_channel_capacity: policy.datagram_channel_capacity as f64,
-    }
+    })
 }
 
 /// The inclusive payload size at or below which delivery stays engine-owned.

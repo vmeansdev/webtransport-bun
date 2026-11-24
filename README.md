@@ -106,10 +106,17 @@ Detailed migration playbook:
 - AI-agent entrypoint: `llms.txt`
 
 ## Status
-- Native surface is a release candidate: `1.0.0-rc.1`.
-- Version: `1.0.0-rc.1` (latest published release candidate; release tags
-  stamp the published version over the committed base `1.0.0`). The canonical
-  release status lives in
+- npm `latest` is `0.3.0`, an older pre-1.0 API that exports only the root
+  (native) entrypoint: a plain
+  `bun add @webtransport-bun/webtransport` installs it, and `/wasm`,
+  `/portable` and `/sink-reader` do not exist there.
+- The 1.0 surface this README documents is published only under the `canary`
+  and `nightly` dist-tags (`bun add @webtransport-bun/webtransport@canary`).
+  No 1.0 release candidate is on npm: the `v1.0.0-rc.N` releases (up to
+  `v1.0.0-rc.5`) exist only as git tags and GitHub pre-releases. No 1.0
+  release date is set.
+- The committed package version is the base `1.0.0`; the release and channel
+  workflows stamp the published version. The canonical release status lives in
   `docs/release-status.json`; the native root entrypoint and `/wasm` are
   candidate surfaces, not stable/GA.
 - Configured release targets: Bun (`>= 1.3.14`), Node, and Deno. Candidate support remains unclaimed until the matching entries in
@@ -122,8 +129,9 @@ Detailed migration playbook:
 
 ### Runtime
 - Bun `>= 1.3.14`
-- Node (Node-API compatible runtime)
-- Deno (npm + Node-API addon support)
+- Node `>= 18` (`engines.node`); CI runs the package-consumer smoke on Node
+  18.20.4, 20.19.0 and 22.23.1
+- Deno (npm + Node-API addon support); CI runs the same smoke on Deno 2.9.3
 
 ### OS / Arch
 - macOS arm64 (`darwin-arm64`), macOS x64 (`darwin-x64`)
@@ -136,13 +144,17 @@ See `docs/COMPATIBILITY.md` for policy details.
 
 ### From package
 ```bash
-bun add @webtransport-bun/webtransport
-npm i @webtransport-bun/webtransport
-pnpm add @webtransport-bun/webtransport
-yarn add @webtransport-bun/webtransport
+bun add @webtransport-bun/webtransport@canary
+npm i @webtransport-bun/webtransport@canary
+pnpm add @webtransport-bun/webtransport@canary
+yarn add @webtransport-bun/webtransport@canary
 ```
 
-The npm package contains:
+`@canary` (and `@nightly`) carry the 1.0 surface this README documents. Without
+a tag you get npm `latest`, which is `0.3.0`: an older API with the root
+entrypoint only (see [Status](#status)).
+
+The 1.0 npm package contains:
 - `dist/` compiled JS + TypeScript declarations for the four entrypoints:
   `@webtransport-bun/webtransport` (native), `/wasm`, `/portable` and
   `/sink-reader`
@@ -154,13 +166,16 @@ Note: GitHub source zip/tar downloads are source snapshots and may not include g
 
 ### From local workspace (development)
 
-The package's entrypoints point at compiled `dist/`, and the addon is looked
-up in `prebuilds/` next to it, so build both before installing from a
-checkout:
+The package's entrypoints point at compiled `dist/`, the addon is looked up in
+`prebuilds/` next to it, and `/wasm` loads the engine from `wasm-dist/`, so
+build all three before installing from a checkout (the wasm step needs the
+Rust and `wasm-bindgen` toolchain described in `crates/wasm/build-wasm.sh`;
+skip it if you only use the native root entrypoint):
 
 ```bash
 bun install
 bun run build:native                       # addon -> crates/native/*.node
+bun run build:wasm:dist                    # wasm engine -> packages/webtransport/wasm-dist
 bun run --cwd packages/webtransport build  # TypeScript -> packages/webtransport/dist
 mkdir -p packages/webtransport/prebuilds
 cp crates/native/webtransport-native.*.node packages/webtransport/prebuilds/
@@ -171,6 +186,10 @@ Then, from your project:
 ```bash
 bun add file:/path/to/webtransport-bun/packages/webtransport
 ```
+
+`bun add file:` copies the package into your `node_modules` instead of
+linking it: after rebuilding the checkout, run `bun install` in your project
+again to refresh the copy with the new `dist/`, `prebuilds/` and `wasm-dist/`.
 
 Set `WEBTRANSPORT_NATIVE_ADDON_PATH=/path/to/webtransport-native.<platform>.node`
 to load an addon from anywhere else.
@@ -220,7 +239,9 @@ The current release status is pending in `docs/release-status.json`; treat the
 - **Bring your own socket**: the core never touches the network. Any transport
   implementing `UdpTransport` (`send(data, dest)` + `onPacket(data, source)`)
   feeds it raw UDP payloads — Direct Sockets `UDPSocket` in a Chromium
-  Isolated Web App, `Bun.udpSocket` in Bun, or an in-memory relay in tests.
+  Isolated Web App (`DirectSocketsUdpTransport`), `Bun.udpSocket` in Bun (a
+  few lines of your own, below), or an in-memory relay in tests
+  (`InMemoryRelay`).
 - **Server + client**: `serveOverUdp(...)` accepts sessions (multi-client,
   routed per source address) and returns the `serverCertificateHashes` value;
   `connectWasm(...)` / `createUnifiedClient(...)` connect as a client.
@@ -236,13 +257,41 @@ The current release status is pending in `docs/release-status.json`; treat the
   (validity clamped to the 14-day `serverCertificateHashes` limit).
 
 ```ts
-import { loadWasmModule, serveOverUdp } from "@webtransport-bun/webtransport/wasm";
+import {
+  loadWasmModule,
+  serveOverUdp,
+  toWasmServerSession,
+  type UdpTransport,
+} from "@webtransport-bun/webtransport/wasm";
+
+// The package ships no Bun UDP adapter; this is the whole of one. Inside a
+// Chromium IWA, pass DirectSocketsUdpTransport.bind instead.
+async function bindUdp(localAddress: string, localPort: number): Promise<UdpTransport> {
+  let onPacket: ((data: Uint8Array, src: { address: string; port: number }) => void) | undefined;
+  const socket = await Bun.udpSocket({
+    hostname: localAddress,
+    port: localPort,
+    socket: { data: (_s, buf, port, address) => onPacket?.(new Uint8Array(buf), { address, port }) },
+  });
+  return {
+    localPort: socket.port,
+    send: (data, dest) => void socket.send(data, dest.port, dest.address),
+    onPacket: (fn) => { onPacket = fn; },
+    close: () => socket.close(),
+  };
+}
 
 const wasm = await loadWasmModule(); // prebuilt artifact shipped in the package
 const { manager, certHashBase64 } = await serveOverUdp(wasm, bindUdp, {
   localPort: 4433,
-  onSession: (session) => session.onDatagram((d) => session.sendDatagram(d)),
+  onSession: async (raw) => {
+    const session = toWasmServerSession(raw);
+    for await (const d of session.incomingDatagrams()) {
+      await session.sendDatagram(d);
+    }
+  },
 });
+// clients pin certHashBase64; manager.close() shuts the server down
 ```
 
 The same echo server, written once and run on whichever backend the runtime
@@ -301,8 +350,9 @@ await server.close();
   clients pin the hash, so a new cert means a new hash.
 - **You bring the I/O — unless you use IWA plug-and-play.** The wasm core is
   sans-IO: it never opens sockets, reads clocks, or schedules timers by itself.
-  Shipped adapters (`DirectSocketsUdpTransport`, Bun UDP, `InMemoryRelay`) pump
-  packets and drive timeouts. Inside a Chromium IWA with Direct Sockets,
+  The shipped adapters (`DirectSocketsUdpTransport`, `InMemoryRelay`) pump
+  packets and drive timeouts; under Bun you wrap `Bun.udpSocket` yourself, as
+  in the snippet above. Inside a Chromium IWA with Direct Sockets,
   `await createServer(...)` from `@webtransport-bun/webtransport/wasm` (alias
   `createIwaServer`) owns bind + pumps for you. That is not the root package's
   native sync `createServer`, and it still cannot run on a normal webpage.
@@ -326,10 +376,7 @@ sendOrder, durable tickets, live TLS, metrics — IWA async `createServer` on
 
 ### 1) Install package
 ```bash
-bun add @webtransport-bun/webtransport
-npm i @webtransport-bun/webtransport
-pnpm add @webtransport-bun/webtransport
-yarn add @webtransport-bun/webtransport
+bun add @webtransport-bun/webtransport@canary   # 1.0 surface; plain `latest` is 0.3.0
 ```
 
 ### 2) Start a server
@@ -424,9 +471,18 @@ The stream helpers are symbol-based to avoid collisions with Node stream APIs:
 - `WT_STOP_SENDING`
 
 ```ts
-import { WT_RESET } from "@webtransport-bun/webtransport";
+import type { Duplex } from "node:stream";
+import {
+  WT_RESET,
+  type Resettable,
+  type StopSendable,
+} from "@webtransport-bun/webtransport";
 
-const bidi = await session.createBidirectionalStream();
+// The session API types streams as plain Node Duplexes; the symbol methods
+// are on the runtime object, so cast to reach them.
+const bidi = (await session.createBidirectionalStream()) as Duplex &
+  Resettable &
+  StopSendable;
 bidi[WT_RESET](42);
 ```
 
@@ -509,7 +565,7 @@ bun run test:load-addon
 bun run test:load-scale-addon
 bun run test:overload-addon
 bun run test:load-profiles-addon
-BENCH_P95_MAX_MS=500 bun run bench:handshake
+bun run bench:handshake
 SOAK_DURATION=120 bun run test:soak-addon
 bun run test:interop
 bun tools/smoke-readme.ts

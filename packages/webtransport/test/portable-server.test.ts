@@ -1,10 +1,16 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { connectWasm } from "../src/backend.js";
-import { createServer } from "../src/portable.js";
+import {
+	E_TLS,
+	E_UNSUPPORTED_ARGUMENT,
+	WebTransportError,
+} from "../src/index.js";
 import type { PortableServerSession } from "../src/portable.js";
+import { createServer } from "../src/portable.js";
 import { InMemoryRelay } from "../src/wasm-relay.js";
+import { generateLocalhostCert } from "./helpers/certs.js";
 import {
 	forEachWithTimeout,
 	readWithTimeout,
@@ -18,6 +24,11 @@ const wasm = wasmAvailable
 	: (null as unknown as Awaited<ReturnType<typeof loadWasmModule>>);
 
 const srcDir = fileURLToPath(new URL("../src/", import.meta.url));
+
+const cert = generateLocalhostCert();
+if (!cert) throw new Error("failed to generate the native test certificate");
+afterAll(() => cert.cleanup());
+const nativeTls = { certPem: cert.certPem, keyPem: cert.keyPem };
 
 describe("portable createServer", () => {
 	test("the portable module never statically imports node: builtins", () => {
@@ -43,7 +54,7 @@ describe("portable createServer", () => {
 			backend: "native",
 			host: "127.0.0.1",
 			port,
-			tls: { certPem: "", keyPem: "" },
+			tls: nativeTls,
 			onSession: async (session: PortableServerSession) => {
 				await forEachWithTimeout(
 					session.incomingDatagrams(),
@@ -94,7 +105,7 @@ describe("portable createServer", () => {
 			backend: "native",
 			host: "127.0.0.1",
 			port,
-			tls: { certPem: "", keyPem: "" },
+			tls: nativeTls,
 			onSession: async (session: PortableServerSession) => {
 				const stream = await session.createBidirectionalStream();
 				opened?.resolve(stream);
@@ -173,14 +184,193 @@ describe("portable createServer", () => {
 		},
 	);
 
-	test("rejects wasm-only allowSelfSigned on the native backend", async () => {
-		await expect(
-			createServer({
-				backend: "native",
-				port: nextPort(16600, 200),
+	test.skipIf(!wasmAvailable)(
+		"wasmOptions reach the wasm server sessions",
+		async () => {
+			const relay = new InMemoryRelay();
+			const serverAddr = { address: "127.0.0.1", port: 4721 };
+			const clientAddr = { address: "127.0.0.1", port: 5721 };
+			const seen = Promise.withResolvers<unknown>();
+
+			const server = await createServer({
+				backend: "wasm",
+				host: serverAddr.address,
+				port: serverAddr.port,
 				tls: { allowSelfSigned: true },
+				wasmModule: wasm,
+				wasmBind: async () => relay.endpoint(serverAddr),
+				wasmOptions: { strictW3CErrors: true },
+				onSession: async (session) => {
+					// An invalid stream option fails validation before any
+					// stream opens; strict mode names it like a browser would.
+					seen.resolve(
+						await session
+							.createBidirectionalStream({
+								waitUntilAvailable: "yes" as unknown as boolean,
+							})
+							.catch((e: unknown) => e),
+					);
+				},
+			});
+
+			try {
+				const { session, manager } = await connectWasm(
+					wasm,
+					relay.endpoint(clientAddr),
+					"localhost",
+					`${clientAddr.address}:${clientAddr.port}`,
+					`${serverAddr.address}:${serverAddr.port}`,
+					{ certHashBase64: server.certHashBase64 },
+				);
+				await session.ready;
+				const err = await withTimeout(
+					seen.promise,
+					5000,
+					"wasm portable session error",
+				);
+				expect(err).toBeInstanceOf(WebTransportError);
+				expect(err).toMatchObject({
+					code: "E_INVALID_ARGUMENT",
+					name: "TypeError",
+				});
+				manager.close();
+			} finally {
+				await server.close();
+			}
+		},
+	);
+
+	test.skipIf(!wasmAvailable)(
+		"invalid wasmOptions fail createServer on the wasm backend",
+		async () => {
+			const relay = new InMemoryRelay();
+			const err = await createServer({
+				backend: "wasm",
+				host: "127.0.0.1",
+				port: 4731,
+				tls: { allowSelfSigned: true },
+				wasmModule: wasm,
+				wasmBind: async () =>
+					relay.endpoint({ address: "127.0.0.1", port: 4731 }),
+				wasmOptions: { congestionControl: "bogus" as "default" },
 				onSession: () => {},
-			}),
-		).rejects.toThrow(/wasm-only/);
+			}).catch((e: unknown) => e);
+			expect(err).toBeInstanceOf(WebTransportError);
+			expect(err).toMatchObject({ code: "E_INVALID_ARGUMENT" });
+		},
+	);
+
+	// The portable log contract: one event shape on both backends.
+	const expectPortableLogShape = (event: Record<string, unknown>) => {
+		expect(typeof event.type).toBe("string");
+		expect(["debug", "info", "warn", "error"]).toContain(String(event.level));
+		expect(typeof event.msg).toBe("string");
+	};
+
+	test("log events carry type, level and msg on native", async () => {
+		const events: Record<string, unknown>[] = [];
+		const server = await createServer({
+			backend: "native",
+			host: "127.0.0.1",
+			port: 0,
+			tls: nativeTls,
+			log: (event) => events.push(event),
+			onSession: () => {},
+		});
+		try {
+			const wt = await openWTWithRetry(
+				`https://127.0.0.1:${server.address.port}`,
+				{ tls: { insecureSkipVerify: true } },
+			);
+			const deadline = Date.now() + 5000;
+			while (events.length === 0 && Date.now() < deadline) {
+				await Bun.sleep(25);
+			}
+			wt.close();
+			expect(events.length).toBeGreaterThan(0);
+			for (const event of events) {
+				expectPortableLogShape(event);
+				expect(event.type).toBe("log");
+			}
+		} finally {
+			await server.close();
+		}
+	});
+
+	test.skipIf(!wasmAvailable)(
+		"log events carry type, level and msg on wasm",
+		async () => {
+			const relay = new InMemoryRelay();
+			const serverAddr = { address: "127.0.0.1", port: 4741 };
+			const clientAddr = { address: "127.0.0.1", port: 5741 };
+			const events: Record<string, unknown>[] = [];
+			const server = await createServer({
+				backend: "wasm",
+				host: serverAddr.address,
+				port: serverAddr.port,
+				tls: { allowSelfSigned: true },
+				wasmModule: wasm,
+				wasmBind: async () => relay.endpoint(serverAddr),
+				log: (event) => events.push(event),
+				onSession: () => {},
+			});
+			try {
+				const { session, manager } = await connectWasm(
+					wasm,
+					relay.endpoint(clientAddr),
+					"localhost",
+					`${clientAddr.address}:${clientAddr.port}`,
+					`${serverAddr.address}:${serverAddr.port}`,
+					{ certHashBase64: server.certHashBase64 },
+				);
+				await session.ready;
+				const deadline = Date.now() + 5000;
+				while (
+					!events.some((e) => e.type === "session_established") &&
+					Date.now() < deadline
+				) {
+					await Bun.sleep(25);
+				}
+				manager.close();
+				const established = events.find(
+					(e) => e.type === "session_established",
+				);
+				expect(established).toMatchObject({ level: "info" });
+				for (const event of events) expectPortableLogShape(event);
+			} finally {
+				await server.close();
+			}
+		},
+	);
+
+	test("rejects wasm-only allowSelfSigned on the native backend", async () => {
+		const err = await createServer({
+			backend: "native",
+			port: 0,
+			tls: { allowSelfSigned: true },
+			onSession: () => {},
+		}).catch((e: unknown) => e);
+		expect(err).toBeInstanceOf(WebTransportError);
+		expect(err).toMatchObject({ code: E_UNSUPPORTED_ARGUMENT });
+		expect((err as Error).message).toMatch(/wasm-only/);
+	});
+
+	test("requires a certificate on the native backend instead of generating one", async () => {
+		for (const tls of [
+			{},
+			{ certPem: "", keyPem: "" },
+			{ certPem: cert.certPem },
+			{ keyPem: cert.keyPem },
+		]) {
+			const err = await createServer({
+				backend: "native",
+				host: "127.0.0.1",
+				port: 0,
+				tls,
+				onSession: () => {},
+			}).catch((e: unknown) => e);
+			expect(err).toBeInstanceOf(WebTransportError);
+			expect(err).toMatchObject({ code: E_TLS });
+		}
 	});
 });

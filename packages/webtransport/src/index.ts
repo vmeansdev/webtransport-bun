@@ -241,6 +241,8 @@ import type {
 import {
 	createW3CMappedError as createMappedError,
 	normalizeW3CBrowserName as normalizeToBrowserName,
+	validateW3CClientOptions,
+	type W3CClientOptionSurface,
 } from "./w3c-client-options.js";
 
 /** Web IDL BufferSource (ArrayBuffer | ArrayBufferView) for spec alignment */
@@ -518,6 +520,12 @@ export type { RateLimitOptions } from "./types.js";
 
 /**
  * Resource limits. Merge with {@link DEFAULT_LIMITS} for defaults.
+ *
+ * Every field is an integer. A value that is negative, fractional or below its
+ * floor throws `E_INVALID_ARGUMENT` instead of being clamped: `maxSessions`,
+ * `maxHandshakesInFlight` and `maxDatagramSize` >= 1, `backpressureTimeoutMs`
+ * and `handshakeTimeoutMs` >= 100, `idleTimeoutMs` >= 1000, the QUIC windows
+ * (when set) >= 1, everything else >= 0.
  * @see DEFAULT_LIMITS Default values (e.g. handshakeTimeoutMs: 10000, maxDatagramSize: 1200).
  */
 export type LimitsOptions = {
@@ -590,8 +598,12 @@ export type LimitsOptions = {
 	keepAliveIntervalMs?: number;
 };
 
-/** Default limit values from AGENTS.md */
-export const DEFAULT_LIMITS: LimitsOptions = {
+/**
+ * Default limit values from AGENTS.md. Frozen: every createServer/connect
+ * merges the caller's limits over this object, so writing to it would
+ * silently change the defaults of every later server and client.
+ */
+export const DEFAULT_LIMITS: Readonly<LimitsOptions> = Object.freeze({
 	maxSessions: 2000,
 	maxHandshakesInFlight: 200,
 	maxStreamsPerSessionBidi: 200,
@@ -604,10 +616,10 @@ export const DEFAULT_LIMITS: LimitsOptions = {
 	backpressureTimeoutMs: 5000,
 	handshakeTimeoutMs: 10_000,
 	idleTimeoutMs: 60_000,
-};
+});
 
-/** Default rate-limit values from AGENTS.md */
-export const DEFAULT_RATE_LIMITS: RateLimitOptions = {
+/** Default rate-limit values from AGENTS.md. Frozen for the same reason. */
+export const DEFAULT_RATE_LIMITS: Readonly<RateLimitOptions> = Object.freeze({
 	handshakesPerSec: 20,
 	handshakesBurst: 40,
 	handshakesBurstPerPrefix: 100,
@@ -615,7 +627,7 @@ export const DEFAULT_RATE_LIMITS: RateLimitOptions = {
 	streamsBurst: 400,
 	datagramsPerSec: 2000,
 	datagramsBurst: 5000,
-};
+});
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -776,9 +788,11 @@ export type ServerOptions = {
 	 * (`sockArrayPinPath`), and — when `attachProgPinPath` is set — attach the
 	 * pinned `sk_reuseport` steering program to the group (exactly one instance
 	 * per group passes it; the program lives on the group afterwards and covers
-	 * later joiners). By convention `key` equals this instance's numeric QUIC-LB
-	 * server id, matching what the steering program's `slot_by_server_id` map
-	 * resolves. See examples/quic-lb for the program and the load recipe.
+	 * later joiners). `key` is this instance's slot index in the sockarray, not
+	 * its QUIC-LB server id: it must equal the slot that the steering program's
+	 * `slot_by_server_id` map assigns to this instance's `quicLb.serverId`
+	 * (examples/quic-lb/attach.sh.example maps server ids 7, 8 and 9 to slots
+	 * 0, 1 and 2). See examples/quic-lb for the program and the load recipe.
 	 *
 	 * Requires `reusePort: true` (there is no group to steer otherwise) and
 	 * `quicLb` (without QUIC-LB CIDs every packet takes the hash fallback while
@@ -795,7 +809,7 @@ export type ServerOptions = {
 	reusePortSteering?: {
 		/** Absolute bpffs path of the pinned `REUSEPORT_SOCKARRAY`. */
 		sockArrayPinPath: string;
-		/** This instance's slot in the sockarray (its QUIC-LB server id). */
+		/** This instance's slot index in the sockarray (the value `slot_by_server_id` maps its server id to). */
 		key: number;
 		/** Absolute bpffs path of the pinned `sk_reuseport` program to attach. */
 		attachProgPinPath?: string;
@@ -1443,7 +1457,7 @@ export function metricsToPrometheus(
 		`# HELP ${p}stream_tasks_active Internal stream tasks`,
 		`# TYPE ${p}stream_tasks_active gauge`,
 		`${p}stream_tasks_active${metricLabels} ${m.streamTasksActive}`,
-		`# HELP ${p}queued_bytes_global Bytes queued globally`,
+		`# HELP ${p}queued_bytes_global Queued receive bytes plus queued stream-send bytes`,
 		`# TYPE ${p}queued_bytes_global gauge`,
 		`${p}queued_bytes_global${metricLabels} ${m.queuedBytesGlobal}`,
 		`# HELP ${p}datagrams_in Datagrams received`,
@@ -1455,13 +1469,13 @@ export function metricsToPrometheus(
 		`# HELP ${p}datagrams_dropped Datagrams dropped`,
 		`# TYPE ${p}datagrams_dropped counter`,
 		`${p}datagrams_dropped${metricLabels} ${m.datagramsDropped}`,
-		`# HELP ${p}backpressure_wait_total Times senders waited on backpressure`,
+		`# HELP ${p}backpressure_wait_total Failed datagram send budget reservation attempts`,
 		`# TYPE ${p}backpressure_wait_total counter`,
 		`${p}backpressure_wait_total${metricLabels} ${m.backpressureWaitCount}`,
 		`# HELP ${p}backpressure_timeout_total Times backpressure timeout fired`,
 		`# TYPE ${p}backpressure_timeout_total counter`,
 		`${p}backpressure_timeout_total${metricLabels} ${m.backpressureTimeoutCount}`,
-		`# HELP ${p}rate_limited_total Sessions rejected by rate limit`,
+		`# HELP ${p}rate_limited_total Handshakes, stream opens and datagrams refused by a rate limit`,
 		`# TYPE ${p}rate_limited_total counter`,
 		`${p}rate_limited_total${metricLabels} ${m.rateLimitedCount}`,
 		`# HELP ${p}limit_exceeded_total Sessions rejected (limits)`,
@@ -1668,6 +1682,8 @@ interface NativeSessionHandle {
 	metricsSnapshot(): SessionMetricsSnapshot;
 	connectionStats?(): QuicConnectionStats | null;
 	pathMaxDatagramSize?: () => number | null;
+	/** min(configured limits.maxDatagramSize, path maximum). Client handles only. */
+	maxDatagramSize?: () => number;
 	/** 0-RTT getters (absent on older prebuilt addons). */
 	has0Rtt?: boolean;
 	accepted0Rtt?: boolean;
@@ -2540,6 +2556,11 @@ function pacerStatsForwards(handle: {
  * @param opts - Server configuration. Requires `port`, `tls` (certPem, keyPem), and `onSession` callback.
  * @returns WebTransportServer with address, live TLS management methods, `close()`, and `metricsSnapshot()`.
  * @throws Error if native addon is not loaded.
+ * @throws WebTransportError with a stable `code` for every other failure:
+ *   `E_INVALID_ARGUMENT` (malformed options, including a missing or
+ *   out-of-range `port`), `E_UNSUPPORTED_ARGUMENT`, `E_TLS` (unusable
+ *   certificate/key) or `E_INTERNAL` (the server could not start, e.g. the
+ *   port is in use). The TLS methods reject the same way.
  *
  * @example
  * ```ts
@@ -2559,6 +2580,19 @@ function pacerStatsForwards(handle: {
 export function createServer(opts: ServerOptions): WebTransportServer {
 	warnIfLeakyBunRuntime();
 	const native = getNativeOrThrow();
+
+	if (
+		typeof opts.port !== "number" ||
+		!Number.isInteger(opts.port) ||
+		opts.port < 0 ||
+		opts.port > 65535
+	) {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			`E_INVALID_ARGUMENT: port must be an integer in 0..65535 (0 selects an ephemeral port), got ${String(opts.port)}`,
+		);
+	}
+	validateUnknownSniPolicy(opts.tls.unknownSniPolicy);
 
 	const decodePem = (value: string | Uint8Array | undefined): string =>
 		typeof value === "string"
@@ -2861,17 +2895,31 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 		}
 	};
 
-	const handle = new native.ServerHandle(
-		opts.port,
-		bindHost.host,
-		opts.debug === true,
-		tlsConfigToJson(opts.tls),
-		limitsJson,
-		rateLimitsJson,
-		serverOptsJson,
-		onSessionEvents,
-		logCallback,
-	);
+	let handle: InstanceType<typeof native.ServerHandle>;
+	try {
+		handle = new native.ServerHandle(
+			opts.port,
+			bindHost.host,
+			opts.debug === true,
+			tlsConfigToJson(opts.tls),
+			limitsJson,
+			rateLimitsJson,
+			serverOptsJson,
+			onSessionEvents,
+			logCallback,
+		);
+	} catch (err) {
+		throw toWebTransportError(err);
+	}
+	// Native rejects with a plain Error whose message carries the code; the
+	// public contract is a WebTransportError with `code` set.
+	const mapNative = async <T>(op: () => Promise<T>): Promise<T> => {
+		try {
+			return await op();
+		} catch (err) {
+			throw toWebTransportError(err);
+		}
+	};
 
 	function onSessionCallbackDone() {
 		activeOnSessionCallbacks--;
@@ -2884,39 +2932,49 @@ export function createServer(opts: ServerOptions): WebTransportServer {
 	const server: WebTransportServer = {
 		address: { host: bindHost.host, port: handle.port },
 		congestionControl: opts.congestionControl ?? "default",
-		updateCert: async (tls) => {
-			const nextCertPem = decodePem(tls.certPem);
-			const nextKeyPem = decodePem(tls.keyPem);
-			await handle.updateCert(nextCertPem, nextKeyPem);
-		},
-		updateTls: async (tls) => {
-			await handle.updateTls(tlsConfigToJson(tls));
-		},
-		replaceSniCerts: async (sni) => {
-			await handle.replaceSniCerts(
-				JSON.stringify(
-					sni.map((entry) => ({
-						serverName: entry.serverName,
-						certPem: decodePem(entry.certPem),
-						keyPem: decodePem(entry.keyPem),
-					})),
+		updateCert: (tls) =>
+			mapNative(() =>
+				handle.updateCert(decodePem(tls.certPem), decodePem(tls.keyPem)),
+			),
+		updateTls: (tls) =>
+			mapNative(async () => {
+				validateUnknownSniPolicy(tls.unknownSniPolicy);
+				await handle.updateTls(tlsConfigToJson(tls));
+			}),
+		replaceSniCerts: (sni) =>
+			mapNative(() =>
+				handle.replaceSniCerts(
+					JSON.stringify(
+						sni.map((entry) => ({
+							serverName: entry.serverName,
+							certPem: decodePem(entry.certPem),
+							keyPem: decodePem(entry.keyPem),
+						})),
+					),
 				),
-			);
+			),
+		upsertSniCert: (entry) =>
+			mapNative(() =>
+				handle.upsertSniCert(
+					entry.serverName,
+					decodePem(entry.certPem),
+					decodePem(entry.keyPem),
+				),
+			),
+		removeSniCert: (serverName) =>
+			mapNative(() => handle.removeSniCert(serverName)),
+		setUnknownSniPolicy: (policy) =>
+			mapNative(async () => {
+				validateUnknownSniPolicy(policy, true);
+				await handle.setUnknownSniPolicy(policy);
+			}),
+		tlsSnapshot: () => {
+			try {
+				return handle.tlsSnapshot();
+			} catch (err) {
+				throw toWebTransportError(err);
+			}
 		},
-		upsertSniCert: async (entry) => {
-			await handle.upsertSniCert(
-				entry.serverName,
-				decodePem(entry.certPem),
-				decodePem(entry.keyPem),
-			);
-		},
-		removeSniCert: async (serverName) => {
-			await handle.removeSniCert(serverName);
-		},
-		setUnknownSniPolicy: async (policy) => {
-			await handle.setUnknownSniPolicy(policy);
-		},
-		tlsSnapshot: () => handle.tlsSnapshot(),
 		sendDatagramMirror: (targets, payload) =>
 			sendDatagramMirrorChecked(
 				(ids, bytes) => handle.sendDatagramMirror(ids, bytes),
@@ -3259,11 +3317,15 @@ class NativeClientSession implements ClientSession {
 			: null;
 	}
 
-	/** Current path MTU-derived max datagram payload size, or null when unknown. */
-	/** @internal */
-	_pathMaxDatagramSize(): number | null {
-		return typeof this.#nativeHandle.pathMaxDatagramSize === "function"
-			? (this.#nativeHandle.pathMaxDatagramSize() ?? null)
+	/**
+	 * Largest datagram this session sends: the configured
+	 * `limits.maxDatagramSize`, lowered to the path maximum once known.
+	 * Null when the addon predates the getter.
+	 * @internal
+	 */
+	_maxDatagramSize(): number | null {
+		return typeof this.#nativeHandle.maxDatagramSize === "function"
+			? this.#nativeHandle.maxDatagramSize()
 			: null;
 	}
 }
@@ -3539,6 +3601,7 @@ export async function connect(
 	warnIfLeakyBunRuntime();
 	const native = getNativeOrThrow();
 	validateConnectUrl(url, opts?.strictW3CErrors);
+	validateClientOptions(opts, opts?.strictW3CErrors);
 	const serverCertificateHashes = mapServerCertificateHashes(
 		opts?.serverCertificateHashes,
 	);
@@ -3555,12 +3618,6 @@ export async function connect(
 		});
 	}
 
-	if (opts?.serverCertificateHashes !== undefined) {
-		validateServerCertificateHashes(
-			opts.serverCertificateHashes,
-			opts?.strictW3CErrors,
-		);
-	}
 	if (opts !== undefined) {
 		validateQpackOptions(opts, opts.strictW3CErrors);
 	}
@@ -3625,24 +3682,14 @@ export function releaseNativeMemory(): boolean {
 // Browser-style WebTransport facade (Phase P1)
 // ---------------------------------------------------------------------------
 
-function validateServerCertificateHashes(
-	arr: unknown,
+/**
+ * The entries of a `serverCertificateHashes` array the shared W3C validator has
+ * already accepted as a non-empty array: only the native pin path reads them.
+ */
+function validateServerCertificateHashEntries(
+	arr: ReadonlyArray<{ algorithm: string; value: unknown }>,
 	strictW3CErrors?: boolean,
 ): void {
-	if (!Array.isArray(arr)) {
-		throw createMappedError(
-			E_INVALID_ARGUMENT as ErrorCode,
-			"E_INVALID_ARGUMENT: serverCertificateHashes must be an array",
-			strictW3CErrors,
-		);
-	}
-	if (arr.length === 0) {
-		throw createMappedError(
-			E_INVALID_ARGUMENT as ErrorCode,
-			"E_INVALID_ARGUMENT: serverCertificateHashes must be a non-empty array",
-			strictW3CErrors,
-		);
-	}
 	for (const entry of arr) {
 		if (entry.algorithm !== "sha-256") {
 			throw createMappedError(
@@ -3695,10 +3742,20 @@ function mapServerCertificateHashes(
 	}));
 }
 
+/** `tls.unknownSniPolicy`: absent means default unless the caller requires it. */
+function validateUnknownSniPolicy(policy: unknown, required = false): void {
+	if (policy === undefined && !required) return;
+	if (policy !== "reject" && policy !== "default") {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			`E_INVALID_ARGUMENT: unknownSniPolicy must be "reject" or "default", got ${JSON.stringify(policy) ?? String(policy)}`,
+		);
+	}
+}
+
 const VALID_CONGESTION = new Set(["default", "throughput", "low-latency"]);
 /** Hard cap on advertised QPACK dynamic-table capacity (mirrors the native `MAX_QPACK_TABLE_CAPACITY`, 64 KiB). */
 const MAX_QPACK_TABLE_CAPACITY = 65536;
-const VALID_DATAGRAMS_READABLE_TYPE = new Set(["bytes", "default"]);
 
 /**
  * Both QPACK options, validated the same way on the server and the client.
@@ -3706,11 +3763,30 @@ const VALID_DATAGRAMS_READABLE_TYPE = new Set(["bytes", "default"]);
  * advertising something other than what was asked for would be a worse answer
  * than saying no.
  */
+/**
+ * The smallest accepted value of every integer `limits` field (the QUIC
+ * windows are checked separately). Anything lower, negative or fractional is
+ * rejected rather than clamped, so the value in force is the value asked for.
+ * Mirrored by the native parser (`crates/native/src/limits.rs`).
+ */
+const LIMIT_FLOORS: Readonly<Record<string, number>> = Object.freeze({
+	maxSessions: 1,
+	maxHandshakesInFlight: 1,
+	maxStreamsPerSessionBidi: 0,
+	maxStreamsPerSessionUni: 0,
+	maxStreamsGlobal: 0,
+	maxDatagramSize: 1,
+	maxQueuedBytesGlobal: 0,
+	maxQueuedBytesPerSession: 0,
+	maxQueuedBytesPerStream: 0,
+	backpressureTimeoutMs: 100,
+	handshakeTimeoutMs: 100,
+	idleTimeoutMs: 1000,
+	keepAliveIntervalMs: 0,
+});
+
 /** Every numeric `limits` field native reads (the windows are checked below). */
-const NUMERIC_LIMIT_KEYS = [
-	...Object.keys(DEFAULT_LIMITS),
-	"keepAliveIntervalMs",
-] as const;
+const NUMERIC_LIMIT_KEYS = Object.keys(LIMIT_FLOORS);
 
 /**
  * Reject a malformed `limits` object instead of letting native silently fall
@@ -3737,20 +3813,29 @@ function validateLimitsShape(
 		field === "limits" ? NUMERIC_LIMIT_KEYS : NUMERIC_RATE_LIMIT_KEYS;
 	for (const key of numericKeys) {
 		const value = record[key];
-		if (
-			value !== undefined &&
-			(typeof value !== "number" || !Number.isFinite(value))
-		)
+		if (value === undefined) continue;
+		if (typeof value !== "number" || !Number.isFinite(value))
 			fail(`${field}.${key} must be a finite number, got ${String(value)}`);
+		const n = value as number;
+		if (field === "limits") {
+			const floor = LIMIT_FLOORS[key] ?? 0;
+			if (!Number.isSafeInteger(n) || n < floor)
+				fail(`${field}.${key} must be an integer >= ${floor}, got ${n}`);
+		} else if (key.endsWith("PerSec")) {
+			if (n < 0) fail(`${field}.${key} must be >= 0, got ${n}`);
+		} else if (!Number.isSafeInteger(n) || n < 0) {
+			fail(`${field}.${key} must be an integer >= 0, got ${n}`);
+		}
 	}
 	if (field === "limits") validateQuicWindows(record, strictW3CErrors);
 }
 
-/** Every numeric `rateLimits` field native reads. */
-const NUMERIC_RATE_LIMIT_KEYS = [
-	...Object.keys(DEFAULT_RATE_LIMITS),
-	"handshakesBurstPerPrefix",
-] as const;
+/**
+ * Every numeric `rateLimits` field native reads: `*PerSec` rates are
+ * non-negative numbers (fractional rates are fine), bursts are non-negative
+ * token counts.
+ */
+const NUMERIC_RATE_LIMIT_KEYS = Object.keys(DEFAULT_RATE_LIMITS);
 
 /**
  * Reject a malformed explicit QUIC window instead of letting native silently
@@ -3813,81 +3898,36 @@ function validateQpackOptions(
 	}
 }
 
+/**
+ * The one client-option validator behind both `connect()` and
+ * `new WebTransport()`: the W3C surface shared with the wasm facade, then the
+ * options only the native client reads.
+ */
 function validateClientOptions(
-	opts?: WebTransportClientOptions,
+	opts: (W3CClientOptionSurface & { enable0Rtt?: unknown }) | undefined,
 	strictW3CErrors?: boolean,
 ): void {
 	if (!opts) return;
-	if (
-		opts.allowPooling !== undefined &&
-		typeof opts.allowPooling !== "boolean"
-	) {
-		throw createMappedError(
-			E_INVALID_ARGUMENT as ErrorCode,
-			"E_INVALID_ARGUMENT: allowPooling must be a boolean",
-			strictW3CErrors,
-		);
-	}
-	if (
-		opts.requireUnreliable !== undefined &&
-		typeof opts.requireUnreliable !== "boolean"
-	) {
-		throw createMappedError(
-			E_INVALID_ARGUMENT as ErrorCode,
-			"E_INVALID_ARGUMENT: requireUnreliable must be a boolean",
-			strictW3CErrors,
-		);
-	}
-	if (
-		opts.congestionControl !== undefined &&
-		!VALID_CONGESTION.has(opts.congestionControl)
-	) {
-		throw createMappedError(
-			E_INVALID_ARGUMENT as ErrorCode,
-			`E_INVALID_ARGUMENT: congestionControl must be "default", "throughput", or "low-latency", got "${opts.congestionControl}"`,
-			strictW3CErrors,
-		);
-	}
-	if (
-		opts.datagramsReadableType !== undefined &&
-		!VALID_DATAGRAMS_READABLE_TYPE.has(opts.datagramsReadableType)
-	) {
-		throw createMappedError(
-			E_INVALID_ARGUMENT as ErrorCode,
-			`E_INVALID_ARGUMENT: datagramsReadableType must be "bytes" or "default", got "${opts.datagramsReadableType}"`,
-			strictW3CErrors,
-		);
-	}
+	validateW3CClientOptions(opts, strictW3CErrors);
 	if (opts.serverCertificateHashes !== undefined) {
-		if (!Array.isArray(opts.serverCertificateHashes)) {
-			throw createMappedError(
-				E_INVALID_ARGUMENT as ErrorCode,
-				"E_INVALID_ARGUMENT: serverCertificateHashes must be an array",
-				strictW3CErrors,
-			);
-		}
-		// An empty array is a silent pinning downgrade: the consumer asked for
-		// cert pinning but supplied no hashes. Reject rather than fall back to
-		// accept-any.
-		if (opts.serverCertificateHashes.length === 0) {
-			throw createMappedError(
-				E_INVALID_ARGUMENT as ErrorCode,
-				"E_INVALID_ARGUMENT: serverCertificateHashes must be a non-empty array",
-				strictW3CErrors,
-			);
-		}
-		if (opts.allowPooling === true) {
-			// W3C mandates NotSupportedError for this combination regardless of
-			// the strict flag (asserted by parity-compat) — intentionally not
-			// gated on strictW3CErrors.
-			throw createMappedError(
-				E_UNSUPPORTED_ARGUMENT as ErrorCode,
-				"E_UNSUPPORTED_ARGUMENT: serverCertificateHashes cannot be used with allowPooling=true",
-				true,
-			);
-		}
-		validateServerCertificateHashes(
+		validateServerCertificateHashEntries(
 			opts.serverCertificateHashes,
+			strictW3CErrors,
+		);
+	}
+	if (opts.enable0Rtt !== undefined && typeof opts.enable0Rtt !== "boolean") {
+		throw createMappedError(
+			E_INVALID_ARGUMENT as ErrorCode,
+			"E_INVALID_ARGUMENT: enable0Rtt must be a boolean",
+			strictW3CErrors,
+		);
+	}
+	if (opts.enable0Rtt === true && opts.allowPooling === true) {
+		// Pooling reuses live connections, while 0-RTT and its
+		// has0Rtt/accepted0Rtt reporting are per handshake.
+		throw createMappedError(
+			E_UNSUPPORTED_ARGUMENT as ErrorCode,
+			"E_UNSUPPORTED_ARGUMENT: enable0Rtt cannot be used with allowPooling=true",
 			strictW3CErrors,
 		);
 	}
@@ -4064,11 +4104,14 @@ export class WebTransport {
 	};
 	readonly #congestionControl: "default" | "throughput" | "low-latency";
 	#strictW3CErrors = false;
+	readonly #configuredMaxDatagramSize: number;
 
 	constructor(
 		urlOrSession: string | ClientSession,
 		options?: WebTransportClientOptions,
 	) {
+		this.#configuredMaxDatagramSize =
+			options?.limits?.maxDatagramSize ?? DEFAULT_LIMITS.maxDatagramSize;
 		if (typeof urlOrSession === "string") {
 			this.#datagramsReadableType = options?.datagramsReadableType ?? "default";
 			const requestedCongestion = options?.congestionControl ?? "default";
@@ -4367,13 +4410,17 @@ export class WebTransport {
 		return this.#sessionPromise;
 	}
 
-	/** Internal: MTU-derived datagram size from the live session, if connected */
-	/** @internal */
-	_getPathMaxDatagramSize(): number | null {
+	/**
+	 * W3C `datagrams.maxDatagramSize`: the live session's cap (configured
+	 * limit, lowered to the path maximum) once connected, the configured limit
+	 * before that.
+	 * @internal
+	 */
+	_getMaxDatagramSize(): number {
 		const s = this.#session as unknown as {
-			_pathMaxDatagramSize?: () => number | null;
+			_maxDatagramSize?: () => number | null;
 		} | null;
-		return s?._pathMaxDatagramSize?.() ?? null;
+		return s?._maxDatagramSize?.() ?? this.#configuredMaxDatagramSize;
 	}
 
 	/** Internal: state for createWritable guard (not part of spec) */
@@ -4441,6 +4488,9 @@ export class WebTransport {
 	): Promise<void> {
 		await this.#sendScheduler.enqueue(policy, async () => {
 			const s = await this.#sessionPromise;
+			// W3C: a datagram larger than maxDatagramSize is discarded and the
+			// write resolves, so the writable stays usable for later writes.
+			if (chunk.byteLength > this._getMaxDatagramSize()) return;
 			await s.sendDatagram(chunk);
 			this.#connStats.bytesSent += chunk.byteLength;
 			this.#connStats.datagramsOut += 1;
@@ -4541,9 +4591,7 @@ function createDatagramStreams(
 			return createDatagramWritable(wt, wt._resolveSendPolicy(options));
 		},
 		get maxDatagramSize(): number {
-			// Path-MTU-derived value from QUIC when connected; configured
-			// default until the handshake completes.
-			return wt._getPathMaxDatagramSize() ?? DEFAULT_LIMITS.maxDatagramSize;
+			return wt._getMaxDatagramSize();
 		},
 	};
 }

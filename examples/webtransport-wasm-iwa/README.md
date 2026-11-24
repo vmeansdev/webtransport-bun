@@ -59,24 +59,51 @@ backend (`@webtransport-bun/webtransport/wasm`) over the Direct Sockets
    # Bundle this directory, then sign the identical bytes for Chromium's
    # automated developer-mode install and the auditable release artifact.
    npm i --no-save --ignore-scripts wbn@0.0.9 wbn-sign@0.3.1
-   npx wbn@0.0.9 --dir . --output /tmp/webtransport-wasm-iwa.wbn --formatVersion b2
+   npx wbn@0.0.9 --dir . --output ../../.release-evidence/iwa/webtransport-wasm-iwa.wbn --formatVersion b2
    node -e '
      const { NodeCryptoSigningStrategy, IntegrityBlockSigner, WebBundleId } = require("wbn-sign");
      const crypto = require("node:crypto"), fs = require("node:fs");
+     const out = "../../.release-evidence/iwa/";
      const key = crypto.createPrivateKey(fs.readFileSync("/tmp/wt-iwa-signing.key.pem"));
-     console.log("origin:", new WebBundleId(key).serializeWithIsolatedWebAppOrigin());
-     new IntegrityBlockSigner(fs.readFileSync("/tmp/webtransport-wasm-iwa.wbn"),
+     fs.writeFileSync(out + "origin.txt", new WebBundleId(key).serializeWithIsolatedWebAppOrigin());
+     new IntegrityBlockSigner(fs.readFileSync(out + "webtransport-wasm-iwa.wbn"),
        new WebBundleId(key).serialize(),
        [new NodeCryptoSigningStrategy(key)]
      ).sign().then(({ signedWebBundle }) =>
-       fs.writeFileSync("../../.release-evidence/iwa/webtransport-wasm-iwa.swbn", signedWebBundle));
+       fs.writeFileSync(out + "webtransport-wasm-iwa.swbn", signedWebBundle));
    '
    ```
+
+   That leaves the three inputs `tools/interop/run-iwa.mjs` needs in
+   `.release-evidence/iwa/` (untracked): the unsigned bundle, the signed
+   bundle and `origin.txt`. These are the same steps and paths `iwa.yml` uses.
 
    The `wbn-sign` API moves; if the snippet drifts, the authoritative flow is
    <https://chromeos.dev/en/web/isolated-web-apps> and the `wbn-sign` README.
 
-## Run (Chromium)
+## Run the automated proof
+
+`tools/interop/run-iwa.mjs` installs the signed bundle into a fresh Chromium
+profile with the developer-mode file switch, runs the release proof and writes
+evidence. Without overrides it looks for the bundles and `origin.txt` in this
+example directory, so point it at the files step 3 wrote (from the repo root,
+after `cd tools/interop && bun install && bun run install:browsers`):
+
+```bash
+WT_IWA_BUNDLE_PATH=.release-evidence/iwa/webtransport-wasm-iwa.swbn \
+WT_IWA_UNSIGNED_BUNDLE_PATH=.release-evidence/iwa/webtransport-wasm-iwa.wbn \
+WT_IWA_ORIGIN_PATH=.release-evidence/iwa/origin.txt \
+  node tools/interop/run-iwa.mjs
+```
+
+Evidence goes to `.release-evidence/iwa/evidence.json` (`WT_IWA_EVIDENCE_PATH`)
+and the browser profile to `.release-evidence/iwa/chromium-profile`
+(`WT_IWA_PROFILE_DIR`). `WT_IWA_BROWSER_CHANNEL=chrome-beta` or
+`WT_IWA_BROWSER_EXECUTABLE=<path>` selects another Chromium build;
+`WT_IWA_TIMEOUT_MS` (default 180000) bounds the run. On Linux without a display
+CI wraps the command in `xvfb-run`.
+
+## Run by hand (Chromium)
 
 1. Enable the flags in `chrome://flags`:
    - `#enable-isolated-web-apps`

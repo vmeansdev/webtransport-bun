@@ -183,10 +183,20 @@ fn handle_connect_callback_status(success_id: Option<&str>, status: napi::Status
     }
 }
 
-fn map_connecting_error(
+/// Turn a failed WebTransport connect into an error whose message carries the
+/// stable code. Shared by the dedicated and the pooled connect paths.
+pub(crate) fn map_connecting_error(
     err: wtransport::error::ConnectingError,
 ) -> Box<dyn std::error::Error + Send + Sync> {
     match err {
+        // Certificate verification failed on either side (unknown issuer,
+        // name mismatch, a server with no certificate for the requested SNI):
+        // the handshake ended with a QUIC CRYPTO_ERROR.
+        wtransport::error::ConnectingError::ConnectionError(conn_err)
+            if conn_err.is_tls_handshake_failure() =>
+        {
+            std::io::Error::other(format!("E_TLS: TLS handshake failed: {conn_err}")).into()
+        }
         wtransport::error::ConnectingError::SessionRejected => {
             std::io::Error::other("E_RATE_LIMITED: server rejected WebTransport session request")
                 .into()
@@ -766,7 +776,7 @@ fn parse_client_limits(opts_json: &str) -> std::result::Result<crate::limits::Li
     if let Some(limits) = parsed.get("limits") {
         let s = serde_json::to_string(limits)
             .map_err(|e| format!("E_INTERNAL: invalid limits payload: {}", e))?;
-        Ok(crate::limits::Limits::from_json(&s))
+        crate::limits::Limits::from_json(&s)
     } else {
         Ok(crate::limits::Limits::default())
     }
@@ -995,6 +1005,13 @@ pub(crate) fn insecure_loopback_client_config(
     )
 }
 
+/// `min(configured, path)`; the configured cap alone while the path maximum is
+/// unknown (or datagrams are unsupported by the peer).
+fn effective_max_datagram_size(configured: usize, path: Option<usize>) -> u32 {
+    let effective = path.map_or(configured, |p| p.min(configured));
+    u32::try_from(effective).unwrap_or(u32::MAX)
+}
+
 #[napi]
 #[derive(Clone)]
 pub struct ClientSessionHandle {
@@ -1077,6 +1094,15 @@ impl ClientSessionHandle {
             return Ok(None);
         }
         Ok(self.conn.as_ref().map(crate::metrics::quic_stats_from_conn))
+    }
+
+    /// The largest datagram payload this session will send: the configured
+    /// `limits.maxDatagramSize`, lowered to the path's current maximum once
+    /// QUIC knows it. What the W3C facade reports as `maxDatagramSize`.
+    #[napi]
+    pub fn max_datagram_size(&self) -> u32 {
+        let path = self.conn.as_ref().and_then(|c| c.max_datagram_size());
+        effective_max_datagram_size(self.max_datagram_size, path)
     }
 
     /// Current max datagram payload size for the path (MTU-derived), if known.
@@ -2308,6 +2334,31 @@ pub type RunConnectResult = (
     Option<crate::zero_rtt::ZeroRttHandleState>,
 );
 
+/// Option combinations pooling cannot honor. The TypeScript layer refuses
+/// them first with the same codes; this keeps the addon from accepting them
+/// when called directly.
+fn check_pooling_compatibility(
+    allow_pooling: bool,
+    has_pinned_hashes: bool,
+    enable_0rtt: bool,
+) -> std::result::Result<(), &'static str> {
+    if !allow_pooling {
+        return Ok(());
+    }
+    if has_pinned_hashes {
+        return Err(
+            "E_UNSUPPORTED_ARGUMENT: serverCertificateHashes cannot be used with allowPooling=true",
+        );
+    }
+    // Pooling reuses live connections; 0-RTT is about new-connection latency
+    // and its has0Rtt/accepted0Rtt reporting is per-handshake. Combining the
+    // two would silently report nothing, so reject loudly instead.
+    if enable_0rtt {
+        return Err("E_UNSUPPORTED_ARGUMENT: enable0Rtt cannot be used with allowPooling=true");
+    }
+    Ok(())
+}
+
 async fn run_connect(
     url: &str,
     opts_json: String,
@@ -2338,22 +2389,12 @@ async fn run_connect(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    if allow_pooling && !pinned_hashes.is_empty() {
-        return Err(
-            "E_INTERNAL: serverCertificateHashes cannot be used with allowPooling=true".into(),
-        );
-    }
-
     let enable_0rtt = opts
         .get("enable0Rtt")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    // Pooling reuses live connections; 0-RTT is about new-connection latency
-    // and its has0Rtt/accepted0Rtt reporting is per-handshake. Combining the
-    // two would silently report nothing, so reject loudly instead.
-    if enable_0rtt && allow_pooling {
-        return Err("E_INTERNAL: enable0Rtt cannot be used with allowPooling=true".into());
-    }
+    check_pooling_compatibility(allow_pooling, !pinned_hashes.is_empty(), enable_0rtt)
+        .map_err(std::io::Error::other)?;
 
     // QPACK dynamic-table capacity to advertise (0 = static-only, the default).
     let qpack_max_table_capacity =
@@ -2622,6 +2663,90 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn connecting_error_message(err: wtransport::error::ConnectingError) -> String {
+        super::map_connecting_error(err).to_string()
+    }
+
+    fn transport_failure(
+        code: quinn_proto::TransportErrorCode,
+        reason: &str,
+    ) -> wtransport::error::ConnectingError {
+        wtransport::error::ConnectingError::ConnectionError(
+            wtransport::quinn::ConnectionError::TransportError(quinn_proto::TransportError {
+                code,
+                frame: None,
+                reason: reason.to_string(),
+            })
+            .into(),
+        )
+    }
+
+    fn peer_close(code: quinn_proto::TransportErrorCode) -> wtransport::error::ConnectingError {
+        wtransport::error::ConnectingError::ConnectionError(
+            wtransport::quinn::ConnectionError::ConnectionClosed(quinn_proto::ConnectionClose {
+                error_code: code,
+                frame_type: None,
+                reason: bytes::Bytes::new(),
+            })
+            .into(),
+        )
+    }
+
+    #[test]
+    fn effective_max_datagram_size_is_the_smaller_of_config_and_path() {
+        use super::effective_max_datagram_size;
+        assert_eq!(effective_max_datagram_size(1200, None), 1200);
+        assert_eq!(effective_max_datagram_size(1200, Some(1413)), 1200);
+        assert_eq!(effective_max_datagram_size(1200, Some(900)), 900);
+        assert_eq!(effective_max_datagram_size(usize::MAX, None), u32::MAX);
+    }
+
+    #[test]
+    fn pooling_refuses_pinning_and_0rtt_as_unsupported() {
+        use super::check_pooling_compatibility;
+        assert_eq!(check_pooling_compatibility(false, true, true), Ok(()));
+        assert_eq!(check_pooling_compatibility(true, false, false), Ok(()));
+        let pinned = check_pooling_compatibility(true, true, false).unwrap_err();
+        assert!(pinned.starts_with("E_UNSUPPORTED_ARGUMENT: serverCertificateHashes"));
+        let early = check_pooling_compatibility(true, false, true).unwrap_err();
+        assert!(early.starts_with("E_UNSUPPORTED_ARGUMENT: enable0Rtt"));
+    }
+
+    #[test]
+    fn certificate_failures_map_to_e_tls() {
+        // Local verification failure: rustls rejects the peer certificate and
+        // quinn closes with CRYPTO_ERROR(bad_certificate / unknown_ca).
+        for alert in [42u8, 48] {
+            let msg = connecting_error_message(transport_failure(
+                quinn_proto::TransportErrorCode::crypto(alert),
+                "invalid peer certificate: UnknownIssuer",
+            ));
+            assert!(msg.starts_with("E_TLS: "), "{msg}");
+            assert!(msg.contains("UnknownIssuer"), "{msg}");
+        }
+        // A TLS alert from the server (no certificate for the requested SNI).
+        let msg = connecting_error_message(peer_close(quinn_proto::TransportErrorCode::crypto(40)));
+        assert!(msg.starts_with("E_TLS: "), "{msg}");
+    }
+
+    #[test]
+    fn non_tls_connect_failures_keep_their_codes() {
+        let refused = connecting_error_message(peer_close(
+            quinn_proto::TransportErrorCode::CONNECTION_REFUSED,
+        ));
+        assert!(refused.starts_with("E_LIMIT_EXCEEDED: "), "{refused}");
+        let rejected =
+            connecting_error_message(wtransport::error::ConnectingError::SessionRejected);
+        assert!(rejected.starts_with("E_RATE_LIMITED: "), "{rejected}");
+        // A protocol violation is not a TLS failure and stays codeless (the
+        // TypeScript layer reports codeless errors as E_INTERNAL).
+        let proto = connecting_error_message(transport_failure(
+            quinn_proto::TransportErrorCode::PROTOCOL_VIOLATION,
+            "bad frame",
+        ));
+        assert!(!proto.starts_with("E_"), "{proto}");
+    }
 
     #[test]
     fn wait_until_drained_returns_as_soon_as_nothing_is_pending() {

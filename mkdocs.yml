@@ -44,3 +44,8 @@ nav:
   - Compatibility: COMPATIBILITY.md
   - Parity Matrix: PARITY_MATRIX.md
   - Benchmark Baselines: BENCHMARK_BASELINES.md
+  - Branches, channels and tags: BRANCHING.md
+  - Release checklist: RELEASE_CHECKLIST.md
+  - Release status: RELEASE_1.0_STATUS.md
+  - wtransport fork maintenance: FORK_MAINTENANCE.md
+  - WASM protocol scope: WASM_PROTOCOL_SCOPE.md

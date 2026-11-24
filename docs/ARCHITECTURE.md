@@ -32,12 +32,34 @@ The addon is implemented in Rust using napi-rs. QUIC/HTTP3/WebTransport is imple
   89,002/s, four delivered 81,682/s, and ten delivered 48,042/s. Nothing here
   justifies `available_parallelism()`. The only Linux host available has 4 vCPU
   and only the one- and two-worker arms were testable on it, so the count is not
-  calibrated to production hardware. It is a hardcoded constant with no
-  environment override: every measured alternative was worse, so a knob would
-  only offer ways to regress.
+  calibrated to production hardware. The default is a constant, and the only
+  override is the unsupported `WEBTRANSPORT_NATIVE_SERVER_WORKERS` campaign
+  knob described above: every measured alternative was worse, so there is no
+  supported way to change it.
 - The client runtime stays at one worker. Every delivery measurement covers the
   server receive path only; raising the client for symmetry would be an
   unmeasured change.
+
+### Other native threads
+
+Besides the two runtimes, the addon can run these threads. Only the first is
+always present; the others exist only when their feature is in use:
+
+- **napi-rs's async runtime**, which drives every `Env::spawn_future` call:
+  the per-datagram read, batch read, send and discard paths below, and the
+  stream read group's `next()`.
+- **`wt-egress-pacer`**: one OS thread per process, started on first use of
+  the experimental egress pacer (`ServerOptions.egressPacer` or
+  `WEBTRANSPORT_PACER_PPS`). It owns the paced-mirror schedule.
+- **`wt-quic-recv-<serverId>`**: one current-thread runtime on its own OS
+  thread per server, only with the unsupported
+  `WEBTRANSPORT_NATIVE_SERVER_RECV_RUNTIME=dedicated` knob. It runs quinn's
+  endpoint driver (UDP receive) off the `wt-server` workers.
+- **`wt-udp-send-batch`**: the cross-connection `sendmmsg` flusher, only with
+  the unsupported `WEBTRANSPORT_NATIVE_UDP_SEND_BATCH` knob.
+- **`wt-reflect-sender`**: one OS thread per process that sends the internal
+  datagram reflector's replies, started on the reflector's first use. The
+  reflector is reachable only through `__TESTING__.serverInternals`.
 
 ### Datagram delivery must not hop between runtimes
 - `readDatagram`, `readDatagramBatch`, `sendDatagram`, and per-datagram
@@ -76,15 +98,21 @@ The addon is implemented in Rust using napi-rs. QUIC/HTTP3/WebTransport is imple
   their hops: opens never bound the cadence (~1,530/s either way), and the bulk
   drain is one spawn then a native loop that must not monopolise the JS thread.
 - `scripts/check-doc-truth.ts` source-policies both runtime declarations, their
-  individual worker counts, and their dedicated thread names, and rejects a
-  worker count derived from the environment or from `available_parallelism()`,
-  so the documented constructors and the implementation cannot drift silently.
+  individual worker counts, and their dedicated thread names. It rejects a
+  worker count derived from `available_parallelism()`, and pins the server
+  resolver's default of 2, its `1..=8` bound on the environment override and
+  its warn-and-fall-back handling of a bad value, so the documented
+  constructors and the implementation cannot drift silently.
 - Isolation prevents same-process deadlock when client and server share a process (e.g. tests).
 - All wtransport objects are owned and driven on these runtimes.
 - JS calls enqueue commands to the runtimes via bounded channels. Datagram
   read, batch read, send, and per-datagram discard are the exception: they run
   directly on the N-API runtime rather than hopping onto the server runtime first.
-- Runtimes emit events back to JS via ThreadsafeFunction (TSFN) using batching.
+- Data reaches JS by pull, not push (see "Event delivery batching" below).
+  ThreadsafeFunctions (TSFN) carry control events only, batched where they can
+  arrive in bursts: server session events, client connect results and close
+  notifications, and `log` hook events. Datagram and stream payloads never
+  travel through a TSFN.
 
 ## Object model and lifetimes
 - ServerHandle: owns UDP socket and accept loop.
@@ -113,22 +141,35 @@ Rule: before enqueueing a buffer, atomically reserve bytes from budgets. If rese
 Release reservation when bytes are dequeued and handed off to wtransport (outgoing) or handed to JS consumer (incoming).
 
 ## Event delivery batching (mandatory)
-Do not call into JS per packet/frame.
-Instead:
-- datagrams: batch up to N datagrams per JS tick (e.g., 256), or up to X bytes (e.g., 256 KiB)
-- stream reads: batch up to Y bytes per stream per tick (e.g., 128 KiB)
+Do not call into JS per packet/frame. The native side never calls into JS to
+deliver data: it fills bounded queues, and JS pulls from them, so a slow
+consumer is backpressure by construction.
 
-Implementation pattern:
-- runtime pushes items into bounded queues
-- a single “notifier” triggers TSFN at most once per interval (e.g., every 1–5 ms)
-- JS drains queues and feeds Node streams / iterators
+- **Datagrams:** the session's `incomingDatagrams()` iterator calls the
+  addon's `readDatagramBatch(max)`, which resolves with up to
+  `WEBTRANSPORT_DATAGRAM_BATCH` (default 64, at most 256) queued datagrams per
+  Node-API crossing; `WEBTRANSPORT_DATAGRAM_BATCH=0` falls back to one
+  `readDatagram()` per datagram. See `docs/SPEC.md`, "Incoming datagram
+  delivery".
+- **Server stream reads:** one process-level read group serves every
+  server-accepted stream. JS grants each stream read credit, and one
+  `next(maxEntries)` crossing returns the queued chunks of every stream that
+  has credit (at most 4096 entries and 1 MiB). Client streams, and every
+  stream with `WEBTRANSPORT_STREAM_READ_GROUP=0`, pull per stream instead. See
+  `docs/SPEC.md`, "Incoming stream chunk delivery".
+- Nothing is read from QUIC for a queue that is full: the byte budgets below
+  are reserved at ingest, so an unread queue leaves the rest in the transport
+  under QUIC flow control.
 
 ## Node stream integration
-Streams are exposed as Node streams implemented in JS (recommended):
-- JS creates a Duplex/Readable/Writable wrapper with internal native handle id
-- On `_write`, JS sends buffers to native via `stream_write(handle, buf)` which reserves budget and enqueues
-- On native incoming data, JS pushes into Readable side via `push()`, respecting `highWaterMark`
-- If JS consumer is slow, stop pulling from native by not draining the incoming queue; native must stop reading from QUIC when queue is near capacity
+Streams are exposed as Node streams implemented in JS:
+- JS creates a Duplex/Readable/Writable wrapper around an opaque native handle id
+- `_write` calls the handle's Node-API `write(chunk)`, which reserves budget and
+  enqueues; it waits (backpressure) while the budget is full
+- `_read` pulls the next chunk (through the read group or the handle's own
+  read) and `push()`es it, so `highWaterMark` decides how far ahead JS reads
+- A slow JS consumer stops pulling; native stops reading from QUIC once that
+  stream's budget is reserved
 
 ## Shutdown ordering (must be deterministic)
 1. Server close:

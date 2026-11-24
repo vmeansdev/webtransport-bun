@@ -7,7 +7,7 @@
 // statically import `node:*`. The native branch — and only the native branch —
 // pulls in `./portable-native.js` through a dynamic import.
 
-import { selectBackend, type BackendKind } from "./backend.js";
+import { type BackendKind, selectBackend } from "./backend.js";
 import type { WasmModule } from "./backend-wasm.js";
 import type { UdpTransport } from "./wasm-relay.js";
 import type {
@@ -120,6 +120,47 @@ export type PortableTlsOptions = {
 	allowSelfSigned?: boolean;
 };
 
+/**
+ * One structured log event, the same shape on both backends.
+ *
+ * - `type`: the event kind. The wasm backend names its events
+ *   (`session_established`, `handshake_failed`, `limit_exceeded`, ...); the
+ *   native addon logs free-text messages, so its events are all `"log"`.
+ * - `level` and `msg`: the native fields. Wasm events get `level` from their
+ *   kind (failures and refusals are `"warn"`, lifecycle events `"info"`) and
+ *   `msg` from the kind plus its `detail`, when there is one.
+ * - Anything else is backend-specific context: `sessionId`/`peerIp`/`peerPort`
+ *   on native (redacted unless `debug`), the event's own fields on wasm.
+ */
+export type PortableLogEvent = {
+	type: string;
+	level: "debug" | "info" | "warn" | "error";
+	msg: string;
+	[key: string]: unknown;
+};
+
+const WASM_WARN_EVENTS = new Set([
+	"handshake_failed",
+	"limit_exceeded",
+	"rate_limited",
+	"ticket_persist_failed",
+	"tls_update_failed",
+]);
+
+/** Give a wasm `{ type, ...fields }` event the portable `level` and `msg`. */
+function wasmLogEventToPortable(event: {
+	type: string;
+	[key: string]: unknown;
+}): PortableLogEvent {
+	const detail = typeof event.detail === "string" ? event.detail : undefined;
+	return {
+		...event,
+		type: event.type,
+		level: WASM_WARN_EVENTS.has(event.type) ? "warn" : "info",
+		msg: detail ? `${event.type}: ${detail}` : event.type,
+	};
+}
+
 export type PortableLimits = {
 	maxStreamsPerSessionBidi?: number;
 	maxStreamsGlobal?: number;
@@ -135,9 +176,14 @@ export type PortableCreateServerOptions = {
 	tls: PortableTlsOptions;
 	limits?: PortableLimits;
 	onSession: (session: PortableServerSession) => void | Promise<void>;
-	log?: (event: { type: string; [key: string]: unknown }) => void;
+	/** Structured events, one shape on both backends ({@link PortableLogEvent}). */
+	log?: (event: PortableLogEvent) => void;
 	debug?: boolean;
-	/** Wasm-only knobs forwarded to the W3C facade. */
+	/**
+	 * Wasm-only: options for the W3C facade each wasm server session is built
+	 * on (`strictW3CErrors`, `datagramsReadableType`, `congestionControl`).
+	 * Validated when the server starts; ignored on the native backend.
+	 */
 	wasmOptions?: WasmWebTransportOptions;
 	/**
 	 * Wasm-only: pre-initialized wasm module. Defaults to loading
@@ -206,9 +252,18 @@ export async function createServer(
 async function createWasmPortableServer(
 	opts: PortableCreateServerOptions,
 ): Promise<PortableServer> {
-	const { createServer: createWasmServer } = await import(
-		"./wasm-create-server.js"
-	);
+	const [
+		{ createServer: createWasmServer },
+		{ validateW3CClientOptions },
+		{ toWasmServerSession },
+	] = await Promise.all([
+		import("./wasm-create-server.js"),
+		import("./w3c-client-options.js"),
+		import("./wasm-server-session.js"),
+	]);
+	const { wasmOptions } = opts;
+	// Fail at startup, not on the first stream a session opens.
+	validateW3CClientOptions(wasmOptions);
 	const host = opts.host ?? "127.0.0.1";
 	const server = await createWasmServer({
 		host,
@@ -219,12 +274,19 @@ async function createWasmPortableServer(
 			allowSelfSigned: opts.tls.allowSelfSigned,
 		},
 		limits: opts.limits,
-		log: opts.log,
+		log: opts.log && ((event) => opts.log?.(wasmLogEventToPortable(event))),
 		debug: opts.debug,
 		...(opts.wasmModule ? { wasm: opts.wasmModule } : {}),
 		...(opts.wasmBind ? { bind: opts.wasmBind } : {}),
-		// WasmServerSession already implements the portable surface.
-		onSession: (session) => opts.onSession(session),
+		// WasmServerSession already implements the portable surface. Its W3C
+		// view is built lazily, so re-wrapping the session with the caller's
+		// facade options leaves nothing behind on the discarded wrapper.
+		onSession: (session) =>
+			opts.onSession(
+				wasmOptions
+					? toWasmServerSession(session.unwrap(), wasmOptions)
+					: session,
+			),
 	});
 
 	return {

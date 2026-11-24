@@ -29,6 +29,32 @@ used as a production control plane.
 Complete bidi and uni bodies are capped at 256 KiB. Inputs over that limit are
 cancelled before the example retains or broadcasts the body.
 
+### Without Docker
+
+The compose image builds the addon and generates a dev certificate for you; a
+direct run has to do both itself. From the repo root:
+
+```bash
+bun install
+bun run build:native
+mkdir -p examples/compose-collab/certs
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 10 -nodes \
+  -keyout examples/compose-collab/certs/key.pem \
+  -out examples/compose-collab/certs/cert.pem \
+  -subj '/CN=localhost' -addext 'subjectAltName = DNS:localhost,IP:127.0.0.1'
+
+bun run examples/compose-collab/server.ts                  # terminal 1
+CLIENT_ID=client-a WT_URL=https://127.0.0.1:4433 \
+  bun run examples/compose-collab/client.ts                # terminal 2 (and more)
+```
+
+The client defaults to `WT_URL=https://wt-server:4433`, the compose service
+name, so a direct run must set `WT_URL`. The server reads `WT_HOST` /
+`WT_PORT` (default `0.0.0.0:4433`) and `HTTP_HOST` / `HTTP_PORT` (default
+`127.0.0.1:8080`); the client also takes `PRESENCE_MS`, `CHAT_MS` and `UNI_MS`.
+The certificate lives 10 days (`certs/*.pem` is git-ignored): regenerate it when
+it expires.
+
 ## What you should see
 
 - Server logs showing sessions joining/leaving

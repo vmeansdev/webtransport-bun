@@ -31,7 +31,7 @@ Source of truth: `docs/PARITY_MATRIX.md` (W3C snapshot: `docs/w3c/w3c.github.io-
 
 - Implemented in facade:
   - lifecycle (`ready`, `closed`, `draining`)
-  - datagram duplex shape (`readable`, `writable`, `createWritable`, `maxDatagramSize`)
+  - datagram duplex shape (`readable`, `writable`, `createWritable`, `maxDatagramSize`). `maxDatagramSize` is the configured `limits.maxDatagramSize` (default 1200), lowered to the QUIC path maximum once known. A write larger than it resolves and the datagram is discarded, as the W3C write algorithm specifies, so the writable stays usable; the session-level `sendDatagram()` keeps rejecting oversize payloads
   - datagram send options (`sendOrder`, `sendGroup`) with ownership validation + deterministic scheduling
   - stream creation/incoming stream surfaces
   - stream send options (`sendOrder`, `sendGroup`) with deterministic scheduling
@@ -64,9 +64,10 @@ On supported targets (Bun/Node/Deno on macOS/Linux/Windows), the transport backe
 ## Error Model and Browser-Style Names
 
 - **Stable `E_*` codes:** All errors carry `code` (e.g. `E_TLS`, `E_HANDSHAKE_TIMEOUT`) for programmatic handling. This is preserved for backward compatibility.
-- **Deterministic browser name for validation:** `allowPooling + serverCertificateHashes` throws with `name: "NotSupportedError"` and `code: E_INTERNAL`.
+- **One option validator for both client APIs:** `connect()` and `new WebTransport()` run the same validation before anything is dialed. A malformed option (wrong type, unknown `congestionControl`, an empty `serverCertificateHashes`) is `E_INVALID_ARGUMENT`; a combination the client cannot honor is `E_UNSUPPORTED_ARGUMENT`: `allowPooling` with `serverCertificateHashes`, and (on `connect()`, the only API that takes it) `enable0Rtt` with `allowPooling`.
+- **Deterministic browser name for validation:** `allowPooling + serverCertificateHashes` throws with `name: "NotSupportedError"` and `code: E_UNSUPPORTED_ARGUMENT`, whether or not `strictW3CErrors` is set (W3C mandates `NotSupportedError` here).
 - **strictW3CErrors option:** When `strictW3CErrors: true` is passed to `connect()` or `new WebTransport()`, connect-path, session, and Web Streams facade errors use browser-style DOMException names while retaining `code: E_*`. Default is `false` for backward compatibility. Strict mode affects error surface only, not transport internals.
-- **Mapping rules (when strictW3CErrors):** E_TLS → NetworkError; E_HANDSHAKE_TIMEOUT/E_BACKPRESSURE_TIMEOUT → TimeoutError; E_SESSION_CLOSED/E_SESSION_IDLE_TIMEOUT → InvalidStateError; E_STREAM_RESET/E_STOP_SENDING → AbortError; E_LIMIT_EXCEEDED/E_QUEUE_FULL/E_RATE_LIMITED → QuotaExceededError; invalid option types → TypeError; allowPooling+serverCertificateHashes → NotSupportedError; other E_INTERNAL cases → OperationError.
+- **Mapping rules (when strictW3CErrors):** E_TLS → NetworkError; E_HANDSHAKE_TIMEOUT/E_BACKPRESSURE_TIMEOUT → TimeoutError; E_SESSION_CLOSED/E_SESSION_IDLE_TIMEOUT → InvalidStateError; E_STREAM_RESET/E_STOP_SENDING → AbortError; E_LIMIT_EXCEEDED/E_QUEUE_FULL/E_RATE_LIMITED → QuotaExceededError; E_INVALID_ARGUMENT → TypeError; E_UNSUPPORTED_ARGUMENT → NotSupportedError; E_INTERNAL → OperationError.
 - **Unknown errors:** No broad catch-all; unmapped cases keep `name: "WebTransportError"`.
 - **Close-reason-only codes:** `E_SERVER_CLOSING` is in the `ErrorCode` union and exported like its peers, but it is only ever produced as a `CloseInfo.reason` (with close code `3993`), never as a thrown `WebTransportError.code` — so it has no `strictW3CErrors` mapping. See "Server shutdown close semantics".
 
@@ -92,7 +93,8 @@ export type TlsOptions = {
    * Default is "reject". No-SNI clients still receive the default cert.
    */
   unknownSniPolicy?: "reject" | "default";
-  /** Production guard override for empty cert/key fallback. */
+  /** Serve the generated development certificate for an empty cert/key even
+   * when NODE_ENV=production (see "Development certificate fallback"). */
   allowSelfSigned?: boolean;
 };
 
@@ -260,6 +262,18 @@ export interface WebTransportServer {
       error: WebTransportError;
     }[];
   };
+  /**
+   * Experimental. Hand one payload and many targets to the native egress
+   * pacer; `admitted` counts scheduled targets, failures arrive later through
+   * readMirrorReports(). Throws E_UNSUPPORTED_ARGUMENT when the pacer is off.
+   * See "The paced mirror (experimental)".
+   */
+  sendDatagramMirrorPaced(
+    targets: readonly string[],
+    payload: Uint8Array,
+  ): DatagramMirrorAdmission;
+  /** Experimental. Drain up to `max` deferred paced-mirror failures, oldest first. */
+  readMirrorReports(max?: number): readonly MirrorReport[];
   close(): Promise<void>;
   metricsSnapshot(): MetricsSnapshot;
 }
@@ -267,8 +281,30 @@ export interface WebTransportServer {
 export function createServer(opts: ServerOptions): WebTransportServer;
 ```
 
+**Accepted limit ranges** (`createServer`, `connect` and `new WebTransport` on the native
+backend). Every `limits` field is an integer; a value that is negative,
+fractional, not a number, or below its floor throws `E_INVALID_ARGUMENT`
+rather than being clamped or replaced by the default. An absent field means
+the default.
+
+| Field | Floor |
+|---|---|
+| `maxSessions`, `maxHandshakesInFlight`, `maxDatagramSize` | 1 |
+| `maxStreamsPerSessionBidi`, `maxStreamsPerSessionUni`, `maxStreamsGlobal` | 0 |
+| `maxQueuedBytesGlobal`, `maxQueuedBytesPerSession`, `maxQueuedBytesPerStream` | 0 |
+| `streamReceiveWindow`, `receiveWindow`, `sendWindow` (when set) | 1 |
+| `backpressureTimeoutMs`, `handshakeTimeoutMs` | 100 |
+| `idleTimeoutMs` | 1000 |
+| `keepAliveIntervalMs` (0 disables) | 0 |
+
+`rateLimits` rates (`handshakesPerSec`, `streamsPerSec`, `datagramsPerSec`)
+are finite numbers `>= 0` and may be fractional; bursts (`handshakesBurst`,
+`handshakesBurstPerPrefix`, `streamsBurst`, `datagramsBurst`) are integers
+`>= 0`. The wasm backend validates its own limits (`backend.ts`).
+
 ### Server TLS / SNI semantics
 
+- **Development certificate fallback (root `createServer` only).** An empty `tls.certPem` or `tls.keyPem` makes the server generate a self-signed certificate at startup (SANs `localhost`, `127.0.0.1`, `::1`; valid 14 days; a new key on every start), so local development needs no PEM pair. With `NODE_ENV=production` that input throws `E_TLS` instead, unless `tls.allowSelfSigned: true` is set. Clients only accept that certificate with `insecureSkipVerify` or a matching `serverCertificateHashes` pin. `/portable` never takes this path: it requires a PEM pair on native and on wasm (unless the wasm backend's `allowSelfSigned` is set). See `SECURITY.md`.
 - `tls.certPem` / `tls.keyPem` are the default server certificate and key.
 - `tls.keyPem` accepts unencrypted PKCS#8 (`BEGIN PRIVATE KEY`), SEC1 ECDSA (`BEGIN EC PRIVATE KEY`), and PKCS#1 RSA (`BEGIN RSA PRIVATE KEY`) PEM. Encrypted keys are not supported. A key that does not match the leaf certificate's public key fails server construction.
 - `tls.sni` adds hostname-specific certificates chosen from the client SNI value.
@@ -290,6 +326,15 @@ export function createServer(opts: ServerOptions): WebTransportServer;
 - Operators should review configured Unicode hostnames for homograph/confusable risk; IDNA normalization makes names protocol-correct, not human-safe.
 - `tls.sni` and `unknownSniPolicy` require a non-empty default `certPem` / `keyPem`; they do not participate in the dev self-signed fallback path.
 
+Server construction and TLS management errors:
+
+- `createServer()` throws synchronously, and the TLS methods reject, with a `WebTransportError` whose `code` is the stable `E_*` (never a raw Node-API error).
+- `port` must be an integer in `0..65535` (`0` picks an ephemeral port); anything else, including a missing `port`, is `E_INVALID_ARGUMENT`. Other malformed options are `E_INVALID_ARGUMENT` too, and an option this build or platform cannot honor is `E_UNSUPPORTED_ARGUMENT`.
+- Unusable TLS material at construction (no certificate in the PEM, a key that does not match the certificate, server `tls.caPem`) is `E_TLS`.
+- A server that cannot start (for example the port is already in use) is `E_INTERNAL` with a `server startup failed` message.
+- `unknownSniPolicy` other than `"reject"` or `"default"` is `E_INVALID_ARGUMENT`, in `createServer()`, `updateTls()` and `setUnknownSniPolicy()` alike; the policy in force is left unchanged.
+- A rotation the resolver refuses (unparseable PEM, an unknown name passed to `removeSniCert()`, SNI management without a default certificate) rejects with `E_INTERNAL` and a `tls rotation failed` / `certificate rotation failed` message. On a closed server the TLS methods reject with `E_SESSION_CLOSED`.
+
 ### Client
 
 ```ts
@@ -307,11 +352,11 @@ export type ClientOptions = {
   /** Pin the server leaf by SHA-256 (W3C semantics; cert validity <= 14 days). */
   serverCertificateHashes?: Array<{ algorithm: "sha-256"; value: BufferSource }>;
   congestionControl?: "default" | "throughput" | "low-latency";
-  /** Reuse one QUIC connection for compatible connects (see "Pooling Semantics"). */
+  /** Reuse a pooled endpoint for compatible connects; each connect still makes its own connection (see "Pooling Semantics"). */
   allowPooling?: boolean;
   /** Requires datagram support; participates in pool compatibility. */
   requireUnreliable?: boolean;
-  /** Browser-style DOMException names instead of E_* codes (see "Error Model"). */
+  /** Browser-style DOMException names; `code` keeps the E_* (see "Error Model"). */
   strictW3CErrors?: boolean;
   /** Offer 0-RTT to servers this process has seen; incompatible with allowPooling. */
   enable0Rtt?: boolean;
@@ -441,10 +486,11 @@ loss leave `streamErrorCode` null.
 
 The block below lists the core fields. `docs/METRICS.md` is the full
 reference (paced-mirror, native send-path, sink and close-cause counters
-included), and `metricsToPrometheus(snapshot, opts?)` renders a snapshot in
+included), and `metricsToPrometheus(snapshot, labels?)` renders a snapshot in
 Prometheus text format with the `METRICS_PREFIX` name prefix
 (`webtransport_`, overridable via `WEBTRANSPORT_METRICS_PREFIX`).
-`DEFAULT_LIMITS` and `DEFAULT_RATE_LIMITS` export the defaults.
+`DEFAULT_LIMITS` and `DEFAULT_RATE_LIMITS` export the defaults as frozen
+objects; spread them into a new object to derive your own.
 
 ```ts
 export type MetricsSnapshot = {
@@ -520,7 +566,7 @@ with a dedicated, wire-visible code and reason:
 
 | Field | Value |
 |---|---|
-| Close code | `3993` (`SERVER_CLOSING_CLOSE_CODE`) |
+| Close code | `3993` |
 | Close reason | `"E_SERVER_CLOSING"` (`E_SERVER_CLOSING`, exported from the root entrypoint) |
 
 **When it is sent.** Every path by which `server.close()` terminates a session
@@ -534,6 +580,13 @@ uses this pair, so the peer sees one answer regardless of which one ran:
   `closed` promise of every still-owned session with the same `{ code, reason }`
   so an app sees identical values whether the event arrived off the wire or from
   the local fallback.
+
+The package exports no close-code constants: compare against the numbers.
+The well-known codes are `3990` (idle timeout: reported locally with reason
+`E_SESSION_IDLE_TIMEOUT` when the QUIC idle timer ends the connection),
+`3992` (the server refused the session over a limit, reason
+`E_LIMIT_EXCEEDED`) and `3993` (server closing, reason `E_SERVER_CLOSING`).
+The reason strings are exported as constants of the same names.
 
 **Why it is distinct.** `3993` sits with the other well-known server-originated
 close codes (`3990` idle timeout, `3992` limit exceeded) and answers a question
@@ -958,7 +1011,7 @@ session from each backend.
 | `@webtransport-bun/webtransport` (root) | Native Node-API server/client API. `createServer()` is **synchronous**. Node streams (`Duplex`/`Writable`) on the session stream constructors. Native-only capabilities live here and only here: `releaseNativeMemory()`, `exportTicketVault`/`importTicketVault`, `connect()`, `metricsToPrometheus()`, `ServerSession.goAway()`, SNI/cert rotation, keep-alive and congestion-control knobs. |
 | `@webtransport-bun/webtransport/wasm` | Async WASM/IWA API. `createServer()` returns a promise. Backend-specific extensions are allowed and documented here: Direct Sockets binding, `UdpTransport` injection, ticket-store hosts, `serveOverUdp`, self-signed cert generation and `certHashBase64` pinning. |
 | `@webtransport-bun/webtransport/sink-reader` (**experimental**) | The Worker-side consumer of the native stream sink: `SinkReader` and its record types, importable without loading any native code. It is the same `SinkReader` the root re-exports, and it may change in a 1.x minor with the rest of the sink (see "Experimental surfaces"). |
-| `@webtransport-bun/webtransport/portable` | The common async subset implemented by *both* backends: one `createServer()` returning `PortableServer`, whose sessions expose `id`, `peer`, `ready`, `closed`, `close()`, `drain()`, `sendDatagram()`, `incomingDatagrams()`, the two incoming-stream `ReadableStream`s, the two stream constructors, and `metricsSnapshot()`. Stream constructors resolve to W3C `{ readable, writable }` pairs on both backends. `incomingDatagrams()` is equal *within the contract*: same item type, memoization, receive order, and bounded termination, but not identical hidden buffering — native batching stays active behind `/portable`, with the bounds in "Incoming datagram delivery" above. |
+| `@webtransport-bun/webtransport/portable` | The common async subset implemented by *both* backends: one `createServer()` returning `PortableServer`, whose sessions expose `id`, `peer`, `ready`, `closed`, `close()`, `drain()`, `sendDatagram()`, `incomingDatagrams()`, the two incoming-stream `ReadableStream`s, the two stream constructors, and `metricsSnapshot()`. Stream constructors resolve to W3C `{ readable, writable }` pairs on both backends. The `log` option receives one event shape on both backends, `PortableLogEvent` `{ type, level, msg, ... }` (native events are all `type: "log"`; the `type` vocabulary and extra fields are backend-specific). `incomingDatagrams()` is equal *within the contract*: same item type, memoization, receive order, and bounded termination, but not identical hidden buffering — native batching stays active behind `/portable`, with the bounds in "Incoming datagram delivery" above. |
 
 Capabilities only one backend can honour stay out of `/portable` by design —
 native `goAway()` (the wasm h3 module has no control-stream `GOAWAY` handling),
@@ -970,6 +1023,36 @@ and `undefined` on native.
 `/wasm` has a frozen export list but a `candidate` stability label; see
 `docs/release-status.json`. Freezing names is not the same as promising
 behavior under gates that have not passed.
+
+### Frozen exports this spec does not spell out
+
+The TypeScript API above is the core contract, not the full export list.
+These frozen exports are public too; their contract lives in their TSDoc and
+in the document named:
+
+- **Root, W3C-shaped client:** the `WebTransport` class with
+  `WebTransportClientOptions`, `WebTransportSendGroup`,
+  `WebTransportCloseInfo`, `WebTransportConnectionStats`,
+  `WebTransportDatagramDuplexStream`, `WebTransportBidirectionalStream`,
+  `WebTransportReceiveStream`, `WebTransportErrorOptions` and
+  `WebTransportErrorSource` (`docs/RFC_CLIENT_FACADE.md`,
+  `docs/PARITY_MATRIX.md`).
+- **Root, backend-agnostic client contract:** `nativeToWebTransportLike()`,
+  `WebTransportLike`, `WtBidiStream` and `WtCloseInfo`
+  (`packages/webtransport/src/types.ts`; `/wasm` exports the same types).
+- **Root, server TLS and mirror types:** `ServerTlsSnapshot`,
+  `ServerTlsSniEntry` and `UnknownSniPolicy` ("Server TLS / SNI semantics"),
+  and `DatagramMirrorResult`, `DatagramMirrorFailure`,
+  `DatagramMirrorAdmission`, `MirrorReport` ("One payload to many sessions").
+- **Root, experimental:** the `StreamSink*`, `SinkRecord*` and egress-pacer
+  types listed in "Experimental surfaces".
+- **`./sink-reader`:** `SinkReaderOptions` alongside `SinkReader`
+  (`docs/RFC_STREAM_SINK.md`).
+- **`./portable`:** `PortableCreateServerOptions`, `PortableLimits`,
+  `PortableTlsOptions`, `PortableStreamOpenOptions`, `PortableServerSession`
+  and `BackendKind` (`packages/webtransport/src/portable.ts`).
+- **`./wasm`:** the whole entrypoint (`packages/webtransport/src/wasm.ts`, the
+  README's wasm section, `docs/WASM_PROTOCOL_SCOPE.md`).
 
 ### Semver rules
 

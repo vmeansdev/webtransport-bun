@@ -68,6 +68,24 @@ impl ConnectionError {
     pub(crate) fn local_h3_error(error_code: ErrorCode) -> Self {
         ConnectionError::LocalH3Error(H3Error { code: error_code })
     }
+
+    /// Whether the connection ended with a QUIC `CRYPTO_ERROR` (0x0100-0x01ff):
+    /// the TLS handshake failed, either locally (e.g. the peer certificate did
+    /// not verify) or because the peer sent a TLS alert (e.g. it had no
+    /// certificate for the requested server name).
+    pub fn is_tls_handshake_failure(&self) -> bool {
+        let code = match self {
+            ConnectionError::QuicProto(proto) => proto.code.map(VarInt::into_inner),
+            ConnectionError::ConnectionClosed(close) => Some(u64::from(close.0.error_code)),
+            _ => None,
+        };
+        code.is_some_and(is_crypto_error_code)
+    }
+}
+
+/// QUIC reserves 0x0100-0x01ff for TLS alerts (RFC 9000 §20.1, `CRYPTO_ERROR`).
+fn is_crypto_error_code(code: u64) -> bool {
+    (0x0100..=0x01ff).contains(&code)
 }
 
 /// An enumeration representing various errors that can occur during a WebTransport client connecting.
@@ -370,6 +388,36 @@ mod connection_close_tests {
             frame_type: None,
             reason: Default::default(),
         })
+    }
+
+    #[test]
+    fn crypto_errors_read_as_tls_handshake_failures() {
+        use super::{ConnectionError, QuicProtoError};
+        use std::borrow::Cow;
+        // quinn does not re-export proto::TransportError, so build what the
+        // From<quinn::ConnectionError> impl produces for a local TLS failure.
+        let local = |code: quinn::TransportErrorCode| {
+            ConnectionError::QuicProto(QuicProtoError {
+                code: crate::VarInt::try_from_u64(u64::from(code)).ok(),
+                reason: Cow::Borrowed("invalid peer certificate: UnknownIssuer"),
+            })
+        };
+        // Bad certificate (42) raised locally, and the edges of the range.
+        assert!(local(quinn::TransportErrorCode::crypto(42)).is_tls_handshake_failure());
+        assert!(local(quinn::TransportErrorCode::crypto(0)).is_tls_handshake_failure());
+        assert!(local(quinn::TransportErrorCode::crypto(255)).is_tls_handshake_failure());
+        assert!(!local(quinn::TransportErrorCode::PROTOCOL_VIOLATION).is_tls_handshake_failure());
+
+        // A TLS alert from the peer (handshake_failure, 40).
+        let peer = ConnectionError::ConnectionClosed(close(quinn::TransportErrorCode::crypto(40)));
+        assert!(peer.is_tls_handshake_failure());
+        let refused =
+            ConnectionError::ConnectionClosed(close(quinn::TransportErrorCode::CONNECTION_REFUSED));
+        assert!(!refused.is_tls_handshake_failure());
+
+        assert!(!ConnectionError::TimedOut.is_tls_handshake_failure());
+        assert!(!ConnectionError::LocallyClosed.is_tls_handshake_failure());
+        assert!(!ConnectionError::from(quinn::ConnectionError::Reset).is_tls_handshake_failure());
     }
 
     #[test]
