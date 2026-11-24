@@ -28,6 +28,14 @@ async function main() {
 	const server = createServer({
 		port: PORT,
 		tls: { certPem: cert.certPem, keyPem: cert.keyPem },
+		// Every dial comes from one address, so the default per-IP handshake
+		// bucket (burst 40) would refuse part of the run. This measures
+		// handshake latency, not the rate limiter: open the buckets.
+		rateLimits: {
+			handshakesPerSec: N * 10,
+			handshakesBurst: N,
+			handshakesBurstPerPrefix: N,
+		},
 		onSession: (s) => {
 			s.closed
 				.then(() => {})
@@ -40,6 +48,7 @@ async function main() {
 
 	const latencies: number[] = [];
 	const closeLatencies: number[] = [];
+	const failures: string[] = [];
 	const url = `https://127.0.0.1:${PORT}`;
 
 	for (let i = 0; i < N; i++) {
@@ -67,7 +76,8 @@ async function main() {
 				),
 			);
 		} catch (err) {
-			console.warn("[handshake-latency] connect failed during sample:", err);
+			const code = (err as { code?: string }).code ?? "no code";
+			failures.push(`sample ${i}: ${code}: ${(err as Error).message}`);
 		}
 	}
 
@@ -75,8 +85,12 @@ async function main() {
 	await Bun.sleep(500);
 	cert.cleanup();
 
-	if (latencies.length < N / 2) {
-		console.error("handshake-latency: too many failures, aborting");
+	// A failed dial is missing from the percentiles, so a run with any
+	// failure measures a different population than the one it reports.
+	if (failures.length > 0) {
+		console.error(
+			`handshake-latency: FAIL (${failures.length}/${N} handshakes failed)\n${failures.join("\n")}`,
+		);
 		process.exit(1);
 	}
 
