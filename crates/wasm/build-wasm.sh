@@ -6,13 +6,14 @@ cd "$(dirname "$0")"
 # from the repository policy instead of following the mutable `stable` alias.
 POLICY_PATH="../../.github/release-toolchain.json"
 if command -v bun >/dev/null 2>&1; then
-  POLICY_VERSIONS="$(bun -e 'const p = await Bun.file(process.argv[1]).json(); const exact = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/; if (!Array.isArray(p.rust) || p.rust.length !== 1 || !exact.test(p.rust[0]) || !Array.isArray(p.wasmBindgen) || p.wasmBindgen.length !== 1 || !exact.test(p.wasmBindgen[0])) process.exit(2); process.stdout.write(`${p.rust[0]}\t${p.wasmBindgen[0]}`);' "$POLICY_PATH")"
+  JS_EVAL=(bun -e)
 elif command -v node >/dev/null 2>&1; then
-  POLICY_VERSIONS="$(node -e 'const p = require(process.argv[1]); const exact = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/; if (!Array.isArray(p.rust) || p.rust.length !== 1 || !exact.test(p.rust[0]) || !Array.isArray(p.wasmBindgen) || p.wasmBindgen.length !== 1 || !exact.test(p.wasmBindgen[0])) process.exit(2); process.stdout.write(`${p.rust[0]}\t${p.wasmBindgen[0]}`);' "$POLICY_PATH")"
+  JS_EVAL=(node -e)
 else
   echo "build-wasm: Bun or Node is required to read $POLICY_PATH" >&2
   exit 1
 fi
+POLICY_VERSIONS="$("${JS_EVAL[@]}" 'const p = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); const exact = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/; if (!Array.isArray(p.rust) || p.rust.length !== 1 || !exact.test(p.rust[0]) || !Array.isArray(p.wasmBindgen) || p.wasmBindgen.length !== 1 || !exact.test(p.wasmBindgen[0])) process.exit(2); process.stdout.write(`${p.rust[0]}\t${p.wasmBindgen[0]}`);' "$POLICY_PATH")"
 IFS=$'\t' read -r RELEASE_RUST_TOOLCHAIN EXPECTED_WB_VERSION <<< "$POLICY_VERSIONS"
 if [[ ! "$RELEASE_RUST_TOOLCHAIN" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] ||
    [[ ! "$EXPECTED_WB_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
@@ -25,13 +26,47 @@ if command -v rustup >/dev/null 2>&1; then
   CARGO=(rustup run "$RELEASE_RUST_TOOLCHAIN" cargo)
 fi
 
-# wasm32 C deps (ring) need an LLVM clang that can target wasm32. Respect
-# caller-provided env; otherwise fall back to Homebrew LLVM when present
-# (macOS), else leave cargo's default toolchain to handle it (Linux/CI set
-# these explicitly).
-if [ -z "${CC_wasm32_unknown_unknown:-}" ] && [ -x /opt/homebrew/opt/llvm/bin/clang ]; then
-  export CC_wasm32_unknown_unknown=/opt/homebrew/opt/llvm/bin/clang
-  export AR_wasm32_unknown_unknown=/opt/homebrew/opt/llvm/bin/llvm-ar
+# wasm32 C deps (ring) need a clang that can target wasm32 and an llvm-ar:
+# the system ar (macOS) writes archives without a wasm symbol index, so the
+# linker silently drops ring's C objects and the module ends up importing
+# them from "env". Respect caller-provided env (CI sets both); otherwise use
+# the first Homebrew LLVM (unversioned, then llvm@NN newest first) or clang on
+# PATH that has a matching llvm-ar and passes a wasm32 compile probe.
+wasm_cc_works() {
+  [ -x "$1" ] && [ -x "$2" ] &&
+    printf 'int f(void) { return 0; }\n' |
+      "$1" --target=wasm32-unknown-unknown -x c -c - -o /dev/null >/dev/null 2>&1
+}
+
+find_wasm_cc() {
+  local prefix dir clang_path
+  for prefix in ${HOMEBREW_PREFIX:+"$HOMEBREW_PREFIX"} /opt/homebrew /usr/local; do
+    for dir in "$prefix/opt/llvm" $(ls -d "$prefix"/opt/llvm@* 2>/dev/null | sort -t@ -k2 -n -r); do
+      if wasm_cc_works "$dir/bin/clang" "$dir/bin/llvm-ar"; then
+        WASM_CC="$dir/bin/clang" WASM_AR="$dir/bin/llvm-ar"
+        return 0
+      fi
+    done
+  done
+  clang_path="$(command -v clang || true)"
+  if [ -n "$clang_path" ]; then
+    for WASM_AR in "$(dirname "$clang_path")/llvm-ar" "$(command -v llvm-ar || true)"; do
+      if wasm_cc_works "$clang_path" "$WASM_AR"; then
+        WASM_CC="$clang_path"
+        return 0
+      fi
+    done
+  fi
+  return 1
+}
+
+if [ -z "${CC_wasm32_unknown_unknown:-}" ]; then
+  if find_wasm_cc; then
+    export CC_wasm32_unknown_unknown="$WASM_CC"
+    export AR_wasm32_unknown_unknown="${AR_wasm32_unknown_unknown:-$WASM_AR}"
+  else
+    echo "build-wasm: no clang with the wasm32 target plus llvm-ar found (macOS: brew install llvm); set CC_wasm32_unknown_unknown and AR_wasm32_unknown_unknown" >&2
+  fi
 fi
 
 # Fail fast with actionable errors instead of deep inside cargo/ring — this
@@ -73,7 +108,22 @@ else
   export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--cfg wt_ship_production"
   "${CARGO[@]}" build --release --target wasm32-unknown-unknown
 fi
-WASM=target/wasm32-unknown-unknown/release/webtransport_wasm.wasm
+# The target dir follows CARGO_TARGET_DIR and any .cargo/config.toml
+# build.target-dir, so ask cargo instead of assuming ./target.
+TARGET_DIR="$("${CARGO[@]}" metadata --format-version 1 --no-deps |
+  "${JS_EVAL[@]}" 'process.stdout.write(JSON.parse(require("fs").readFileSync(0, "utf8")).target_directory)')"
+WASM="$TARGET_DIR/wasm32-unknown-unknown/release/webtransport_wasm.wasm"
+
+# A module that still imports from "env" has unresolved C symbols (ring was
+# compiled or archived with the wrong toolchain); its glue would fail to load
+# with "Cannot find package 'env'", so refuse to ship it.
+ENV_IMPORTS="$("${JS_EVAL[@]}" 'const m = new WebAssembly.Module(require("fs").readFileSync(process.argv[1])); process.stdout.write(WebAssembly.Module.imports(m).filter((i) => i.module === "env").map((i) => i.name).join(" "));' "$WASM")"
+if [ -n "$ENV_IMPORTS" ]; then
+  read -r -a env_symbols <<< "$ENV_IMPORTS"
+  echo "build-wasm: $WASM has ${#env_symbols[@]} unresolved \"env\" imports (first: ${env_symbols[*]:0:5})." >&2
+  echo "build-wasm: ring's C objects were not linked; build them with an LLVM clang and llvm-ar by setting CC_wasm32_unknown_unknown and AR_wasm32_unknown_unknown (macOS: brew install llvm), then rebuild." >&2
+  exit 1
+fi
 
 # Modes: pkg (default) -> crates/wasm/pkg for tests; web -> the IWA example's
 # vendor dir; dist -> the npm package's shipped wasm-dist/{node,web}.

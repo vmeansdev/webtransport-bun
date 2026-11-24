@@ -330,6 +330,20 @@ unstable `__TESTING__.serverInternals(server)` accessor (`docs/SPEC.md`,
 
 ### Fixed
 
+- `build:wasm:dist` (also run by `prepublishOnly`) exited 0 with a broken
+  artifact when only a versioned Homebrew LLVM (`llvm@NN`) was installed: the
+  system `ar` archived ring's wasm32 objects without a symbol index, so the
+  module imported 44 ring symbols from `env` and failed to load. The script
+  now finds `llvm@NN` (newest first) or a wasm32-capable `clang` on PATH with
+  a matching `llvm-ar`, fails with the unresolved symbol names when the module
+  still imports `env`, and reads the cargo target directory from
+  `cargo metadata`, so `CARGO_TARGET_DIR` and `.cargo/config.toml`
+  `build.target-dir` no longer break it.
+- `loadWasmModule()` from `webtransport-bun/wasm` said "prebuilt wasm module
+  not found" for every load failure, including a present but broken
+  `wasm-dist` artifact (for example glue that still imports `env` because
+  ring's C code was not built for wasm32). The error now includes the
+  underlying load error, so `Cannot find package 'env'` is visible.
 - `handshakeTimeoutMs` now bounds the whole server-side handshake. It used to
   start only after the CONNECT request had been read, so a handshake that
   stalled in QUIC or TLS (one replayed client Initial is enough) held its
