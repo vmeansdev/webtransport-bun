@@ -14,6 +14,9 @@ describe("runtime-portable deadline helpers", () => {
 	const originalAbortController = globalThis.AbortController;
 	const pendingTimers = new Set<ReturnType<typeof setTimeout>>();
 	const clearedTimers = new Set<ReturnType<typeof setTimeout>>();
+	// Only clears of timers the spy created count: leftovers from earlier
+	// suites in the same process also call clearTimeout while a spy is live.
+	const spiedTimers = new Set<ReturnType<typeof setTimeout>>();
 
 	function listSourceFiles(dir: string): string[] {
 		return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
@@ -31,6 +34,7 @@ describe("runtime-portable deadline helpers", () => {
 		}
 		pendingTimers.clear();
 		clearedTimers.clear();
+		spiedTimers.clear();
 		globalThis.setTimeout = originalSetTimeout;
 		globalThis.clearTimeout = originalClearTimeout;
 		globalThis.AbortController = originalAbortController;
@@ -48,11 +52,12 @@ describe("runtime-portable deadline helpers", () => {
 				}
 			}, timeout);
 			pendingTimers.add(timer);
+			spiedTimers.add(timer);
 			return timer;
 		}) as typeof setTimeout;
 
 		globalThis.clearTimeout = ((timer: ReturnType<typeof setTimeout>) => {
-			clearedTimers.add(timer);
+			if (spiedTimers.has(timer)) clearedTimers.add(timer);
 			pendingTimers.delete(timer);
 			return originalClearTimeout(timer);
 		}) as typeof clearTimeout;

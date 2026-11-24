@@ -7,6 +7,7 @@
 
 import {
 	createServer,
+	E_SESSION_CLOSED,
 	type LimitsOptions,
 	type RateLimitOptions,
 	type ServerSession,
@@ -75,6 +76,14 @@ export function startGameServer(opts: GameServerOptions) {
 		},
 	});
 
+	// A player who disconnects between ticks is still in `players` until their
+	// `closed` settles, so the next send can fail with E_SESSION_CLOSED. That
+	// is a departure, not a failed snapshot.
+	const countSnapshotError = (err: unknown) => {
+		if (err && (err as { code?: string }).code !== E_SESSION_CLOSED)
+			snapshotErrors++;
+	};
+
 	const sliceMs = 1000 / SNAPSHOT_HZ / SLICES;
 	let slice = 0;
 	const timer = setInterval(() => {
@@ -89,12 +98,16 @@ export function startGameServer(opts: GameServerOptions) {
 				view.setFloat64(5, now, true);
 				view.setUint8(13, index);
 			});
-			player.session.sendDatagramBatch(player.snapshot).then(
-				(result) => {
-					if (result.error) snapshotErrors++;
-				},
-				() => snapshotErrors++,
-			);
+			try {
+				player.session
+					.sendDatagramBatch(player.snapshot)
+					.then(
+						(result) => countSnapshotError(result.error),
+						countSnapshotError,
+					);
+			} catch (err) {
+				countSnapshotError(err);
+			}
 		}
 		slice = (slice + 1) % SLICES;
 	}, sliceMs);

@@ -17,8 +17,11 @@ const wasm = wasmAvailable
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
-async function startEchoServer(port: number) {
-	const udp = await BunUdpTransport.bind("127.0.0.1", port);
+// Binds an OS-assigned port: fixed ports collided with other suites' sockets
+// on shared CI runners (EADDRINUSE).
+async function startEchoServer() {
+	const udp = await BunUdpTransport.bind("127.0.0.1", 0);
+	const port = udp.localPort as number;
 	const sessions: WasmSession[] = [];
 	const { manager, certHashBase64 } = await serveOverUdp(
 		wasm,
@@ -32,7 +35,7 @@ async function startEchoServer(port: number) {
 			},
 		},
 	);
-	return { udp, manager, certHashBase64, sessions };
+	return { udp, port, manager, certHashBase64, sessions };
 }
 
 describe("formatAddr (IPv6 vs IPv4)", () => {
@@ -51,8 +54,8 @@ describe("cert pinning (serverCertificateHashes model)", () => {
 	test.skipIf(!wasmAvailable)(
 		"correct hash connects; wrong hash rejects",
 		async () => {
-			const PORT = 47850;
-			const srv = await startEchoServer(PORT);
+			const srv = await startEchoServer();
+			const PORT = srv.port;
 
 			// Correct pin: session establishes and echoes.
 			const udpOk = await BunUdpTransport.connect("127.0.0.1", PORT);
@@ -123,8 +126,8 @@ describe("connection lifecycle", () => {
 	test.skipIf(!wasmAvailable)(
 		"closing one server session leaves the other client connected",
 		async () => {
-			const PORT = 47851;
-			const srv = await startEchoServer(PORT);
+			const srv = await startEchoServer();
+			const PORT = srv.port;
 
 			const udpA = await BunUdpTransport.connect("127.0.0.1", PORT);
 			const a = await connectWasm(
@@ -176,8 +179,8 @@ describe("connection lifecycle", () => {
 	test.skipIf(!wasmAvailable)(
 		"a server drain resolves the client's draining without closing it",
 		async () => {
-			const PORT = 47852;
-			const srv = await startEchoServer(PORT);
+			const srv = await startEchoServer();
+			const PORT = srv.port;
 			const udp = await BunUdpTransport.connect("127.0.0.1", PORT);
 			const c = await connectWasm(
 				wasm,
@@ -209,8 +212,8 @@ describe("connection lifecycle", () => {
 	test.skipIf(!wasmAvailable)(
 		"draining still resolves on a local close when the peer never drains",
 		async () => {
-			const PORT = 47853;
-			const srv = await startEchoServer(PORT);
+			const srv = await startEchoServer();
+			const PORT = srv.port;
 			const udp = await BunUdpTransport.connect("127.0.0.1", PORT);
 			const c = await connectWasm(
 				wasm,
