@@ -41,6 +41,7 @@ Canonical release truth: `docs/release-status.json`. This document defines the s
 - maxDatagramSize cap
 3. Rate limits per peer IP and per prefix
 - RateLimitOptions: per-IP handshakesBurst, per-prefix handshakesBurstPerPrefix (/24 IPv4, /64 IPv6). Both also cap the sessions open at once from that IP or prefix (defaults 40 and 100)
+- Over-rate traffic is refused, not punished: a handshake is refused, a stream open is reset, and a datagram over the ingress rate is dropped and counted in `rateLimitedCount` and `datagramsDropped`. The session survives, on both the native and wasm engines.
 - The handshake token bucket and the per-IP / per-prefix session caps are
   charged once the QUIC and TLS handshake has finished and the CONNECT
   request has been read, and a refused peer gets HTTP 429 (`E_RATE_LIMITED`).

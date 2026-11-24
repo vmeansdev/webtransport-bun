@@ -430,6 +430,13 @@ For browser-shaped facade streams, the control mapping is:
 - Readable stream `cancel(reason)` -> stop-sending (native stop-sending path)
 - Symbol controls remain available for Node-first compatibility.
 
+The receiving side sees the peer's code. A peer reset fails the readable, and a
+peer stop-sending fails the next write, with a `WebTransportError` whose `code`
+is `E_STREAM_RESET` / `E_STOP_SENDING`, `source` is `"stream"`, and
+`streamErrorCode` is the peer's application code. This holds for Node streams,
+facade streams and server streams on both backends. Local resets and session
+loss leave `streamErrorCode` null.
+
 ### Metrics
 
 The block below lists the core fields. `docs/METRICS.md` is the full

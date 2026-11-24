@@ -79,6 +79,13 @@ hatch exists. Checked against the rc.1 candidate (875dfbfe).
   streams) failed with plain `Error`s whose message began with the code. They
   now emit a `WebTransportError` with the same message and `.code` set, like
   the server's streams; code reading `err.message` is unaffected.
+- **A wasm server drops over-rate datagrams instead of closing the
+  connection.** A datagram over the per-IP ingress rate
+  (`rateLimits.datagramsIngressPerSec` / `datagramsIngressBurst`) used to
+  close the sender's whole connection on the wasm engine, while native drops
+  the datagram and keeps the session. wasm now matches native: the datagram
+  is dropped, counted in `rateLimitedCount` and `datagramsDropped`, and the
+  session stays open. There is no option to restore the close.
 - **Not breaking, listed for completeness.** The surfaces under "Removed and
   internalized" below were never in rc.1, so no rc.1 caller can depend on
   them: the reflector, the campaign getters, `__sendPathDiagnostics`, the
@@ -330,6 +337,25 @@ unstable `__TESTING__.serverInternals(server)` accessor (`docs/SPEC.md`,
 
 ### Fixed
 
+- Native streams now report the peer's application error code. A peer
+  `RESET_STREAM` or `STOP_SENDING` failed the receiving side with
+  `streamErrorCode: null`, because the code was dropped where the transport
+  error became an `E_*` string; wasm already reported it. Client Node streams,
+  the `WebTransport` facade's streams and the server's streams now carry it on
+  `WebTransportError.streamErrorCode`, and the message reads
+  `E_STREAM_RESET: stream reset by peer (code N)` /
+  `E_STOP_SENDING: stream stopped by peer (code N)` on both backends (the
+  `E_*` prefix and `.code` are unchanged). A native sink's `reset` record also
+  carried the on-wire HTTP/3 value (clamped to `4294967295`) instead of the
+  peer's code; it now carries the code.
+- The wasm manager's `metricsSnapshot()` reported 0 for `rateLimitedCount`,
+  `limitExceededCount`, `sniCertSelections`, `defaultCertSelections` and
+  `unknownSniRejectedCount`: it read keys the governor snapshot does not have,
+  and the wasm governor counted no cap refusals at all. `rateLimitedCount` is
+  now the sum of the handshake, stream-open and datagram-ingress rate-limit
+  counters, `limitExceededCount` counts refusals at `maxHandshakesInFlight`,
+  `maxSessions` and the stream caps (also exposed as the governor snapshot's
+  `limitExceededCount`), and the SNI counters come from the TLS resolver.
 - `build:wasm:dist` (also run by `prepublishOnly`) exited 0 with a broken
   artifact when only a versioned Homebrew LLVM (`llvm@NN`) was installed: the
   system `ar` archived ring's wasm32 objects without a symbol index, so the

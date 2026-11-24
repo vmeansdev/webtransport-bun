@@ -113,6 +113,7 @@ pub mod session;
 pub mod session_napi;
 pub mod session_registry;
 pub mod spawn_tracked;
+pub(crate) mod stream_fault;
 pub mod stream_sink;
 pub mod transport_memory;
 pub mod udp_send_batch;

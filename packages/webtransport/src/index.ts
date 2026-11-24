@@ -207,6 +207,7 @@ import {
 	E_TLS,
 	E_UNSUPPORTED_ARGUMENT,
 	extractStreamErrorCode,
+	peerStreamErrorCode,
 	unwrapNativeValue,
 	unwrapNativeVoid,
 	WebTransportError,
@@ -324,13 +325,17 @@ function toWebTransportError(
 			? (explicitCode as ErrorCode)
 			: undefined;
 	const msg = err instanceof Error ? err.message : String(err);
-	if (knownExplicitCode) {
-		return createMappedError(knownExplicitCode, msg, strictW3CErrors);
-	}
+	const streamErrorCode =
+		err instanceof WebTransportError && err.streamErrorCode !== null
+			? err.streamErrorCode
+			: peerStreamErrorCode(msg);
 	return createMappedError(
-		extractMessageErrorCode(msg) ?? (E_INTERNAL as ErrorCode),
+		knownExplicitCode ??
+			extractMessageErrorCode(msg) ??
+			(E_INTERNAL as ErrorCode),
 		msg,
 		strictW3CErrors,
+		{ streamErrorCode },
 	);
 }
 

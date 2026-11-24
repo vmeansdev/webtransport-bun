@@ -103,6 +103,21 @@ export function extractStreamErrorCode(reason: unknown): number {
 	return 0;
 }
 
+const PEER_STREAM_ERROR_RE =
+	/\b(?:E_STREAM_RESET: stream reset|E_STOP_SENDING: stream stopped) by peer \(code (\d+)\)/;
+
+/**
+ * The application error code a peer's RESET_STREAM or STOP_SENDING carried,
+ * read back from the failure message. Both engines render it the same way
+ * (`E_STREAM_RESET: stream reset by peer (code N)`, `E_STOP_SENDING: stream
+ * stopped by peer (code N)`), keeping the `E_CODE:` prefix every code parser
+ * keys on. Null for any other failure, including local resets.
+ */
+export function peerStreamErrorCode(message: string): number | null {
+	const match = PEER_STREAM_ERROR_RE.exec(message);
+	return match ? Number(match[1]) : null;
+}
+
 function codeToSource(code: ErrorCode): WebTransportErrorSource {
 	switch (code) {
 		case E_STREAM_RESET:
